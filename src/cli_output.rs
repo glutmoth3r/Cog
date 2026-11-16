@@ -71,6 +71,9 @@ impl Color {
             } else if let Some(note) = line.strip_prefix(" note: ") {
                 eprintln!(" {} {note}", self.paint("note:", "1;36"));
                 continue;
+            } else if let Some(help) = line.strip_prefix(" help: ") {
+                eprintln!(" {} {help}", self.paint("help:", "1;32"));
+                continue;
             } else if let Some((gutter, source)) = line.split_once('|')
                 && gutter.chars().all(|c| c.is_ascii_digit() || c == ' ')
             {
@@ -100,6 +103,8 @@ impl Color {
                 eprintln!(" {} {location}", self.paint("-->", "1;36"));
             } else if let Some(note) = line.strip_prefix(" note: ") {
                 eprintln!(" {} {note}", self.paint("note:", "1;36"));
+            } else if let Some(help) = line.strip_prefix(" help: ") {
+                eprintln!(" {} {help}", self.paint("help:", "1;32"));
             } else if let Some((gutter, source)) = line.split_once('|')
                 && gutter.chars().all(|c| c.is_ascii_digit() || c == ' ')
             {
