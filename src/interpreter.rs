@@ -162,6 +162,7 @@ impl VmExecutionPlan {
         bp: usize,
         stack: &mut Vec<Value>,
         operand_base: usize,
+        propagation_pending: &mut bool,
         context: &RuntimeContext<'_>,
     ) -> Option<JitExit> {
         if !context.jit_enabled || context.limits.any_active() {
@@ -192,6 +193,7 @@ impl VmExecutionPlan {
             bp,
             stack,
             operand_base,
+            propagation_pending,
             context.jit_debug,
         )
     }
@@ -3632,7 +3634,7 @@ fn callable_region_start(artifact: &CompiledProgram, pc: usize) -> usize {
         .map_or(0, |(entry, _)| *entry)
 }
 
-fn matches_runtime_type(expected: &RuntimeType, value: &Value) -> bool {
+pub(crate) fn matches_runtime_type(expected: &RuntimeType, value: &Value) -> bool {
     if matches!(value, Value::Error(_)) {
         return true;
     }
@@ -3650,7 +3652,7 @@ fn matches_runtime_type(expected: &RuntimeType, value: &Value) -> bool {
     matches_primitive
 }
 
-fn call_arguments_match(signature: &CallableSignature, arguments: &[Value]) -> bool {
+pub(crate) fn call_arguments_match(signature: &CallableSignature, arguments: &[Value]) -> bool {
     let Some(parameter_types) = &signature.parameter_types else {
         return true;
     };
@@ -4903,6 +4905,7 @@ fn execute_vm(
                             bp,
                             &mut stack,
                             operand_base,
+                            &mut propagation_pending,
                             context,
                         )
                     {
@@ -4932,6 +4935,7 @@ fn execute_vm(
                                     bp,
                                     &mut stack,
                                     operand_base,
+                                    &mut propagation_pending,
                                     context,
                                 )
                             {
@@ -4969,6 +4973,7 @@ fn execute_vm(
                                     bp,
                                     &mut stack,
                                     operand_base,
+                                    &mut propagation_pending,
                                     context,
                                 )
                             {
