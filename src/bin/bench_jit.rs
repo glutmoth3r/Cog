@@ -314,6 +314,36 @@ fn main() -> nil {{
     )
 }
 
+fn bigint_compare_source(iterations: u64) -> String {
+    format!(
+        r#"
+@!include("std")
+use io;
+
+fn compare(negative: bigint, positive: bigint, large: bigint, n: int) -> int {{
+    var index = 0;
+    var result = 0;
+    while index < n {{
+        if negative < positive {{ result += 1; }}
+        if positive > negative {{ result += 2; }}
+        if negative <= large {{ result += 4; }}
+        if large >= negative {{ result += 8; }}
+        if positive < large {{ result += 16; }}
+        if large > positive {{ result += 32; }}
+        if negative == positive {{ result += 64; }}
+        if negative != positive {{ result += 128; }}
+        index += 1;
+    }}
+    return result;
+}}
+
+fn main() -> nil {{
+    io::println(compare(-1 as bigint, 7 as bigint, 9223372036854775808 as bigint, {iterations}))!!;
+}}
+"#
+    )
+}
+
 fn run(program: &Program, jit: bool, profile: Option<&Path>) -> Result<(Duration, String), String> {
     let mut output = Vec::new();
     let mut context = RunContext::new(&mut output).with_jit(jit);
@@ -413,6 +443,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Case {
             name: "bigint-divmod",
             source: bigint_divmod_source,
+        },
+        Case {
+            name: "bigint-compare",
+            source: bigint_compare_source,
         },
     ];
 
