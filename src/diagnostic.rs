@@ -164,6 +164,7 @@ pub struct Diagnostic {
     pub message: String,
     pub span: Option<SourceSpan>,
     pub notes: Vec<String>,
+    pub helps: Vec<String>,
 }
 
 impl Diagnostic {
@@ -173,6 +174,7 @@ impl Diagnostic {
             message: message.into(),
             span,
             notes: Vec::new(),
+            helps: Vec::new(),
         }
     }
 
@@ -194,6 +196,11 @@ impl Diagnostic {
 
     pub fn note(mut self, note: impl Into<String>) -> Self {
         self.notes.push(note.into());
+        self
+    }
+
+    pub fn help(mut self, help: impl Into<String>) -> Self {
+        self.helps.push(help.into());
         self
     }
 }
@@ -242,6 +249,9 @@ impl std::fmt::Display for Diagnostic {
             let padding = prefix.len() + span.source.text[excerpt_start..start].chars().count();
             writeln!(f, " {line} | {prefix}{text}{suffix}")?;
             writeln!(f, "   | {}{}", " ".repeat(padding), "^".repeat(width))?;
+        }
+        for help in &self.helps {
+            writeln!(f, " help: {help}")?;
         }
         for note in &self.notes {
             writeln!(f, " note: {note}")?;

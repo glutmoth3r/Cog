@@ -94,6 +94,127 @@ fn bigint_literal_expression(expr: &Expr) -> bool {
     }
 }
 
+fn expression_source_excerpt(expression: &Expr) -> Option<String> {
+    let span = expression.span()?;
+    let text = span.source.text.get(span.range.clone())?.trim();
+    if text.is_empty() || text.len() > 64 || text.contains('\n') || text.contains('\r') {
+        return None;
+    }
+    Some(text.to_owned())
+}
+
+fn mixed_numeric_help(
+    left_type: VarType,
+    right_type: VarType,
+    op: BinOp,
+    left: &Expr,
+    right: &Expr,
+) -> Option<String> {
+    let operator = match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Mod => "%",
+        _ => return None,
+    };
+    let left_text = expression_source_excerpt(left);
+    let right_text = expression_source_excerpt(right);
+    match (left_type, right_type) {
+        (VarType::BigInt, VarType::Int | VarType::UInt) => Some(match (left_text, right_text) {
+            (Some(left), Some(right)) => format!(
+                "convert the `{}` operand to `bigint`, for example `({left}) {operator} (({right}) as bigint)`",
+                right_type.name()
+            ),
+            _ => format!(
+                "convert the `{}` operand explicitly with `as bigint`",
+                right_type.name()
+            ),
+        }),
+        (VarType::Int | VarType::UInt, VarType::BigInt) => Some(match (left_text, right_text) {
+            (Some(left), Some(right)) => format!(
+                "convert the `{}` operand to `bigint`, for example `(({left}) as bigint) {operator} ({right})`",
+                left_type.name()
+            ),
+            _ => format!(
+                "convert the `{}` operand explicitly with `as bigint`",
+                left_type.name()
+            ),
+        }),
+        (VarType::Int, VarType::UInt) => Some(match (left_text, right_text) {
+            (Some(left), Some(right)) => format!(
+                "choose a common integer type and convert explicitly, for example `(({left}) as uint) {operator} ({right})` or `({left}) {operator} (({right}) as int)` after checking the value ranges"
+            ),
+            _ => "choose a common integer type and convert one operand explicitly with `as int` or `as uint` after checking the value range".into(),
+        }),
+        (VarType::UInt, VarType::Int) => Some(match (left_text, right_text) {
+            (Some(left), Some(right)) => format!(
+                "choose a common integer type and convert explicitly, for example `({left}) {operator} (({right}) as uint)` or `(({left}) as int) {operator} ({right})` after checking the value ranges"
+            ),
+            _ => "choose a common integer type and convert one operand explicitly with `as int` or `as uint` after checking the value range".into(),
+        }),
+        (VarType::BigInt, VarType::Float) | (VarType::Float, VarType::BigInt) => Some(
+            "convert the `bigint` operand with `as float` if rounding large integers is acceptable".into(),
+        ),
+        _ => None,
+    }
+}
+
+fn primitive_type_mismatch_help(expected: &Type, actual: &Type) -> Option<String> {
+    match (expected, actual) {
+        (Type::Primitive(expected, false), Type::Nil) if *expected != VarType::Nil => {
+            Some(format!(
+                "this value may be `nil`; check it before use or make the destination `{}`",
+                Type::Primitive(*expected, true).display()
+            ))
+        }
+        (Type::Primitive(expected, false), Type::Primitive(actual, true))
+            if expected == actual && *expected != VarType::Nil =>
+        {
+            Some(format!(
+                "this value may be `nil`; check it before use or make the destination `{}`",
+                Type::Primitive(*expected, true).display()
+            ))
+        }
+        (Type::Primitive(expected, _), Type::Dynamic) if *expected != VarType::Nil => {
+            Some(format!(
+                "use `as {}` to request a checked conversion",
+                expected.name()
+            ))
+        }
+        (Type::Primitive(expected, _), Type::Primitive(actual, _))
+            if supports_primitive_cast(*actual, *expected) =>
+        {
+            Some(format!(
+                "use `as {}` to request a checked conversion",
+                expected.name()
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn supports_primitive_cast(from: VarType, to: VarType) -> bool {
+    match to {
+        VarType::Int | VarType::UInt => matches!(
+            from,
+            VarType::Int | VarType::UInt | VarType::BigInt | VarType::Float | VarType::Str
+        ),
+        VarType::BigInt => matches!(
+            from,
+            VarType::Int | VarType::UInt | VarType::BigInt | VarType::Str
+        ),
+        VarType::Float => matches!(
+            from,
+            VarType::Int | VarType::UInt | VarType::BigInt | VarType::Float | VarType::Str
+        ),
+        VarType::Bool => matches!(from, VarType::Bool | VarType::Str),
+        VarType::Char => matches!(from, VarType::Char | VarType::Str),
+        VarType::Str => true,
+        VarType::Nil => false,
+    }
+}
+
 fn array_element_compatible(expected: &Type, actual: &Type) -> bool {
     match (expected, actual) {
         (Type::Dynamic, _) | (_, Type::Dynamic) => true,
@@ -1762,7 +1883,7 @@ impl<'a> Checker<'a> {
             if let Some(expected) = function.params[parameter_index].ty.as_ref() {
                 let expected_type = self.substituted_type(expected, &substitutions);
                 if !type_compatible(&expected_type, actual_type) {
-                    self.error(
+                    let mut diagnostic = Diagnostic::new(
                         "E2001",
                         format!(
                             "type mismatch: parameter `{}` of `{name}` expects {}, got {}",
@@ -1770,8 +1891,12 @@ impl<'a> Checker<'a> {
                             expected_type.display(),
                             actual_type.display()
                         ),
-                        args[argument_index].value.span(),
+                        args[argument_index].value.span().cloned(),
                     );
+                    if let Some(help) = primitive_type_mismatch_help(&expected_type, actual_type) {
+                        diagnostic = diagnostic.help(help);
+                    }
+                    self.diagnostics.push(diagnostic);
                 }
             }
         }
@@ -1931,7 +2056,7 @@ impl<'a> Checker<'a> {
                 {
                     self.refine_empty_array(&args[argument_index].value, &element);
                 } else if !type_compatible(&expected_type, actual_type) {
-                    self.error(
+                    let mut diagnostic = Diagnostic::new(
                         "E2001",
                         format!(
                             "type mismatch: field `{}` of `{name}` expects {}, got {}",
@@ -1939,8 +2064,12 @@ impl<'a> Checker<'a> {
                             expected_type.display(),
                             actual_type.display()
                         ),
-                        args[argument_index].value.span(),
+                        args[argument_index].value.span().cloned(),
                     );
+                    if let Some(help) = primitive_type_mismatch_help(&expected_type, actual_type) {
+                        diagnostic = diagnostic.help(help);
+                    }
+                    self.diagnostics.push(diagnostic);
                 }
             } else if contains_unresolved_empty_array(actual_type) {
                 self.error(
@@ -2484,24 +2613,8 @@ impl<'a> Checker<'a> {
                 ),
                 span.cloned().or_else(|| self.location.clone()),
             );
-            if let TypeKind::Primitive(base) = &expected.kind
-                && *base != VarType::Nil
-            {
-                let nullable_actual = matches!(actual, Type::Nil)
-                    || matches!(actual, Type::Primitive(actual_base, true) if actual_base == *base);
-                if !expected.nilable && nullable_actual {
-                    let mut nullable_expected = expected.clone();
-                    nullable_expected.nilable = true;
-                    diagnostic = diagnostic.note(format!(
-                        "this value may be `nil`; check it before assignment or use `{}` if nil is valid",
-                        nullable_expected.display()
-                    ));
-                } else if matches!(actual, Type::Dynamic | Type::Primitive(_, _)) {
-                    diagnostic = diagnostic.note(format!(
-                        "use `as {}` to request a checked conversion; it does not require try/catch",
-                        base.name()
-                    ));
-                }
+            if let Some(help) = primitive_type_mismatch_help(&expected_type, &actual) {
+                diagnostic = diagnostic.help(help);
             }
             self.diagnostics.push(diagnostic);
         }
@@ -2552,7 +2665,7 @@ impl<'a> Checker<'a> {
                 );
                 match (&expected, &actual) {
                     (Type::Array(expected), Type::Array(_)) => {
-                        diagnostic = diagnostic.note(format!(
+                        diagnostic = diagnostic.help(format!(
                             "array element types are invariant; make the elements match `{}` or convert them before assignment",
                             expected.display()
                         ));
@@ -2560,7 +2673,7 @@ impl<'a> Checker<'a> {
                     (Type::Tuple(expected), Type::Tuple(actual))
                         if expected.len() == actual.len() =>
                     {
-                        diagnostic = diagnostic.note(
+                        diagnostic = diagnostic.help(
                             "tuple element types are positional; check each element against its declared position",
                         );
                     }
@@ -3142,7 +3255,8 @@ impl<'a> Checker<'a> {
                     self.contextualize_integer_literals(value, &left);
                 }
                 let right = self.expr(value);
-                let actual = self.binary_types(*op, left, right, value.span());
+                let actual =
+                    self.binary_types(*op, left, right, value.span(), Some((target, value)));
                 return self.assignment(target, value, actual, value.span());
             }
             Stmt::Assign { target, value } => {
@@ -3523,7 +3637,14 @@ impl<'a> Checker<'a> {
         Type::Nil
     }
 
-    fn binary_types(&mut self, op: BinOp, a: Type, b: Type, span: Option<&SourceSpan>) -> Type {
+    fn binary_types(
+        &mut self,
+        op: BinOp,
+        a: Type,
+        b: Type,
+        span: Option<&SourceSpan>,
+        operands: Option<(&Expr, &Expr)>,
+    ) -> Type {
         if a == Type::Poison || b == Type::Poison {
             return Type::Poison;
         }
@@ -3598,11 +3719,17 @@ impl<'a> Checker<'a> {
                 {
                     Type::concrete(VarType::Float)
                 } else {
-                    self.error(
+                    let mut diagnostic = Diagnostic::new(
                         "E2002",
                         "mixed integer arithmetic requires an explicit conversion",
-                        span,
+                        span.cloned().or_else(|| self.location.clone()),
                     );
+                    if let Some((left, right)) = operands
+                        && let Some(help) = mixed_numeric_help(x, y, op, left, right)
+                    {
+                        diagnostic = diagnostic.help(help);
+                    }
+                    self.diagnostics.push(diagnostic);
                     Type::Poison
                 }
             }
@@ -4302,10 +4429,13 @@ impl<'a> Checker<'a> {
                     }
                 }
                 if inconsistent {
-                    self.error(
-                        "E2001",
-                        "type mismatch: array elements must have a consistent type",
-                        expr.span(),
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E2001",
+                            "type mismatch: array elements must have a consistent type",
+                            expr.span().cloned().or_else(|| self.location.clone()),
+                        )
+                        .help("make the array elements the same type or explicitly convert the outliers with `as`")
                     );
                     return Type::Poison;
                 }
@@ -4441,7 +4571,7 @@ impl<'a> Checker<'a> {
                 if matches!(op, BinOp::Prepend) {
                     self.refine_empty_array(b, &left);
                 }
-                self.binary_types(*op, left, right, expr.span())
+                self.binary_types(*op, left, right, expr.span(), Some((a, b)))
             }
             Expr::Index(a, b) => {
                 let receiver = self.expr(a);
