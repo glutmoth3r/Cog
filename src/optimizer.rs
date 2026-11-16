@@ -2,8 +2,9 @@
 //!
 //! The pass propagates scalar constants through local slots and operand-stack
 //! values, simplifies branches whose condition is known, and removes blocks
-//! made unreachable by those branches. Potentially failing operations are only
-//! folded when the existing comptime evaluator proves that they succeed.
+//! made unreachable by those branches. Local slots with disjoint CFG liveness
+//! share frame storage. Potentially failing operations are only folded when
+//! the existing comptime evaluator proves that they succeed.
 
 use crate::ast::{BinOp, Expr, UnOp};
 use crate::backend::{CallableSignature, CompiledProgram, SourceMapEntry};
@@ -15,6 +16,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 const MAX_REGION_INSTRUCTIONS: usize = 200_000;
 const MAX_ANALYSIS_VISITS: usize = 1_000_000;
 const MAX_TRACKED_VALUES: usize = 256;
+const MAX_SLOT_COMPACTION_SLOTS: usize = 4_096;
+const MAX_SLOT_FLOW_WORDS: usize = 250_000;
+const MAX_SLOT_FLOW_OPERATIONS: usize = 4_000_000;
+const MAX_SLOT_INTERFERENCE_OPERATIONS: usize = 2_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Scalar {
@@ -280,12 +285,268 @@ pub(crate) fn optimize(program: &CompiledProgram) -> CompiledProgram {
         return program.clone();
     };
 
-    CompiledProgram {
+    let mut optimized = CompiledProgram {
         instructions: rewritten,
         imports: program.imports.clone(),
         functions,
         callables,
         source_map,
+    };
+    compact_local_slots(&mut optimized);
+    optimized
+}
+
+/// Reuses a local slot only when CFG liveness proves that its previous value is
+/// dead. The analysis is bounded; oversized or unusual regions are untouched.
+fn compact_local_slots(program: &mut CompiledProgram) {
+    let instruction_count = program.instructions.len();
+    let mut boundaries = vec![0, instruction_count];
+    boundaries.extend(program.callables.keys().copied());
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    for window in boundaries.windows(2) {
+        let (start, end) = (window[0], window[1]);
+        if start >= end || end > instruction_count {
+            continue;
+        }
+        let Some(mapping) = local_slot_mapping(program, start, end) else {
+            continue;
+        };
+        for instruction in &mut program.instructions[start..end] {
+            let slot = match instruction {
+                Instruction::Load(slot) | Instruction::Store(slot) => slot,
+                _ => continue,
+            };
+            if let Some(compact) = mapping.get(*slot) {
+                *slot = *compact;
+            }
+        }
+    }
+}
+
+fn local_slot_mapping(program: &CompiledProgram, start: usize, end: usize) -> Option<Vec<usize>> {
+    let length = end.checked_sub(start)?;
+    if length == 0 || length > MAX_REGION_INSTRUCTIONS {
+        return None;
+    }
+
+    let mut slot_count = 0usize;
+    for instruction in &program.instructions[start..end] {
+        if let Instruction::Load(slot) | Instruction::Store(slot) = instruction {
+            slot_count = slot_count.max(slot.checked_add(1)?);
+        }
+    }
+    if slot_count == 0 || slot_count > MAX_SLOT_COMPACTION_SLOTS {
+        return None;
+    }
+
+    let mut leaders = BTreeSet::from([start]);
+    for pc in start..end {
+        let instruction = &program.instructions[pc];
+        if let Some(target) = branch_target(instruction) {
+            if !(start..end).contains(&target) {
+                return None;
+            }
+            leaders.insert(target);
+        }
+        if is_block_terminator(instruction) && pc + 1 < end {
+            leaders.insert(pc + 1);
+        }
+    }
+
+    let words = slot_count.checked_add(63)?.checked_div(64)?;
+    let leaders = leaders.into_iter().collect::<Vec<_>>();
+    let mut blocks = Vec::with_capacity(leaders.len());
+    let mut pc_to_block = vec![usize::MAX; length];
+    for (index, leader) in leaders.iter().copied().enumerate() {
+        let block_end = leaders.get(index + 1).copied().unwrap_or(end);
+        if leader >= block_end {
+            return None;
+        }
+        blocks.push(BasicBlock {
+            start: leader,
+            end: block_end,
+        });
+        for pc in leader..block_end {
+            pc_to_block[pc - start] = index;
+        }
+    }
+
+    let flow_len = blocks.len().checked_mul(words)?;
+    if flow_len > MAX_SLOT_FLOW_WORDS {
+        return None;
+    }
+    let block_count = blocks.len();
+    let mut uses = vec![0u64; flow_len];
+    let mut definitions = vec![0u64; flow_len];
+    let mut successors = Vec::with_capacity(block_count);
+    let mut predecessors = vec![Vec::new(); block_count];
+    for (block_index, block) in blocks.iter().enumerate() {
+        let row = block_index * words;
+        for pc in block.start..block.end {
+            match &program.instructions[pc] {
+                Instruction::Load(slot) => {
+                    if !bit_is_set(&definitions[row..row + words], *slot) {
+                        bit_set(&mut uses[row..row + words], *slot);
+                    }
+                }
+                Instruction::Store(slot) => bit_set(&mut definitions[row..row + words], *slot),
+                _ => {}
+            }
+        }
+        let next = block_successors(
+            &program.instructions[block.end - 1],
+            block.end - 1,
+            block_index,
+            block_count,
+            start,
+            end,
+            &pc_to_block,
+            None,
+        )?;
+        for successor in next.into_iter().flatten() {
+            if successor >= block_count {
+                return None;
+            }
+            predecessors[successor].push(block_index);
+        }
+        successors.push(next);
+    }
+
+    let mut live_in = vec![0u64; flow_len];
+    let mut live_out = vec![0u64; flow_len];
+    let mut queue = (0..block_count).rev().collect::<VecDeque<_>>();
+    let mut queued = vec![true; block_count];
+    let mut next_out = vec![0u64; words];
+    let mut flow_operations = 0usize;
+    while let Some(block) = queue.pop_front() {
+        queued[block] = false;
+        next_out.fill(0);
+        for successor in successors[block].into_iter().flatten() {
+            let successor_row = successor * words;
+            for (out, input) in next_out
+                .iter_mut()
+                .zip(&live_in[successor_row..successor_row + words])
+            {
+                *out |= *input;
+            }
+            flow_operations = flow_operations.checked_add(words)?;
+        }
+
+        let row = block * words;
+        let mut changed = false;
+        for word in 0..words {
+            let incoming = uses[row + word] | (next_out[word] & !definitions[row + word]);
+            if live_out[row + word] != next_out[word] || live_in[row + word] != incoming {
+                live_out[row + word] = next_out[word];
+                live_in[row + word] = incoming;
+                changed = true;
+            }
+        }
+        flow_operations = flow_operations.checked_add(words)?;
+        if flow_operations > MAX_SLOT_FLOW_OPERATIONS {
+            return None;
+        }
+        if changed {
+            for predecessor in &predecessors[block] {
+                if !queued[*predecessor] {
+                    queued[*predecessor] = true;
+                    queue.push_back(*predecessor);
+                }
+            }
+        }
+    }
+
+    let interference_words = slot_count.checked_mul(words)?;
+    if interference_words > MAX_SLOT_INTERFERENCE_OPERATIONS {
+        return None;
+    }
+    let mut interference = vec![0u64; interference_words];
+    let mut live = vec![0u64; words];
+    let mut interference_operations = 0usize;
+    for (block_index, block) in blocks.iter().enumerate() {
+        let row = block_index * words;
+        live.copy_from_slice(&live_out[row..row + words]);
+        for pc in (block.start..block.end).rev() {
+            match &program.instructions[pc] {
+                Instruction::Store(slot) => {
+                    for (word_index, word) in live.iter().copied().enumerate() {
+                        let mut neighbors = word;
+                        while neighbors != 0 {
+                            let neighbor = word_index * 64 + neighbors.trailing_zeros() as usize;
+                            neighbors &= neighbors - 1;
+                            if neighbor >= slot_count || neighbor == *slot {
+                                continue;
+                            }
+                            let slot_row = *slot * words;
+                            let neighbor_row = neighbor * words;
+                            bit_set(&mut interference[slot_row..slot_row + words], neighbor);
+                            bit_set(&mut interference[neighbor_row..neighbor_row + words], *slot);
+                            interference_operations = interference_operations.checked_add(1)?;
+                            if interference_operations > MAX_SLOT_INTERFERENCE_OPERATIONS {
+                                return None;
+                            }
+                        }
+                    }
+                    bit_clear(&mut live, *slot);
+                }
+                Instruction::Load(slot) => bit_set(&mut live, *slot),
+                _ => {}
+            }
+        }
+    }
+
+    let mut degrees = Vec::with_capacity(slot_count);
+    for slot in 0..slot_count {
+        let row = slot * words;
+        degrees.push(
+            interference[row..row + words]
+                .iter()
+                .map(|word| word.count_ones() as usize)
+                .sum::<usize>(),
+        );
+    }
+    let mut order = (0..slot_count).collect::<Vec<_>>();
+    order.sort_by(|left, right| {
+        degrees[*right]
+            .cmp(&degrees[*left])
+            .then_with(|| left.cmp(right))
+    });
+    let mut colors = vec![usize::MAX; slot_count];
+    let mut blocked = vec![false; slot_count];
+    let mut color_count = 0usize;
+    for slot in order {
+        blocked.fill(false);
+        let row = slot * words;
+        for neighbor in 0..slot_count {
+            if colors[neighbor] != usize::MAX
+                && bit_is_set(&interference[row..row + words], neighbor)
+            {
+                blocked[colors[neighbor]] = true;
+            }
+        }
+        let color = blocked.iter().position(|is_blocked| !is_blocked)?;
+        colors[slot] = color;
+        color_count = color_count.max(color + 1);
+    }
+    (color_count < slot_count).then_some(colors)
+}
+
+fn bit_is_set(bits: &[u64], index: usize) -> bool {
+    bits.get(index / 64)
+        .is_some_and(|word| word & (1u64 << (index % 64)) != 0)
+}
+
+fn bit_set(bits: &mut [u64], index: usize) {
+    if let Some(word) = bits.get_mut(index / 64) {
+        *word |= 1u64 << (index % 64);
+    }
+}
+
+fn bit_clear(bits: &mut [u64], index: usize) {
+    if let Some(word) = bits.get_mut(index / 64) {
+        *word &= !(1u64 << (index % 64));
     }
 }
 

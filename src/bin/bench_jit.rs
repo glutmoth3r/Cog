@@ -1,4 +1,5 @@
 use cog::sdk::{Engine, Program, RunContext};
+use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -20,6 +21,33 @@ fn work(n: int) -> int {{
     var total = 0;
     while index < n {{
         total += index;
+        index += 1;
+    }}
+    return total;
+}}
+
+fn main() -> nil {{
+    io::println(work({iterations}))!!;
+}}
+"#
+    )
+}
+
+fn slot_pressure_source(iterations: u64) -> String {
+    let mut scratch = String::with_capacity(8_000);
+    for slot in 0..200 {
+        writeln!(scratch, "        const scratch_{slot} = index;").unwrap();
+    }
+    format!(
+        r#"
+@!include("std")
+use io;
+
+fn work(n: int) -> int {{
+    var index = 0;
+    var total = 0;
+    while index < n {{
+{scratch}        total += index;
         index += 1;
     }}
     return total;
@@ -466,6 +494,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             source: int_source,
         },
         Case {
+            name: "slot-pressure",
+            source: slot_pressure_source,
+        },
+        Case {
             name: "uint",
             source: uint_source,
         },
@@ -595,10 +627,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             jit_ns_per_backedge,
             calibrated
         );
+        let slot_report = (case.name == "slot-pressure")
+            .then(|| local_slot_count(&jit_program, "work"))
+            .flatten()
+            .map_or_else(String::new, |slots| format!("; work_local_slots={slots}"));
         eprintln!(
-            "{}: bytecode={} bytes; matching output {:?}",
+            "{}: bytecode={} bytes{}; matching output {:?}",
             case.name,
             artifact_bytes,
+            slot_report,
             expected_output.trim_end()
         );
 
@@ -606,4 +643,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn local_slot_count(program: &Program, function_name: &str) -> Option<usize> {
+    let mut in_function = false;
+    let mut max_slot = None;
+    let disassembly = program.disassemble();
+    for line in disassembly.lines() {
+        if line.starts_with("function ") && in_function {
+            break;
+        }
+        if let Some(label) = line.strip_suffix(':') {
+            if in_function {
+                break;
+            }
+            in_function = label == function_name;
+            continue;
+        }
+        if in_function {
+            let mut fields = line.split_whitespace();
+            let operation = fields.next()?;
+            if !matches!(operation, "load" | "store") {
+                continue;
+            }
+            let slot = fields.next()?.parse::<usize>().ok()?.checked_add(1)?;
+            max_slot = Some(max_slot.map_or(slot, |current: usize| current.max(slot)));
+        }
+    }
+    max_slot
 }
