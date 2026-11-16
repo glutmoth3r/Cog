@@ -344,6 +344,59 @@ fn main() -> nil {{
     )
 }
 
+fn bigint_mixed_arithmetic_source(iterations: u64) -> String {
+    format!(
+        r#"
+@!include("std")
+use io;
+
+fn mixed_work(negative: bigint, large: bigint, n: int) -> int {{
+    var index = 0;
+    var result = 0;
+    while index < n {{
+        const sum = negative + large;
+        const difference = large - negative;
+        const product = negative * large;
+        const reverse_product = large * negative;
+        if sum == 9223372036854775807 {{ result += 1; }}
+        if difference > 9223372036854775807 {{ result += 2; }}
+        if product == (-9223372036854775807 - 1) {{ result += 4; }}
+        if reverse_product == (-9223372036854775807 - 1) {{ result += 8; }}
+        index += 1;
+    }}
+    return result;
+}}
+
+fn main() -> nil {{
+    io::println(mixed_work(-1 as bigint, 9223372036854775808 as bigint, {iterations}))!!;
+}}
+"#
+    )
+}
+
+fn bigint_mixed_overflow_source(iterations: u64) -> String {
+    format!(
+        r#"
+@!include("std")
+use io;
+
+fn mixed_overflow(signed: bigint, unsigned: bigint, n: int) -> bigint {{
+    var index = 0;
+    var result: bigint = 0 as bigint;
+    while index < n {{
+        result = signed - unsigned;
+        index += 1;
+    }}
+    return result;
+}}
+
+fn main() -> nil {{
+    io::println(mixed_overflow(-1 as bigint, 9223372036854775808 as bigint, {iterations}))!!;
+}}
+"#
+    )
+}
+
 fn run(program: &Program, jit: bool, profile: Option<&Path>) -> Result<(Duration, String), String> {
     let mut output = Vec::new();
     let mut context = RunContext::new(&mut output).with_jit(jit);
@@ -447,6 +500,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Case {
             name: "bigint-compare",
             source: bigint_compare_source,
+        },
+        Case {
+            name: "bigint-mixed-arithmetic",
+            source: bigint_mixed_arithmetic_source,
+        },
+        Case {
+            name: "bigint-mixed-overflow",
+            source: bigint_mixed_overflow_source,
         },
     ];
 
