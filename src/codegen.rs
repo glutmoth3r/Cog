@@ -2957,11 +2957,25 @@ impl<'a> Codegen<'a> {
             values.push(Self::constant_value_expression(&value)?);
         }
         *nodes += function.nodes;
-        let parameter_names = function
+        let mut parameter_names = function
             .parameters
             .iter()
             .map(|parameter| parameter.name.clone())
             .collect::<Vec<_>>();
+        for binding in &function.bindings {
+            let Stmt::Const {
+                pattern: BindingPattern::Name(name),
+                ty: None,
+                value,
+            } = binding.node()
+            else {
+                return None;
+            };
+            let expression = substitute_constant_parameters(value, &parameter_names, &values)?;
+            let value = crate::comptime::fold_constant_expression(&expression)?;
+            parameter_names.push(name.clone());
+            values.push(Self::constant_value_expression(&value)?);
+        }
         let expression = substitute_constant_parameters(&function.body, &parameter_names, &values)?;
         crate::comptime::fold_constant_expression(&expression)
     }
