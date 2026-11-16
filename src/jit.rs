@@ -47,7 +47,7 @@ const MAX_ACTIVITY_GAP_NS: u64 = 1_000_000_000;
 const TOKEN_CAPACITY_NS: u64 = 20_000_000;
 const TOKEN_REFILL_PER_NS: f64 = 0.02;
 const MAX_PROFILE_METRIC_NS: u64 = 60_000_000_000;
-const APE_VERSION: u32 = 15;
+const APE_VERSION: u32 = 16;
 static PROFILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const EXIT_COMPLETED: i32 = 0;
@@ -735,6 +735,8 @@ impl JitState {
             }
             (compiled.entry, compiled.probe_pending)
         };
+        // OSR timings include VM/JIT entry costs; they do not predict whether
+        // calling this compiled function from another JIT function is useful.
         let callables = self
             .candidates
             .iter()
@@ -745,8 +747,7 @@ impl JitState {
                     && !compiled.probe_pending
                     && !candidate.disabled
                     && candidate.profile.calibrated
-                    && candidate.profile.total_backedges >= candidate.retry_after_backedges
-                    && adaptive_gain(candidate) > 0.0)
+                    && candidate.profile.total_backedges >= candidate.retry_after_backedges)
                     .then_some((
                         candidate_entry,
                         JitCallable {
@@ -839,7 +840,11 @@ impl JitState {
         *propagation_pending = frame.propagation_pending != 0;
 
         let backedges = frame.backedge_count;
-        if debug {
+        if debug
+            && (probe_pending
+                || frame.exit_reason != REASON_NORMAL
+                || !matches!(exit, JitExit::Completed))
+        {
             eprintln!(
                 "[jit] exit function={entry} exit={exit:?} backedges={backedges} budget={} reason={} pc={} locals={jit_locals:?}",
                 frame.backedge_budget, frame.exit_reason, frame.pc
@@ -1326,6 +1331,9 @@ fn analyze_function(
                 | Instruction::MakeTuple(_)
                 | Instruction::MakeTypedTuple(_, _)
                 | Instruction::MakeTypedArray(_, _)
+                // Scalar values pass through in the JIT; arrays resume in the
+                // VM at this instruction, which keeps the direct-call path safe.
+                | Instruction::ConstrainArrayFrom
                 | Instruction::Return
                 | Instruction::Crash(_)
         ) || matches!(instruction, Instruction::CallNative(index)
@@ -1948,8 +1956,53 @@ unsafe fn jit_native_call_inner(
     if depth > MAX_STACK || arity > 3 {
         return false;
     }
-    let mut arguments = std::array::from_fn::<_, 3, _>(|_| Value::Nil);
     let roots = unsafe { &*frame_ref.roots };
+    if matches!(import.name(), "bytes::get" | "bytes::set") {
+        let expected_arity = if import.name() == "bytes::get" { 2 } else { 3 };
+        if arity != expected_arity {
+            return false;
+        }
+        let buffer_slot = unsafe { *frame_ref.stack.add(base) };
+        let offset_slot = unsafe { *frame_ref.stack.add(base + 1) };
+        if buffer_slot.tag != TAG_OPAQUE || offset_slot.tag != TAG_INT {
+            return false;
+        }
+        let Ok(root_index) = usize::try_from(buffer_slot.payload) else {
+            return false;
+        };
+        let Some(buffer) = roots.get(root_index) else {
+            return false;
+        };
+        let offset = offset_slot.payload as i64;
+        if import.name() == "bytes::get" {
+            let Some(value) = crate::runtime::jit_bytes_get(buffer, offset) else {
+                return false;
+            };
+            unsafe {
+                *frame_ref.stack.add(base) = JitSlot {
+                    tag: TAG_INT,
+                    payload: i64::from(value) as u64,
+                };
+            }
+            return true;
+        }
+
+        let value_slot = unsafe { *frame_ref.stack.add(base + 2) };
+        if value_slot.tag != TAG_INT
+            || !crate::runtime::jit_bytes_set(buffer, offset, value_slot.payload as i64)
+        {
+            return false;
+        }
+        unsafe {
+            *frame_ref.stack.add(base) = JitSlot {
+                tag: TAG_NIL,
+                payload: 0,
+            };
+        }
+        return true;
+    }
+
+    let mut arguments = std::array::from_fn::<_, 3, _>(|_| Value::Nil);
     for index in base..depth {
         let slot = unsafe { *frame_ref.stack.add(index) };
         let Ok(Some(value)) = from_slot(slot, roots, context.variant_tags) else {
@@ -1959,11 +2012,6 @@ unsafe fn jit_native_call_inner(
     }
     let arguments = &arguments[..arity];
     let result = match import.name() {
-        "bytes::get" => match crate::runtime::jit_bytes_get(arguments) {
-            Some(value) => Value::Int(i64::from(value)),
-            None => return false,
-        },
-        "bytes::set" if crate::runtime::jit_bytes_set(arguments) => Value::Nil,
         "str::to_bigint" => match arguments.first() {
             Some(Value::Error(_)) | Some(Value::BigInt(_)) => arguments[0].clone(),
             Some(Value::Int(value)) => Value::BigInt((*value).into()),
@@ -2018,24 +2066,41 @@ unsafe fn jit_direct_call_inner(
     if depth > MAX_STACK || arity > depth {
         return false;
     }
-    let context = unsafe { &mut *frame_ref.runtime_context.cast::<JitExecutionContext<'_>>() };
-    if !matches!(
-        context.artifact.instructions.get(pc),
-        Some(Instruction::Call(actual_target, actual_arity))
-            if *actual_target == target && *actual_arity == arity
-    ) {
-        return false;
-    }
-    let Some(signature) = context.artifact.callables.get(&target) else {
-        return false;
-    };
-    if signature.asynchronous || signature.captures != 0 || signature.parameters != arity {
-        return false;
-    }
-    let Some(callable) = context.callables.get(&target).cloned() else {
-        return false;
+    let context_ptr = frame_ref.runtime_context.cast::<JitExecutionContext<'_>>();
+    let (signature, callable) = {
+        let context = unsafe { &*context_ptr };
+        if !matches!(
+            context.artifact.instructions.get(pc),
+            Some(Instruction::Call(actual_target, actual_arity))
+                if *actual_target == target && *actual_arity == arity
+        ) {
+            return false;
+        }
+        let Some(signature) = context.artifact.callables.get(&target).cloned() else {
+            return false;
+        };
+        if signature.asynchronous || signature.captures != 0 || signature.parameters != arity {
+            return false;
+        }
+        let Some(callable) = context.callables.get(&target).cloned() else {
+            return false;
+        };
+        (signature, callable)
     };
     let base = depth - arity;
+    if signature.parameter_types.is_none()
+        && signature.result_type == Some(crate::value::RuntimeType::Int)
+    {
+        let Some(result) =
+            (unsafe { jit_direct_call_int_slots(frame_ref, base, arity, context_ptr, &callable) })
+        else {
+            return false;
+        };
+        unsafe { *frame_ref.stack.add(base) = result };
+        return true;
+    }
+
+    let variant_tags = unsafe { &(*context_ptr).variant_tags };
     let roots = unsafe { &*frame_ref.roots };
     if arity > MAX_JIT_CALL_ARGS {
         return false;
@@ -2043,7 +2108,7 @@ unsafe fn jit_direct_call_inner(
     let mut arguments = std::array::from_fn::<_, MAX_JIT_CALL_ARGS, _>(|_| Value::Nil);
     for index in base..depth {
         let slot = unsafe { *frame_ref.stack.add(index) };
-        let Ok(Some(value)) = from_slot(slot, roots, context.variant_tags) else {
+        let Ok(Some(value)) = from_slot(slot, roots, variant_tags) else {
             return false;
         };
         if matches!(value, Value::Error(_)) {
@@ -2051,55 +2116,108 @@ unsafe fn jit_direct_call_inner(
         }
         arguments[index - base] = value;
     }
-    if !crate::interpreter::call_arguments_match(signature, &arguments[..arity]) {
+    if !crate::interpreter::call_arguments_match(&signature, &arguments[..arity]) {
         return false;
     }
-    if context.call_frame.is_none() {
-        context.call_frame = Some(Box::new(JitCallFrame::new(frame_ref.runtime_context)));
-    }
-    let Some(child) = context.call_frame.as_mut() else {
-        return false;
-    };
+    let mut child = unsafe { (&mut *context_ptr).call_frame.take() }
+        .unwrap_or_else(|| Box::new(JitCallFrame::new(frame_ref.runtime_context)));
     child.prepare(&callable.plan, frame_ref.runtime_context);
     for (index, value) in arguments.iter_mut().take(arity).enumerate() {
         let value = std::mem::replace(value, Value::Nil);
-        let Some(slot) = append_owned_value(value, &mut child.roots, context.variant_tags) else {
+        let Some(slot) = append_owned_value(value, &mut child.roots, variant_tags) else {
             return false;
         };
         child.stack[index] = slot;
     }
     child.frame.stack_len = arity as u64;
     let status = unsafe { (callable.entry)(&mut child.frame) };
-    let Ok(JitExit::Completed) =
-        decode_exit(&callable.plan, context.artifact, &child.frame, status)
-    else {
+    let result_slot =
+        (|| {
+            let context = unsafe { &*context_ptr };
+            if !matches!(
+                decode_exit(&callable.plan, context.artifact, &child.frame, status),
+                Ok(JitExit::Completed)
+            ) {
+                return None;
+            }
+            let result_depth = usize::try_from(child.frame.stack_len).ok()?;
+            let result_index = result_depth.checked_sub(1)?;
+            let result_slot = child.stack.get(result_index).copied()?;
+            let Ok(Some(mut result)) = from_slot(result_slot, &child.roots, &context.variant_tags)
+            else {
+                return None;
+            };
+            if signature.result_type.as_ref().is_some_and(|expected| {
+                !crate::interpreter::matches_runtime_type(expected, &result)
+            }) {
+                result = Value::Error(Box::new(RuntimeError::TypeMismatch { op: "return" }));
+            }
+            append_owned_value(
+                result,
+                unsafe { &mut *frame_ref.roots },
+                &context.variant_tags,
+            )
+        })();
+    unsafe { (&mut *context_ptr).call_frame = Some(child) };
+    let Some(result_slot) = result_slot else {
         return false;
     };
-    let Ok(result_depth) = usize::try_from(child.frame.stack_len) else {
-        return false;
-    };
-    let Some(result_index) = result_depth.checked_sub(1) else {
-        return false;
-    };
-    let Some(result_slot) = child.stack.get(result_index).copied() else {
-        return false;
-    };
-    let Ok(Some(mut result)) = from_slot(result_slot, &child.roots, context.variant_tags) else {
-        return false;
-    };
-    if signature
-        .result_type
-        .as_ref()
-        .is_some_and(|expected| !crate::interpreter::matches_runtime_type(expected, &result))
-    {
-        result = Value::Error(Box::new(RuntimeError::TypeMismatch { op: "return" }));
-    }
-    let roots = unsafe { &mut *frame_ref.roots };
-    let Some(slot) = append_owned_value(result, roots, context.variant_tags) else {
-        return false;
-    };
-    unsafe { *frame_ref.stack.add(base) = slot };
+    unsafe { *frame_ref.stack.add(base) = result_slot };
     true
+}
+
+unsafe fn jit_direct_call_int_slots(
+    frame: &JitFrame,
+    base: usize,
+    arity: usize,
+    context_ptr: *mut JitExecutionContext<'_>,
+    callable: &JitCallable,
+) -> Option<JitSlot> {
+    if arity > MAX_JIT_CALL_ARGS {
+        return None;
+    }
+    for index in base..base + arity {
+        let slot = unsafe { *frame.stack.add(index) };
+        if matches!(slot.tag, TAG_UNINITIALIZED | TAG_ERROR) {
+            return None;
+        }
+    }
+
+    let root_len = unsafe { (&*frame.roots).len() };
+    let mut child = unsafe { (&mut *context_ptr).call_frame.take() }
+        .unwrap_or_else(|| Box::new(JitCallFrame::new(context_ptr.cast())));
+    child.prepare(&callable.plan, context_ptr.cast());
+    child.frame.roots = frame.roots;
+    for index in 0..arity {
+        child.stack[index] = unsafe { *frame.stack.add(base + index) };
+    }
+    child.frame.stack_len = arity as u64;
+
+    // The callee plan excludes Cog-to-Cog calls and effectful native imports.
+    // Sharing roots therefore avoids cloning large BigInts for every pixel;
+    // roots created by this call are discarded once its scalar result returns.
+    let status = unsafe { (callable.entry)(&mut child.frame) };
+    let result = {
+        let context = unsafe { &*context_ptr };
+        if matches!(
+            decode_exit(&callable.plan, context.artifact, &child.frame, status),
+            Ok(JitExit::Completed)
+        ) && child.frame.stack_len == 1
+        {
+            child
+                .stack
+                .first()
+                .copied()
+                .filter(|slot| slot.tag == TAG_INT)
+        } else {
+            None
+        }
+    };
+    unsafe {
+        (&mut *frame.roots).truncate(root_len);
+        (&mut *context_ptr).call_frame = Some(child);
+    }
+    result
 }
 
 fn decode_exit(
@@ -2326,7 +2444,9 @@ fn jit_reachable_pcs(
                 next.into_iter().collect()
             }
             Instruction::Jump(target) => vec![*target],
-            Instruction::JumpIfFalse(target) | Instruction::JumpIfTrue(target) => {
+            Instruction::JumpIfFalse(target)
+            | Instruction::JumpIfTrue(target)
+            | Instruction::JumpIfNoPropagation(target) => {
                 let mut successors = vec![*target];
                 successors.extend(next);
                 successors
