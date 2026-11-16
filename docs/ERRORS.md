@@ -17,16 +17,18 @@ Compiler warnings are non-fatal. For example, `while false` and literal
 ascending ranges with no iterations report that their loop bodies never run.
 Type mismatch diagnostics may suggest a checked `as` conversion, a nullable
 destination such as `str?`, or the element positions that need attention in an
-array or tuple. Suggestions are rendered with a separate `help:` label. For
-mixed integer arithmetic, the compiler includes the source operands in a
-conversion example when it can do so safely. For example:
+array or tuple. When a fix is unambiguous, a `help:` entry shows the exact
+source span replaced by the suggested conversion. For `int`/`uint` arithmetic,
+the compiler shows conditional alternatives because the safe conversion depends
+on the value range.
+
+For `a: int` and `b: bigint`, the replacement appears in context:
 
 ```text
-error[E2002]: mixed integer arithmetic requires an explicit conversion
- --> src/main.cog:5:12
- 5 |     const c = a + b;
-   |               ^^^^^
- help: convert the `int` operand to `bigint`, for example `((a) as bigint) + (b)`
+help: convert this `int` operand to `bigint`
+   |
+ 5 |     const c = (a) as bigint + b;
+   |               ^^^^^^^^^^^^^
 ```
 
 ## Error values and inspection

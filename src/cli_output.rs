@@ -55,8 +55,10 @@ impl Color {
         } else {
             format!("error: {error}")
         };
+        let mut suggestion_preview = false;
         for line in text.lines() {
             if line.starts_with("error[") || line.starts_with("error:") {
+                suggestion_preview = false;
                 if let Some((label, message)) = line.split_once(": ") {
                     eprintln!(
                         "{}: {}",
@@ -69,16 +71,22 @@ impl Color {
                 eprintln!(" {} {location}", self.paint("-->", "1;36"));
                 continue;
             } else if let Some(note) = line.strip_prefix(" note: ") {
+                suggestion_preview = false;
                 eprintln!(" {} {note}", self.paint("note:", "1;36"));
                 continue;
             } else if let Some(help) = line.strip_prefix(" help: ") {
+                suggestion_preview = true;
                 eprintln!(" {} {help}", self.paint("help:", "1;32"));
                 continue;
             } else if let Some((gutter, source)) = line.split_once('|')
                 && gutter.chars().all(|c| c.is_ascii_digit() || c == ' ')
             {
                 let source = if gutter.trim().is_empty() && source.trim_start().starts_with('^') {
-                    self.paint(source, "1;31")
+                    let style = if suggestion_preview { "1;32" } else { "1;31" };
+                    suggestion_preview = false;
+                    self.paint(source, style)
+                } else if suggestion_preview && !gutter.trim().is_empty() {
+                    self.paint(source, "32")
                 } else {
                     source.into()
                 };

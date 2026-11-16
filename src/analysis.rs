@@ -2,7 +2,7 @@
 //! invalid source, not a runtime error value, and suppresses derivative errors.
 use crate::ast::*;
 use crate::builtins::Builtin;
-use crate::diagnostic::{Diagnostic, SourceSpan};
+use crate::diagnostic::{Diagnostic, DiagnosticSuggestion, SourceSpan};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 const CLONE_TRAIT: &str = "$core::clone::Clone";
@@ -94,77 +94,129 @@ fn bigint_literal_expression(expr: &Expr) -> bool {
     }
 }
 
-fn expression_source_excerpt(expression: &Expr) -> Option<String> {
-    let span = expression.span()?;
+fn source_replacement(
+    span: &SourceSpan,
+    message: impl Into<String>,
+    target: VarType,
+) -> Option<DiagnosticSuggestion> {
     let text = span.source.text.get(span.range.clone())?.trim();
     if text.is_empty() || text.len() > 64 || text.contains('\n') || text.contains('\r') {
         return None;
     }
-    Some(text.to_owned())
+    Some(DiagnosticSuggestion {
+        message: message.into(),
+        span: span.clone(),
+        replacement: format!("({text}) as {}", target.name()),
+    })
 }
 
-fn mixed_numeric_help(
+fn expression_conversion_suggestion(
+    expression: &Expr,
+    from: VarType,
+    to: VarType,
+    condition: Option<&str>,
+) -> Option<DiagnosticSuggestion> {
+    let span = expression.span()?;
+    let message = if let Some(condition) = condition {
+        format!(
+            "{condition}; convert this `{}` operand to `{}`",
+            from.name(),
+            to.name()
+        )
+    } else {
+        format!("convert this `{}` operand to `{}`", from.name(), to.name())
+    };
+    source_replacement(span, message, to)
+}
+
+fn mixed_numeric_suggestions(
     left_type: VarType,
     right_type: VarType,
-    op: BinOp,
     left: &Expr,
     right: &Expr,
-) -> Option<String> {
-    let operator = match op {
-        BinOp::Add => "+",
-        BinOp::Sub => "-",
-        BinOp::Mul => "*",
-        BinOp::Div => "/",
-        BinOp::Mod => "%",
-        _ => return None,
-    };
-    let left_text = expression_source_excerpt(left);
-    let right_text = expression_source_excerpt(right);
+) -> Vec<DiagnosticSuggestion> {
+    let mut suggestions = Vec::new();
     match (left_type, right_type) {
-        (VarType::BigInt, VarType::Int | VarType::UInt) => Some(match (left_text, right_text) {
-            (Some(left), Some(right)) => format!(
-                "convert the `{}` operand to `bigint`, for example `({left}) {operator} (({right}) as bigint)`",
-                right_type.name()
-            ),
-            _ => format!(
-                "convert the `{}` operand explicitly with `as bigint`",
-                right_type.name()
-            ),
-        }),
-        (VarType::Int | VarType::UInt, VarType::BigInt) => Some(match (left_text, right_text) {
-            (Some(left), Some(right)) => format!(
-                "convert the `{}` operand to `bigint`, for example `(({left}) as bigint) {operator} ({right})`",
-                left_type.name()
-            ),
-            _ => format!(
-                "convert the `{}` operand explicitly with `as bigint`",
-                left_type.name()
-            ),
-        }),
-        (VarType::Int, VarType::UInt) => Some(match (left_text, right_text) {
-            (Some(left), Some(right)) => format!(
-                "choose a common integer type and convert explicitly, for example `(({left}) as uint) {operator} ({right})` or `({left}) {operator} (({right}) as int)` after checking the value ranges"
-            ),
-            _ => "choose a common integer type and convert one operand explicitly with `as int` or `as uint` after checking the value range".into(),
-        }),
-        (VarType::UInt, VarType::Int) => Some(match (left_text, right_text) {
-            (Some(left), Some(right)) => format!(
-                "choose a common integer type and convert explicitly, for example `({left}) {operator} (({right}) as uint)` or `(({left}) as int) {operator} ({right})` after checking the value ranges"
-            ),
-            _ => "choose a common integer type and convert one operand explicitly with `as int` or `as uint` after checking the value range".into(),
-        }),
-        (VarType::BigInt, VarType::Float) | (VarType::Float, VarType::BigInt) => Some(
-            "convert the `bigint` operand with `as float` if rounding large integers is acceptable".into(),
-        ),
-        _ => None,
+        (VarType::BigInt, VarType::Int | VarType::UInt) => {
+            if let Some(suggestion) =
+                expression_conversion_suggestion(right, right_type, VarType::BigInt, None)
+            {
+                suggestions.push(suggestion);
+            }
+        }
+        (VarType::Int | VarType::UInt, VarType::BigInt) => {
+            if let Some(suggestion) =
+                expression_conversion_suggestion(left, left_type, VarType::BigInt, None)
+            {
+                suggestions.push(suggestion);
+            }
+        }
+        (VarType::Int, VarType::UInt) => {
+            if let Some(suggestion) = expression_conversion_suggestion(
+                left,
+                VarType::Int,
+                VarType::UInt,
+                Some("if the signed value is non-negative"),
+            ) {
+                suggestions.push(suggestion);
+            }
+            if let Some(suggestion) = expression_conversion_suggestion(
+                right,
+                VarType::UInt,
+                VarType::Int,
+                Some("if the unsigned value fits in `int`"),
+            ) {
+                suggestions.push(suggestion);
+            }
+        }
+        (VarType::UInt, VarType::Int) => {
+            if let Some(suggestion) = expression_conversion_suggestion(
+                left,
+                VarType::UInt,
+                VarType::Int,
+                Some("if the unsigned value fits in `int`"),
+            ) {
+                suggestions.push(suggestion);
+            }
+            if let Some(suggestion) = expression_conversion_suggestion(
+                right,
+                VarType::Int,
+                VarType::UInt,
+                Some("if the signed value is non-negative"),
+            ) {
+                suggestions.push(suggestion);
+            }
+        }
+        (VarType::BigInt, VarType::Float) => {
+            if let Some(suggestion) = expression_conversion_suggestion(
+                left,
+                VarType::BigInt,
+                VarType::Float,
+                Some("if the value fits in `float` and rounding large integers is acceptable"),
+            ) {
+                suggestions.push(suggestion);
+            }
+        }
+        (VarType::Float, VarType::BigInt) => {
+            if let Some(suggestion) = expression_conversion_suggestion(
+                right,
+                VarType::BigInt,
+                VarType::Float,
+                Some("if the value fits in `float` and rounding large integers is acceptable"),
+            ) {
+                suggestions.push(suggestion);
+            }
+        }
+        _ => {}
     }
+    suggestions
 }
 
-fn primitive_type_mismatch_help(expected: &Type, actual: &Type) -> Option<String> {
+fn nullable_type_mismatch_help(expected: &Type, actual: &Type) -> Option<String> {
     match (expected, actual) {
         (Type::Primitive(expected, false), Type::Nil) if *expected != VarType::Nil => {
             Some(format!(
-                "this value may be `nil`; check it before use or make the destination `{}`",
+                "this value may be `nil`; handle that case or make the destination `{}`",
                 Type::Primitive(*expected, true).display()
             ))
         }
@@ -172,26 +224,67 @@ fn primitive_type_mismatch_help(expected: &Type, actual: &Type) -> Option<String
             if expected == actual && *expected != VarType::Nil =>
         {
             Some(format!(
-                "this value may be `nil`; check it before use or make the destination `{}`",
+                "this value may be `nil`; handle that case or make the destination `{}`",
                 Type::Primitive(*expected, true).display()
             ))
         }
-        (Type::Primitive(expected, _), Type::Dynamic) if *expected != VarType::Nil => {
-            Some(format!(
-                "use `as {}` to request a checked conversion",
-                expected.name()
-            ))
-        }
-        (Type::Primitive(expected, _), Type::Primitive(actual, _))
-            if supports_primitive_cast(*actual, *expected) =>
-        {
-            Some(format!(
-                "use `as {}` to request a checked conversion",
-                expected.name()
-            ))
+        (Type::Primitive(_, false), Type::Primitive(_, true)) => {
+            Some("handle the possible `nil` value before converting".into())
         }
         _ => None,
     }
+}
+
+fn primitive_type_mismatch_suggestion(
+    expected: &Type,
+    actual: &Type,
+    span: Option<&SourceSpan>,
+) -> Option<DiagnosticSuggestion> {
+    let Type::Primitive(to, _) = expected else {
+        return None;
+    };
+    if *to == VarType::Nil {
+        return None;
+    }
+    let from = match actual {
+        Type::Primitive(from, false) if *from != *to && supports_primitive_cast(*from, *to) => {
+            Some(*from)
+        }
+        Type::Dynamic => None,
+        _ => return None,
+    };
+    let message = match from {
+        Some(from) => {
+            let condition = match (from, *to) {
+                (VarType::Int, VarType::UInt) => Some("if the signed value is non-negative"),
+                (VarType::UInt, VarType::Int) => Some("if the unsigned value fits in `int`"),
+                (VarType::Float, VarType::Int | VarType::UInt) => {
+                    Some("if truncating the fractional part is intended and the value is in range")
+                }
+                (VarType::BigInt, VarType::Int | VarType::UInt) => {
+                    Some("if the value fits in the target integer type")
+                }
+                (VarType::BigInt, VarType::Float) => {
+                    Some("if rounding large integers is acceptable")
+                }
+                (VarType::Str, VarType::Int | VarType::UInt | VarType::BigInt | VarType::Float) => {
+                    Some("if the string contains a valid number")
+                }
+                _ => None,
+            };
+            if let Some(condition) = condition {
+                format!(
+                    "{condition}; convert this `{}` value to `{}`",
+                    from.name(),
+                    to.name()
+                )
+            } else {
+                format!("convert this `{}` value to `{}`", from.name(), to.name())
+            }
+        }
+        None => format!("convert this dynamic value to `{}`", to.name()),
+    };
+    source_replacement(span?, message, *to)
 }
 
 fn supports_primitive_cast(from: VarType, to: VarType) -> bool {
@@ -1893,7 +1986,15 @@ impl<'a> Checker<'a> {
                         ),
                         args[argument_index].value.span().cloned(),
                     );
-                    if let Some(help) = primitive_type_mismatch_help(&expected_type, actual_type) {
+                    if let Some(suggestion) = primitive_type_mismatch_suggestion(
+                        &expected_type,
+                        actual_type,
+                        args[argument_index].value.span(),
+                    ) {
+                        diagnostic = diagnostic.suggestion(suggestion);
+                    } else if let Some(help) =
+                        nullable_type_mismatch_help(&expected_type, actual_type)
+                    {
                         diagnostic = diagnostic.help(help);
                     }
                     self.diagnostics.push(diagnostic);
@@ -2066,7 +2167,15 @@ impl<'a> Checker<'a> {
                         ),
                         args[argument_index].value.span().cloned(),
                     );
-                    if let Some(help) = primitive_type_mismatch_help(&expected_type, actual_type) {
+                    if let Some(suggestion) = primitive_type_mismatch_suggestion(
+                        &expected_type,
+                        actual_type,
+                        args[argument_index].value.span(),
+                    ) {
+                        diagnostic = diagnostic.suggestion(suggestion);
+                    } else if let Some(help) =
+                        nullable_type_mismatch_help(&expected_type, actual_type)
+                    {
                         diagnostic = diagnostic.help(help);
                     }
                     self.diagnostics.push(diagnostic);
@@ -2613,7 +2722,11 @@ impl<'a> Checker<'a> {
                 ),
                 span.cloned().or_else(|| self.location.clone()),
             );
-            if let Some(help) = primitive_type_mismatch_help(&expected_type, &actual) {
+            if let Some(suggestion) =
+                primitive_type_mismatch_suggestion(&expected_type, &actual, span)
+            {
+                diagnostic = diagnostic.suggestion(suggestion);
+            } else if let Some(help) = nullable_type_mismatch_help(&expected_type, &actual) {
                 diagnostic = diagnostic.help(help);
             }
             self.diagnostics.push(diagnostic);
@@ -3255,8 +3368,7 @@ impl<'a> Checker<'a> {
                     self.contextualize_integer_literals(value, &left);
                 }
                 let right = self.expr(value);
-                let actual =
-                    self.binary_types(*op, left, right, value.span(), Some((target, value)));
+                let actual = self.binary_types(*op, left, right, value.span(), None);
                 return self.assignment(target, value, actual, value.span());
             }
             Stmt::Assign { target, value } => {
@@ -3724,10 +3836,17 @@ impl<'a> Checker<'a> {
                         "mixed integer arithmetic requires an explicit conversion",
                         span.cloned().or_else(|| self.location.clone()),
                     );
-                    if let Some((left, right)) = operands
-                        && let Some(help) = mixed_numeric_help(x, y, op, left, right)
-                    {
-                        diagnostic = diagnostic.help(help);
+                    let suggestions = operands.map_or_else(Vec::new, |(left, right)| {
+                        mixed_numeric_suggestions(x, y, left, right)
+                    });
+                    if suggestions.is_empty() {
+                        diagnostic = diagnostic.help(
+                            "make the operand types match with an explicit checked conversion",
+                        );
+                    } else {
+                        for suggestion in suggestions {
+                            diagnostic = diagnostic.suggestion(suggestion);
+                        }
                     }
                     self.diagnostics.push(diagnostic);
                     Type::Poison

@@ -165,6 +165,14 @@ pub struct Diagnostic {
     pub span: Option<SourceSpan>,
     pub notes: Vec<String>,
     pub helps: Vec<String>,
+    pub suggestions: Vec<DiagnosticSuggestion>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiagnosticSuggestion {
+    pub message: String,
+    pub span: SourceSpan,
+    pub replacement: String,
 }
 
 impl Diagnostic {
@@ -175,6 +183,7 @@ impl Diagnostic {
             span,
             notes: Vec::new(),
             helps: Vec::new(),
+            suggestions: Vec::new(),
         }
     }
 
@@ -201,6 +210,11 @@ impl Diagnostic {
 
     pub fn help(mut self, help: impl Into<String>) -> Self {
         self.helps.push(help.into());
+        self
+    }
+
+    pub fn suggestion(mut self, suggestion: DiagnosticSuggestion) -> Self {
+        self.suggestions.push(suggestion);
         self
     }
 }
@@ -253,11 +267,46 @@ impl std::fmt::Display for Diagnostic {
         for help in &self.helps {
             writeln!(f, " help: {help}")?;
         }
+        for suggestion in &self.suggestions {
+            write_suggestion(f, suggestion)?;
+        }
         for note in &self.notes {
             writeln!(f, " note: {note}")?;
         }
         Ok(())
     }
+}
+
+fn write_suggestion(
+    f: &mut std::fmt::Formatter<'_>,
+    suggestion: &DiagnosticSuggestion,
+) -> std::fmt::Result {
+    writeln!(f, " help: {}", suggestion.message)?;
+    let source = &suggestion.span.source;
+    let start = source.byte_boundary(suggestion.span.range.start);
+    let end = source.byte_boundary(suggestion.span.range.end).max(start);
+    let line_start = source.text[..start]
+        .rfind('\n')
+        .map_or(0, |offset| offset + 1);
+    let line_end = source.line_end(start);
+    if end > line_end {
+        return Ok(());
+    }
+    let Some(prefix) = source.text.get(line_start..start) else {
+        return Ok(());
+    };
+    let Some(suffix) = source.text.get(end..line_end) else {
+        return Ok(());
+    };
+    let (line, _) = source.line_column(start);
+    writeln!(f, "   |")?;
+    writeln!(f, " {line} | {prefix}{}{suffix}", suggestion.replacement)?;
+    writeln!(
+        f,
+        "   | {}{}",
+        " ".repeat(prefix.chars().count()),
+        "^".repeat(suggestion.replacement.chars().count().max(1))
+    )
 }
 
 #[cfg(test)]
