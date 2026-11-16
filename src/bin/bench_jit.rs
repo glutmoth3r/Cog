@@ -244,9 +244,82 @@ fn main() -> nil {{
     )
 }
 
+fn bigint_divmod_source(iterations: u64) -> String {
+    format!(
+        r#"
+@!include("std")
+use io;
+
+@inline
+fn bigint_divide(left: bigint, right: bigint) -> bigint {{
+    return left / right;
+}}
+
+@inline
+fn bigint_remainder(left: bigint, right: bigint) -> bigint {{
+    return left % right;
+}}
+
+@inline
+fn bigint_multiply(left: bigint, right: bigint) -> bigint {{
+    return left * right;
+}}
+
+fn signed_work(n: int, initial: int) -> bigint {{
+    const one: bigint = 1 as bigint;
+    const two: bigint = 2 as bigint;
+    const three: bigint = 3 as bigint;
+    var index = 0;
+    var value: bigint = initial as bigint;
+    while index < n {{
+        value = value / two;
+        value = value % three;
+        value = value - one;
+        index += 1;
+    }}
+    return value;
+}}
+
+fn unsigned_work(n: int) -> bigint {{
+    const high: bigint = 9223372036854775808 as bigint;
+    var index = 0;
+    var value: bigint = high;
+    while index < n {{
+        value = bigint_divide(value, high);
+        value = bigint_remainder(value, high);
+        value = bigint_multiply(value, high);
+        index += 1;
+    }}
+    return value;
+}}
+
+fn boundary_work(n: int, minimum: int, negative_one: int) -> bigint {{
+    const minimum_big: bigint = minimum as bigint;
+    const negative_one_big: bigint = negative_one as bigint;
+    var index = 0;
+    var value: bigint = 0 as bigint;
+    while index < n {{
+        value = minimum_big / negative_one_big;
+        index += 1;
+    }}
+    return value;
+}}
+
+fn main() -> nil {{
+    io::println(signed_work({iterations}, -17))!!;
+    io::println(unsigned_work({iterations}))!!;
+    io::println(boundary_work({iterations}, -9223372036854775807 - 1, -1))!!;
+}}
+"#
+    )
+}
+
 fn run(program: &Program, jit: bool, profile: Option<&Path>) -> Result<(Duration, String), String> {
     let mut output = Vec::new();
     let mut context = RunContext::new(&mut output).with_jit(jit);
+    if std::env::var_os("COG_JIT_BENCH_DEBUG").is_some() {
+        context = context.with_jit_debug(true);
+    }
     if let Some(profile) = profile {
         context = context.with_jit_profile_path(profile);
     }
@@ -336,6 +409,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Case {
             name: "bigint-helper",
             source: bigint_helper_source,
+        },
+        Case {
+            name: "bigint-divmod",
+            source: bigint_divmod_source,
         },
     ];
 
