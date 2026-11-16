@@ -431,9 +431,9 @@ fn mandelbrot_render_source(_: u64) -> String {
 use bytes;
 use io;
 
-@comptime const WIDTH: int = 96;
-@comptime const HEIGHT: int = 64;
-@comptime const MAX_ITER: int = 64;
+@comptime const WIDTH: int = 320;
+@comptime const HEIGHT: int = 200;
+@comptime const MAX_ITER: int = 160;
 @comptime const ROWS_PER_BATCH: int = 6;
 
 @inline("never")
@@ -689,18 +689,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut vm_ns_per_backedge = 0;
         let mut jit_ns_per_backedge = 0;
         let mut calibrated = false;
+        let mut function_profiles = Vec::new();
         if let Ok(bytes) = fs::read(&profile) {
             let data: serde_json::Value = serde_json::from_slice(&bytes)?;
             if let Some(functions) = data["functions"].as_object() {
-                for function in functions.values() {
+                for (entry, function) in functions {
                     let compile = function["compile_ns"].as_u64().unwrap_or(0);
+                    let vm = function["vm_ns_per_backedge"].as_u64().unwrap_or(0);
+                    let jit = function["jit_ns_per_backedge"].as_u64().unwrap_or(0);
+                    let function_calibrated = function["calibrated"].as_bool() == Some(true);
+                    function_profiles.push((
+                        entry.parse::<usize>()?,
+                        compile,
+                        vm,
+                        jit,
+                        function_calibrated,
+                    ));
                     if compile > 0 {
                         compile_ns = compile_ns.max(compile);
-                        vm_ns_per_backedge = vm_ns_per_backedge
-                            .max(function["vm_ns_per_backedge"].as_u64().unwrap_or(0));
-                        jit_ns_per_backedge = jit_ns_per_backedge
-                            .max(function["jit_ns_per_backedge"].as_u64().unwrap_or(0));
-                        calibrated |= function["calibrated"].as_bool() == Some(true);
+                        vm_ns_per_backedge = vm_ns_per_backedge.max(vm);
+                        jit_ns_per_backedge = jit_ns_per_backedge.max(jit);
+                        calibrated |= function_calibrated;
                     }
                 }
             }
@@ -719,6 +728,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             jit_ns_per_backedge,
             calibrated
         );
+        if case.name == "mandelbrot-render" {
+            let names = function_entry_names(&jit_program);
+            for (entry, compile, vm, jit, function_calibrated) in function_profiles {
+                if compile > 0 || vm > 0 {
+                    eprintln!(
+                        "mandelbrot-render: function={} entry={entry} compile_us={} vm_ns/backedge={vm} jit_ns/backedge={jit} calibrated={function_calibrated}",
+                        names.get(&entry).map_or("?", String::as_str),
+                        compile / 1_000
+                    );
+                }
+            }
+        }
         let slot_report = (case.name == "slot-pressure")
             .then(|| local_slot_count(&jit_program, "work"))
             .flatten()
@@ -763,4 +784,22 @@ fn local_slot_count(program: &Program, function_name: &str) -> Option<usize> {
         }
     }
     max_slot
+}
+
+fn function_entry_names(program: &Program) -> std::collections::BTreeMap<usize, String> {
+    let mut names = std::collections::BTreeMap::new();
+    let mut pending_entry = None;
+    for line in program.disassemble().lines() {
+        if let Some(signature) = line.strip_prefix("function ") {
+            pending_entry = signature
+                .split_whitespace()
+                .next()
+                .and_then(|entry| entry.parse::<usize>().ok());
+        } else if let Some(name) = line.strip_suffix(':')
+            && let Some(entry) = pending_entry.take()
+        {
+            names.insert(entry, name.to_owned());
+        }
+    }
+    names
 }
