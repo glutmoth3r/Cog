@@ -1,0 +1,20 @@
+@!include("std")
+use err::Error;
+use io;
+use process;
+
+@async fn main() -> nil {
+    const fast = await process::run("echo", ["finished"], 1000)!!;
+    if fast.success {
+        io::println("child finished before the deadline")!!;
+    } else {
+        crash("expected the short process to finish");
+    }
+
+    const result = await process::run("sleep", ["5"], 50);
+    when result is Error::Timeout {
+        io::println("child process timed out and was stopped")!!;
+    } else {
+        crash("expected the process deadline to expire");
+    }
+}

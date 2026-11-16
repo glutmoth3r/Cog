@@ -7,7 +7,7 @@ use cog::error::RuntimeError;
 use cog::{bytecode, frontend, interpreter, project};
 
 fn source(body: &str) -> String {
-    format!("include std; use io; use str; use err::Error;\n{body}")
+    format!("@!include(\"std\") use io; use str; use err::Error;\n{body}")
 }
 
 fn compile(body: &str) -> cog::backend::CompiledProgram {
@@ -344,6 +344,51 @@ fn poison_05_enum_payload_retains_nominal_variant_and_component_poison() {
         }
         "#,
         "payload\n",
+    );
+}
+
+#[test]
+fn error_leaves_survive_aggregate_writes_and_nested_json_serialization() {
+    output(
+        r#"
+        use collections;
+        use json;
+
+        struct Box { value: int }
+
+        fn preserved(value) {
+            when value is Error::MissingField(field) {
+                if field != "marker" {
+                    crash("aggregate Error payload was changed");
+                }
+            } else {
+                crash("aggregate Error leaf was changed or consumed");
+            }
+        }
+
+        fn main() {
+            const failure = Error::MissingField("marker");
+
+            var items: int[] = [1];
+            items[0] = failure;
+            preserved(items[0]);
+
+            var pair: (int, str) = (2, "kept");
+            pair.0 = failure;
+            preserved(pair.0);
+
+            var item = Box(value: 3);
+            item.value = failure;
+            preserved(item.value);
+
+            var values: collections::Map[str, int] = collections::Map::new();
+            values.set("item", failure)!!;
+            preserved(values.get("item"));
+
+            preserved(json::stringify([{ value: failure }]));
+        }
+        "#,
+        "",
     );
 }
 
@@ -692,25 +737,49 @@ fn propagate_01_success_and_nil_continue_and_evaluate_once() {
 }
 
 #[test]
-fn propagate_02_bypasses_all_local_catches_and_caller_catches_the_returned_error() {
+fn propagate_02_bypasses_origin_catches_and_relays_through_callers() {
     output(
         r#"
         fn fail() { io::println("operand"); return 1 / 0; }
-        fn work() {
-            defer { io::println("outer cleanup"); }
+        fn leaf() {
+            defer { io::println("leaf cleanup"); }
             try {
-                defer { io::println("inner cleanup"); }
-                try { fail()!!; }
-                catch(inner) { crash("inner catch intercepted propagation"); }
+                fail()!!;
                 io::println("unreachable");
-            } catch(outer) { crash("outer catch intercepted propagation"); }
+            } catch(error) { crash("origin catch intercepted propagation"); }
+        }
+        fn middle() {
+            defer { io::println("middle cleanup"); }
+            leaf();
+            io::println("unreachable middle");
+        }
+        fn work() {
+            defer { io::println("work cleanup"); }
+            middle();
         }
         fn main() {
             try { work(); io::println("unreachable caller"); }
             catch(error) { io::println(error.error_kind()); }
         }
         "#,
-        "operand\ninner cleanup\nouter cleanup\nDivisionByZero\n",
+        "operand\nleaf cleanup\nmiddle cleanup\nwork cleanup\nDivisionByZero\n",
+    );
+}
+
+#[test]
+fn propagate_06_stops_at_the_nearest_caller_handler() {
+    output(
+        r#"
+        fn leaf() { (1 / 0)!!; }
+        fn middle() -> int {
+            try { leaf(); }
+            catch(error) { io::println(error.error_kind()); return 9; }
+            return 0;
+        }
+        fn outer() -> int { middle() }
+        fn main() { io::println(outer()); }
+        "#,
+        "DivisionByZero\n9\n",
     );
 }
 
@@ -803,8 +872,8 @@ fn propagate_05_requires_an_enclosing_function() {
 #[test]
 fn phase_16_propagation_requires_a_comptime_callable_not_an_initializer_root() {
     for body in [
-        "comptime VALUE = (1 / 0)!!; fn main() {}",
-        "fn main() { comptime VALUE = (1 / 0)!!; }",
+        "@comptime const VALUE = (1 / 0)!!; fn main() {}",
+        "fn main() { @comptime const VALUE = (1 / 0)!!; }",
     ] {
         rejects_semantically(body, &["callable"]);
     }
@@ -814,26 +883,28 @@ fn phase_16_propagation_requires_a_comptime_callable_not_an_initializer_root() {
 fn phase_17_comptime_fallbacks_are_lazy_and_respect_propagation() {
     output(
         r#"
-        comptime fn nil_fallback(value: int?) -> int { value ?? 5 }
-        comptime fn error_fallback(value: int) -> int { value ?! 9 }
-        comptime fn preserve_error(value: int) -> int { value ?? 3 }
-        comptime fn propagate_before_fallback() -> int { (1 / 0)!! ?! 77 }
-        comptime fn recover_propagated() -> int {
-            try { propagate_before_fallback(); }
+        @comptime fn nil_fallback(value: int?) -> int { value ?? 5 }
+        @comptime fn error_fallback(value: int) -> int { value ?! 9 }
+        @comptime fn preserve_error(value: int) -> int { value ?? 3 }
+        @comptime fn propagate_before_fallback() -> int { (1 / 0)!! ?! 77 }
+        @comptime fn relay_propagation() -> int { propagate_before_fallback() }
+        @comptime fn relay_again() -> int { relay_propagation() }
+        @comptime fn recover_propagated() -> int {
+            try { relay_again(); }
             catch(error) { return 13; }
             return 0;
         }
-        comptime fn recover_preserved_error() -> int {
+        @comptime fn recover_preserved_error() -> int {
             try { preserve_error(1 / 0); }
             catch(error) { return 12; }
             return 0;
         }
-        comptime FROM_NIL = nil_fallback(nil);
-        comptime FROM_VALUE = nil_fallback(4);
-        comptime FROM_ERROR = error_fallback(1 / 0);
-        comptime FROM_NORMAL = error_fallback(8);
-        comptime PRESERVED_ERROR = recover_preserved_error();
-        comptime PROPAGATED_ERROR = recover_propagated();
+        @comptime const FROM_NIL = nil_fallback(nil);
+        @comptime const FROM_VALUE = nil_fallback(4);
+        @comptime const FROM_ERROR = error_fallback(1 / 0);
+        @comptime const FROM_NORMAL = error_fallback(8);
+        @comptime const PRESERVED_ERROR = recover_preserved_error();
+        @comptime const PROPAGATED_ERROR = recover_propagated();
         fn main() {
             io::println(FROM_NIL);
             io::println(FROM_VALUE);
@@ -847,7 +918,7 @@ fn phase_17_comptime_fallbacks_are_lazy_and_respect_propagation() {
     );
 
     rejects_semantically(
-        "fn runtime_only() -> int { 1 } comptime fn choose(value: int) -> int { value ?? runtime_only() } comptime RESULT = choose(7); fn main() {}",
+        "fn runtime_only() -> int { 1 } @comptime fn choose(value: int) -> int { value ?? runtime_only() } @comptime const RESULT = choose(7); fn main() {}",
         &["cannot call runtime-only function"],
     );
 }
@@ -998,7 +1069,7 @@ fn flow_02_nonreturning_error_branch_excludes_error_on_the_success_path() {
 #[test]
 fn phase_01_scalar_comptime_value_flows_to_runtime() {
     output(
-        "comptime VALUE: int = BASE * 2; comptime BASE: int = 3; fn main() { io::println(VALUE); }",
+        "@comptime const VALUE: int = BASE * 2; @comptime const BASE: int = 3; fn main() { io::println(VALUE); }",
         "6\n",
     );
 }
@@ -1007,10 +1078,10 @@ fn phase_01_scalar_comptime_value_flows_to_runtime() {
 fn comptime_01_local_scalar_bindings_materialize_and_reject_runtime_values() {
     output(
         r#"
-        comptime BASE: int = 3;
+        @comptime const BASE: int = 3;
         fn main() {
-            comptime LOCAL: int = BASE * 2;
-            comptime NEXT = LOCAL + 1;
+            @comptime const LOCAL: int = BASE * 2;
+            @comptime const NEXT = LOCAL + 1;
             io::println(NEXT);
         }
         "#,
@@ -1018,35 +1089,35 @@ fn comptime_01_local_scalar_bindings_materialize_and_reject_runtime_values() {
     );
 
     rejects_semantically(
-        "fn calculate(input: int) { comptime VALUE = input * 2; } fn main() { calculate(3); }",
+        "fn calculate(input: int) { @comptime const VALUE = input * 2; } fn main() { calculate(3); }",
         &["runtime", "comptime"],
     );
     rejects_semantically(
-        "fn twice(value: int) -> int { return value * 2; } comptime VALUE = twice(3); fn main() {}",
+        "fn twice(value: int) -> int { return value * 2; } @comptime const VALUE = twice(3); fn main() {}",
         &["runtime", "comptime"],
     );
     rejects_semantically(
-        "comptime fn identity(value: int) -> int { return value; } comptime VALUE = identity(\"text\"); fn main() {}",
+        "@comptime fn identity(value: int) -> int { return value; } @comptime const VALUE = identity(\"text\"); fn main() {}",
         &["parameter", "int", "str"],
     );
     rejects_semantically(
-        "fn runtime_helper() -> int { return 1; } comptime fn calculate() -> int { if false { runtime_helper(); } return 7; } comptime VALUE = calculate(); fn main() {}",
+        "fn runtime_helper() -> int { return 1; } @comptime fn calculate() -> int { if false { runtime_helper(); } return 7; } @comptime const VALUE = calculate(); fn main() {}",
         &["runtime", "comptime"],
     );
     rejects_semantically(
-        "comptime VALUE: int = 1 / 0; fn main() {}",
+        "@comptime const VALUE: int = 1 / 0; fn main() {}",
         &["comptime", "division"],
     );
     rejects_semantically(
-        "comptime VALUE: float = 1.0 / -0.0; fn main() {}",
+        "@comptime const VALUE: float = 1.0 / -0.0; fn main() {}",
         &["comptime", "division"],
     );
     rejects_semantically(
-        "use time; comptime VALUE = false && time::now() > 0; fn main() {}",
+        "use time; @comptime const VALUE = false && time::now() > 0; fn main() {}",
         &["comptime", "runtime-only"],
     );
     output(
-        "comptime VALUE = false && (1 / 0 == 0); fn main() { io::println(VALUE); }",
+        "@comptime const VALUE = false && (1 / 0 == 0); fn main() { io::println(VALUE); }",
         "false\n",
     );
 }
@@ -1066,20 +1137,20 @@ fn comptime_02_const_modifier_is_not_part_of_binding_syntax() {
 fn phase_02_comptime_functions_call_comptime_functions() {
     output(
         r#"
-        comptime fn twice(value: int) -> int { return value * 2; }
-        comptime fn calculate(value: int) -> int {
+        @comptime fn twice(value: int) -> int { return value * 2; }
+        @comptime fn calculate(value: int) -> int {
             const doubled = twice(value);
             if doubled > 5 { return doubled + 1; } else { doubled }
         }
-        comptime fn factorial(value: int) -> int {
+        @comptime fn factorial(value: int) -> int {
             if value <= 1 { return 1; }
             return value * factorial(value - 1);
         }
-        comptime fn add(a: int, b: int = 2) -> int { a + b }
-        comptime VALUE: int = calculate(3);
-        comptime FACTORIAL: int = factorial(5);
+        @comptime fn add(a: int, b: int = 2) -> int { a + b }
+        @comptime const VALUE: int = calculate(3);
+        @comptime const FACTORIAL: int = factorial(5);
         fn main() {
-            comptime LOCAL: int = calculate(value: VALUE) + add(b: 3, a: 4) + add(1);
+            @comptime const LOCAL: int = calculate(value: VALUE) + add(b: 3, a: 4) + add(1);
             io::println(VALUE);
             io::println(FACTORIAL);
             io::println(LOCAL);
@@ -1093,17 +1164,17 @@ fn phase_02_comptime_functions_call_comptime_functions() {
 fn comptime_functions_read_global_values_from_the_shared_environment() {
     output(
         r#"
-        comptime PREFIX: str = "Cog";
-        comptime fn greet(suffix: str) -> str { PREFIX + suffix }
+        @comptime const PREFIX: str = "Cog";
+        @comptime fn greet(suffix: str) -> str { PREFIX + suffix }
         fn main() {
-            comptime MESSAGE = greet("!");
+            @comptime const MESSAGE = greet("!");
             io::println(MESSAGE);
         }
         "#,
         "Cog!\n",
     );
     rejects_semantically(
-        "comptime VALUE: int = 7; fn shadow(VALUE: int) { comptime LOCAL = VALUE; } fn main() {}",
+        "@comptime const VALUE: int = 7; fn shadow(VALUE: int) { @comptime const LOCAL = VALUE; } fn main() {}",
         &["runtime", "comptime"],
     );
 }
@@ -1115,14 +1186,14 @@ fn comptime_03_struct_constructors_are_evaluated_and_materialized() {
         struct A { a: int, b: int }
         struct Inner { value: int, extra: int = 9 }
         struct Outer { inner: Inner }
-        comptime fn newa(a: int, b: int) -> A { return A(a * 2, b + 1); }
-        comptime fn wrap(value: int) -> Outer {
+        @comptime fn newa(a: int, b: int) -> A { return A(a * 2, b + 1); }
+        @comptime fn wrap(value: int) -> Outer {
             return Outer(Inner(value));
         }
-        comptime B = newa(5, 10);
-        comptime NESTED = wrap(17);
+        @comptime const B = newa(5, 10);
+        @comptime const NESTED = wrap(17);
         fn main() {
-            comptime LOCAL = newa(2, 4);
+            @comptime const LOCAL = newa(2, 4);
             io::println(B.a);
             io::println(B.b);
             io::println(NESTED.inner.value);
@@ -1153,19 +1224,19 @@ fn comptime_03_struct_constructors_are_evaluated_and_materialized() {
 fn phase_03_comptime_error_can_be_recovered_before_the_mandatory_boundary() {
     output(
         r#"
-        comptime fn safe_divide(a: int, b: int) -> int {
+        @comptime fn safe_divide(a: int, b: int) -> int {
             const quotient: int = a / b;
             const result: int = quotient + 1;
             when result is Error::DivisionByZero { return 0; }
             return result;
         }
-        comptime fn safe_add(a: int, b: int) -> int {
+        @comptime fn safe_add(a: int, b: int) -> int {
             const result: int = a + b;
             when result is Error::Overflow { return 9; }
             return result;
         }
-        comptime VALUE: int = safe_divide(10, 0);
-        comptime OVERFLOW: int = safe_add(9223372036854775807, 1);
+        @comptime const VALUE: int = safe_divide(10, 0);
+        @comptime const OVERFLOW: int = safe_add(9223372036854775807, 1);
         fn main() { io::println(VALUE); io::println(OVERFLOW); }
         "#,
         "0\n9\n",
@@ -1176,8 +1247,8 @@ fn phase_03_comptime_error_can_be_recovered_before_the_mandatory_boundary() {
 fn phase_04_unhandled_comptime_error_is_not_a_runtime_constant() {
     rejects_semantically(
         r#"
-        comptime fn divide(a: int, b: int) -> int { return a / b; }
-        comptime VALUE: int = divide(10, 0);
+        @comptime fn divide(a: int, b: int) -> int { return a / b; }
+        @comptime const VALUE: int = divide(10, 0);
         fn main() { io::println(VALUE); }
         "#,
         &["comptime", "division"],
@@ -1188,8 +1259,8 @@ fn phase_04_unhandled_comptime_error_is_not_a_runtime_constant() {
 fn phase_05_runtime_parameter_is_not_comptime_information() {
     rejects_semantically(
         r#"
-        comptime fn twice(value: int) -> int { return value * 2; }
-        fn work(input: int) { comptime VALUE: int = twice(input); }
+        @comptime fn twice(value: int) -> int { return value * 2; }
+        fn work(input: int) { @comptime const VALUE: int = twice(input); }
         fn main() { work(3); }
         "#,
         &["runtime", "comptime"],
@@ -1201,7 +1272,7 @@ fn phase_06_pure_ordinary_function_is_still_runtime_only() {
     rejects_semantically(
         r#"
         fn twice(value: int) -> int { return value * 2; }
-        comptime VALUE: int = twice(3);
+        @comptime const VALUE: int = twice(3);
         fn main() {}
         "#,
         &["runtime", "comptime"],
@@ -1212,7 +1283,7 @@ fn phase_06_pure_ordinary_function_is_still_runtime_only() {
 fn phase_07_dead_runtime_branch_cannot_call_a_comptime_function() {
     rejects_semantically(
         r#"
-        comptime fn twice(value: int) -> int { return value * 2; }
+        @comptime fn twice(value: int) -> int { return value * 2; }
         fn main() { if false { twice(3); } }
         "#,
         &["runtime", "comptime"],
@@ -1230,7 +1301,7 @@ fn phase_08_runtime_storage_and_indirect_calls_cannot_hide_a_comptime_callable()
     ] {
         rejects_semantically(
             &format!(
-                "comptime fn twice(value: int) -> int {{ return value * 2; }} fn apply(callback) {{ return callback(3); }} fn main() {{ {body} }}"
+                "@comptime fn twice(value: int) -> int {{ return value * 2; }} fn apply(callback) {{ return callback(3); }} fn main() {{ {body} }}"
             ),
             &["runtime", "comptime"],
         );
@@ -1241,7 +1312,7 @@ fn phase_08_runtime_storage_and_indirect_calls_cannot_hide_a_comptime_callable()
 fn phase_09_closure_expression_syntax_is_not_in_the_current_grammar() {
     let text = source(
         r#"
-        comptime fn twice(value: int) -> int { return value * 2; }
+        @comptime fn twice(value: int) -> int { return value * 2; }
         fn main() {
             const callback = closure(value: int) -> int { return twice(value); };
         }
@@ -1267,19 +1338,19 @@ fn phase_10_runtime_host_effects_are_rejected_even_in_dead_branches() {
         ("use entropy;", "entropy::bytes(4)"),
         (
             "use process;",
-            "process::run(\"unreachable-cog-contract\", [])",
+            "process::run_sync(\"unreachable-cog-contract\", [])",
         ),
         ("", "io::open(\"unreachable-cog-contract\", \"r\", 0)"),
     ] {
         rejects_semantically(
             &format!(
-                "{imports} comptime fn calculate() -> int {{ if false {{ {operation}; }} return 7; }} comptime VALUE: int = calculate(); fn main() {{}}"
+                "{imports} @comptime fn calculate() -> int {{ if false {{ {operation}; }} return 7; }} @comptime const VALUE: int = calculate(); fn main() {{}}"
             ),
             &["runtime-only function", "cannot execute at comptime"],
         );
     }
     rejects_semantically(
-        "use time; comptime fn calculate(value: int = time::now()) -> int { return value; } comptime VALUE = calculate(7); fn main() {}",
+        "use time; @comptime fn calculate(value: int = time::now()) -> int { return value; } @comptime const VALUE = calculate(7); fn main() {}",
         &["comptime", "runtime-only"],
     );
 }
@@ -1290,14 +1361,14 @@ fn phase_11_comptime_type_values_substitute_annotations_without_runtime_values()
         r#"
         struct Point { x: int }
         enum Status { Ready }
-        comptime fn identity_type(value: type) -> type { value }
-        comptime Scalar: type = int;
-        comptime ComputedScalar: type = identity_type(Scalar);
-        comptime Matrix: type = int[][];
-        comptime Pair: type = (int, str);
-        comptime Optional: type = int?;
-        comptime Position: type = Point;
-        comptime State: type = Status;
+        @comptime fn identity_type(value: type) -> type { value }
+        @comptime const Scalar: type = int;
+        @comptime const ComputedScalar: type = identity_type(Scalar);
+        @comptime const Matrix: type = int[][];
+        @comptime const Pair: type = (int, str);
+        @comptime const Optional: type = int?;
+        @comptime const Position: type = Point;
+        @comptime const State: type = Status;
         fn identity(value: Scalar) -> Scalar { value }
         fn computed_identity(value: ComputedScalar) -> ComputedScalar { value }
         fn first(matrix: Matrix) -> int { matrix[0][0] }
@@ -1320,7 +1391,7 @@ fn phase_11_comptime_type_values_substitute_annotations_without_runtime_values()
         "7\n8\n9\ntuple\ntrue\n42\ntrue\n",
     );
     rejects_semantically(
-        "comptime T: type = 42; fn main() {}",
+        "@comptime const T: type = 42; fn main() {}",
         &["type binding expects a type value"],
     );
 }
@@ -1330,15 +1401,15 @@ fn inherent_and_comptime_extensions_dispatch_by_receiver_type() {
     output(
         r#"
         struct Point { x: int }
-        comptime Scalar: type = int;
+        @comptime const Scalar: type = int;
         extend Point {
             fn describe(self) -> str { $"point {self.x}" }
         }
-        comptime extend Scalar {
+        @comptime extend Scalar {
             fn describe(self) -> str { $"integer {self}" }
         }
-        comptime Pair: type = (int, str);
-        comptime extend Pair {
+        @comptime const Pair: type = (int, str);
+        @comptime extend Pair {
             fn flipped(self) -> (str, int) { (self.1, self.0) }
         }
         fn main() {
@@ -1350,7 +1421,7 @@ fn inherent_and_comptime_extensions_dispatch_by_receiver_type() {
         "point 7\ninteger 42\n[three, 3]\n",
     );
     rejects_semantically(
-        "comptime extend int { fn add(self, value: int) -> int { self + value } } fn main() { 1.add(\"wrong\"); }",
+        "@comptime extend int { fn add(self, value: int) -> int { self + value } } fn main() { 1.add(\"wrong\"); }",
         &[
             "argument `value` of `add()`",
             "declared as int but given str",
@@ -1362,15 +1433,15 @@ fn inherent_and_comptime_extensions_dispatch_by_receiver_type() {
 fn phase_12_comptime_propagation_bypasses_local_catch_and_caller_can_recover() {
     output(
         r#"
-        comptime fn fail() -> int {
+        @comptime fn fail() -> int {
             try { (1 / 0)!!; } catch(error) { return 99; }
             return 10;
         }
-        comptime fn recover() -> int {
+        @comptime fn recover() -> int {
             try { fail(); } catch(error) { return 0; }
             return 7;
         }
-        comptime VALUE: int = recover();
+        @comptime const VALUE: int = recover();
         fn main() { io::println(VALUE); }
         "#,
         "0\n",
@@ -1385,7 +1456,7 @@ fn phase_13_static_phase_errors_are_not_computational_errors_for_catch() {
     ] {
         rejects_semantically(
             &format!(
-                "{imports} comptime fn calculate() -> int {{ try {{ {operation}; }} catch(error) {{ return 0; }} return 7; }} comptime VALUE: int = calculate(); fn main() {{}}"
+                "{imports} @comptime fn calculate() -> int {{ try {{ {operation}; }} catch(error) {{ return 0; }} return 7; }} @comptime const VALUE: int = calculate(); fn main() {{}}"
             ),
             &["runtime-only function", "cannot execute at comptime"],
         );
@@ -1396,8 +1467,8 @@ fn phase_13_static_phase_errors_are_not_computational_errors_for_catch() {
 fn phase_14_runtime_artifact_contains_the_computed_value_and_no_comptime_callable() {
     let compiled = compile(
         r#"
-        comptime fn ct_only_twice(value: int) -> int { return value * 2; }
-        comptime VALUE: int = ct_only_twice(3);
+        @comptime fn ct_only_twice(value: int) -> int { return value * 2; }
+        @comptime const VALUE: int = ct_only_twice(3);
         fn main() { io::println(VALUE); }
         "#,
     );
@@ -1414,15 +1485,15 @@ fn phase_14_runtime_artifact_contains_the_computed_value_and_no_comptime_callabl
 }
 
 #[test]
-fn phase_15_comptime_binding_does_not_use_const_modifier() {
+fn phase_15_comptime_binding_requires_attribute_and_const() {
     // Establish accepted syntax first so an absent comptime parser cannot pass
     // merely by rejecting every declaration containing the keyword.
     output(
         r#"
-        comptime VERSION: str = "0.1.0";
-        comptime fn calculate() -> int { return 7; }
+        @comptime const VERSION: str = "0.1.0";
+        @comptime fn calculate() -> int { return 7; }
         fn main() {
-            comptime VALUE = calculate();
+            @comptime const VALUE = calculate();
             io::println(VERSION); io::println(VALUE);
         }
         "#,
@@ -1883,11 +1954,11 @@ fn collection_12_arrays_of_tuples_keep_recursive_element_types() {
 fn comptime_and_runtime_mixed_numeric_comparisons_agree() {
     output(
         r#"
-        comptime ABOVE_53 = 9007199254740993 > 9007199254740992.0;
-        comptime MAX_BELOW_2_63 = 9223372036854775807 < 9223372036854775808.0;
-        comptime MIN_EQUALS_FLOAT = (-9223372036854775807 - 1) == -9223372036854775808.0;
-        comptime NEGATIVE_RANGE = (-9223372036854775807 - 1) > -9223372036854777856.0;
-        comptime SIGNED_ZERO = -0.0 == 0;
+        @comptime const ABOVE_53 = 9007199254740993 > 9007199254740992.0;
+        @comptime const MAX_BELOW_2_63 = 9223372036854775807 < 9223372036854775808.0;
+        @comptime const MIN_EQUALS_FLOAT = (-9223372036854775807 - 1) == -9223372036854775808.0;
+        @comptime const NEGATIVE_RANGE = (-9223372036854775807 - 1) > -9223372036854777856.0;
+        @comptime const SIGNED_ZERO = -0.0 == 0;
         fn main() {
             io::println(ABOVE_53);
             io::println(MAX_BELOW_2_63);

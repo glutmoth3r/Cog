@@ -32,13 +32,22 @@ impl Loaded {
 /// Preparation parses the entry point before the build cache is checked.
 pub struct Prepared {
     pub artifact_name: String,
+    pub kind: config::PackageKind,
+    /// Native plugin metadata declared by the root package and its dependencies.
+    /// Each manifest is paired with the package root used to resolve its library.
+    pub plugins: Vec<(PathBuf, crate::sdk::PluginManifest)>,
     pub lock_update: Option<(PathBuf, String)>,
     pub(crate) root: PathBuf,
+    pub(crate) package_roots: Vec<PathBuf>,
+    pub(crate) package_metadata: Vec<config::Package>,
+    pub(crate) archive_inputs: Vec<PathBuf>,
+    pub(crate) assets: Vec<(PathBuf, PathBuf)>,
     pub(crate) sources: BTreeMap<ModuleKey, Source>,
     pub(crate) aliases: BTreeMap<(usize, String), usize>,
     pub(crate) entry: ModuleKey,
-    pub(crate) resolved_includes: BTreeSet<(String, Option<String>)>,
+    pub(crate) resolved_includes: BTreeSet<String>,
     pub(crate) manifests: Vec<PathBuf>,
+    pub(crate) build_manifest: Option<String>,
     pub(crate) resolution: String,
     pub(crate) build_inputs: crate::build_inputs::BuildInputs,
 }
@@ -65,6 +74,7 @@ struct Package {
 struct Graph {
     packages: Vec<Package>,
     by_path: BTreeMap<PathBuf, usize>,
+    archive_inputs: Vec<PathBuf>,
     aliases: BTreeMap<(usize, String), usize>,
     alias_spans: BTreeMap<(usize, String), SourceSpan>,
     errors: Vec<Diagnostic>,
@@ -195,6 +205,9 @@ impl Graph {
                     .unwrap_or("app")
                     .into(),
                 version: "0.0.0".into(),
+                kind: config::PackageKind::Application,
+                plugins: Vec::new(),
+                assets: Vec::new(),
             }
         };
         let id = self.packages.len();
@@ -211,7 +224,57 @@ impl Graph {
             }
         };
         for dep in deps {
-            if let Some(target) = self.package(&root.join(&dep.path), true) {
+            let dependency_root = if let Some((name, version)) = &dep.installed {
+                let archive_path = match crate::package::installed_library_archive(name, version) {
+                    Ok(path) => path,
+                    Err(message) => {
+                        self.errors
+                            .push(Diagnostic::new("E3001", message, Some(dep.span)));
+                        continue;
+                    }
+                };
+                match crate::package::extract_dependency_archive(&root, &archive_path) {
+                    Ok(path) => {
+                        self.archive_inputs.push(archive_path);
+                        path
+                    }
+                    Err(message) => {
+                        self.errors
+                            .push(Diagnostic::new("E3001", message, Some(dep.span)));
+                        continue;
+                    }
+                }
+            } else if dep.archive {
+                let archive_path = root.join(&dep.path);
+                match crate::package::extract_dependency_archive(&root, &archive_path) {
+                    Ok(path) => {
+                        self.archive_inputs.push(archive_path);
+                        path
+                    }
+                    Err(message) => {
+                        self.errors
+                            .push(Diagnostic::new("E3001", message, Some(dep.span)));
+                        continue;
+                    }
+                }
+            } else {
+                root.join(&dep.path)
+            };
+            if let Some(target) = self.package(&dependency_root, true) {
+                if let Some((name, version)) = &dep.installed
+                    && (self.packages[target].metadata.name != *name
+                        || self.packages[target].metadata.version != *version
+                        || self.packages[target].metadata.kind != config::PackageKind::Library)
+                {
+                    self.errors.push(Diagnostic::new(
+                        "E3001",
+                        format!(
+                            "installed package archive does not match `{name}` version `{version}`"
+                        ),
+                        Some(dep.span),
+                    ));
+                    continue;
+                }
                 self.bind_alias(id, &dep.alias, target, Some(dep.span.clone()));
                 if matches!(dep.alias.as_str(), "self" | "super")
                     || crate::builtins::native_module(&dep.alias)
@@ -326,7 +389,7 @@ fn discover(directory: &Path, prefix: &str, state: &mut DiscoveryState<'_>) {
                 .push(error(format!("cannot read directory entry: {e}"))),
         }
     }
-    paths.sort();
+    sort_discovery_paths(&mut paths);
     for path in paths {
         if state.budget.exceeded {
             break;
@@ -399,6 +462,14 @@ fn discover(directory: &Path, prefix: &str, state: &mut DiscoveryState<'_>) {
     }
 }
 
+fn sort_discovery_paths(paths: &mut [PathBuf]) {
+    // Every path came from the same read_dir call and therefore has a unique
+    // final component. Sorting only that component preserves full-path order
+    // without comparing the shared parent prefix or allocating stable-sort
+    // scratch space.
+    paths.sort_unstable_by(|left, right| left.file_name().cmp(&right.file_name()));
+}
+
 fn core_sources(sources: &mut BTreeMap<ModuleKey, Source>) {
     sources.insert((CORE, String::new()), Source::Empty);
     for (name, text) in crate::core_modules::SOURCES {
@@ -454,17 +525,33 @@ pub fn prepare(
     let mut graph = Graph {
         packages: Vec::new(),
         by_path: BTreeMap::new(),
+        archive_inputs: Vec::new(),
         aliases: BTreeMap::new(),
         alias_spans: BTreeMap::new(),
         errors: Vec::new(),
     };
     graph.package(&root, false);
-    let targets = match config::targets(&root.join("build.kdl")) {
-        Ok(v) => v,
-        Err(errors) => {
-            graph.errors.extend(errors);
-            Vec::new()
+    let build_manifest_path = root.join("build.kdl");
+    let build_manifest = if build_manifest_path.exists() {
+        match config::read_configuration(&build_manifest_path) {
+            Ok(text) => Some(text),
+            Err(errors) => {
+                graph.errors.extend(errors);
+                None
+            }
         }
+    } else {
+        None
+    };
+    let targets = match build_manifest.as_deref() {
+        Some(text) => match config::targets_from_source(&build_manifest_path, text) {
+            Ok(targets) => targets,
+            Err(errors) => {
+                graph.errors.extend(errors);
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
     };
     if explicit_file && selected_target.is_some() {
         graph
@@ -476,6 +563,11 @@ pub fn prepare(
         .first()
         .map(|p| p.metadata.name.clone())
         .unwrap_or_else(|| "main".into());
+    let package_kind = graph
+        .packages
+        .first()
+        .map(|p| p.metadata.kind)
+        .unwrap_or_default();
     let (entry, artifact_name) = if explicit_file {
         (
             absolute.clone(),
@@ -485,6 +577,23 @@ pub fn prepare(
                 .unwrap_or("main")
                 .into(),
         )
+    } else if package_kind == config::PackageKind::Library && selected_target.is_some() {
+        graph
+            .errors
+            .push(error("library packages do not have executable targets"));
+        (root.join("src/lib.cog"), package_name)
+    } else if package_kind == config::PackageKind::Library {
+        let entry = if root.join("src/lib.cog").is_file() {
+            root.join("src/lib.cog")
+        } else if !root.join("src").is_dir() && root.join("lib.cog").is_file() {
+            root.join("lib.cog")
+        } else {
+            graph.errors.push(error(
+                "library package requires src/lib.cog when src/ exists, otherwise lib.cog",
+            ));
+            root.join("src/lib.cog")
+        };
+        (entry, package_name)
     } else if let Some(name) = selected_target {
         if let Some(target) = targets.iter().find(|t| t.name == name) {
             (root.join(&target.entry), name.into())
@@ -509,39 +618,33 @@ pub fn prepare(
     let mut resolved_includes = BTreeSet::new();
     if let Ok(text) = crate::limits::read_source_text(&entry) {
         let parsed = frontend::parse(entry.display().to_string(), &text);
-        if parsed.diagnostics.is_empty() {
-            for include in parsed.program.items.iter().filter_map(|item| match item {
-                crate::ast::Item::ComptimeInclude {
-                    package,
-                    path,
-                    span,
-                    ..
-                } => Some((package, path, span)),
-                _ => None,
-            }) {
-                let (alias, requested_path, span) = include;
-                resolved_includes.insert((alias.clone(), requested_path.clone()));
-                if alias == "std" && requested_path.is_none() {
-                    graph.bind_alias(0, alias, CORE, span.clone());
-                    continue;
-                }
-                let target = if let Some(path) = requested_path {
-                    std::env::current_dir()
-                        .unwrap_or_else(|_| root.clone())
-                        .join(path)
-                } else if let Some(target) = graph.aliases.get(&(0, alias.clone())).copied() {
-                    graph.packages[target].root.clone()
-                } else {
-                    let source_dir = root.join("src").join(alias);
-                    if source_dir.is_dir() {
-                        source_dir
-                    } else {
-                        root.join(alias)
-                    }
-                };
-                if let Some(id) = graph.package(&target, false) {
-                    graph.bind_alias(0, alias, id, span.clone());
-                }
+        // Valid declarations in the recovered AST still establish imports.
+        // The resolver reports independent frontend errors before compilation.
+        for (alias, span) in parsed.program.items.iter().filter_map(|item| match item {
+            crate::ast::Item::ComptimeInclude { package, span } => Some((package, span)),
+            _ => None,
+        }) {
+            resolved_includes.insert(alias.clone());
+            if alias == "std" {
+                graph.bind_alias(0, alias, CORE, span.clone());
+                continue;
+            }
+            let Some(target) = graph.aliases.get(&(0, alias.clone())).copied() else {
+                graph.errors.push(Diagnostic::new(
+                    "E3001",
+                    format!(
+                        "unknown package dependency alias {}{}{}; declare it in dependencies.kdl",
+                        char::from(96),
+                        alias,
+                        char::from(96)
+                    ),
+                    span.clone(),
+                ));
+                continue;
+            };
+            let target_root = graph.packages[target].root.clone();
+            if let Some(id) = graph.package(&target_root, false) {
+                graph.bind_alias(0, alias, id, span.clone());
             }
         }
     }
@@ -664,6 +767,40 @@ pub fn prepare(
         manifests.push(package.root.join("dependencies.kdl"));
     }
     manifests.sort();
+    let plugins = graph
+        .packages
+        .iter()
+        .flat_map(|package| {
+            package
+                .metadata
+                .plugins
+                .iter()
+                .cloned()
+                .map(|plugin| (package.root.clone(), plugin))
+        })
+        .collect();
+    let package_roots = graph
+        .packages
+        .iter()
+        .map(|package| package.root.clone())
+        .collect();
+    let package_metadata = graph
+        .packages
+        .iter()
+        .map(|package| package.metadata.clone())
+        .collect();
+    let assets = graph
+        .packages
+        .iter()
+        .flat_map(|package| {
+            package
+                .metadata
+                .assets
+                .iter()
+                .cloned()
+                .map(|asset| (package.root.clone(), asset))
+        })
+        .collect();
     let default_base = if explicit_file {
         std::env::current_dir().map_err(|e| {
             vec![error(format!(
@@ -692,12 +829,19 @@ pub fn prepare(
         build_inputs,
         lock_update,
         artifact_name,
+        kind: package_kind,
+        plugins,
+        package_roots,
+        package_metadata,
+        archive_inputs: graph.archive_inputs,
+        assets,
         root,
         sources,
         aliases: graph.aliases,
         entry: entry_key,
         resolved_includes,
         manifests,
+        build_manifest,
         resolution,
     })
 }
@@ -736,11 +880,9 @@ pub fn compile_source_with_inputs_and_warnings(
         .items
         .iter()
         .filter_map(|item| match item {
-            crate::ast::Item::ComptimeInclude {
-                package,
-                path: None,
-                ..
-            } if package == "std" => Some((package.clone(), None)),
+            crate::ast::Item::ComptimeInclude { package, .. } if package == "std" => {
+                Some(package.clone())
+            }
             _ => None,
         })
         .collect();
@@ -792,6 +934,55 @@ pub fn compile_with_inputs(
         .map(|(program, _)| program)
 }
 
+/// Check a library package without generating executable bytecode.
+pub fn check_with_inputs_and_warnings(
+    program: Program,
+    mut diagnostics: Vec<Diagnostic>,
+    names: &BTreeMap<String, String>,
+    inputs: &crate::build_inputs::BuildInputs,
+) -> Result<Vec<Diagnostic>, String> {
+    inputs.begin();
+    let mut program = program;
+    if let Err(message) = crate::ast_budget::program(&program) {
+        diagnostics.push(Diagnostic::new("E4003", message, None));
+    }
+    if diagnostics.is_empty() {
+        diagnostics.extend(crate::comptime::evaluate_program_with_inputs(
+            &mut program,
+            inputs,
+        ));
+    }
+    let display = |mut text: String| {
+        let mut pairs: Vec<_> = names
+            .iter()
+            .filter(|(bound, _)| bound.starts_with('$'))
+            .collect();
+        pairs.sort_by_key(|(bound, _)| std::cmp::Reverse(bound.len()));
+        for (bound, name) in pairs {
+            text = text.replace(bound, name);
+        }
+        text
+    };
+    let render = |mut diagnostics: Vec<Diagnostic>| {
+        for diagnostic in &mut diagnostics {
+            diagnostic.message = display(std::mem::take(&mut diagnostic.message));
+            for note in &mut diagnostic.notes {
+                *note = display(std::mem::take(note));
+            }
+        }
+        frontend::render(&diagnostics)
+    };
+    if !diagnostics.is_empty() {
+        diagnostics.extend(crate::analysis::check(
+            &program,
+            &std::collections::HashMap::new(),
+        ));
+        return Err(render(diagnostics));
+    }
+    crate::codegen::compile_library(&program).map_err(|error| render(error.diagnostics))?;
+    Ok(crate::lint::check_with_names(&program, names))
+}
+
 pub fn compile_with_inputs_and_warnings(
     program: Program,
     mut diagnostics: Vec<Diagnostic>,
@@ -838,7 +1029,7 @@ pub fn compile_with_inputs_and_warnings(
         ));
         return Err(render(diagnostics));
     }
-    let warnings = crate::lint::check(&program);
+    let warnings = crate::lint::check_with_names(&program, names);
     let mut compiled = crate::codegen::compile(&program).map_err(|e| render(e.diagnostics))?;
     for name in compiled.functions.values_mut() {
         if let Some(original) = names.get(name) {
@@ -867,7 +1058,27 @@ pub fn write_lock(update: Option<(PathBuf, String)>) -> Result<(), String> {
 
 #[cfg(test)]
 mod discovery_tests {
-    use super::{DiscoveryBudget, MAX_PROJECT_DISCOVERY_ENTRIES, MAX_PROJECT_DISCOVERY_PATH_BYTES};
+    use super::{
+        DiscoveryBudget, MAX_PROJECT_DISCOVERY_ENTRIES, MAX_PROJECT_DISCOVERY_PATH_BYTES,
+        sort_discovery_paths,
+    };
+    use std::path::PathBuf;
+
+    #[test]
+    fn sibling_path_sort_preserves_lexical_discovery_order() {
+        let paths = [
+            PathBuf::from("root/modules/zeta.cog"),
+            PathBuf::from("root/modules/alpha.cog"),
+            PathBuf::from("root/modules/mu.cog"),
+        ];
+        let mut expected = paths.clone();
+        expected.sort();
+        let mut actual = paths;
+
+        sort_discovery_paths(&mut actual);
+
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn project_discovery_has_aggregate_entry_and_path_byte_budgets() {

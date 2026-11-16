@@ -1,0 +1,63 @@
+@!include("std")
+use io;
+
+struct Meter {
+    value: int,
+}
+
+extend Meter {
+    @async fn increment_after_yield(self) -> int {
+        await yield_now();
+        self.value + 1
+    }
+
+    @async fn initial_value() -> int {
+        await yield_now();
+        10
+    }
+}
+
+struct Holder[T: type] {
+    value: T,
+}
+
+extend [T: type] Holder[T] {
+    @async fn get(self) -> T {
+        await yield_now();
+        self.value
+    }
+}
+
+trait Loadable {
+    @async fn load(self) -> int;
+}
+
+struct RemoteValue {
+    value: int,
+}
+
+extend RemoteValue with Loadable {
+    @async fn load(self) -> int {
+        await yield_now();
+        self.value
+    }
+}
+
+@async fn load_generic[T: type + Loadable](value: T) -> int {
+    await value.load()
+}
+
+@async fn main() -> nil {
+    const meter = Meter(41);
+    const increment = spawn(meter.increment_after_yield());
+    const initial = spawn(Meter::initial_value());
+    const held = spawn(Holder(7).get());
+    const remote = RemoteValue(99);
+    const direct_load = spawn(remote.load());
+    const generic_load = spawn(load_generic(remote));
+    io::println(await increment)!!;
+    io::println(await initial)!!;
+    io::println(await held)!!;
+    io::println(await direct_load)!!;
+    io::println(await generic_load)!!;
+}

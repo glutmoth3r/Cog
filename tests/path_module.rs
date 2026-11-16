@@ -16,7 +16,7 @@ fn cog_string(value: &str) -> String {
 
 fn run(source: &str) {
     let source = format!(
-        "include std; use path; use err::Error;\nfn require(condition: bool) {{ if !condition {{ crash(\"assertion failed\"); }} }}\n{source}"
+        "@!include(\"std\") use path; use err::Error;\nfn require(condition: bool) {{ if !condition {{ crash(\"assertion failed\"); }} }}\n{source}"
     );
     let program = project::compile_source("path-module.cog", &source)
         .unwrap_or_else(|error| panic!("{error}"));
@@ -116,7 +116,7 @@ fn invalid_extensions_return_errors_and_follow_host_separator_rules() {
 #[test]
 fn joined_and_rewritten_paths_obey_the_runtime_buffer_limit() {
     let source = r#"
-        include std;
+        @!include("std")
         use path;
         use err::Error;
         fn main() {

@@ -1,11 +1,13 @@
 use crate::ast::{
-    BinOp, Block, CallArgument, Expr, ExtendDecl, ExtensionMethod, FallbackKind, FunctionDecl,
-    Item, MatchArm, MatchPattern, Param, Program, Stmt, StringPart, StructField, TraitBound,
-    TraitDecl, TraitMethod, TypeAnnotation, TypeKind, TypeParameter, UnOp, UseDecl, VarType,
-    Visibility,
+    BinOp, BindingPattern, Block, CallArgument, Expr, ExtendDecl, ExtensionMethod, FallbackKind,
+    ForClause, FunctionDecl, InlineMode, Item, MatchArm, MatchPattern, Param, Program, Stmt,
+    StringPart, StructField, TraitBound, TraitDecl, TraitMethod, TypeAnnotation, TypeKind,
+    TypeParameter, UnOp, UseDecl, VarType, Visibility,
 };
 use crate::diagnostic::{Diagnostic, SourceFile, SourceSpan};
 use crate::lexer::{InterpolationToken, InterpolationTokenPart, SpannedToken, Token};
+use num_bigint::BigInt;
+use num_traits::ToPrimitive;
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -72,6 +74,14 @@ struct Parser<'a> {
     limits: crate::limits::CompilerLimits,
 }
 
+#[derive(Default)]
+struct DeclarationAttributes {
+    comptime: bool,
+    public: bool,
+    asynchronous: bool,
+    inline: InlineMode,
+}
+
 impl<'a> Parser<'a> {
     fn new(tokens: &'a [SpannedToken], source: Option<Rc<SourceFile>>) -> Self {
         Parser {
@@ -106,7 +116,6 @@ impl<'a> Parser<'a> {
                             Token::Fn
                                 | Token::Public
                                 | Token::Const
-                                | Token::Comptime
                                 | Token::Var
                                 | Token::Struct
                                 | Token::Enum
@@ -159,14 +168,7 @@ impl<'a> Parser<'a> {
             if braces == 0
                 && matches!(
                     self.peek(),
-                    Some(
-                        Token::Const
-                            | Token::Comptime
-                            | Token::Var
-                            | Token::Use
-                            | Token::Struct
-                            | Token::Enum
-                    )
+                    Some(Token::Const | Token::Var | Token::Use | Token::Struct | Token::Enum)
                 )
             {
                 break;
@@ -182,6 +184,10 @@ impl<'a> Parser<'a> {
 
     fn synchronize_statement(&mut self, start: usize) {
         let mut braces = 0usize;
+        let attributed = self
+            .tokens
+            .get(start)
+            .is_some_and(|token| token.token == Token::At);
         for token in &self.tokens[start..self.pos] {
             match token.token {
                 Token::LBrace => braces += 1,
@@ -196,14 +202,9 @@ impl<'a> Parser<'a> {
                     self.advance();
                     break;
                 }
-                Some(
-                    Token::Const
-                    | Token::Comptime
-                    | Token::Var
-                    | Token::Return
-                    | Token::Fn
-                    | Token::Public,
-                ) if braces == 0 && self.pos > start => {
+                Some(Token::Const | Token::Var | Token::Return | Token::Fn | Token::Public)
+                    if braces == 0 && self.pos > start && !attributed =>
+                {
                     break;
                 }
                 Some(Token::LBrace) => braces += 1,
@@ -401,6 +402,11 @@ impl<'a> Parser<'a> {
                         push(&arg.value);
                     }
                 }
+                Expr::AssociatedCall { args, .. } => {
+                    for arg in args {
+                        push(&arg.value);
+                    }
+                }
                 Expr::BracketApply(receiver, args) | Expr::MethodCall(receiver, _, args) => {
                     push(receiver.as_ref());
                     for arg in args {
@@ -440,42 +446,25 @@ impl<'a> Parser<'a> {
 
     fn parse_item(&mut self) -> Result<Item, HlParseError> {
         match self.peek() {
-            Some(Token::Comptime) if self.peek_ident_at(1, "include") => {
-                Err(self.err("`comptime` cannot precede `include`; write `include ...;` instead"))
-            }
-            Some(Token::Comptime) if self.peek_at(1) == Some(&Token::Fn) => {
-                self.parse_function_item()
-            }
-            Some(Token::Comptime) if self.peek_ident_at(1, "extend") => {
-                self.parse_extend_decl(true)
-            }
-            Some(Token::Comptime) => self.parse_global_comptime(Visibility::Private),
-            Some(Token::Const) | Some(Token::Var) => match self.peek() {
-                Some(Token::Const) => self.parse_global_const(Visibility::Private),
-                Some(Token::Var) => self.parse_global_var(Visibility::Private),
-                _ => unreachable!(),
-            },
+            Some(Token::At) => self.parse_attributed_item(),
+            Some(Token::Const) => self.parse_global_const(Visibility::Private),
+            Some(Token::Var) => self.parse_global_var(Visibility::Private),
             Some(Token::Fn) | Some(Token::Public) => {
                 if self.peek() == Some(&Token::Public) {
                     if self.peek_ident_at(1, "trait") {
                         self.advance();
                         return self.parse_trait_decl(Visibility::Public);
                     }
-                    let mut look = self.tokens.iter().skip(self.pos + 1);
-                    let second = look.next().map(|x| &x.token);
-                    let third = look.next().map(|x| &x.token);
+                    let second = self.peek_at(1);
                     if matches!(
                         second,
                         Some(Token::Struct)
                             | Some(Token::Enum)
                             | Some(Token::Const)
                             | Some(Token::Var)
-                    ) || (second == Some(&Token::Comptime) && third != Some(&Token::Fn))
-                    {
-                        let visibility = {
-                            self.advance();
-                            Visibility::Public
-                        };
+                    ) {
+                        self.advance();
+                        let visibility = Visibility::Public;
                         match self.peek() {
                             Some(Token::Struct) => {
                                 let (name, type_params, fields) = self.parse_struct_decl()?;
@@ -496,7 +485,6 @@ impl<'a> Parser<'a> {
                                 })
                             }
                             Some(Token::Const) => self.parse_global_const(visibility),
-                            Some(Token::Comptime) => self.parse_global_comptime(visibility),
                             Some(Token::Var) => self.parse_global_var(visibility),
                             _ => unreachable!(),
                         }
@@ -529,14 +517,196 @@ impl<'a> Parser<'a> {
             Some(Token::Ident(name)) if name == "trait" => {
                 self.parse_trait_decl(Visibility::Private)
             }
-            Some(Token::Ident(name)) if name == "include" => self.parse_include(),
-            Some(Token::Ident(name)) if name == "extend" => self.parse_extend_decl(false),
-            Some(t) => Err(self.err(format!(
+            Some(Token::Ident(name)) if name == "include" => Err(self.err(
+                "legacy package inclusion was removed; use @!include with an alias declared in dependencies.kdl",
+            )),
+            Some(Token::Ident(name)) if name == "extend" => {
+                self.parse_extend_decl_body(false)
+            }
+            Some(token) => Err(self.err(format!(
                 "expected a top-level declaration, found {}",
-                token_description(t)
+                token_description(token)
             ))),
             None => Err(self.err("expected top-level declaration, found end of input")),
         }
+    }
+
+    fn parse_attributed_item(&mut self) -> Result<Item, HlParseError> {
+        let start = self.pos;
+        self.expect(&Token::At)?;
+        if self.peek() == Some(&Token::Bang) {
+            self.advance();
+            let directive = self.expect_ident()?;
+            if directive != "include" {
+                return Err(self.err(format!("unknown compiler directive `@!{directive}`")));
+            }
+            self.expect(&Token::LParen)?;
+            let package = match self.peek().cloned() {
+                Some(Token::Str(package)) => {
+                    self.advance();
+                    package
+                }
+                Some(token) => {
+                    return Err(self.err(format!(
+                        "expected a package alias string in `@!include(...)`, found {}",
+                        token_description(&token)
+                    )));
+                }
+                None => return Err(self.err("expected a package alias string in `@!include(...)`")),
+            };
+            self.expect(&Token::RParen)?;
+            if self.peek() == Some(&Token::Semi) {
+                self.advance();
+            }
+            return Ok(Item::ComptimeInclude {
+                package,
+                span: self.location(start),
+            });
+        }
+
+        let attributes = self.parse_declaration_attributes()?;
+        if attributes.inline != InlineMode::Auto
+            && (!matches!(self.peek(), Some(Token::Fn) | Some(Token::Public))
+                || attributes.comptime)
+        {
+            return Err(self.err("`@inline` applies only to runtime function declarations"));
+        }
+        if attributes.asynchronous && !matches!(self.peek(), Some(Token::Fn) | Some(Token::Public))
+        {
+            return Err(self.err("`@async` applies only to function declarations"));
+        }
+
+        let visibility = if attributes.public {
+            Visibility::Public
+        } else {
+            Visibility::Private
+        };
+        match self.peek() {
+            Some(Token::Fn) | Some(Token::Public) => {
+                self.parse_function_item_with_attributes(
+                    attributes.comptime,
+                    attributes.public,
+                    attributes.asynchronous,
+                    attributes.inline,
+                )
+            }
+            Some(Token::Struct) if !attributes.comptime => {
+                let (name, type_params, fields) = self.parse_struct_decl()?;
+                Ok(Item::StructDecl {
+                    name,
+                    visibility,
+                    type_params,
+                    fields,
+                    owner: None,
+                })
+            }
+            Some(Token::Enum) if !attributes.comptime => {
+                let (name, variants) = self.parse_enum_decl()?;
+                Ok(Item::EnumDecl {
+                    name,
+                    visibility,
+                    variants,
+                })
+            }
+            Some(Token::Ident(name)) if name == "trait" && !attributes.comptime => {
+                self.parse_trait_decl(visibility)
+            }
+            Some(Token::Const) if attributes.comptime => {
+                self.parse_attributed_comptime_const(visibility)
+            }
+            Some(Token::Const) => self.parse_global_const(visibility),
+            Some(Token::Var) if attributes.comptime => Err(self.err(
+                "`@comptime var` is not supported; compile-time mutable bindings are not implemented yet",
+            )),
+            Some(Token::Var) => self.parse_global_var(visibility),
+            Some(Token::Ident(name)) if name == "extend" && !attributes.public => {
+                self.parse_extend_decl_body(attributes.comptime)
+            }
+            _ => Err(self.err("declaration attributes must precede a supported declaration")),
+        }
+    }
+
+    fn parse_declaration_attributes(&mut self) -> Result<DeclarationAttributes, HlParseError> {
+        let mut attributes = DeclarationAttributes::default();
+        loop {
+            let name = match self.peek() {
+                Some(Token::Public) => "public".to_owned(),
+                Some(Token::Ident(name)) => name.clone(),
+                Some(token) => {
+                    return Err(self.err(format!(
+                        "expected a declaration attribute, found {}",
+                        token_description(token)
+                    )));
+                }
+                None => {
+                    return Err(self.err("expected a declaration attribute, found end of input"));
+                }
+            };
+            self.advance();
+            if name == "inline" {
+                if attributes.inline != InlineMode::Auto {
+                    return Err(self.err("duplicate declaration attribute `@inline`"));
+                }
+                attributes.inline = if self.peek() == Some(&Token::LParen) {
+                    self.advance();
+                    let mode = match self.peek() {
+                        Some(Token::Str(mode)) if mode == "never" => {
+                            self.advance();
+                            InlineMode::Never
+                        }
+                        Some(Token::Str(mode)) => {
+                            return Err(self.err(format!(
+                                "unsupported `@inline` mode `{mode}`; expected `never`"
+                            )));
+                        }
+                        Some(token) => {
+                            return Err(self.err(format!(
+                                "expected `never` in `@inline(...)`, found {}",
+                                token_description(token)
+                            )));
+                        }
+                        None => return Err(self.err("expected `never` in `@inline(...)`")),
+                    };
+                    self.expect(&Token::RParen)?;
+                    mode
+                } else {
+                    InlineMode::Hint
+                };
+            } else {
+                let slot = match name.as_str() {
+                    "comptime" => &mut attributes.comptime,
+                    "public" => &mut attributes.public,
+                    "async" => &mut attributes.asynchronous,
+                    _ => return Err(self.err(format!("unknown declaration attribute `@{name}`"))),
+                };
+                if self.peek() == Some(&Token::LParen) {
+                    return Err(self.err(format!("attribute `@{name}` does not take arguments")));
+                }
+                if *slot {
+                    return Err(self.err(format!("duplicate declaration attribute `@{name}`")));
+                }
+                *slot = true;
+            }
+            if self.peek() != Some(&Token::At) {
+                break;
+            }
+            self.advance();
+            if self.peek() == Some(&Token::Bang) {
+                return Err(self.err("compiler directives cannot be composed with attributes"));
+            }
+        }
+        if attributes.comptime && attributes.asynchronous {
+            return Err(self.err("`@async` and `@comptime` cannot be combined"));
+        }
+        Ok(attributes)
+    }
+
+    fn parse_attributed_comptime_const(
+        &mut self,
+        visibility: Visibility,
+    ) -> Result<Item, HlParseError> {
+        self.expect(&Token::Const)?;
+        self.parse_global_comptime_body(visibility)
     }
 
     // A single struct field: `name`, `name: Type`, `name: Type?`, any of
@@ -779,44 +949,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_include(&mut self) -> Result<Item, HlParseError> {
-        let start = self.pos;
-        self.expect_context_ident("include")?;
-        let package = self.expect_ident()?;
-        let path = if self.peek_ident_at(0, "from") {
-            self.advance();
-            match self.peek().cloned() {
-                Some(Token::Str(path)) => {
-                    self.advance();
-                    Some(path)
-                }
-                Some(Token::Path(path)) => {
-                    self.advance();
-                    Some(path)
-                }
-                Some(token) => {
-                    return Err(self.err(format!(
-                        "expected a relative path after `from`, found {}",
-                        token_description(&token)
-                    )));
-                }
-                None => return Err(self.err("expected a relative path after `from`")),
-            }
-        } else {
-            None
-        };
-        self.expect(&Token::Semi)?;
-        Ok(Item::ComptimeInclude {
-            package,
-            path,
-            span: self.location(start),
-        })
-    }
-
-    fn parse_extend_decl(&mut self, comptime: bool) -> Result<Item, HlParseError> {
-        if comptime {
-            self.expect(&Token::Comptime)?;
-        }
+    fn parse_extend_decl_body(&mut self, comptime: bool) -> Result<Item, HlParseError> {
         self.expect_context_ident("extend")?;
         self.type_parameters.push(HashSet::new());
         let parsed =
@@ -854,16 +987,16 @@ impl<'a> Parser<'a> {
                     let method_type_params = std::mem::take(&mut function.type_params);
                     function.type_params.extend(type_params.iter().cloned());
                     function.type_params.extend(method_type_params);
-                    let Some(receiver) = function.params.first_mut() else {
-                        return Err(self.err("extension methods require a first `self` parameter"));
-                    };
-                    if receiver.name != "self" {
-                        return Err(
-                            self.err("the first extension method parameter must be named `self`")
-                        );
-                    }
-                    if receiver.ty.is_none() {
-                        receiver.ty = Some(target.clone());
+                    if let Some(receiver) = function
+                        .params
+                        .first_mut()
+                        .filter(|parameter| parameter.name == "self")
+                    {
+                        if receiver.ty.is_none() {
+                            receiver.ty = Some(target.clone());
+                        }
+                    } else if mutating_receiver {
+                        return Err(self.err("`mut` requires a first `self` parameter"));
                     }
                     methods.push(ExtensionMethod {
                         name: std::mem::take(&mut function.name),
@@ -911,6 +1044,28 @@ impl<'a> Parser<'a> {
                 if self.at_end() {
                     return Err(self.err("unterminated trait declaration, expected `}`"));
                 }
+                let attributes = if self.peek() == Some(&Token::At) {
+                    self.advance();
+                    self.parse_declaration_attributes()?
+                } else {
+                    DeclarationAttributes::default()
+                };
+                if attributes.comptime {
+                    return Err(self.err("trait methods must be runtime functions"));
+                }
+                if attributes.inline != InlineMode::Auto {
+                    return Err(self.err("`@inline` applies only to function definitions"));
+                }
+                if attributes.public {
+                    return Err(
+                        self.err("trait method visibility is inherited from the trait declaration")
+                    );
+                }
+                if attributes.asynchronous
+                    && !matches!(self.peek(), Some(Token::Fn) | Some(Token::Public))
+                {
+                    return Err(self.err("`@async` applies only to function declarations"));
+                }
                 self.expect(&Token::Fn)?;
                 let method_name = self.expect_ident()?;
                 self.expect(&Token::LParen)?;
@@ -938,6 +1093,7 @@ impl<'a> Parser<'a> {
                     name: method_name,
                     params,
                     mutating_receiver,
+                    asynchronous: attributes.asynchronous,
                     result_type,
                 });
             }
@@ -968,11 +1124,6 @@ impl<'a> Parser<'a> {
         let mut parameters = Vec::new();
         let mut names = HashSet::new();
         loop {
-            if self.peek() == Some(&Token::Comptime) {
-                return Err(
-                    self.err("parameters inside `[]` are already comptime; write `[T: type]`")
-                );
-            }
             let name = self.expect_ident()?;
             if name == "Self" || !names.insert(name.clone()) {
                 return Err(self.err(format!("invalid or duplicate generic parameter `{name}`")));
@@ -1042,19 +1193,50 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_function(&mut self) -> Result<(FunctionDecl, bool), HlParseError> {
-        let visibility = match self.peek() {
+        let attributes = if self.peek() == Some(&Token::At) {
+            self.advance();
+            self.parse_declaration_attributes()?
+        } else {
+            DeclarationAttributes::default()
+        };
+        if attributes.asynchronous && !matches!(self.peek(), Some(Token::Fn) | Some(Token::Public))
+        {
+            return Err(self.err("`@async` applies only to function declarations"));
+        }
+        self.parse_function_with_attributes(
+            attributes.comptime,
+            attributes.public,
+            attributes.asynchronous,
+            attributes.inline,
+        )
+    }
+
+    fn parse_function_with_attributes(
+        &mut self,
+        attribute_comptime: bool,
+        attribute_public: bool,
+        asynchronous: bool,
+        inline: InlineMode,
+    ) -> Result<(FunctionDecl, bool), HlParseError> {
+        if attribute_comptime && inline != InlineMode::Auto {
+            return Err(self.err("`@inline` applies only to runtime function declarations"));
+        }
+        let keyword_public = match self.peek() {
             Some(Token::Public) => {
                 self.advance();
-                Visibility::Public
+                true
             }
-            _ => Visibility::Private,
+            _ => false,
         };
-        let comptime = if self.peek() == Some(&Token::Comptime) {
-            self.advance();
-            true
+        if keyword_public && attribute_public {
+            return Err(self.err("duplicate visibility: use either `public` or `@public`"));
+        }
+        let visibility = if attribute_public || keyword_public {
+            Visibility::Public
         } else {
-            false
+            Visibility::Private
         };
+        let comptime = attribute_comptime;
         self.expect(&Token::Fn)?;
         let name = self.expect_ident()?;
         self.type_parameters.push(HashSet::new());
@@ -1073,7 +1255,7 @@ impl<'a> Parser<'a> {
             };
             let body = self.parse_block()?;
             if comptime && !type_params.is_empty() {
-                return Err(self.err("generic `comptime fn` declarations are not supported"));
+                return Err(self.err("generic `@comptime fn` declarations are not supported"));
             }
             Ok((
                 FunctionDecl {
@@ -1083,6 +1265,8 @@ impl<'a> Parser<'a> {
                     owner: None,
                     visibility,
                     comptime,
+                    asynchronous,
+                    inline,
                     type_params,
                     params,
                     body,
@@ -1095,7 +1279,18 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_function_item(&mut self) -> Result<Item, HlParseError> {
-        let (function, mutating_receiver) = self.parse_function()?;
+        self.parse_function_item_with_attributes(false, false, false, InlineMode::Auto)
+    }
+
+    fn parse_function_item_with_attributes(
+        &mut self,
+        comptime: bool,
+        public: bool,
+        asynchronous: bool,
+        inline: InlineMode,
+    ) -> Result<Item, HlParseError> {
+        let (function, mutating_receiver) =
+            self.parse_function_with_attributes(comptime, public, asynchronous, inline)?;
         if mutating_receiver {
             return Err(self.err("`mut self` is only valid on extension methods"));
         }
@@ -1103,9 +1298,6 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_function_params(&mut self) -> Result<(Vec<Param>, bool), HlParseError> {
-        if self.peek() == Some(&Token::Comptime) {
-            return Err(self.err("declare generic parameters before `(` with `[T: type]`"));
-        }
         self.parse_params()
     }
 
@@ -1120,9 +1312,6 @@ impl<'a> Parser<'a> {
         }
         let mut mutating_receiver = false;
         loop {
-            if self.peek() == Some(&Token::Comptime) {
-                return Err(self.err("declare generic parameters before `(` with `[T: type]`"));
-            }
             let marked_mutating = self.peek_ident_at(0, "mut");
             if marked_mutating {
                 if !params.is_empty() {
@@ -1204,7 +1393,7 @@ impl<'a> Parser<'a> {
                     let binding = match (self.tokens.get(start), self.tokens.get(start + 1)) {
                         (
                             Some(SpannedToken {
-                                token: Token::Const | Token::Comptime | Token::Var,
+                                token: Token::Const | Token::Var,
                                 ..
                             }),
                             Some(SpannedToken {
@@ -1234,8 +1423,8 @@ impl<'a> Parser<'a> {
 
     fn parse_stmt_inner(&mut self) -> Result<Stmt, HlParseError> {
         match self.peek() {
+            Some(Token::At) => self.parse_attributed_comptime_stmt(),
             Some(Token::Use) => self.parse_use_stmt(),
-            Some(Token::Comptime) => self.parse_comptime_stmt(),
             Some(Token::Const) => self.parse_const(),
             Some(Token::Var) => self.parse_var_decl(),
             Some(Token::Return) => self.parse_return(),
@@ -1366,6 +1555,26 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_attributed_comptime_stmt(&mut self) -> Result<Stmt, HlParseError> {
+        self.expect(&Token::At)?;
+        self.expect_context_ident("comptime")?;
+        if self.peek() == Some(&Token::LParen) {
+            return Err(self.err("attribute `@comptime` does not take arguments"));
+        }
+        if self.peek() == Some(&Token::Var) {
+            return Err(self.err(
+                "`@comptime var` is not supported; compile-time mutable bindings are not implemented yet",
+            ));
+        }
+        self.expect(&Token::Const)?;
+        let name = self.expect_ident()?;
+        let ty = self.parse_type_annotation()?;
+        self.expect(&Token::Eq)?;
+        let value = self.parse_expr()?;
+        self.expect(&Token::Semi)?;
+        Ok(Stmt::Comptime { name, ty, value })
+    }
+
     fn parse_defer(&mut self) -> Result<Stmt, HlParseError> {
         self.expect(&Token::Defer)?;
         let body = self.parse_block()?;
@@ -1463,8 +1672,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_global_comptime(&mut self, visibility: Visibility) -> Result<Item, HlParseError> {
-        self.expect(&Token::Comptime)?;
+    fn parse_global_comptime_body(&mut self, visibility: Visibility) -> Result<Item, HlParseError> {
         let name = self.expect_ident()?;
         let ty = self.parse_type_annotation()?;
         self.expect(&Token::Eq)?;
@@ -1491,12 +1699,12 @@ impl<'a> Parser<'a> {
 
     fn parse_var_decl(&mut self) -> Result<Stmt, HlParseError> {
         self.expect(&Token::Var)?;
-        let name = self.expect_ident()?;
+        let pattern = self.parse_binding_pattern()?;
         let ty = self.parse_type_annotation()?;
         self.expect(&Token::Eq)?;
         let value = self.parse_expr()?;
         self.expect(&Token::Semi)?;
-        Ok(Stmt::VarDecl { name, ty, value })
+        Ok(Stmt::VarDecl { pattern, ty, value })
     }
 
     // `: int` / `: bool` / `: str` / `: float` after a variable name,
@@ -1554,7 +1762,10 @@ impl<'a> Parser<'a> {
                     }
                     let mut kind = match name.as_str() {
                         "int" => TypeKind::Primitive(VarType::Int),
+                        "uint" => TypeKind::Primitive(VarType::UInt),
+                        "bigint" => TypeKind::Primitive(VarType::BigInt),
                         "bool" => TypeKind::Primitive(VarType::Bool),
+                        "char" => TypeKind::Primitive(VarType::Char),
                         "str" => TypeKind::Primitive(VarType::Str),
                         "float" => TypeKind::Primitive(VarType::Float),
                         "Self" => TypeKind::SelfType,
@@ -1651,22 +1862,12 @@ impl<'a> Parser<'a> {
     // checking (`const` had no `: Type` support at all before this).
     fn parse_const(&mut self) -> Result<Stmt, HlParseError> {
         self.expect(&Token::Const)?;
-        let name = self.expect_ident()?;
+        let pattern = self.parse_binding_pattern()?;
         let ty = self.parse_type_annotation()?;
         self.expect(&Token::Eq)?;
         let value = self.parse_expr()?;
         self.expect(&Token::Semi)?;
-        Ok(Stmt::Const { name, ty, value })
-    }
-
-    fn parse_comptime_stmt(&mut self) -> Result<Stmt, HlParseError> {
-        self.expect(&Token::Comptime)?;
-        let name = self.expect_ident()?;
-        let ty = self.parse_type_annotation()?;
-        self.expect(&Token::Eq)?;
-        let value = self.parse_expr()?;
-        self.expect(&Token::Semi)?;
-        Ok(Stmt::Comptime { name, ty, value })
+        Ok(Stmt::Const { pattern, ty, value })
     }
 
     fn parse_return(&mut self) -> Result<Stmt, HlParseError> {
@@ -1843,25 +2044,49 @@ impl<'a> Parser<'a> {
 
     fn parse_for(&mut self) -> Result<Stmt, HlParseError> {
         self.expect(&Token::For)?;
-        let var = self.expect_ident()?;
-        match self.peek() {
-            Some(Token::Ident(s)) if s == "in" => {
-                self.advance();
-            }
-            Some(t) => {
-                return Err(self.err(format!("expected `in`, found {}", token_description(t))));
-            }
-            None => return Err(self.err("expected `in`, found end of input")),
+        let mut clauses = vec![self.parse_for_clause()?];
+        while self.peek() == Some(&Token::Comma) {
+            self.advance();
+            clauses.push(self.parse_for_clause()?);
         }
+        let body = self.parse_block()?;
+        if clauses.len() > 1 {
+            return Ok(Stmt::ForZip { clauses, body });
+        }
+        match clauses.pop().expect("for has at least one clause") {
+            ForClause::Range {
+                var,
+                start,
+                end,
+                step,
+            } => Ok(Stmt::For {
+                var,
+                start,
+                end,
+                step,
+                body,
+            }),
+            ForClause::Each { pattern, iterable } => Ok(Stmt::ForEach {
+                pattern,
+                iterable,
+                body,
+            }),
+        }
+    }
+
+    fn parse_for_clause(&mut self) -> Result<ForClause, HlParseError> {
+        let pattern = self.parse_binding_pattern()?;
+        self.expect_context_ident("in")?;
         let start = self.parse_expr()?;
         if self.peek() != Some(&Token::DotDot) {
-            let body = self.parse_block()?;
-            return Ok(Stmt::ForEach {
-                var,
+            return Ok(ForClause::Each {
+                pattern,
                 iterable: start,
-                body,
             });
         }
+        let BindingPattern::Name(var) = pattern else {
+            return Err(self.err("range iteration requires a single binding name"));
+        };
         self.advance();
         let end = self.parse_expr()?;
         // `step` isn't a reserved keyword (same treatment as `in` just
@@ -1874,14 +2099,54 @@ impl<'a> Parser<'a> {
             }
             _ => None,
         };
-        let body = self.parse_block()?;
-        Ok(Stmt::For {
+        Ok(ForClause::Range {
             var,
             start,
             end,
             step,
-            body,
         })
+    }
+
+    fn parse_binding_pattern(&mut self) -> Result<BindingPattern, HlParseError> {
+        if self.depth >= self.limits.max_syntax_depth {
+            return Err(self.err("compiler syntax depth limit exceeded"));
+        }
+        self.depth += 1;
+        let result = self.parse_binding_pattern_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_binding_pattern_inner(&mut self) -> Result<BindingPattern, HlParseError> {
+        if let Some(Token::Ident(_)) = self.peek() {
+            return self.expect_ident().map(BindingPattern::Name);
+        }
+        if self.peek() != Some(&Token::LParen) {
+            return Err(self.err("expected a binding name or tuple pattern"));
+        }
+        self.advance();
+        if self.peek() == Some(&Token::RParen) {
+            return Err(self.err("tuple binding pattern cannot be empty"));
+        }
+        let mut items = vec![self.parse_binding_pattern()?];
+        let mut is_tuple = false;
+        while self.peek() == Some(&Token::Comma) {
+            is_tuple = true;
+            self.advance();
+            if self.peek() == Some(&Token::RParen) {
+                break;
+            }
+            items.push(self.parse_binding_pattern()?);
+        }
+        self.expect(&Token::RParen)?;
+        if is_tuple {
+            if items.len() < 2 {
+                return Err(self.err("tuple binding pattern requires at least two elements"));
+            }
+            Ok(BindingPattern::Tuple(items))
+        } else {
+            Ok(items.pop().expect("a non-empty pattern was parsed"))
+        }
     }
 
     fn parse_expr(&mut self) -> Result<Expr, HlParseError> {
@@ -1980,6 +2245,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_match_pattern(&mut self) -> Result<MatchPattern, HlParseError> {
+        if let Some(Token::Char(value)) = self.peek().cloned() {
+            self.advance();
+            return Ok(MatchPattern::CharacterLiteral(value));
+        }
         if let Some(Token::Str(value)) = self.peek().cloned() {
             self.advance();
             return Ok(MatchPattern::StringLiteral(value));
@@ -2214,8 +2483,8 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
-    // The type name after `as` — same four bare identifiers as
-    // `parse_type_annotation` (`int`/`bool`/`str`/`float`), recognized the
+    // The type name after `as` — the same primitive identifiers as
+    // `parse_type_annotation` (`int`/`uint`/`bool`/`char`/`str`/`float`), recognized the
     // same positional way (no dedicated keyword tokens for them). No `?`
     // here: a cast always produces a concrete value or a runtime
     // `Value::Error`, never `nil` — see `Expr::Cast`'s doc comment.
@@ -2225,9 +2494,21 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Ok(VarType::Int)
             }
+            Some(Token::Ident(s)) if s == "uint" => {
+                self.advance();
+                Ok(VarType::UInt)
+            }
+            Some(Token::Ident(s)) if s == "bigint" => {
+                self.advance();
+                Ok(VarType::BigInt)
+            }
             Some(Token::Ident(s)) if s == "bool" => {
                 self.advance();
                 Ok(VarType::Bool)
+            }
+            Some(Token::Ident(s)) if s == "char" => {
+                self.advance();
+                Ok(VarType::Char)
             }
             Some(Token::Ident(s)) if s == "str" => {
                 self.advance();
@@ -2238,7 +2519,7 @@ impl<'a> Parser<'a> {
                 Ok(VarType::Float)
             }
             Some(t) => Err(self.err(format!(
-                "expected a type after `as` (`int`, `bool`, `str`, or `float`), found {}",
+                "expected a type after `as` (`int`, `uint`, `bool`, `char`, `str`, or `float`), found {}",
                 token_description(&t)
             ))),
             None => Err(self.err("expected type after `as`, found end of input")),
@@ -2264,8 +2545,28 @@ impl<'a> Parser<'a> {
             }
             Some(Token::Minus) => {
                 self.advance();
+                match self.peek().cloned() {
+                    Some(Token::Int(value)) if value == (1_u64 << 63) => {
+                        self.advance();
+                        return Ok(Expr::Int(i64::MIN));
+                    }
+                    Some(Token::Int(value)) if value > i64::MAX as u64 => {
+                        self.advance();
+                        return Ok(Expr::BigInt(-BigInt::from(value)));
+                    }
+                    Some(Token::BigInt(value)) => {
+                        self.advance();
+                        return Ok(Expr::BigInt(-value));
+                    }
+                    _ => {}
+                }
                 let expr = self.parse_unary()?;
                 Ok(Expr::Unary(UnOp::Neg, Box::new(expr)))
+            }
+            Some(Token::Ident(name)) if name == "await" => {
+                self.advance();
+                let expr = self.parse_unary()?;
+                Ok(Expr::Unary(UnOp::Await, Box::new(expr)))
             }
             _ => self.parse_primary(),
         }
@@ -2296,7 +2597,21 @@ impl<'a> Parser<'a> {
         match self.peek().cloned() {
             Some(Token::Int(n)) => {
                 self.advance();
-                Ok(Expr::Int(n))
+                if n <= i64::MAX as u64 {
+                    Ok(Expr::Int(n as i64))
+                } else {
+                    Ok(Expr::UInt(n))
+                }
+            }
+            Some(Token::BigInt(n)) => {
+                self.advance();
+                if let Some(value) = n.to_i64() {
+                    Ok(Expr::Int(value))
+                } else if let Some(value) = n.to_u64() {
+                    Ok(Expr::UInt(value))
+                } else {
+                    Ok(Expr::BigInt(n))
+                }
             }
             Some(Token::Float(n)) => {
                 self.advance();
@@ -2305,6 +2620,10 @@ impl<'a> Parser<'a> {
             Some(Token::Str(s)) => {
                 self.advance();
                 Ok(Expr::Str(s))
+            }
+            Some(Token::Char(c)) => {
+                self.advance();
+                Ok(Expr::Char(c))
             }
             Some(Token::True) => {
                 self.advance();
@@ -2449,6 +2768,9 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let field = if let Some(Token::Int(n)) = self.peek().cloned() {
                     self.advance();
+                    let Ok(n) = i64::try_from(n) else {
+                        return Err(self.err("tuple position does not fit int"));
+                    };
                     Expr::Int(n)
                 } else {
                     Expr::Str(self.expect_ident()?)
@@ -2538,8 +2860,12 @@ fn token_description(token: &Token) -> String {
     match token {
         Token::Invalid => "invalid token".into(),
         Token::Int(value) => format!("integer literal {}", quote_excerpt(&value.to_string())),
+        Token::BigInt(value) => {
+            format!("integer literal {}", quote_excerpt(&value.to_string()))
+        }
         Token::Float(value) => format!("float literal {}", quote_excerpt(&value.to_string())),
         Token::Str(_) => "string literal".into(),
+        Token::Char(_) => "character literal".into(),
         Token::Interpolated(_) => "interpolated string".into(),
         Token::Ident(name) => format!("identifier {}", quote_excerpt(name)),
         Token::Path(path) => format!("path {}", quote_excerpt(path)),
@@ -2564,6 +2890,7 @@ fn token_lexeme(token: &Token) -> &'static str {
         Token::False => "false",
         Token::Nil => "nil",
         Token::Fn => "fn",
+        Token::At => "@",
         Token::Public => "public",
         Token::Private => "private",
         Token::Struct => "struct",
@@ -2571,7 +2898,6 @@ fn token_lexeme(token: &Token) -> &'static str {
         Token::Use => "use",
         Token::Var => "var",
         Token::Const => "const",
-        Token::Comptime => "comptime",
         Token::If => "if",
         Token::Else => "else",
         Token::While => "while",
@@ -2634,7 +2960,9 @@ fn token_lexeme(token: &Token) -> &'static str {
         Token::Invalid
         | Token::Float(_)
         | Token::Int(_)
+        | Token::BigInt(_)
         | Token::Str(_)
+        | Token::Char(_)
         | Token::Interpolated(_)
         | Token::Ident(_)
         | Token::Path(_) => unreachable!("described token has no fixed lexeme"),
@@ -2810,12 +3138,12 @@ mod tests {
     fn parses_qualified_runtime_calls() {
         let src = r#"
             fn main() {
-                var out = process::run("echo", ["hello"]);
+                var out = process::run_sync("echo", ["hello"]);
                 io::println(out.stdout);
                 return 0;
             }
         "#;
-        let program = parse(src).expect("should parse process::run and io::println");
+        let program = parse(src).expect("should parse process::run_sync and io::println");
         let f = match &program.items[0] {
             Item::Function(f) => f,
             other => panic!("expected Function at items[0], got {:?}", other),
@@ -2966,7 +3294,12 @@ mod tests {
         let Item::Function(function) = &program.items[0] else {
             panic!("expected function");
         };
-        let Stmt::ForEach { var, iterable, .. } = function.body.stmts[0].node() else {
+        let Stmt::ForEach {
+            pattern: BindingPattern::Name(var),
+            iterable,
+            ..
+        } = function.body.stmts[0].node()
+        else {
             panic!("expected collection loop");
         };
         assert_eq!(var, "item");
@@ -3080,7 +3413,11 @@ mod tests {
             other => panic!("expected Function at items[0], got {:?}", other),
         };
         match &f.body.stmts[0] {
-            Stmt::VarDecl { name, value, .. } => {
+            Stmt::VarDecl {
+                pattern: BindingPattern::Name(name),
+                value,
+                ..
+            } => {
                 assert_eq!(name, "x");
                 assert_eq!(
                     *value,
@@ -3509,6 +3846,77 @@ mod tests {
             Item::Function(f) => assert_eq!(f.visibility, Visibility::Private),
             other => panic!("expected function, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_composable_public_and_comptime_attributes() {
+        let program = parse(
+            "@public @comptime fn factorial(n: int) { return n; } @public trait Show { fn show(self); }",
+        )
+        .expect("parse attributes");
+        let Item::Function(function) = &program.items[0] else {
+            panic!("expected function")
+        };
+        assert_eq!(function.visibility, Visibility::Public);
+        assert!(function.comptime);
+        let Item::Trait(trait_decl) = &program.items[1] else {
+            panic!("expected trait")
+        };
+        assert_eq!(trait_decl.visibility, Visibility::Public);
+    }
+
+    #[test]
+    fn parses_manifest_include_directive_without_a_semicolon() {
+        let program = parse("@!include(\"std\")\nfn main() {}").expect("parse directive");
+        assert!(matches!(
+            &program.items[0],
+            Item::ComptimeInclude { package, .. } if package == "std"
+        ));
+    }
+
+    #[test]
+    fn parses_comptime_const_attributes_at_global_and_local_scope() {
+        let program = parse(
+            "@public @comptime const BASE: int = 3; fn main() { @comptime const LOCAL: int = BASE + 1; }",
+        )
+        .expect("parse compile-time consts");
+        assert!(matches!(
+            &program.items[0],
+            Item::Comptime {
+                name,
+                visibility: Visibility::Public,
+                ..
+            } if name == "BASE"
+        ));
+        let Item::Function(function) = &program.items[1] else {
+            panic!("expected function")
+        };
+        assert!(matches!(
+            &function.body.stmts[0],
+            Stmt::Comptime { name, .. } if name == "LOCAL"
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_or_malformed_declaration_attributes() {
+        assert!(
+            parse("@repr(\"C\") struct User {}")
+                .unwrap_err()
+                .message
+                .contains("unknown declaration attribute `@repr`")
+        );
+        assert!(
+            parse("@comptime(\"yes\") fn work() {}")
+                .unwrap_err()
+                .message
+                .contains("attribute `@comptime` does not take arguments")
+        );
+        assert!(
+            parse("fn work() { @comptime var count = 0; }")
+                .unwrap_err()
+                .message
+                .contains("compile-time mutable bindings are not implemented yet")
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@ use cog::error::RuntimeError;
 use cog::{bytecode, frontend, interpreter, project};
 
 fn compile(body: &str) -> cog::backend::CompiledProgram {
-    let source = format!("include std; use io; use str; use err::Error;\n{body}");
+    let source = format!("@!include(\"std\") use io; use str; use err::Error;\n{body}");
     let program = project::compile_source("propagation.cog", &source)
         .unwrap_or_else(|error| panic!("{error}"));
     bytecode::decode(&bytecode::encode(&program).unwrap()).unwrap()
@@ -98,6 +98,29 @@ fn explicit_propagation_preserves_primary_payload_through_caller_catch_and_rethr
     ));
     assert_eq!(error.suppressed().len(), 1);
     assert_eq!(error.suppressed()[0].kind(), "ParseFailure");
+}
+
+#[test]
+fn direct_error_inspection_consumes_propagation_at_the_observation_site() {
+    output(
+        r#"
+        fn fail() -> int { Error::InvalidArgument("probe")!! }
+        fn main() {
+            try {
+                when fail() is Error::InvalidArgument(operation) {
+                    io::println(operation);
+                } else { crash("when missed propagated Error"); }
+                io::println(fail().error_kind());
+                io::println(fail() ?! 42);
+                io::println(match fail() {
+                    Error::InvalidArgument(operation) => operation,
+                    _ => "wrong",
+                });
+            } catch(error) { crash("inspection propagated past its call site"); }
+        }
+        "#,
+        "probe\nInvalidArgument\n42\nprobe\n",
+    );
 }
 
 #[test]

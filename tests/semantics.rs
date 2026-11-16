@@ -6,7 +6,7 @@ fn compile(source: &str) -> cog::backend::CompiledProgram {
     } else {
         "use err::Error;"
     };
-    let source = format!("include std; use io; {error_import}\n{source}");
+    let source = format!("@!include(\"std\") use io; {error_import}\n{source}");
     let compiled =
         project::compile_source("semantics.cog", &source).unwrap_or_else(|e| panic!("{e}"));
     bytecode::decode(&bytecode::encode(&compiled).unwrap()).unwrap()
@@ -28,16 +28,109 @@ fn numeric_literal_forms_run_through_the_vm() {
 }
 
 #[test]
+fn nested_numeric_tuple_fields_read_write_and_interpolate_after_round_trip() {
+    assert_eq!(
+        run(r#"
+        fn main() {
+            var nested = (((10, 20), 30), (40, 50));
+            const alias = nested;
+            io::println(nested.0.0.1);
+            nested.0.0.0 = 11;
+            nested.1.1 += 2;
+            io::println(alias.0.0.0);
+            io::println($"{nested.0.0.0}:{nested.1.1}");
+            io::println($"nested={$"{nested.0.0.0}:{nested.1.1}"}");
+            io::println((nested.0).0.1);
+            io::println(1.25e2);
+            io::println(7E-2);
+        }
+        "#),
+        "20\n11\n11:52\nnested=11:52\n20\n125\n0.07\n"
+    );
+}
+
+#[test]
+fn declared_tuple_contract_survives_initial_error_and_aliases_after_round_trip() {
+    assert_eq!(
+        run(r#"
+        fn main() {
+            var pair: (int, str) = (1 / 0, "kept");
+            const alias = pair;
+            overwrite(pair, "wrong");
+            overwrite(pair, 42);
+            io::println(alias.0);
+            io::println(alias.1);
+        }
+        fn overwrite(pair, replacement) {
+            try { pair.0 = replacement; }
+            catch(error) { io::println(error.error_kind()); }
+        }
+        "#),
+        "TypeMismatch\n42\nkept\n"
+    );
+}
+
+#[test]
+fn nominal_struct_field_contract_survives_dynamic_alias_and_nullable_writes() {
+    assert_eq!(
+        run(r#"
+        struct Box { value: int, note: str? }
+        struct TypedBox[T: type] { value: T }
+        fn overwrite(item, replacement) {
+            try { item.value = replacement; }
+            catch(error) { io::println(error.error_kind()); }
+        }
+        fn main() {
+            var item = Box(7, nil);
+            const alias = item;
+            overwrite(item, "wrong");
+            io::println(alias.value);
+            overwrite(item, 9);
+            item.note = "ready";
+            io::println(item.value);
+            io::println(item.note);
+            var generic = TypedBox(11);
+            overwrite(generic, "wrong");
+            io::println(generic.value);
+        }
+        "#),
+        "TypeMismatch\n7\n9\nready\nTypeMismatch\n11\n"
+    );
+}
+
+#[test]
+fn numeric_tuple_fields_parse_without_source_and_reject_exponent_indices() {
+    let tokens =
+        cog::lexer::tokenize("fn main() { const pair = ((10, 20), 30); pair.0.1 }").unwrap();
+    cog::hlparser::parse_program(&tokens).unwrap();
+
+    for field in ["0e1", "0.1e2", "0.1E-2"] {
+        for expression in [format!("pair.{field}"), format!("$\"{{pair.{field}}}\"")] {
+            let source = format!("fn main() {{ const pair = ((10, 20), 30); {expression} }}");
+            let parsed = cog::frontend::parse("fields.cog", source);
+            assert!(
+                parsed.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "E0002" && diagnostic.message.contains("expected identifier")
+                }),
+                "{expression}: {}",
+                cog::frontend::render(&parsed.diagnostics)
+            );
+        }
+    }
+}
+
+#[test]
 fn main_accepts_only_no_parameters_or_one_str_array_argument() {
-    let accepted = cog::project::compile_source("main.cog", "include std; fn main(args: str[]) {}");
+    let accepted =
+        cog::project::compile_source("main.cog", "@!include(\"std\") fn main(args: str[]) {}");
     assert!(accepted.is_ok(), "{accepted:?}");
 
     for source in [
-        "include std; fn main(args: int[]) {}",
-        "include std; fn main(input: str[]) {}",
-        "include std; fn main(args: str, rest: str[]) {}",
-        "include std; fn main(args: str[] = [\"default\"]) {}",
-        "include std; fn main(args: str[]?) {}",
+        "@!include(\"std\") fn main(args: int[]) {}",
+        "@!include(\"std\") fn main(input: str[]) {}",
+        "@!include(\"std\") fn main(args: str, rest: str[]) {}",
+        "@!include(\"std\") fn main(args: str[] = [\"default\"]) {}",
+        "@!include(\"std\") fn main(args: str[]?) {}",
     ] {
         let error = cog::project::compile_source("main.cog", source).unwrap_err();
         assert!(
@@ -291,7 +384,7 @@ fn compound_assignment_preserves_generic_method_resolution_in_rhs() {
         run(r#"
         use collections;
         fn main() {
-            var values = collections::map_new[int, int]();
+            var values = collections::Map::new[int, int]();
             for index in 0..3 { values.set(index, index * 2)!!; }
             var checksum = 0;
             for index in 0..3 { checksum += values.get(index)!!; }
@@ -798,7 +891,7 @@ fn denied_host_operations_consume_their_arguments_and_leave_one_error() {
         "push 99\npush 1\ncall_native time::sleep",
         "push 99\npush \"unused\"\ncall_native process::shell",
         "push 99\npush 1\ncall_native entropy::bytes",
-        "push 99\npush \"unused\"\narray 0\ncall_native process::run",
+        "push 99\npush \"unused\"\narray 0\ncall_native process::run_sync",
     ] {
         let program = cog::parser::assemble(&format!("{source}\npop\npop\npop\nhalt")).unwrap();
         assert!(

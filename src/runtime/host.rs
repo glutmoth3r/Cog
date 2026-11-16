@@ -1,13 +1,19 @@
 //! Host effects share the linked native ABI; none are VM instructions.
-use super::{RuntimeContext, bytes_new, invalid, io_error, string};
+use super::string;
+use super::{RuntimeContext, bytes_new, invalid, io_error};
 use crate::error::RuntimeError;
 use crate::heap::HeapRef;
 use crate::value::{ArrayValue, RuntimeType, Value};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::io::{self, Read};
-use std::process::{Child, Command, Stdio};
+use std::io;
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static MONOTONIC_EPOCH: OnceLock<Instant> = OnceLock::new();
@@ -16,31 +22,39 @@ pub(super) fn sleep(
     context: &mut RuntimeContext<'_>,
     args: &[Value],
 ) -> Result<Value, RuntimeError> {
+    let duration = sleep_duration(context, args, "time::sleep")?;
+    std::thread::sleep(duration);
+    Ok(Value::Nil)
+}
+
+pub(crate) fn sleep_duration(
+    context: &RuntimeContext<'_>,
+    args: &[Value],
+    op: &'static str,
+) -> Result<Duration, RuntimeError> {
     if !context.capabilities.allow_sleep {
-        return Err(RuntimeError::PermissionDenied { op: "time::sleep" });
+        return Err(RuntimeError::PermissionDenied { op });
     }
     let duration = match args[0] {
         Value::Int(seconds) if seconds >= 0 => Duration::from_secs(seconds as u64),
         Value::Int(seconds) => return Err(RuntimeError::NegativeSleep(seconds as f64)),
+        Value::UInt(seconds) => Duration::from_secs(seconds),
         Value::Float(seconds) if seconds < 0.0 => return Err(RuntimeError::NegativeSleep(seconds)),
-        Value::Float(seconds) => {
-            Duration::try_from_secs_f64(seconds).map_err(|_| invalid("time::sleep"))?
-        }
+        Value::Float(seconds) => Duration::try_from_secs_f64(seconds).map_err(|_| invalid(op))?,
         _ => unreachable!(),
     };
     #[cfg(windows)]
     if windows_timeout_millis(duration) >= u128::from(u32::MAX) {
         // Windows uses u32::MAX as INFINITE; passing that timeout would block
         // forever instead of returning after a finite duration.
-        return Err(invalid("time::sleep"));
+        return Err(invalid(op));
     }
     // Reject durations that cannot be represented by the host clock, before
     // handing them to an OS wait implementation. Sub-second precision is kept.
     std::time::Instant::now()
         .checked_add(duration)
-        .ok_or_else(|| invalid("time::sleep"))?;
-    std::thread::sleep(duration);
-    Ok(Value::Nil)
+        .ok_or_else(|| invalid(op))?;
+    Ok(duration)
 }
 
 #[cfg(windows)]
@@ -137,16 +151,59 @@ pub(super) fn entropy(
     Ok(value)
 }
 
-pub(super) fn run(context: &mut RuntimeContext<'_>, args: &[Value]) -> Result<Value, RuntimeError> {
+pub(super) fn run_sync(
+    context: &mut RuntimeContext<'_>,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
+    run_with_timeout(context, args, "process::run_sync", None)
+}
+
+fn run_with_timeout(
+    context: &mut RuntimeContext<'_>,
+    args: &[Value],
+    op: &'static str,
+    timeout: Option<Duration>,
+) -> Result<Value, RuntimeError> {
+    run_with_cancellation(context, args, op, None, timeout, None, None)
+}
+
+pub(super) fn run_cancellable(
+    context: &mut RuntimeContext<'_>,
+    args: &[Value],
+    input: Option<Vec<u8>>,
+    timeout: Option<Duration>,
+    output_limit: Option<usize>,
+    cancelled: Arc<AtomicBool>,
+) -> Result<Value, RuntimeError> {
+    run_with_cancellation(
+        context,
+        args,
+        "process::run",
+        input,
+        timeout,
+        output_limit,
+        Some(cancelled),
+    )
+}
+
+fn run_with_cancellation(
+    context: &mut RuntimeContext<'_>,
+    args: &[Value],
+    op: &'static str,
+    input: Option<Vec<u8>>,
+    timeout: Option<Duration>,
+    output_limit: Option<usize>,
+    cancellation: Option<Arc<AtomicBool>>,
+) -> Result<Value, RuntimeError> {
     if !context.capabilities.allow_exec {
-        return Err(RuntimeError::PermissionDenied { op: "process::run" });
+        return Err(RuntimeError::PermissionDenied { op });
     }
     let Value::Array(arguments) = &args[1] else {
         unreachable!()
     };
     let arguments = arguments
         .try_borrow()
-        .map_err(|_| RuntimeError::InvalidArgument { op: "process::run" })?;
+        .map_err(|_| RuntimeError::InvalidArgument { op })?;
     // This function has a dynamic array parameter, so validate its complete view
     // before spawning. The array object still keeps its own element invariant.
     for value in arguments.iter() {
@@ -154,16 +211,22 @@ pub(super) fn run(context: &mut RuntimeContext<'_>, args: &[Value]) -> Result<Va
             Value::Str(_) => {}
             Value::Error(_) => return Ok(value.clone()),
             _ => {
-                return Err(RuntimeError::TypeMismatch {
-                    op: "process::run arguments",
-                });
+                return Err(RuntimeError::TypeMismatch { op });
             }
         }
     }
     let program = string(&args[0]);
     let mut command = Command::new(program);
     command.args(arguments.iter().map(string));
-    capture(context, command, "process::run")
+    capture(
+        context,
+        command,
+        op,
+        input,
+        timeout,
+        output_limit,
+        cancellation,
+    )
 }
 
 pub(super) fn shell(
@@ -180,7 +243,7 @@ pub(super) fn shell(
         let script = string(&args[0]);
         let mut command = Command::new("/bin/sh");
         command.arg("-c").arg(script);
-        capture(context, command, "process::shell")
+        capture(context, command, "process::shell", None, None, None, None)
     }
     #[cfg(not(unix))]
     {
@@ -274,10 +337,29 @@ pub(super) fn environment(
 
 // The runtime owns the direct child until it has been reaped, including when
 // spawning a reader, capturing output or waiting fails. No child handle escapes.
-struct OwnedChild(Child);
+struct OwnedChild(Child, bool);
+
+impl OwnedChild {
+    fn terminate(&mut self) {
+        if self.1 {
+            #[cfg(unix)]
+            {
+                // SAFETY: async setup placed this child in a process group keyed by
+                // its PID. A negative PID signals that group, never this process.
+                if let Ok(process_group) = i32::try_from(self.0.id())
+                    && unsafe { libc::kill(-process_group, libc::SIGKILL) } == 0
+                {
+                    return;
+                }
+            }
+        }
+        let _ = self.0.kill();
+    }
+}
+
 impl Drop for OwnedChild {
     fn drop(&mut self) {
-        let _ = self.0.kill();
+        self.terminate();
         let _ = self.0.wait();
     }
 }
@@ -286,7 +368,11 @@ enum CaptureError {
     Limit,
     Io(io::Error),
 }
-fn read_capped(mut input: impl Read, limit: usize) -> Result<Vec<u8>, CaptureError> {
+fn read_capped(
+    mut input: impl Read,
+    limit: usize,
+    total: Option<(Arc<AtomicUsize>, usize)>,
+) -> Result<Vec<u8>, CaptureError> {
     let mut bytes = Vec::new();
     let mut chunk = [0; 8192];
     loop {
@@ -299,61 +385,202 @@ fn read_capped(mut input: impl Read, limit: usize) -> Result<Vec<u8>, CaptureErr
         if count > limit.saturating_sub(bytes.len()) {
             return Err(CaptureError::Limit);
         }
+        if let Some((captured, total_limit)) = &total {
+            let mut used = captured.load(Ordering::Acquire);
+            loop {
+                let Some(next) = used.checked_add(count).filter(|next| *next <= *total_limit)
+                else {
+                    return Err(CaptureError::Limit);
+                };
+                match captured.compare_exchange_weak(
+                    used,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => used = current,
+                }
+            }
+        }
         bytes.try_reserve(count).map_err(|_| CaptureError::Limit)?;
         bytes.extend_from_slice(&chunk[..count]);
     }
+}
+
+fn write_process_input(
+    mut stdin: ChildStdin,
+    input: Vec<u8>,
+    cancelled: Option<&AtomicBool>,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let fd = stdin.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut written = 0;
+        while written < input.len() {
+            if cancelled.is_some_and(|token| token.load(Ordering::Acquire)) {
+                return Ok(());
+            }
+            match stdin.write(&input[written..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write child stdin",
+                    ));
+                }
+                Ok(count) => written += count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cancelled;
+        match stdin.write_all(&input) {
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {}
+            result => result?,
+        }
+    }
+    Ok(())
 }
 
 fn capture(
     context: &RuntimeContext<'_>,
     mut command: Command,
     op: &'static str,
+    input: Option<Vec<u8>>,
+    timeout: Option<Duration>,
+    output_limit: Option<usize>,
+    cancellation: Option<Arc<AtomicBool>>,
 ) -> Result<Value, RuntimeError> {
+    let deadline = timeout
+        .map(|timeout| {
+            Instant::now()
+                .checked_add(timeout)
+                .ok_or(RuntimeError::Overflow)
+        })
+        .transpose()?;
+    if cancellation
+        .as_ref()
+        .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+    {
+        return Err(RuntimeError::Cancelled);
+    }
+    let terminate_group = cancellation.is_some();
+    #[cfg(unix)]
+    if terminate_group {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = OwnedChild(
         command
-            .stdin(Stdio::null())
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| io_error(op, error))?,
+        terminate_group,
     );
     let stdout = child.0.stdout.take().unwrap();
     let stderr = child.0.stderr.take().unwrap();
     let limit = context.limits.buffer_limit();
+    let captured = output_limit.map(|limit| (Arc::new(AtomicUsize::new(0)), limit));
     let (sender, receiver) = std::sync::mpsc::channel();
     let first_sender = sender.clone();
+    let stdout_total = captured
+        .as_ref()
+        .map(|(captured, limit)| (Arc::clone(captured), *limit));
     if let Err(error) = std::thread::Builder::new().spawn(move || {
-        let _ = first_sender.send((0, read_capped(stdout, limit)));
+        let _ = first_sender.send((0, read_capped(stdout, limit, stdout_total)));
     }) {
         let _ = child.0.kill();
         return Err(io_error(op, error));
     }
+    let stderr_total = captured
+        .as_ref()
+        .map(|(captured, limit)| (Arc::clone(captured), *limit));
     if let Err(error) = std::thread::Builder::new().spawn(move || {
-        let _ = sender.send((1, read_capped(stderr, limit)));
+        let _ = sender.send((1, read_capped(stderr, limit, stderr_total)));
     }) {
         let _ = child.0.kill();
         return Err(io_error(op, error));
     }
-    let mut outputs = [Vec::new(), Vec::new()];
-    for _ in 0..2 {
-        let (index, result) = receiver
-            .recv()
-            .map_err(|_| io_error(op, io::Error::other("process capture reader disconnected")))?;
-        match result {
-            Ok(bytes) => outputs[index] = bytes,
-            Err(CaptureError::Limit) => {
-                let _ = child.0.kill();
-                return Err(RuntimeError::ResourceLimit {
-                    resource: "process output",
-                });
+    let input_writer = if let Some(input) = input {
+        let stdin = child.0.stdin.take().unwrap();
+        let cancellation = cancellation.clone();
+        Some(
+            std::thread::Builder::new()
+                .name("cog-process-stdin".into())
+                .spawn(move || write_process_input(stdin, input, cancellation.as_deref()))
+                .map_err(|error| io_error(op, error))?,
+        )
+    } else {
+        None
+    };
+    let capture_result = if deadline.is_some() || cancellation.is_some() {
+        capture_until(&mut child, &receiver, deadline, cancellation.as_deref(), op)
+    } else {
+        (|| {
+            let mut outputs = [Vec::new(), Vec::new()];
+            for _ in 0..2 {
+                let (index, result) = receiver.recv().map_err(|_| {
+                    io_error(op, io::Error::other("process capture reader disconnected"))
+                })?;
+                match result {
+                    Ok(bytes) => outputs[index] = bytes,
+                    Err(CaptureError::Limit) => {
+                        let _ = child.0.kill();
+                        return Err(RuntimeError::ResourceLimit {
+                            resource: "process output",
+                        });
+                    }
+                    Err(CaptureError::Io(error)) => {
+                        let _ = child.0.kill();
+                        return Err(io_error(op, error));
+                    }
+                }
             }
-            Err(CaptureError::Io(error)) => {
-                let _ = child.0.kill();
-                return Err(io_error(op, error));
-            }
-        }
+            let status = child.0.wait().map_err(|error| io_error(op, error))?;
+            Ok((outputs, status))
+        })()
+    };
+    let cancellation_requested = cancellation
+        .as_ref()
+        .is_some_and(|cancelled| cancelled.load(Ordering::Acquire));
+    if capture_result.is_err() || cancellation_requested {
+        child.terminate();
+        child.1 = false;
+        let _ = child.0.wait();
     }
-    let status = child.0.wait().map_err(|error| io_error(op, error))?;
+    let input_result = input_writer.map(|writer| {
+        writer
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("child stdin writer panicked")))
+    });
+    let (outputs, status) = capture_result?;
+    if cancellation
+        .as_ref()
+        .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+    {
+        return Err(RuntimeError::Cancelled);
+    }
+    if let Some(result) = input_result {
+        result.map_err(|error| io_error(op, error))?;
+    }
+    child.1 = false;
     let [stdout, stderr] = outputs;
     let fields = HashMap::from([
         (
@@ -375,4 +602,81 @@ fn capture(
     Ok(Value::Record(HeapRef::try_new(
         crate::value::RecordValue::new(fields),
     )?))
+}
+
+fn capture_until(
+    child: &mut OwnedChild,
+    receiver: &std::sync::mpsc::Receiver<(usize, Result<Vec<u8>, CaptureError>)>,
+    deadline: Option<Instant>,
+    cancellation: Option<&AtomicBool>,
+    op: &'static str,
+) -> Result<([Vec<u8>; 2], std::process::ExitStatus), RuntimeError> {
+    let mut outputs = [Vec::new(), Vec::new()];
+    let mut received = 0;
+    let mut status = None;
+    while received < 2 || status.is_none() {
+        if cancellation.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+            child.terminate();
+            child.1 = false;
+            let _ = child.0.wait();
+            return Err(RuntimeError::Cancelled);
+        }
+        if status.is_none() {
+            status = child.0.try_wait().map_err(|error| io_error(op, error))?;
+        }
+        if received == 2 && status.is_some() {
+            break;
+        }
+        let poll_interval = Duration::from_millis(10);
+        let wait = if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                child.terminate();
+                child.1 = false;
+                let _ = child.0.wait();
+                return Err(RuntimeError::Timeout);
+            }
+            remaining.min(poll_interval)
+        } else {
+            poll_interval
+        };
+        if received == 2 {
+            std::thread::sleep(wait);
+            continue;
+        }
+        match receiver.recv_timeout(wait) {
+            Ok((index, result)) => {
+                received += 1;
+                match result {
+                    Ok(bytes) if index < outputs.len() => outputs[index] = bytes,
+                    Ok(_) => {
+                        let _ = child.0.kill();
+                        return Err(io_error(
+                            op,
+                            io::Error::other("process capture returned an invalid stream index"),
+                        ));
+                    }
+                    Err(CaptureError::Limit) => {
+                        let _ = child.0.kill();
+                        return Err(RuntimeError::ResourceLimit {
+                            resource: "process output",
+                        });
+                    }
+                    Err(CaptureError::Io(error)) => {
+                        let _ = child.0.kill();
+                        return Err(io_error(op, error));
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = child.0.kill();
+                return Err(io_error(
+                    op,
+                    io::Error::other("process capture reader disconnected"),
+                ));
+            }
+        }
+    }
+    Ok((outputs, status.ok_or(RuntimeError::InvalidNativeCall)?))
 }

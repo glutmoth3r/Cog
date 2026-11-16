@@ -1,0 +1,17 @@
+@!include("std")
+use err::Error;
+use io;
+use process;
+use async::time;
+
+@async fn main() -> nil {
+    const child = spawn(process::run("/bin/sh", ["-c", "sleep 5 & wait"]));
+    await time::sleep(0.02);
+    io::println($"process-tree cancellation accepted: {cancel(child)}");
+
+    when await child is Error::Cancelled {
+        io::println("process tree stopped and direct child reaped");
+    } else {
+        crash("expected process cancellation");
+    }
+}

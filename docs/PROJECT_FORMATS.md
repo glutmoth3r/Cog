@@ -1,7 +1,8 @@
 # Projects and configuration
 
 Cog uses KDL 2 for user configuration and a separate generated `cog.lock` format.
-Current dependency support is local/path only. A standalone program needs no
+Dependencies can use local paths, local archives, or exact versions from the
+user-local package store. A standalone program needs no
 configuration; create configuration files only when their settings are needed.
 
 ## Start a project
@@ -11,12 +12,18 @@ cog init my-app
 cog check my-app
 cog run my-app
 cog build my-app
+cog init --lib integer-math
+cog check integer-math
+cog package build integer-math
+cog install --path integer-math
 ```
 
-Init requires an explicit directory and creates `src/main.cog` plus commented
-`package.kdl`, `dependencies.kdl`, and `build.kdl` templates. The generated `app`
-target works immediately: `cog run my-app --target app`. Dependency examples stay
-commented until you create their source packages.
+Init requires an explicit directory. By default it creates `src/main.cog` plus
+commented `package.kdl`, `dependencies.kdl`, and `build.kdl` templates. The
+generated `app` target works immediately: `cog run my-app --target app`. Use
+`cog init --lib <directory>` to create a library manifest, `src/lib.cog`, and a
+small public `src/api.cog` module ready for `cog package build` or local install.
+Dependency examples stay commented until you create their source packages.
 Use `cog init .` to initialize the current directory. The package name is derived
 from the selected directory. Once created, the manifest name
 survives directory renames. Package names must be nonempty and cannot be `.`/`..`
@@ -24,8 +31,8 @@ or contain path separators/control characters.
 
 | File | Purpose |
 | --- | --- |
-| `package.kdl` | Package name and version |
-| `dependencies.kdl` | Explicit local dependency aliases and paths |
+| `package.kdl` | Package name, version, kind and optional embedded native plugin declarations |
+| `dependencies.kdl` | Dependency aliases with local paths, `.cogpkg` archives, or installed package identities |
 | `build.kdl` | Optional named targets with nonstandard entry points |
 | `cog.lock` | Generated dependency resolution; keep it with the project |
 | `target/` | Disposable artifacts and build cache |
@@ -34,6 +41,15 @@ or contain path separators/control characters.
 // package.kdl
 package "my-app" version="0.1.0"
 ```
+
+`kind` defaults to `application`, preserving existing projects. A library
+package sets `kind="library"`; `src/lib.cog` (or `lib.cog` when there is no
+`src/` tree) is its check entry point and does not itself define an importable
+module name. Public modules such as `src/integer_math.cog` are imported by
+module name after the package is included. `cog check` validates a library
+without requiring `main` or writing bytecode. `cog package build` emits a
+library dependency archive; executable `build` or `run` support for library
+roots is not implemented.
 
 ## KDL syntax and supported settings
 
@@ -46,13 +62,14 @@ Cog supports the following complete configuration schema:
 
 | File | Declaration | Effect |
 | --- | --- | --- |
-| `package.kdl` | `package "name" version="value"` | Package identity and default artifact name; version recorded in dependency resolution and lockfiles |
-| `dependencies.kdl` | `alias path="directory"` | Connects a local source package for imports; paths are relative to this file |
+| `package.kdl` | `package "name" version="value"`; optional kind is `application` or `library`; child `plugin` and `asset` declarations | Package identity, kind, native signatures, declared assets and default artifact name; version recorded in dependency resolution and lockfiles |
+| `dependencies.kdl` | `alias path="directory"`, `alias archive="file.cogpkg"`, or `alias package="name" version="exact-version"` | Connects a local or user-installed source package for imports; paths are relative to this file |
 | `build.kdl` | `target "name" entry="source.cog"` | Selects a named executable with `--target name` |
 
-All values are strings. These schemas use flat declarations; child blocks,
-additional properties and duplicate declarations are rejected with diagnostics.
-Version is metadata, without semver solving or version constraints. Compiler
+Manifest values are strings, except the plugin ABI version integer. A package
+plugin block may contain shared function declarations and target library
+declarations; other configuration declarations remain flat. Unknown child nodes, additional properties and duplicate
+declarations are rejected with diagnostics. Version is metadata, without semver solving or version constraints. Compiler
 optimization profiles, runtime permissions, registry dependencies and arbitrary
 build scripts are not currently KDL settings. Configuration is read and checked
 during source project preparation, including cache hits; saved bytecode runs
@@ -61,56 +78,225 @@ without it.
 ```kdl
 // dependencies.kdl
 geometry path="./packages/geometry"
+regex archive="./vendor/cog-regex.cogpkg"
+arithmetic package="integer-math" version="0.1.0"
 ```
 
-The node name is the dependency alias in the consuming package. Its path is
-relative to the directory containing `dependencies.kdl`; the dependency needs its
-own `package.kdl`. Aliases can differ from actual package names. Transitive
-packages declare their own dependencies; consumers do not repeat them.
+The node name is the dependency alias in the consuming package. Exactly one
+dependency source is required: `path`, `archive`, or the `package` and `version`
+pair. A path is relative to the directory containing `dependencies.kdl`; a
+directory dependency needs its own `package.kdl`, while a `.cogpkg` archive must
+contain one at its root. Installed dependencies select an exact package name and
+version from the user-local store. Aliases can differ from actual package names.
+Transitive packages declare their own dependencies; consumers do not repeat them.
+Package metadata, including native plugin signatures and libraries, travels with
+the package archive, so a consuming project only adds its dependency declaration.
+It does not need a separate `plugin.kdl` or a repeated function list.
+
+Local and installed dependency archives are hashed with BLAKE3 and extracted into
+the consuming project's `target/.cog-package-cache/<digest>` directory.
+Dependencies accept only COGPKG 2 archives whose root manifest declares
+`kind="library"`. The lockfile records the content-addressed package path, so
+replacing archive bytes makes `--locked` resolution fail until the owner
+deliberately updates the lock.
+Application archives use COGPKG 3 and are extracted into
+`target/.cog-application-cache/<digest>` when run; COGPKG 2 applications are not
+runnable packages. Both versions contain a regular-file TAR stream inside a
+Zstandard frame, with a root `COGPKG` marker and `package.kdl`. Unsupported
+markers and versions are rejected. Cog long-name headers are supported with a
+4096-byte path limit; PAX and other metadata extensions are rejected.
+Extraction accepts only regular files and directories, rejects traversal,
+duplicate and case-colliding path components, and caps compressed and expanded
+archive bytes at 512 MiB, entries at 65,536, and aggregate path bytes at 64 MiB.
+The archive is copied to a temporary snapshot while its digest is checked, then
+that snapshot is extracted, avoiding a source-file change race. This digest
+detects changed/corrupt local inputs; it does not authenticate the publisher or
+establish that native code is safe. `cog check` can statically validate archive
+dependencies without loading native plugins. `cog install --path <directory>`
+builds a complete COGPKG archive for the current host and installs it locally.
+Libraries are stored under `$COG_HOME/libraries/` and applications under
+`$COG_HOME/programs/`; when
+`COG_HOME` is unset, the store is `~/.cog`. Store directories are keyed by the
+package name and exact version. Reinstalling identical contents is idempotent;
+changing archive contents without changing the version is rejected. An installed
+application can be run by passing its printed `.cogpkg` path to `cog run`.
+Installed libraries can be shared by any project owned by the same user. There
+is no registry, network resolver, version solver, or cache garbage collector.
+Package archive creation and application extraction/validation are also available
+from the Rust crate through `cog::package::build_archive`,
+`cog::package::build_archive_for_target`, `cog::package::install_path`, and
+`cog::package::open_application`. The crate
+does not expose installed dependency resolution; the CLI handles dependency
+resolution and application execution. Before a COGPKG 3 application runs, Cog checks that
+each `package.kdl` identity and `dependencies.kdl` edge matches `cog.lock`; it
+also requires the cached lockfile and vendored package directory components to
+be free of symbolic links. The opener pins directory handles while validating
+manifests, dependencies, the lockfile, bytecode, and declared plugin files, so
+cache path replacement cannot redirect those reads outside the opened package
+tree. The platform loader later receives a path for each native plugin; anyone
+able to modify the local application cache must therefore be treated as trusted
+to replace native code. A package-declared plugin runs with the host process'
+authority, and the archive digest does not authenticate its publisher or safety.
+
+## Package-declared native plugins
+
+A package can declare C ABI v3 signatures and the corresponding library in the
+same `package.kdl`. The function metadata is the static compiler contract and is
+checked against the library's complete runtime descriptor before callbacks are
+registered:
+
+```kdl
+package "cog-regex" version="0.1.0" kind="library" {
+    plugin version=1 {
+        library target="x86_64-unknown-linux-gnu" path="native/linux-x86_64/libcog_regex.so"
+        library target="x86_64-pc-windows-msvc" path="native/windows-x86_64/cog_regex.dll"
+        library target="aarch64-apple-darwin" path="native/macos-arm64/libcog_regex.dylib"
+        function "regex::is_match" result="bool" {
+            param "str"
+            param "str"
+            effect "fs_read"
+        }
+    }
+}
+```
+
+The same package block can list distributable data or bytecode paths with
+`asset "data/stopwords.txt"`. Asset paths use the same normalized relative-path
+rules and are collected from transitive local packages. They are manifest
+inputs to `cog package build`, which copies each declared regular file into the
+package archive.
+
+The library path must be a normalized relative path with forward slashes; it may
+not be absolute or contain `..`, `.` components, backslashes or drive prefixes.
+Control characters are also rejected.
+This is lexical path validation, not a filesystem sandbox; local symlinks remain
+trusted inputs during normal local builds. The package builder rejects symlink
+inputs and opens package files beneath their owning package root. A plugin
+block accepts one `function` node per native import;
+Function children are the same `param`, `effect`, and `mutates` declarations as
+the standalone plugin manifest. A package plugin shares this metadata across its
+target libraries. It may declare any nonempty subset of the supported targets:
+`x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, and
+`aarch64-apple-darwin`. A library package does not need binaries for platforms
+its maintainer cannot build. `cog package build` packages the current host's
+variant by default; `--target <triple>` selects another supported variant and
+keeps only that library declaration and file in the archive. The same option
+works for COGPKG 3 applications. Cog bytecode remains portable, but a packaged
+native plugin is available only for the targets included in its archive. At run
+time Cog chooses only the exact host target and reports an error if it is
+missing. It never falls back to another platform's library. `cog check`,
+`cog build`, and `cog package build` use signatures without loading native code.
+`cog run <project>` and `cog run <application.cogpkg>` load the matching library
+from its owning package and check its descriptor against the shared metadata.
+Application bytecode is decoded and validated before native libraries are
+loaded. This executes trusted native code with the Cog host process's
+operating-system authority; the ABI descriptor check is compatibility
+validation, not a security boundary.
+
+## Building source package archives
+
+`cog package build [project-directory] [--target <triple>] [-o output.cogpkg] [--locked]` validates
+the source project and writes a deterministic TAR archive compressed with
+Zstandard. The default output is `target/package-<name>.cogpkg`. Application
+packages use COGPKG 3 and include validated executable bytecode at
+`.cog/app.cogb`; the bytecode is compiled from the prepared Cog source snapshot
+used during validation. Cog source files are preserved unchanged. If `--target`
+is explicit, the default output name includes the target triple. Library
+packages use COGPKG 2, contain no executable, and do not require `main`. `--locked`
+requires an existing lockfile to match whenever the resolved dependency graph
+requires one. Without it, the archive still receives a canonical lockfile but the
+source project is not modified.
+
+`cog install --path <project-directory> [--locked]` builds for the current host
+and installs the package into the local user store. COGPKG 2 libraries go under
+`libraries/`; COGPKG 3 applications go under `programs/`. The default store is
+`~/.cog`, and an absolute `COG_HOME` path overrides it. The CLI prints the
+installed archive path; `cog run <path>` runs an installed application.
+
+The builder snapshots discovered Cog source bytes before compiler validation and
+compiles from that snapshot. Total Cog source snapshots are limited to 64 MiB in
+memory. Manifests are re-read and checked against the prepared package metadata;
+build configuration, declared assets, and plugin libraries are captured into
+archive entries before writing.
+The builder includes each package's discovered Cog source files and
+`package.kdl`, the root `build.kdl` when present, and explicitly declared assets
+and plugin libraries. It generates `dependencies.kdl` and `cog.lock` for the
+archive. Every
+dependency package is placed under `.cog/packages/<id>`, so dependencies that
+were originally outside the root directory work after extraction. The generated
+`dependencies.kdl` points aliases at those archive-local paths; source directives
+such as `@!include("game")` remain unchanged. A COGPKG 2 library archive can be
+used by declaring it with `archive="relative/path.cogpkg"` in another project's
+`dependencies.kdl`. A COGPKG 2 archive can also be installed with
+`cog install --path <library-directory>` and selected by exact package identity.
+
+Only those allowlisted inputs enter the archive. Unlisted files, `.git`, `target`,
+tests, and examples are omitted. Asset and plugin inputs must be regular files;
+symbolic links, unsafe archive paths, case-colliding paths, and output paths that
+would replace an input are rejected. The TAR and compressed archive are each
+limited to 512 MiB. Package creation does not sign, encrypt, authenticate, or
+load native code. Local COGPKG 2 library dependencies are extracted automatically
+during project preparation. A COGPKG 3 application is run with
+`cog run app.cogpkg -- <program arguments>` and works after moving the archive
+without its source project. A COGPKG 3 application is not accepted as a
+dependency. Package registries, version solving, and cache garbage collection
+are not implemented yet.
+
+Bytecode execution does not inspect an adjacent package manifest, so any `.cogb`
+that imports a plugin still needs explicit `--plugin` manifests at run time.
+`--plugin` remains available for standalone projects and bytecode. An app
+package embeds its executable `.cogb` and plugin target variants in the archive.
 
 ## Compile-time source packages
 
-The package entry point can include a source directory during compilation. Its
+The package entry point can include a source dependency during compilation. Its
 `.cog` files become modules in that package; executable module code still runs in
-the resulting program. Inclusion declarations in other modules are rejected.
-An include declares a package connection; its package name does not need a prior
-`use`. It does not import module names into source scope: that is the role of `use`.
+the resulting program. Directives in other modules are rejected. A directive
+declares a package connection; its alias does not need a prior `use`. It does not
+import module names into source scope: that is the role of `use`.
 
 ```cog
-include game;
+@!include("game")
 use random from game as game_random;
 ```
 
-Without an explicit path, `game` resolves to `src/game/` when it exists, otherwise
-to `game/` at the package root. A directory can use the regular package manifests
-or can simply contain source modules. The standard library is also an explicit
-source package: add `include std;` to the project entry point before
-importing its modules. This makes the `std` alias available for package-qualified
-imports and includes standard modules in ambiguity checks alongside other packages:
+The `game` alias must be declared in `dependencies.kdl`, for example:
+
+```kdl
+game path="vendor/game"
+math package="integer-math" version="0.1.0"
+```
+
+The local dependency directory must have its own `package.kdl`. An installed
+dependency selects an exact package identity from `~/.cog/libraries/`. Package
+source files are read from `src/` when present, otherwise from the package root.
+
+The `std` alias is built in. Include it before importing standard-library
+modules; it participates in package-qualified imports and ambiguity checks:
 
 ```cog
-include game;
-include std;
+@!include("std")
+@!include("game")
 
 use random from game as game_random;
 use random from std as std_random;
 ```
 
-Existing `dependencies.kdl` dependencies and `cog.lock` remain supported.
+Only the built-in `std` alias and aliases present in `dependencies.kdl` resolve
+through `@!include`. Declare each dependency there; local paths are resolved
+relative to that manifest. Resolved package paths and identities are recorded in
+`cog.lock`.
 
 `use module from package as alias;` selects one package explicitly. A plain
 `use module;` works when the module has a single visible provider; if multiple
 included packages provide that namespace, compilation reports an ambiguity and
-requires `from`. A package inclusion can also name a directory explicitly:
+requires `from`. Declare source dependencies in `dependencies.kdl` and include
+them in the project entry point by alias:
 
 ```cog
-include game from ../../game;
+@!include("game")
 use random from game as rand;
 ```
-
-An explicit include path is relative to the compiler's current working directory.
-It can be written as a quoted path or as a relative path beginning with `./` or
-`../`. Resolved package paths are represented by the existing `cog.lock` format.
 
 The version is nonempty metadata, not a semver solver. Registry/git sources and
 version constraints are not supported yet. KDL syntax parsing is separate from
@@ -192,8 +378,27 @@ paths and `..` are forbidden in `entry`. See [multiple targets](../examples/targ
 
 One artifact includes the entry and linked modules/dependencies; there are no
 separate library `.cogb` artifacts. A source passed explicitly produces a `.cogb`
-beside it. `cog build ... -o output.cogb` overrides the destination. An explicit
-`cog run file.cogb` uses that file without source freshness checks.
+beside it. `cog build ... -o output` overrides the destination with any filename.
+Source/project builds reject destinations that resolve to a discovered source,
+configuration manifest or the root `cog.lock`. Keep outputs in a dedicated
+directory such as `target/` or `bin/`.
+Configuration filenames are reserved even when missing, including ASCII case
+variants, to keep output paths safe across common target filesystems.
+
+The CLI recognizes bytecode by its four-byte `COG\0` signature regardless of
+name, suffix or directory; a `.cogb` suffix also selects bytecode decoding so
+corrupt artifacts retain bytecode diagnostics. The bounded decoder validates
+the complete file in either case. An explicit `cog run file` uses recognized
+bytecode without source freshness checks, artifact rewriting or cache creation.
+
+`cog <bytecode-file> <arguments...>` runs a saved artifact and forwards every
+argument after its path verbatim, including an initial `--` and Cog option
+names. This also supports the argument vector from Linux `binfmt_misc` with
+ordinary interpreter flags. Use the explicit `cog run <file> [options] --
+<arguments...>` form for Cog's own flags and separator behavior. Source and
+project invocation retain their existing argument-separator rules. Native
+detached bytecode still requires explicit `--plugin` options; recognizing a
+header never locates package manifests or loads plugin code automatically.
 
 ## Dependency lockfile
 

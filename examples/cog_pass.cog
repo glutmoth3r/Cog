@@ -1,0 +1,76 @@
+// Generate a password using operating-system entropy.
+// Usage: cog run examples/cog_pass.cog -- [length]
+@!include("std")
+use io;
+use bytes;
+use entropy;
+
+@comptime const LOWERCASE = "abcdefghijklmnopqrstuvwxyz";
+@comptime const UPPERCASE = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+@comptime const DIGITS = "0123456789";
+@comptime const SYMBOLS = "!@#$%^&*()-_=+";
+@comptime const ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+";
+@comptime const DEFAULT_LENGTH = 22;
+@comptime const MIN_LENGTH = 4;
+@comptime const MAX_LENGTH = 256;
+
+fn random_below(bound: int) -> int {
+    // Reject the incomplete tail so every index has the same probability.
+    const cutoff = 256 - (256 % bound);
+    while true {
+        const byte = bytes::get(entropy::bytes(1)!!, 0)!!;
+        if byte < cutoff { return byte % bound; }
+    }
+    0
+}
+
+fn choose(alphabet) -> int {
+    const length = bytes::len(alphabet)!!;
+    const index = random_below(length)!!;
+    bytes::get(alphabet, index)!!
+}
+
+fn main(args: str[]) -> nil {
+    if len(args) > 1 { crash("usage: cog-pass [length]"); }
+
+    var length = DEFAULT_LENGTH;
+    if len(args) == 1 {
+        if args[0] == "--help" || args[0] == "-h" {
+            io::println("usage: cog-pass [length]")!!;
+            io::println("length must be between 4 and 256; default is 22")!!;
+            return nil;
+        }
+        length = (args[0] as int)!!;
+    }
+    if length < MIN_LENGTH || length > MAX_LENGTH {
+        crash("password length must be between 4 and 256");
+    }
+
+    const lowercase = bytes::from_str(LOWERCASE)!!;
+    const uppercase = bytes::from_str(UPPERCASE)!!;
+    const digits = bytes::from_str(DIGITS)!!;
+    const symbols = bytes::from_str(SYMBOLS)!!;
+    const alphabet = bytes::from_str(ALPHABET)!!;
+    var password = bytes::new(length)!!;
+
+    // Guarantee each requested character class before shuffling positions.
+    bytes::set(password, 0, choose(lowercase)!!)!!;
+    bytes::set(password, 1, choose(uppercase)!!)!!;
+    bytes::set(password, 2, choose(digits)!!)!!;
+    bytes::set(password, 3, choose(symbols)!!)!!;
+    for index in MIN_LENGTH..length {
+        bytes::set(password, index, choose(alphabet)!!)!!;
+    }
+
+    // Fisher-Yates with the same unbiased OS-entropy index selection.
+    for remaining in 1..length {
+        const index = length - remaining;
+        const other = random_below(index + 1)!!;
+        const left = bytes::get(password, index)!!;
+        const right = bytes::get(password, other)!!;
+        bytes::set(password, index, right)!!;
+        bytes::set(password, other, left)!!;
+    }
+
+    io::println(bytes::to_str(password, 0, length)!!)!!;
+}

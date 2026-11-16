@@ -21,7 +21,7 @@ Output observations pass through bytecode encode/decode and VM execution.
 | cleanup_01..05 | Return snapshot before LIFO cleanup; normal cleanup failure becomes primary; active primary and secondary failures survive propagation; remaining defers run |
 | poison_01..06 | Normal type and Error state are orthogonal; strict eager operations preserve the first cause; aggregate leaves do not recursively poison containers; typed consumers observe needed components |
 | poison_07..09 | Lazy nil/Error fallbacks are distinct; a selected RHS Error uses the surrounding lexical handler |
-| propagate_01..05 | !! evaluates once, passes normal/nil unchanged, bypasses local catches, restores caller operands, performs cleanup, and requires an enclosing runtime function; main reaches the host |
+| propagate_01..06 | !! evaluates once, passes normal/nil unchanged, bypasses catches in its function, relays through synchronous callers to the nearest caller handler or host, restores caller operands, and performs cleanup; async tasks report propagation through await |
 | nil_01..02, tail_01..08 | Singleton nil, unified tails/discard, every normal result exit checked, cleanup snapshots, no loop/defer result collection |
 | binding_01..05, sequence_01 | Reachable mutating use for local var, available static inference, const access restrictions, transitive mutating calls, operator/method capability checks |
 | flow_01 | Excluding Error does not remove nullable from the declared normal type |
@@ -41,8 +41,10 @@ Typed consumption must not mistake a poisoned component for its normal type.
 Try restores the lexical operand-stack baseline and runs exited cleanup without
 rolling back side effects. Explicit inspection handles its operand before outer
 observation. Ordinary return still observes locally; !! is a distinct control-flow
-exit. Its normal type is unchanged, and cleanup failures retain primary/secondary
-information. Complete source provenance and a public suppressed-error API are pending.
+exit that relays through synchronous callers. Its normal type is unchanged, and
+cleanup failures retain primary/secondary information. Async task completion is a
+propagation boundary. Complete source provenance and a public suppressed-error API
+are pending.
 Fatal cleanup precedence and diagnostic storage bounds remain unresolved.
 
 Const forbids mutation through its access path; var does not imply dynamic typing.
@@ -54,11 +56,13 @@ are conservative; acceptance of every safe program is not guaranteed. Resource h
 use mutates a host resource, not its immutable Cog token. Bytes/builders are mutable
 Cog heap values. Const alone does not prove all reachable memory immutable for a JIT.
 
-Poisoned writes/storage remain partly open: indexed writes currently propagate
-Error without writing it, while constructors can store Error components. This does
-not authorize silently changing all mutations. Streaming serialization may have
-written a prefix; transactional output, wire Error representation, and cycle policies
-are not selected by the aggregate contracts.
+Aggregate construction and writes to array/tuple positions and record fields retain
+Error values at their leaves. The aggregate keeps its normal type; an Error in the
+receiver or index still propagates without mutation. Collection values such as Map
+follow the same leaf rule. Reads preserve a stored Error until an operation consumes
+that component. JSON has no Error wire representation: `json::stringify` returns an
+encountered Error unchanged, and its private output buffer is discarded on failure.
+Cycle and resource-limit behavior remain separate serialization contracts.
 
 ## Implemented: normal-type and Error flow facts
 
@@ -114,8 +118,11 @@ does not permit a nullable value at a nonnullable return.
   through dynamic code returns `TypeMismatch` without changing the array.
 - `(int, str)` is a heterogeneous fixed-shape tuple. Tuple literals have two or more
   elements, numeric positions such as `.0`/`.1`, and fixed per-position types. Empty
-  and single-element tuple forms and destructuring are unsupported. `()` remains an
-  empty argument list; nil retains the unit-like role.
+  and single-element tuple forms are unsupported. Recursive tuple binding patterns
+  are supported in local `const`/`var` declarations and collection `for` clauses;
+  function parameter destructuring remains unsupported. A declaration evaluates its
+  right-hand side once, and an optional type annotation describes the complete tuple.
+  `()` remains an empty argument list; nil retains the unit-like role.
 - Tuple assignment and array assignment share reference-like storage. Mutating one
   alias is visible through the others; `const` restricts mutation through its path.
 
@@ -123,15 +130,17 @@ Contracts collection_01..12, `collection_error_elements_use_the_error_nominal_ty
 tuple_01..03, and clone_01..02 are active regressions. `.clone()` creates independent
 array and tuple containers and recursively clones supported primitive/nested
 container elements. It preserves array and tuple type contracts. Custom nominal
-`Clone` implementations work as generic values, but are not composed into automatic
-cloning of arrays or tuples yet. Repeated nested references inside a cloned graph
-remain aliases of the same independent copied object.
+`Clone` implementations work as generic values, but composing them into automatic
+cloning of arrays or tuples is outside the Beta contract. Repeated nested references
+inside a cloned graph remain aliases of the same independent copied object.
 
-## Pending: fixed-size arrays and associated types
+## Pending: fixed-size arrays and trait associated types
 
 - `T[N]` waits for real comptime N values/expressions rather than a temporary size
   evaluator. Layout/materialization/size limits still need implementation.
-- Associated types are not implemented. Generic extension methods use static
+- Trait associated types are not implemented. Type-associated functions such as
+  `Type::new()` are a separate feature implemented by receiverless methods in
+  `extend` declarations. Generic extension methods use static
   receiver matching and monomorphization; generic trait implementations remain
   unsupported. No implicit dynamic type or runtime trait object is introduced.
 - Clone does not transfer ownership, provide a borrow checker, or add lifetime
@@ -141,7 +150,7 @@ Contracts clone_01..02 are active regressions.
 
 ## Implemented: comptime evaluation and functions
 
-Global and local `comptime name[: T] = expression;` bindings are evaluated after
+Global and local `@comptime const name[: T] = expression;` bindings are evaluated after
 name resolution and before runtime lowering. Scalar literals, earlier comptime
 bindings, arithmetic, comparisons, boolean operators, unary operators, string
 concatenation, and nominal struct constructors are supported. Constructors can be
@@ -150,7 +159,7 @@ struct parameters, named/default arguments, local const/var/comptime bindings,
 returns, `if`, and recursion within deterministic evaluator limits. Scalar results
 are materialized as runtime literals; struct results are materialized through
 their resolved constructors. Comptime-only function definitions are omitted from
-runtime code. Top-level `comptime T: type = ...;` bindings can name primitive,
+runtime code. Top-level `@comptime const T: type = ...;` bindings can name primitive,
 nominal, array, tuple, and nullable types used by later annotations. These compiler
 type values are substituted recursively and removed before runtime lowering; they
 cannot be stored as runtime values. Compile-time evaluator functions still do not
@@ -165,29 +174,33 @@ and integer-overflow results flow as Error values through scalar operations and
 comptime calls. `when`/`match` patterns can inspect these errors inside a comptime
 function; an unhandled Error at a `comptime` binding root is a compile diagnostic.
 The evaluator cannot inspect struct fields. `try`/`catch` and `!!` work in
-comptime functions: `!!` bypasses a catch in its own function and reaches the
-caller's lexical handler, while using it at an initializer root is rejected.
+@comptime const functions: `!!` bypasses a catch in its own function and relays
+through comptime calls to the caller's lexical handler. An unhandled propagation
+reaches the initializer root as a compile diagnostic; using `!!` directly at an
+initializer root is rejected.
 Lazy `??` and `?!` select nil and Error fallbacks in compile-time expressions;
-`!!` propagation bypasses either fallback. Mutation statements, loops, arrays,
-tuples, and enum values remain pending as comptime data. Evaluator limits produce
-compile diagnostics.
-`comptime const` is invalid syntax.
+`!!` propagation bypasses either fallback. Mutation statements, loops, array,
+tuple, and enum values, along with tuple destructuring, remain pending as comptime
+data. Evaluator limits produce compile diagnostics.
+`comptime const` without the `@` attribute prefix is invalid syntax.
 
 ## Pending: Error semantics, indirect callables, and richer compile-time data
 
 The broader comptime foundation remains incomplete. Accepted boundaries:
 
-- `comptime name[: T] = expression;` is a standalone local/global binding alongside
-  const/var, never `comptime const`. Its computed result is not reassigned.
+- `@comptime const name[: T] = expression;` is a standalone local/global binding.
+  Its initializer is evaluated before runtime lowering and its computed result is
+  not reassigned.
 - Phase is Runtime or Comptime and is checked before dead-code elimination.
   Runtime information cannot flow into Comptime. Runtime-representable computed
   values may flow from Comptime to Runtime after materialization.
-- Ordinary fn is runtime-only in v1, even when pure; comptime fn is compile-time-only.
+- Ordinary fn is runtime-only in v1, even when pure; @comptime fn is compile-time-only.
   Direct calls enforce this boundary. Function values and indirect calls are not
   supported; a comptime-only function cannot be used as a runtime value or passed
   through an alias/container. Runtime artifacts have no CT-only entries.
-- Ordinary local const/var inside a comptime function execute in its current phase
-  without a modifier on every statement. Mutation statements remain unimplemented.
+- Ordinary local const/var inside an `@comptime fn` execute in its current phase
+  without a modifier on every statement. Reassignment statements remain
+  unimplemented; `@comptime var` is not yet supported.
   Compiler-only TypeValue/reflection handles need not have a runtime representation;
   representability is checked at runtime use.
 - Arithmetic Error values and explicit Error-pattern inspection work in comptime
@@ -248,7 +261,7 @@ not finalized public syntax or guarantees.
 ## Implemented: declared build inputs
 
 The `build` namespace separates declared compilation inputs from runtime
-filesystem effects. It requires `include std; use build;` and is comptime-only:
+filesystem effects. It requires `@!include("std") use build;` and is comptime-only:
 
 | API | Normal result | Missing file | Other computational failures |
 | --- | --- | --- | --- |
@@ -306,11 +319,12 @@ inferences and uninferable parameters are diagnostics. The compiler creates
 deterministic per-compilation specializations, checks each body with concrete
 annotations, and rejects more than 256 instances. Explicit arguments use
 `first[int](values)` or `Box[int](value)` and must supply the full parameter list.
-Result-only inference and generic `comptime fn`s remain unsupported. Generic
-extensions use `extend[T: type] Box[T] { ... }` or `extend[T: type] T[] { ... }`;
-extension and method type
-parameters are inferred from the receiver and arguments, then specialized with the
-same per-compilation limit as generic functions.
+Result-only inference for ordinary generic functions and generic `@comptime fn`s
+remain unsupported. Type-associated generic functions can infer from a direct
+declared result context. Generic extensions use `extend[T: type] Box[T] { ... }`
+or `extend[T: type] T[] { ... }`; extension and method type parameters are inferred
+from the receiver and arguments, then specialized with the same per-compilation
+limit as generic functions.
 
 Structs declare compile-time type parameters in the declaration header, for
 example `struct Box[T: type] { value: T }`. Constructor arguments infer
@@ -325,7 +339,7 @@ cannot be inferred when no supplied constructor argument constrains them.
 Traits declare type parameters as compile-time parameters, for example
 `trait Convert[To: type]`. `extend Type with Trait[Arguments] { ... }`
 binds concrete type values and substitutes them into method signatures. A
-`comptime extend` may implement a trait for a compile-time-resolved target type.
+`@comptime extend` may implement a trait for a compile-time-resolved target type.
 Implementations are checked for duplicates, required methods, parameter names and
 types, and result types. Function bounds can refer to other inferred type
 parameters. Only one implementation of a trait is accepted per target type;
@@ -341,25 +355,27 @@ their custom implementations are not automatically composed through arrays/tuple
 
 ## Implemented: source package inclusion and extensions
 
-The package entry point supports `include name;` for a source directory
-and `include name from path;` for a directory relative to the compiler's
-current working directory. The included directory contributes modules to the
-compile-time source graph; their executable code remains runtime code. Existing
-`dependencies.kdl` aliases remain available. `use module from package as alias;`
+The package entry point supports `@!include("alias")` for the built-in standard
+library and aliases declared in `dependencies.kdl`. The included dependency
+contributes modules to the compile-time source graph; their executable code
+remains runtime code. `use module from package as alias;`
 selects a provider explicitly. A plain module import resolves only when there is
 one provider; duplicate providers produce an ambiguity diagnostic. `std` selects
-the embedded standard library after `include std;`. Lock data uses the
+the embedded standard library after `@!include("std")`. Lock data uses the
 existing `cog.lock` format.
 
 `extend NamedType { ... }` declares inherent methods for a struct or enum.
-`comptime extend TypeValue { ... }` resolves a compile-time type binding and can
+Methods with a first `self` parameter are instance methods; methods without one
+are type-associated functions called as `Type::method(...)`. Generic associated
+functions infer type parameters from arguments or a direct declared result context.
+`@comptime extend TypeValue { ... }` resolves a compile-time type binding and can
 register runtime methods for primitive, array, or tuple types. It may also implement
 a trait for the resolved type. Ordinary `fn` methods are statically dispatched by
 receiver type and lower as runtime functions. Compile-time type parameters and
 trait bounds are described above.
 
 Compile-time method calls and controlled generation from comptime functions remain
-pending; `comptime extend` registers runtime methods and does not make those methods
+pending; `@comptime extend` registers runtime methods and does not make those methods
 callable during compile-time evaluation.
 
 The metaprogramming direction is typed values/specialization, read-only reflection,

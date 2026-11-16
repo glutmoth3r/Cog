@@ -15,7 +15,7 @@ structs and receiver methods are supported; source closures and JIT compilation
 remain planned.
 
 ```cog
-include std;
+@!include("std")
 use io;
 
 fn greet(name: str, punctuation: str = "!") -> str {
@@ -56,18 +56,59 @@ cog --version
 
 cog init my-app
 cog run my-app
+cog package build my-app -o my-app.cogpkg
+cog run my-app.cogpkg -- "argument value"
+cog install --path examples/library_package
 ```
+
+Create a library project directly with `cog init --lib integer-math`. This
+generates `kind="library"`, a `src/lib.cog` check entry point, and an example
+public API module in `src/api.cog`.
 
 `check` analyzes source without writing artifacts. `run` builds or reuses validated
 bytecode and executes it. A saved `.cogb` runs without source files or recompilation.
 Project builds default to `target/<package-name>.cogb`; a standalone source defaults
 to a `.cogb` beside it. Build status and diagnostics go to stderr; program output
 goes to stdout.
+`package build` validates a project and writes a deterministic TAR+Zstandard
+`.cogpkg`. Application archives use COGPKG 3 and contain executable bytecode;
+they run after relocation with `cog run app.cogpkg -- <program arguments>`.
+Library archives use COGPKG 2 and can be used as local dependencies by declaring
+`alias archive="relative/path.cogpkg"` in `dependencies.kdl`.
+Package builds select the current host's native plugins by default; pass
+`--target x86_64-unknown-linux-gnu`, `--target x86_64-pc-windows-msvc`, or
+`--target aarch64-apple-darwin` to build a package for one specific target.
+`cog install --path <project-directory>` builds for the current host and stores
+the package under `~/.cog/libraries/` or `~/.cog/programs/`; set an absolute
+`COG_HOME` to choose
+another store location. A consumer selects an installed library by exact identity
+in one dependency line, for example
+`arithmetic package="integer-math" version="0.1.0"`. Package plugin metadata travels in the archive, so consumers
+do not create a separate plugin manifest. Plugin bundles select an exact Linux,
+Windows, or macOS target without fallback. Archive digests detect changed bytes
+but do not authenticate publishers or make native code safe.
+See [project formats](docs/PROJECT_FORMATS.md) for archive and trust limits.
 
 `run` passes arguments after `--` to an entry point declared as `fn main(args: str[])`.
 The executable name is excluded. `fn main()` remains valid, and other entry-point
 parameter signatures are rejected. `--restricted` disables `process::args()`, so
 access to this argument list is denied there as well.
+
+Bytecode is recognized by its `COG\0` header regardless of its filename or
+directory. `.cogb` remains the default extension, but an explicit build output
+can have any name:
+
+```sh
+cog build examples/command_line_args.cog -o target/args-tool
+cog target/args-tool --help "two words"
+```
+
+With the shorthand `cog <bytecode-file> ...`, every argument after the file
+belongs to the Cog program, including `--` and flags such as `--help` or `-V`.
+Use `cog run <bytecode-file> [Cog options] -- <program arguments>` when passing
+options to Cog itself. This shorthand also accepts the argument vector supplied
+by a Linux `binfmt_misc` interpreter registration. Direct OS execution requires
+the corresponding OS setup and executable file permissions.
 
 `eval` compiles and runs one Cog expression without creating a source or bytecode
 file. Repeat `--use <module>` to import standard-library modules. `--debug` prints

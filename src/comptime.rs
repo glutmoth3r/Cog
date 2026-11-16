@@ -1,10 +1,11 @@
 //! Compile-time evaluation for constant values and compile-time-only functions.
 use crate::ast::{
-    BinOp, Block, CallArgument, Expr, FallbackKind, FunctionDecl, Item, MatchPattern, Program,
-    Stmt, StructField, TypeAnnotation, TypeKind, UnOp,
+    BinOp, BindingPattern, Block, CallArgument, Expr, FallbackKind, ForClause, FunctionDecl, Item,
+    MatchPattern, Program, Stmt, StructField, TypeAnnotation, TypeKind, UnOp,
 };
 use crate::diagnostic::{Diagnostic, SourceSpan};
 use crate::error::RuntimeError;
+use num_bigint::BigInt;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -12,19 +13,29 @@ const MAX_EVALUATION_STEPS: usize = 100_000;
 const MAX_EVALUATION_DEPTH: usize = 256;
 const MAX_FUNCTION_CALL_DEPTH: usize = 128;
 const MAX_STRING_BYTES: usize = 1_000_000;
+const MAX_SCALAR_FOLD_NODES: usize = 64;
+
+#[derive(Clone, Debug)]
+struct PropagatedError {
+    error: RuntimeError,
+    origin_call_depth: usize,
+}
 
 #[derive(Clone, Debug)]
 enum ComptimeValue {
     Int(i64),
+    UInt(u64),
+    BigInt(BigInt),
     Float(f64),
+    Char(char),
     Str(String),
     Bytes(Vec<u8>),
     Bool(bool),
     Nil,
     Error(RuntimeError),
-    /// Internal control flow for `!!`; converted back to an Error at the
-    /// enclosing compile-time function boundary.
-    Propagate(RuntimeError),
+    /// Internal control flow for `!!`, carried through calls until a caller
+    /// handler catches it or the compile-time evaluation root reports it.
+    Propagate(PropagatedError),
     /// Compiler-only type identity. It can be used in annotations but has no
     /// runtime representation and therefore cannot be materialized as Expr.
     Type(TypeAnnotation),
@@ -63,7 +74,10 @@ impl ComptimeValue {
     fn to_expr(&self, span: Option<SourceSpan>) -> Result<Expr, RuntimeError> {
         let value = match self {
             Self::Int(value) => Expr::Int(*value),
+            Self::UInt(value) => Expr::UInt(*value),
+            Self::BigInt(value) => Expr::BigInt(value.clone()),
             Self::Float(value) => Expr::Float(*value),
+            Self::Char(value) => Expr::Char(*value),
             Self::Str(value) => Expr::Str(value.clone()),
             Self::Bytes(value) => Expr::Bytes(value.clone()),
             Self::Bool(value) => Expr::Bool(*value),
@@ -200,6 +214,110 @@ impl Budget {
 
 type Values = HashMap<String, Option<ComptimeValue>>;
 
+/// Fold a closed scalar expression during runtime lowering. Runtime errors and
+/// values without a JIT immediate representation stay in the ordinary VM path.
+pub(crate) fn fold_scalar_expression(expr: &Expr) -> Option<crate::value::Value> {
+    fold_constant_expression_inner(expr, false)
+}
+
+/// Fold a closed scalar or BigInt expression for runtime bytecode generation.
+/// BigInt work stays bounded by the comptime evaluator's allocation budget.
+pub(crate) fn fold_constant_expression(expr: &Expr) -> Option<crate::value::Value> {
+    fold_constant_expression_inner(expr, true)
+}
+
+fn fold_constant_expression_inner(expr: &Expr, allow_bigint: bool) -> Option<crate::value::Value> {
+    let mut nodes = 0;
+    if !constant_foldable(expr, &mut nodes, allow_bigint) || has_float_negation(expr) {
+        return None;
+    }
+
+    let globals = Values::new();
+    let functions = HashMap::new();
+    let constructors = HashMap::new();
+    let types = HashMap::new();
+    let mut budget = Budget::default();
+    let mut context = EvalContext {
+        globals: &globals,
+        functions: &functions,
+        constructors: &constructors,
+        types: &types,
+        budget: &mut budget,
+    };
+    match eval_expr(expr, &Values::new(), &mut context, 0, 0).ok()? {
+        ComptimeValue::Int(value) => Some(crate::value::Value::Int(value)),
+        ComptimeValue::UInt(value) => Some(crate::value::Value::UInt(value)),
+        ComptimeValue::BigInt(value) if allow_bigint => Some(crate::value::Value::BigInt(value)),
+        ComptimeValue::Float(value) => Some(crate::value::Value::Float(value)),
+        ComptimeValue::Bool(value) => Some(crate::value::Value::Bool(value)),
+        ComptimeValue::Char(value) => Some(crate::value::Value::Char(value)),
+        ComptimeValue::Nil => Some(crate::value::Value::Nil),
+        _ => None,
+    }
+}
+
+fn constant_foldable(expr: &Expr, nodes: &mut usize, allow_bigint: bool) -> bool {
+    *nodes += 1;
+    if *nodes > MAX_SCALAR_FOLD_NODES {
+        return false;
+    }
+    match expr.node() {
+        Expr::Int(_)
+        | Expr::UInt(_)
+        | Expr::Float(_)
+        | Expr::Char(_)
+        | Expr::Bool(_)
+        | Expr::Nil => true,
+        Expr::BigInt(_) => allow_bigint,
+        Expr::Unary(UnOp::Neg | UnOp::Not, value) => constant_foldable(value, nodes, allow_bigint),
+        Expr::Binary(op, left, right)
+            if matches!(
+                op,
+                BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Div
+                    | BinOp::Mod
+                    | BinOp::Eq
+                    | BinOp::NotEq
+                    | BinOp::Lt
+                    | BinOp::LtEq
+                    | BinOp::Gt
+                    | BinOp::GtEq
+                    | BinOp::And
+                    | BinOp::Or
+                    | BinOp::Xor
+            ) =>
+        {
+            constant_foldable(left, nodes, allow_bigint)
+                && constant_foldable(right, nodes, allow_bigint)
+        }
+        _ => false,
+    }
+}
+
+fn has_float_negation(expr: &Expr) -> bool {
+    fn contains_float(expr: &Expr) -> bool {
+        match expr.node() {
+            Expr::Float(_) => true,
+            Expr::Unary(_, value) | Expr::Propagate(value) | Expr::Cast(value, _) => {
+                contains_float(value)
+            }
+            Expr::Binary(_, left, right) => contains_float(left) || contains_float(right),
+            _ => false,
+        }
+    }
+
+    match expr.node() {
+        Expr::Unary(UnOp::Neg, value) => contains_float(value) || has_float_negation(value),
+        Expr::Unary(_, value) | Expr::Propagate(value) | Expr::Cast(value, _) => {
+            has_float_negation(value)
+        }
+        Expr::Binary(_, left, right) => has_float_negation(left) || has_float_negation(right),
+        _ => false,
+    }
+}
+
 impl ComptimeValue {
     fn error_clone_cost(error: &RuntimeError, depth: usize) -> usize {
         if depth > MAX_EVALUATION_DEPTH {
@@ -243,6 +361,9 @@ impl ComptimeValue {
             match value {
                 ComptimeValue::Str(text) => cost = cost.saturating_add(text.len()),
                 ComptimeValue::Bytes(bytes) => cost = cost.saturating_add(bytes.len()),
+                ComptimeValue::BigInt(value) => {
+                    cost = cost.saturating_add(bigint_storage_cost(value));
+                }
                 ComptimeValue::Type(ty) => {
                     cost = cost.saturating_add(crate::ast_budget::annotation(ty)?);
                 }
@@ -258,11 +379,17 @@ impl ComptimeValue {
                             .saturating_add(value_cost(value, depth + 1)?);
                     }
                 }
-                ComptimeValue::Error(error) | ComptimeValue::Propagate(error) => {
+                ComptimeValue::Error(error) => {
                     cost = cost.saturating_add(ComptimeValue::error_clone_cost(error, depth));
                 }
+                ComptimeValue::Propagate(propagation) => {
+                    cost = cost
+                        .saturating_add(ComptimeValue::error_clone_cost(&propagation.error, depth));
+                }
                 ComptimeValue::Int(_)
+                | ComptimeValue::UInt(_)
                 | ComptimeValue::Float(_)
+                | ComptimeValue::Char(_)
                 | ComptimeValue::Bool(_)
                 | ComptimeValue::Nil => {}
             }
@@ -284,7 +411,7 @@ struct EvalContext<'a> {
 enum BlockExit {
     Return(ComptimeValue),
     Tail(ComptimeValue),
-    Propagate(RuntimeError),
+    Propagate(PropagatedError),
     Continue,
 }
 
@@ -527,7 +654,14 @@ fn rewrite_stmt(
                 Ok(result) => match result.to_expr_with_budget(span.clone(), budget) {
                     Ok(value) => {
                         values.insert(name.clone(), Some(result));
-                        replace_stmt(statement, Stmt::Const { name, ty, value });
+                        replace_stmt(
+                            statement,
+                            Stmt::Const {
+                                pattern: BindingPattern::Name(name),
+                                ty,
+                                value,
+                            },
+                        );
                     }
                     Err(error) => {
                         diagnostics.push(comptime_error(error, span));
@@ -553,10 +687,10 @@ fn rewrite_stmt(
             }
         }
         Stmt::Const {
-            name, mut value, ..
+            pattern, mut value, ..
         }
         | Stmt::VarDecl {
-            name, mut value, ..
+            pattern, mut value, ..
         } => {
             rewrite_expr(
                 &mut value,
@@ -567,8 +701,10 @@ fn rewrite_stmt(
                 budget,
                 diagnostics,
             );
-            values.insert(name, None);
-            replace_binding_value(statement, value);
+            pattern.visit_names(&mut |name| {
+                values.insert(name.to_owned(), None);
+            });
+            replace_binding_value(statement, pattern, value);
         }
         Stmt::Assign {
             mut target,
@@ -836,7 +972,7 @@ fn rewrite_stmt(
             );
         }
         Stmt::ForEach {
-            var,
+            pattern,
             mut iterable,
             mut body,
         } => {
@@ -853,7 +989,11 @@ fn rewrite_stmt(
             else {
                 return;
             };
-            loop_values.insert(var.clone(), None);
+            let mut names = Vec::new();
+            pattern.visit_names(&mut |name| names.push(name.to_owned()));
+            for name in names {
+                loop_values.insert(name, None);
+            }
             rewrite_block(
                 &mut body,
                 &mut loop_values,
@@ -866,11 +1006,90 @@ fn rewrite_stmt(
             replace_stmt(
                 statement,
                 Stmt::ForEach {
-                    var,
+                    pattern,
                     iterable,
                     body,
                 },
             );
+        }
+        Stmt::ForZip {
+            mut clauses,
+            mut body,
+        } => {
+            for clause in &mut clauses {
+                match clause {
+                    ForClause::Range {
+                        start, end, step, ..
+                    } => {
+                        rewrite_expr(
+                            start,
+                            values,
+                            globals,
+                            functions,
+                            constructors,
+                            budget,
+                            diagnostics,
+                        );
+                        rewrite_expr(
+                            end,
+                            values,
+                            globals,
+                            functions,
+                            constructors,
+                            budget,
+                            diagnostics,
+                        );
+                        if let Some(step) = step {
+                            rewrite_expr(
+                                step,
+                                values,
+                                globals,
+                                functions,
+                                constructors,
+                                budget,
+                                diagnostics,
+                            );
+                        }
+                    }
+                    ForClause::Each { iterable, .. } => rewrite_expr(
+                        iterable,
+                        values,
+                        globals,
+                        functions,
+                        constructors,
+                        budget,
+                        diagnostics,
+                    ),
+                }
+            }
+            let Some(mut loop_values) = clone_values_for_rewrite(values, budget, diagnostics)
+            else {
+                return;
+            };
+            for clause in &clauses {
+                match clause {
+                    ForClause::Range { var, .. } => {
+                        loop_values.insert(var.clone(), None);
+                    }
+                    ForClause::Each { pattern, .. } => {
+                        let mut names = Vec::new();
+                        pattern.visit_names(&mut |name| names.push(name.to_owned()));
+                        for name in names {
+                            loop_values.insert(name, None);
+                        }
+                    }
+                }
+            }
+            rewrite_block(
+                &mut body,
+                &mut loop_values,
+                globals,
+                functions,
+                constructors,
+                budget,
+                diagnostics,
+            );
+            replace_stmt(statement, Stmt::ForZip { clauses, body });
         }
         Stmt::Use { .. } | Stmt::Break | Stmt::Continue | Stmt::Invalid { .. } => {}
         Stmt::Located(_, _) => unreachable!("node removes locations"),
@@ -965,6 +1184,39 @@ fn rewrite_expr(
                         diagnostics,
                     );
                 }
+            }
+        }
+        Expr::AssociatedCall {
+            target,
+            type_arguments,
+            args,
+            ..
+        } => {
+            let aliases = globals
+                .iter()
+                .chain(values.iter())
+                .filter_map(|(name, value)| {
+                    if let Some(ComptimeValue::Type(ty)) = value {
+                        Some((name.clone(), ty.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            substitute_type(target, &aliases);
+            for ty in type_arguments {
+                substitute_type(ty, &aliases);
+            }
+            for argument in args {
+                rewrite_expr(
+                    &mut argument.value,
+                    values,
+                    globals,
+                    functions,
+                    constructors,
+                    budget,
+                    diagnostics,
+                );
             }
         }
         Expr::BracketApply(_, _) | Expr::Apply(_, _) => {}
@@ -1172,7 +1424,10 @@ fn rewrite_expr(
             }
         }
         Expr::Int(_)
+        | Expr::UInt(_)
+        | Expr::BigInt(_)
         | Expr::Float(_)
+        | Expr::Char(_)
         | Expr::Str(_)
         | Expr::Bytes(_)
         | Expr::Bool(_)
@@ -1199,7 +1454,10 @@ fn evaluate(
         budget,
     };
     validate_expr(expr, values, &mut context, 0)?;
-    let value = eval_expr(expr, values, &mut context, 0, 0)?;
+    let value = match eval_expr(expr, values, &mut context, 0, 0)? {
+        ComptimeValue::Propagate(propagation) => ComptimeValue::Error(propagation.error),
+        value => value,
+    };
     context.budget.allocate(value.clone_cost()?)?;
     Ok(value)
 }
@@ -1214,6 +1472,7 @@ fn validate_expr(
     match expr.node() {
         Expr::Int(_)
         | Expr::Float(_)
+        | Expr::Char(_)
         | Expr::Bool(_)
         | Expr::Nil
         | Expr::TypeLiteral(_)
@@ -1239,6 +1498,9 @@ fn validate_expr(
         Expr::Binary(_, left, right) => {
             validate_expr(left, values, context, depth + 1)?;
             validate_expr(right, values, context, depth + 1)
+        }
+        Expr::AssociatedCall { .. } => {
+            Err("type-associated extension calls are not available at comptime yet".into())
         }
         Expr::Call(name, arguments) | Expr::SpecializedCall(name, _, arguments) => {
             if matches!(
@@ -1298,7 +1560,13 @@ fn eval_expr(
     context.budget.step(depth)?;
     match expr.node() {
         Expr::Int(value) => Ok(ComptimeValue::Int(*value)),
+        Expr::UInt(value) => Ok(ComptimeValue::UInt(*value)),
+        Expr::BigInt(value) => {
+            context.budget.allocate(bigint_storage_cost(value))?;
+            Ok(ComptimeValue::BigInt(value.clone()))
+        }
         Expr::Float(value) => Ok(ComptimeValue::Float(*value)),
+        Expr::Char(value) => Ok(ComptimeValue::Char(*value)),
         Expr::Str(value) => {
             context.budget.allocate(value.len())?;
             Ok(ComptimeValue::Str(value.clone()))
@@ -1336,7 +1604,10 @@ fn eval_expr(
             let value = eval_expr(value, values, context, depth + 1, call_depth)?;
             match value {
                 ComptimeValue::Error(error) if call_depth > 0 => {
-                    Ok(ComptimeValue::Propagate(error))
+                    Ok(ComptimeValue::Propagate(PropagatedError {
+                        error,
+                        origin_call_depth: call_depth,
+                    }))
                 }
                 ComptimeValue::Error(_) => {
                     Err("`!!` requires an enclosing comptime callable".into())
@@ -1376,6 +1647,10 @@ fn eval_expr(
                     ComptimeValue::Error(RuntimeError::Overflow),
                     ComptimeValue::Int,
                 )),
+                (UnOp::Neg, ComptimeValue::BigInt(value)) => {
+                    context.budget.allocate(bigint_storage_cost(&value))?;
+                    Ok(ComptimeValue::BigInt(-value))
+                }
                 (UnOp::Neg, ComptimeValue::Float(value)) => Ok(ComptimeValue::Float(-value)),
                 (UnOp::Not, ComptimeValue::Bool(value)) => Ok(ComptimeValue::Bool(!value)),
                 _ => Err("invalid unary operation during comptime evaluation".into()),
@@ -1417,6 +1692,9 @@ fn eval_expr(
             let left = eval_expr(left, values, context, depth + 1, call_depth)?;
             let right = eval_expr(right, values, context, depth + 1, call_depth)?;
             eval_binary(*op, left, right, context.budget)
+        }
+        Expr::AssociatedCall { .. } => {
+            Err("type-associated extension calls are not available at comptime yet".into())
         }
         Expr::Call(name, arguments) | Expr::SpecializedCall(name, _, arguments) => {
             if matches!(
@@ -1605,7 +1883,7 @@ fn eval_struct_constructor(
     let mut result = Vec::new();
     context.budget.reserve_vec(&mut result, fields.len())?;
     for (index, field) in fields.iter().enumerate() {
-        let value = if let Some(argument) = bindings.by_parameter[index] {
+        let mut value = if let Some(argument) = bindings.by_parameter[index] {
             context.budget.clone_value(&supplied[argument])?
         } else if let Some(default) = &field.default {
             eval_expr(default, values, context, depth + 1, call_depth)?
@@ -1615,15 +1893,16 @@ fn eval_struct_constructor(
         if matches!(value, ComptimeValue::Propagate(_)) {
             return Ok(value);
         }
-        if let Some(ty) = &field.ty
-            && !comptime_value_matches_annotation(&value, ty)
-        {
-            return Err(format!(
-                "type mismatch: field `{}` of `{name}` expects {}, got {}",
-                field.name,
-                ty.display(),
-                comptime_value_type_name(&value)
-            ));
+        if let Some(ty) = &field.ty {
+            value = contextualize_comptime_value(value, ty);
+            if !comptime_value_matches_annotation(&value, ty) {
+                return Err(format!(
+                    "type mismatch: field `{}` of `{name}` expects {}, got {}",
+                    field.name,
+                    ty.display(),
+                    comptime_value_type_name(&value)
+                ));
+            }
         }
         let field_name = context.budget.copy_string(&field.name)?;
         result.push((field_name, value));
@@ -1647,7 +1926,7 @@ fn eval_comptime_function(
     }
     let mut values = Values::new();
     for (index, parameter) in function.params.iter().enumerate() {
-        let value = if let Some(argument) = by_parameter[index] {
+        let mut value = if let Some(argument) = by_parameter[index] {
             context.budget.clone_value(&supplied[argument])?
         } else if let Some(default) = &parameter.default {
             eval_expr(default, &values, context, depth + 1, call_depth)?
@@ -1660,16 +1939,17 @@ fn eval_comptime_function(
         if matches!(value, ComptimeValue::Propagate(_)) {
             return Ok(value);
         }
-        if let Some(ty) = &parameter.ty
-            && !comptime_value_matches_annotation(&value, ty)
-        {
-            return Err(format!(
-                "type mismatch: parameter `{}` of `{}` expects {}, got {}",
-                parameter.name,
-                function.name,
-                ty.display(),
-                comptime_value_type_name(&value)
-            ));
+        if let Some(ty) = &parameter.ty {
+            value = contextualize_comptime_value(value, ty);
+            if !comptime_value_matches_annotation(&value, ty) {
+                return Err(format!(
+                    "type mismatch: parameter `{}` of `{}` expects {}, got {}",
+                    parameter.name,
+                    function.name,
+                    ty.display(),
+                    comptime_value_type_name(&value)
+                ));
+            }
         }
         context
             .budget
@@ -1677,8 +1957,22 @@ fn eval_comptime_function(
     }
     match eval_comptime_block(&function.body, &mut values, context, depth + 1, call_depth)? {
         BlockExit::Return(value) | BlockExit::Tail(value) => Ok(value),
-        BlockExit::Propagate(error) => Ok(ComptimeValue::Error(error)),
+        BlockExit::Propagate(error) => Ok(ComptimeValue::Propagate(error)),
         BlockExit::Continue => Ok(ComptimeValue::Nil),
+    }
+}
+
+fn contextualize_comptime_value(value: ComptimeValue, ty: &TypeAnnotation) -> ComptimeValue {
+    match (value, &ty.kind) {
+        (ComptimeValue::Int(value), TypeKind::Primitive(crate::ast::VarType::UInt))
+            if value >= 0 =>
+        {
+            ComptimeValue::UInt(value as u64)
+        }
+        (ComptimeValue::Int(value), TypeKind::Primitive(crate::ast::VarType::BigInt)) => {
+            ComptimeValue::BigInt(BigInt::from(value))
+        }
+        (value, _) => value,
     }
 }
 
@@ -1691,7 +1985,10 @@ fn comptime_value_matches_annotation(value: &ComptimeValue, ty: &TypeAnnotation)
     match (&ty.kind, value) {
         (TypeKind::Named(name), ComptimeValue::Type(_)) if name == "type" => true,
         (TypeKind::Primitive(VarType::Int), ComptimeValue::Int(_))
+        | (TypeKind::Primitive(VarType::UInt), ComptimeValue::UInt(_))
+        | (TypeKind::Primitive(VarType::BigInt), ComptimeValue::BigInt(_))
         | (TypeKind::Primitive(VarType::Float), ComptimeValue::Float(_))
+        | (TypeKind::Primitive(VarType::Char), ComptimeValue::Char(_))
         | (TypeKind::Primitive(VarType::Str), ComptimeValue::Str(_))
         | (TypeKind::Primitive(VarType::Bool), ComptimeValue::Bool(_))
         | (TypeKind::Primitive(VarType::Nil), ComptimeValue::Nil) => true,
@@ -1708,7 +2005,10 @@ fn comptime_value_matches_annotation(value: &ComptimeValue, ty: &TypeAnnotation)
 fn comptime_value_type_name(value: &ComptimeValue) -> String {
     match value {
         ComptimeValue::Int(_) => "int".into(),
+        ComptimeValue::UInt(_) => "uint".into(),
+        ComptimeValue::BigInt(_) => "bigint".into(),
         ComptimeValue::Float(_) => "float".into(),
+        ComptimeValue::Char(_) => "char".into(),
         ComptimeValue::Str(_) => "str".into(),
         ComptimeValue::Bytes(_) => "bytes".into(),
         ComptimeValue::Bool(_) => "bool".into(),
@@ -1728,8 +2028,11 @@ fn primitive_type(name: &str) -> Option<TypeAnnotation> {
     use crate::ast::VarType;
     let primitive = match name {
         "int" => VarType::Int,
+        "uint" => VarType::UInt,
+        "bigint" => VarType::BigInt,
         "float" => VarType::Float,
         "bool" => VarType::Bool,
+        "char" => VarType::Char,
         "str" => VarType::Str,
         "nil" => VarType::Nil,
         _ => return None,
@@ -1777,6 +2080,124 @@ fn substitute_program_types(program: &mut Program, aliases: &HashMap<String, Typ
             stmt(statement, aliases);
         }
     }
+    fn expr(expression: &mut Expr, aliases: &HashMap<String, TypeAnnotation>) {
+        match expression {
+            Expr::Located(_, inner)
+            | Expr::Propagate(inner)
+            | Expr::Unary(_, inner)
+            | Expr::Cast(inner, _) => expr(inner, aliases),
+            Expr::TypeLiteral(ty) => substitute_type(ty, aliases),
+            Expr::Array(items) | Expr::Tuple(items) => {
+                for item in items {
+                    expr(item, aliases);
+                }
+            }
+            Expr::Record(fields) => {
+                for (_, value) in fields {
+                    expr(value, aliases);
+                }
+            }
+            Expr::Call(_, arguments) => {
+                for argument in arguments {
+                    expr(&mut argument.value, aliases);
+                }
+            }
+            Expr::SpecializedCall(_, types, arguments) => {
+                for ty in types {
+                    substitute_type(ty, aliases);
+                }
+                for argument in arguments {
+                    expr(&mut argument.value, aliases);
+                }
+            }
+            Expr::AssociatedCall {
+                target,
+                type_arguments,
+                args,
+                ..
+            } => {
+                substitute_type(target, aliases);
+                for ty in type_arguments {
+                    substitute_type(ty, aliases);
+                }
+                for argument in args {
+                    expr(&mut argument.value, aliases);
+                }
+            }
+            Expr::BracketApply(receiver, arguments) => {
+                expr(receiver, aliases);
+                for argument in arguments {
+                    expr(argument, aliases);
+                }
+            }
+            Expr::Apply(receiver, arguments) => {
+                expr(receiver, aliases);
+                for argument in arguments {
+                    expr(&mut argument.value, aliases);
+                }
+            }
+            Expr::MethodCall(receiver, _, arguments) => {
+                expr(receiver, aliases);
+                for argument in arguments {
+                    expr(argument, aliases);
+                }
+            }
+            Expr::Index(receiver, index) | Expr::Binary(_, receiver, index) => {
+                expr(receiver, aliases);
+                expr(index, aliases);
+            }
+            Expr::Interpolated(parts) => {
+                for part in parts {
+                    if let crate::ast::StringPart::Expression(value) = part {
+                        expr(value, aliases);
+                    }
+                }
+            }
+            Expr::Fallback {
+                value, fallback, ..
+            } => {
+                expr(value, aliases);
+                expr(fallback, aliases);
+            }
+            Expr::Block(body) => block(body, aliases),
+            Expr::Match { value, arms, .. } => {
+                expr(value, aliases);
+                for arm in arms {
+                    if let Some(guard) = &mut arm.guard {
+                        expr(guard, aliases);
+                    }
+                    block(&mut arm.body, aliases);
+                }
+            }
+            Expr::Try {
+                body, catch_block, ..
+            } => {
+                block(body, aliases);
+                block(catch_block, aliases);
+            }
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                expr(cond, aliases);
+                expr(then_branch, aliases);
+                if let Some(else_branch) = else_branch {
+                    expr(else_branch, aliases);
+                }
+            }
+            Expr::Int(_)
+            | Expr::UInt(_)
+            | Expr::BigInt(_)
+            | Expr::Float(_)
+            | Expr::Char(_)
+            | Expr::Str(_)
+            | Expr::Bytes(_)
+            | Expr::Bool(_)
+            | Expr::Nil
+            | Expr::Ident(_) => {}
+        }
+    }
     fn stmt(statement: &mut Stmt, aliases: &HashMap<String, TypeAnnotation>) {
         match statement {
             Stmt::Located(_, inner) => stmt(inner, aliases),
@@ -1789,6 +2210,23 @@ fn substitute_program_types(program: &mut Program, aliases: &HashMap<String, Typ
             | Stmt::While { body, .. }
             | Stmt::For { body, .. }
             | Stmt::ForEach { body, .. } => block(body, aliases),
+            Stmt::ForZip { clauses, body } => {
+                for clause in clauses {
+                    match clause {
+                        ForClause::Range {
+                            start, end, step, ..
+                        } => {
+                            expr(start, aliases);
+                            expr(end, aliases);
+                            if let Some(step) = step {
+                                expr(step, aliases);
+                            }
+                        }
+                        ForClause::Each { iterable, .. } => expr(iterable, aliases),
+                    }
+                }
+                block(body, aliases);
+            }
             Stmt::Try {
                 body, catch_block, ..
             } => {
@@ -1890,9 +2328,25 @@ fn eval_comptime_block(
     for statement in &block.stmts {
         context.budget.step(depth)?;
         match statement.node() {
-            Stmt::Const { name, value, .. }
-            | Stmt::VarDecl { name, value, .. }
-            | Stmt::Comptime { name, value, .. } => {
+            Stmt::Const { pattern, value, .. } | Stmt::VarDecl { pattern, value, .. } => {
+                if matches!(pattern, BindingPattern::Tuple(_)) {
+                    return Err(
+                        "tuple destructuring is not supported inside a comptime function yet"
+                            .into(),
+                    );
+                }
+                let value = eval_expr(value, &values, context, depth + 1, call_depth)?;
+                if let ComptimeValue::Propagate(error) = value {
+                    return Ok(BlockExit::Propagate(error));
+                }
+                let BindingPattern::Name(name) = pattern else {
+                    unreachable!("tuple pattern was handled above")
+                };
+                context
+                    .budget
+                    .insert_value(&mut values, name, Some(value))?;
+            }
+            Stmt::Comptime { name, value, .. } => {
                 let value = eval_expr(value, &values, context, depth + 1, call_depth)?;
                 if let ComptimeValue::Propagate(error) = value {
                     return Ok(BlockExit::Propagate(error));
@@ -2007,6 +2461,9 @@ fn eval_comptime_try(
     let error = match &body_exit {
         BlockExit::Return(ComptimeValue::Error(error))
         | BlockExit::Tail(ComptimeValue::Error(error)) => Some(context.budget.clone_error(error)?),
+        BlockExit::Propagate(propagation) if propagation.origin_call_depth > call_depth => {
+            Some(context.budget.clone_error(&propagation.error)?)
+        }
         _ => None,
     };
     let Some(error) = error else {
@@ -2129,7 +2586,7 @@ fn eval_binary(
     right: ComptimeValue,
     budget: &mut Budget,
 ) -> Result<ComptimeValue, String> {
-    use ComptimeValue::{Bool, Float, Int, Nil, Str};
+    use ComptimeValue::{BigInt as Big, Bool, Float, Int, Nil, Str, UInt};
     if let ComptimeValue::Error(error) = left {
         return Ok(ComptimeValue::Error(error));
     }
@@ -2145,6 +2602,40 @@ fn eval_binary(
         }
         (BinOp::Div, Int(a), Int(b)) => checked_int(a.checked_div(b)),
         (BinOp::Mod, Int(a), Int(b)) => checked_int(a.checked_rem(b)),
+        (BinOp::Add, UInt(a), UInt(b)) => checked_uint(a.checked_add(b)),
+        (BinOp::Sub, UInt(a), UInt(b)) => checked_uint(a.checked_sub(b)),
+        (BinOp::Mul, UInt(a), UInt(b)) => checked_uint(a.checked_mul(b)),
+        (BinOp::Div, UInt(_), UInt(0)) | (BinOp::Mod, UInt(_), UInt(0)) => {
+            Ok(ComptimeValue::Error(RuntimeError::DivisionByZero))
+        }
+        (BinOp::Div, UInt(a), UInt(b)) => checked_uint(a.checked_div(b)),
+        (BinOp::Mod, UInt(a), UInt(b)) => checked_uint(a.checked_rem(b)),
+        (BinOp::Add, Big(a), Big(b)) => {
+            preflight_bigint_binary(&a, &b, op, budget)?;
+            Ok(Big(a + b))
+        }
+        (BinOp::Sub, Big(a), Big(b)) => {
+            preflight_bigint_binary(&a, &b, op, budget)?;
+            Ok(Big(a - b))
+        }
+        (BinOp::Mul, Big(a), Big(b)) => {
+            preflight_bigint_binary(&a, &b, op, budget)?;
+            Ok(Big(a * b))
+        }
+        (BinOp::Div, Big(_), Big(b)) if b == BigInt::from(0) => {
+            Ok(ComptimeValue::Error(RuntimeError::DivisionByZero))
+        }
+        (BinOp::Div, Big(a), Big(b)) => {
+            preflight_bigint_binary(&a, &b, op, budget)?;
+            Ok(Big(a / b))
+        }
+        (BinOp::Mod, Big(_), Big(b)) if b == BigInt::from(0) => {
+            Ok(ComptimeValue::Error(RuntimeError::DivisionByZero))
+        }
+        (BinOp::Mod, Big(a), Big(b)) => {
+            preflight_bigint_binary(&a, &b, op, budget)?;
+            Ok(Big(a % b))
+        }
         (BinOp::Add, Float(a), Float(b)) => Ok(Float(a + b)),
         (BinOp::Sub, Float(a), Float(b)) => Ok(Float(a - b)),
         (BinOp::Mul, Float(a), Float(b)) => Ok(Float(a * b)),
@@ -2158,20 +2649,32 @@ fn eval_binary(
         (BinOp::Mod, Float(a), Float(b)) => Ok(Float(a % b)),
         (BinOp::Add, Int(a), Float(b)) => Ok(Float(a as f64 + b)),
         (BinOp::Add, Float(a), Int(b)) => Ok(Float(a + b as f64)),
+        (BinOp::Add, UInt(a), Float(b)) => Ok(Float(a as f64 + b)),
+        (BinOp::Add, Float(a), UInt(b)) => Ok(Float(a + b as f64)),
         (BinOp::Sub, Int(a), Float(b)) => Ok(Float(a as f64 - b)),
         (BinOp::Sub, Float(a), Int(b)) => Ok(Float(a - b as f64)),
+        (BinOp::Sub, UInt(a), Float(b)) => Ok(Float(a as f64 - b)),
+        (BinOp::Sub, Float(a), UInt(b)) => Ok(Float(a - b as f64)),
         (BinOp::Mul, Int(a), Float(b)) => Ok(Float(a as f64 * b)),
         (BinOp::Mul, Float(a), Int(b)) => Ok(Float(a * b as f64)),
+        (BinOp::Mul, UInt(a), Float(b)) => Ok(Float(a as f64 * b)),
+        (BinOp::Mul, Float(a), UInt(b)) => Ok(Float(a * b as f64)),
         (BinOp::Div, Int(a), Float(b)) if b != 0.0 => Ok(Float(a as f64 / b)),
         (BinOp::Div, Float(a), Int(b)) if b != 0 => Ok(Float(a / b as f64)),
-        (BinOp::Div, Int(_), Float(_)) | (BinOp::Div, Float(_), Int(_)) => {
-            Ok(ComptimeValue::Error(RuntimeError::DivisionByZero))
-        }
+        (BinOp::Div, UInt(a), Float(b)) if b != 0.0 => Ok(Float(a as f64 / b)),
+        (BinOp::Div, Float(a), UInt(b)) if b != 0 => Ok(Float(a / b as f64)),
+        (BinOp::Div, Int(_), Float(_))
+        | (BinOp::Div, Float(_), Int(_))
+        | (BinOp::Div, UInt(_), Float(_))
+        | (BinOp::Div, Float(_), UInt(_)) => Ok(ComptimeValue::Error(RuntimeError::DivisionByZero)),
         (BinOp::Mod, Int(a), Float(b)) if b != 0.0 => Ok(Float(a as f64 % b)),
         (BinOp::Mod, Float(a), Int(b)) if b != 0 => Ok(Float(a % b as f64)),
-        (BinOp::Mod, Int(_), Float(_)) | (BinOp::Mod, Float(_), Int(_)) => {
-            Ok(ComptimeValue::Error(RuntimeError::DivisionByZero))
-        }
+        (BinOp::Mod, UInt(a), Float(b)) if b != 0.0 => Ok(Float(a as f64 % b)),
+        (BinOp::Mod, Float(a), UInt(b)) if b != 0 => Ok(Float(a % b as f64)),
+        (BinOp::Mod, Int(_), Float(_))
+        | (BinOp::Mod, Float(_), Int(_))
+        | (BinOp::Mod, UInt(_), Float(_))
+        | (BinOp::Mod, Float(_), UInt(_)) => Ok(ComptimeValue::Error(RuntimeError::DivisionByZero)),
         (BinOp::Add, Str(a), Str(b)) => {
             let size = a
                 .len()
@@ -2214,16 +2717,58 @@ fn checked_int(value: Option<i64>) -> Result<ComptimeValue, String> {
     ))
 }
 
+fn checked_uint(value: Option<u64>) -> Result<ComptimeValue, String> {
+    Ok(value.map_or(
+        ComptimeValue::Error(RuntimeError::Overflow),
+        ComptimeValue::UInt,
+    ))
+}
+
+fn bigint_storage_cost(value: &BigInt) -> usize {
+    bigint_storage_cost_from_bits(value.bits())
+}
+
+fn bigint_storage_cost_from_bits(bits: u64) -> usize {
+    usize::try_from(bits.saturating_add(31) / 32)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(std::mem::size_of::<u32>())
+        .saturating_add(std::mem::size_of::<BigInt>())
+}
+
+fn preflight_bigint_binary(
+    left: &BigInt,
+    right: &BigInt,
+    op: BinOp,
+    budget: &mut Budget,
+) -> Result<(), String> {
+    let left_bits = left.bits();
+    let right_bits = right.bits();
+    let result_bits = match op {
+        BinOp::Add | BinOp::Sub => left_bits.max(right_bits).saturating_add(1),
+        BinOp::Mul => left_bits.saturating_add(right_bits),
+        BinOp::Div => left_bits,
+        BinOp::Mod => left_bits.min(right_bits),
+        _ => 0,
+    };
+    budget.allocate(bigint_storage_cost_from_bits(result_bits))
+}
+
 fn matches_pattern(pattern: &MatchPattern, value: &ComptimeValue) -> bool {
     match pattern {
         MatchPattern::Wildcard => true,
         MatchPattern::StringLiteral(expected) => {
             matches!(value, ComptimeValue::Str(actual) if actual == expected)
         }
+        MatchPattern::CharacterLiteral(expected) => {
+            matches!(value, ComptimeValue::Char(actual) if actual == expected)
+        }
         MatchPattern::Type(name) => match value {
             ComptimeValue::Int(_) => name == "int",
+            ComptimeValue::UInt(_) => name == "uint",
+            ComptimeValue::BigInt(_) => name == "bigint",
             ComptimeValue::Float(_) => name == "float",
             ComptimeValue::Bool(_) => name == "bool",
+            ComptimeValue::Char(_) => name == "char",
             ComptimeValue::Str(_) => name == "str",
             ComptimeValue::Nil => name == "nil",
             ComptimeValue::Struct { .. } => false,
@@ -2245,14 +2790,39 @@ fn matches_pattern(pattern: &MatchPattern, value: &ComptimeValue) -> bool {
 fn equal(left: &ComptimeValue, right: &ComptimeValue) -> bool {
     match (left, right) {
         (ComptimeValue::Int(a), ComptimeValue::Int(b)) => a == b,
+        (ComptimeValue::UInt(a), ComptimeValue::UInt(b)) => a == b,
+        (ComptimeValue::BigInt(a), ComptimeValue::BigInt(b)) => a == b,
+        (ComptimeValue::BigInt(a), ComptimeValue::Int(b)) => *a == BigInt::from(*b),
+        (ComptimeValue::Int(a), ComptimeValue::BigInt(b)) => BigInt::from(*a) == *b,
+        (ComptimeValue::BigInt(a), ComptimeValue::UInt(b)) => *a == BigInt::from(*b),
+        (ComptimeValue::UInt(a), ComptimeValue::BigInt(b)) => BigInt::from(*a) == *b,
+        (ComptimeValue::Int(a), ComptimeValue::UInt(b)) => {
+            crate::value::compare_int_uint(*a, *b) == Ordering::Equal
+        }
+        (ComptimeValue::UInt(a), ComptimeValue::Int(b)) => {
+            crate::value::compare_int_uint(*b, *a) == Ordering::Equal
+        }
         (ComptimeValue::Float(a), ComptimeValue::Float(b)) => a == b,
         (ComptimeValue::Int(a), ComptimeValue::Float(b)) => {
             crate::value::compare_int_float(*a, *b) == Some(Ordering::Equal)
         }
+        (ComptimeValue::UInt(a), ComptimeValue::Float(b)) => {
+            crate::value::compare_uint_float(*a, *b) == Some(Ordering::Equal)
+        }
+        (ComptimeValue::Float(a), ComptimeValue::UInt(b)) => {
+            crate::value::compare_uint_float(*b, *a) == Some(Ordering::Equal)
+        }
         (ComptimeValue::Float(a), ComptimeValue::Int(b)) => {
             crate::value::compare_int_float(*b, *a) == Some(Ordering::Equal)
         }
+        (ComptimeValue::BigInt(a), ComptimeValue::Float(b)) => {
+            crate::value::compare_bigint_float(a, *b) == Some(Ordering::Equal)
+        }
+        (ComptimeValue::Float(a), ComptimeValue::BigInt(b)) => {
+            crate::value::compare_bigint_float(b, *a) == Some(Ordering::Equal)
+        }
         (ComptimeValue::Str(a), ComptimeValue::Str(b)) => a == b,
+        (ComptimeValue::Char(a), ComptimeValue::Char(b)) => a == b,
         (ComptimeValue::Bool(a), ComptimeValue::Bool(b)) => a == b,
         (ComptimeValue::Nil, ComptimeValue::Nil) => true,
         (ComptimeValue::Type(a), ComptimeValue::Type(b)) => a == b,
@@ -2267,12 +2837,45 @@ fn compare(
 ) -> Result<ComptimeValue, String> {
     let order = match (left, right) {
         (ComptimeValue::Int(left), ComptimeValue::Int(right)) => Some(left.cmp(&right)),
+        (ComptimeValue::UInt(left), ComptimeValue::UInt(right)) => Some(left.cmp(&right)),
+        (ComptimeValue::BigInt(left), ComptimeValue::BigInt(right)) => Some(left.cmp(&right)),
+        (ComptimeValue::BigInt(left), ComptimeValue::Int(right)) => {
+            Some(left.cmp(&BigInt::from(right)))
+        }
+        (ComptimeValue::Int(left), ComptimeValue::BigInt(right)) => {
+            Some(BigInt::from(left).cmp(&right))
+        }
+        (ComptimeValue::BigInt(left), ComptimeValue::UInt(right)) => {
+            Some(left.cmp(&BigInt::from(right)))
+        }
+        (ComptimeValue::UInt(left), ComptimeValue::BigInt(right)) => {
+            Some(BigInt::from(left).cmp(&right))
+        }
+        (ComptimeValue::Int(left), ComptimeValue::UInt(right)) => {
+            Some(crate::value::compare_int_uint(left, right))
+        }
+        (ComptimeValue::UInt(left), ComptimeValue::Int(right)) => {
+            Some(crate::value::compare_int_uint(right, left).reverse())
+        }
         (ComptimeValue::Float(left), ComptimeValue::Float(right)) => left.partial_cmp(&right),
+        (ComptimeValue::Char(left), ComptimeValue::Char(right)) => Some(left.cmp(&right)),
         (ComptimeValue::Int(left), ComptimeValue::Float(right)) => {
             crate::value::compare_int_float(left, right)
         }
         (ComptimeValue::Float(left), ComptimeValue::Int(right)) => {
             crate::value::compare_int_float(right, left).map(Ordering::reverse)
+        }
+        (ComptimeValue::UInt(left), ComptimeValue::Float(right)) => {
+            crate::value::compare_uint_float(left, right)
+        }
+        (ComptimeValue::Float(left), ComptimeValue::UInt(right)) => {
+            crate::value::compare_uint_float(right, left).map(Ordering::reverse)
+        }
+        (ComptimeValue::BigInt(left), ComptimeValue::Float(right)) => {
+            crate::value::compare_bigint_float(&left, right)
+        }
+        (ComptimeValue::Float(left), ComptimeValue::BigInt(right)) => {
+            crate::value::compare_bigint_float(&right, left).map(Ordering::reverse)
         }
         _ => return Err("comparison requires numeric comptime values".into()),
     };
@@ -2295,12 +2898,10 @@ fn replace_stmt(statement: &mut Stmt, replacement: Stmt) {
     }
 }
 
-fn replace_binding_value(statement: &mut Stmt, value: Expr) {
+fn replace_binding_value(statement: &mut Stmt, pattern: BindingPattern, value: Expr) {
     match statement.node().clone() {
-        Stmt::Const { name, ty, .. } => replace_stmt(statement, Stmt::Const { name, ty, value }),
-        Stmt::VarDecl { name, ty, .. } => {
-            replace_stmt(statement, Stmt::VarDecl { name, ty, value })
-        }
+        Stmt::Const { ty, .. } => replace_stmt(statement, Stmt::Const { pattern, ty, value }),
+        Stmt::VarDecl { ty, .. } => replace_stmt(statement, Stmt::VarDecl { pattern, ty, value }),
         _ => unreachable!("binding node is unchanged"),
     }
 }

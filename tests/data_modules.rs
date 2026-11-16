@@ -3,7 +3,7 @@ use cog::{bytecode, interpreter, project};
 
 fn compile(source: &str) -> cog::backend::CompiledProgram {
     let source = format!(
-        r#"include std; use array; use ascii; use base64; use bytes; use hex; use str; use err::Error;
+        r#"@!include("std") use array; use ascii; use base64; use bytes; use hex; use str; use err::Error;
         fn require(condition: bool) {{ if !condition {{ crash("assertion failed"); }} }}
         {source}"#
     );
@@ -73,7 +73,8 @@ fn array_queries_and_slices_cover_empty_values_and_checked_ranges() {
             type_error(add_wrong(array::slice(items, 4, 0)!!));
             type_error(add_wrong(array::reversed(empty)!!));
             type_error(add_wrong(array::concat(empty, empty)!!));
-            type_error(array::concat(empty, empty_words));
+            try { type_error(array::concat(empty, empty_words)); }
+            catch(error) { type_error(error); }
             const selected = array::slice(items, offset: 1, count: 2)!!;
             require(selected[0] == 1 && selected[1] == 3);
             for index in 0..5 {
@@ -119,7 +120,7 @@ fn array_results_have_fresh_outer_storage_and_preserve_nested_aliases() {
 
     let error = project::compile_source(
         "readonly-elements.cog",
-        r#"include std; use array; fn main() {
+        r#"@!include("std") use array; fn main() {
             const original = [[1]];
             var result = array::slice(original, 0, 1);
             result[0] << 2;
@@ -138,16 +139,16 @@ fn array_utilities_validate_inputs_and_follow_language_equality() {
         }
         fn main() {
             const empty: int[] = [];
-            type_error(array::is_empty(""));
-            type_error(array::first(""));
-            type_error(array::last(false));
-            type_error(array::index_of(42, nil));
-            type_error(array::slice("", 0, 0));
-            type_error(array::reversed("abc"));
-            type_error(array::concat(empty, ""));
+            try { type_error(array::is_empty("")); } catch(error) { type_error(error); }
+            try { type_error(array::first("")); } catch(error) { type_error(error); }
+            try { type_error(array::last(false)); } catch(error) { type_error(error); }
+            try { type_error(array::index_of(42, nil)); } catch(error) { type_error(error); }
+            try { type_error(array::slice("", 0, 0)); } catch(error) { type_error(error); }
+            try { type_error(array::reversed("abc")); } catch(error) { type_error(error); }
+            try { type_error(array::concat(empty, "")); } catch(error) { type_error(error); }
             require(array::contains([1], 1.0));
             require(!array::contains([1], "1"));
-            type_error(array::contains([[1]], [1]));
+            try { type_error(array::contains([[1]], [1])); } catch(error) { type_error(error); }
         }
     "#);
 }
@@ -162,14 +163,14 @@ fn array_utilities_propagate_errors_as_they_consume_elements() {
         fn main() {
             const empty: int[] = [];
             const failure = Error::MissingField("marker");
-            preserved(array::first([failure]));
-            preserved(array::last([failure]));
-            preserved(array::slice([failure], 0, 1));
-            preserved(array::reversed([failure]));
-            preserved(array::concat(empty, [failure]));
-            preserved(array::index_of([failure], 7));
-            preserved(array::contains(empty, failure));
-            preserved(array::slice(failure, 0, 0));
+            try { preserved(array::first([failure])); } catch(error) { preserved(error); }
+            try { preserved(array::last([failure])); } catch(error) { preserved(error); }
+            try { preserved(array::slice([failure], 0, 1)); } catch(error) { preserved(error); }
+            try { preserved(array::reversed([failure])); } catch(error) { preserved(error); }
+            try { preserved(array::concat(empty, [failure])); } catch(error) { preserved(error); }
+            try { preserved(array::index_of([failure], 7)); } catch(error) { preserved(error); }
+            try { preserved(array::contains(empty, failure)); } catch(error) { preserved(error); }
+            try { preserved(array::slice(failure, 0, 0)); } catch(error) { preserved(error); }
             require(len(array::slice([failure], 0, 0)) == 0);
             require(array::index_of([7, failure], 7) == 0);
             require(!array::is_empty([failure]));
@@ -349,11 +350,11 @@ fn text_and_hex_helpers_obey_existing_buffer_limits_and_recover() {
             when value is Error::ResourceLimit {} else { crash("buffer limit bypassed"); }
         }
         fn main() {
-            limited(hex::encode(bytes::from_str("ab")));
-            limited(hex::decode("0000"));
-            limited(str::contains("four", "f"));
-            limited(str::split("four", ","));
-            limited(str::join(["ab", "cd"]));
+            try { limited(hex::encode(bytes::from_str("ab"))); } catch(error) { limited(error); }
+            try { limited(hex::decode("0000")); } catch(error) { limited(error); }
+            try { limited(str::contains("four", "f")); } catch(error) { limited(error); }
+            try { limited(str::split("four", ",")); } catch(error) { limited(error); }
+            try { limited(str::join(["ab", "cd"])); } catch(error) { limited(error); }
             require(hex::encode(bytes::from_str("a")) == "61");
             require(str::join(["a", "b"], "-") == "a-b");
         }"#,
@@ -512,9 +513,10 @@ fn base64_preserves_input_errors_and_checks_buffer_limits() {
         fn main() {
             const empty: int[] = [];
             const failure = Error::MissingField("marker");
-            preserved(base64::encode(failure));
-            preserved(base64::decode(failure as str));
-            when base64::encode(empty) is Error::TypeMismatch {} else { crash("non-byte input"); }
+            try { preserved(base64::encode(failure)); } catch(error) { preserved(error); }
+            try { preserved(base64::decode(failure as str)); } catch(error) { preserved(error); }
+            try { when base64::encode(empty) is Error::TypeMismatch {} else { crash("non-byte input"); } }
+            catch(error) { when error is Error::TypeMismatch {} else { crash(error); } }
         }
     "#);
 

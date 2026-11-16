@@ -1,0 +1,20 @@
+@!include("std")
+use async::fs;
+use async::io as aio;
+use bytes;
+use io;
+
+@async fn main() -> nil {
+    const path = ".cog-async-partial-write-demo.txt";
+    const file = await aio::open(path, "w+", 0)!!;
+    const payload = bytes::from_str("partial writes return their count")!!;
+    const accepted = await aio::write(file, payload)!!;
+
+    await aio::seek(file, 0, "start")!!;
+    const prefix = await aio::read_exact(file, accepted)!!;
+    const text = bytes::to_str(prefix, 0, bytes::len(prefix)!!)!!;
+    io::println($"{accepted} bytes: {text}")!!;
+
+    io::close(file)!!;
+    await fs::remove_file(path)!!;
+}

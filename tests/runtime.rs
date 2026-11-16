@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 fn compile(source: &str) -> CompiledProgram {
     let source = format!(
         r#"
-        include std; use io; use bytes; use err::Error;
+        @!include("std") use io; use bytes; use err::Error;
         fn require(ok) {{ if !ok {{ crash("assertion failed"); }} }}
         fn require_error(value) {{
             when value is Error {{}} else {{ crash("expected Error"); }}
@@ -273,7 +273,7 @@ fn native_builder_tags_report_independent_compile_errors_without_cascades() {
     let errors = project::compile_source(
         "formatting.cog",
         r#"
-        include std; use str; use fmt;
+        @!include("std") use str; use fmt;
         fn main() {
             str::build(3); fmt::write("string", 7, 1);
             const b = str::builder(); str::build(b);
@@ -689,8 +689,8 @@ fn permissions_apply_to_stream_operations_and_imports_grant_no_authority() {
             require_error(io::write_all(io::stdout(), data, 0, 1));
             require_error(io::flush(io::stdout()));
             require_error(io::read_into(io::stdin(), data, 0, 1));
-            require_error(io::print(1));
-            require_error(io::println(2));
+            try {{ require_error(io::print(1)); }} catch(error) {{ require_error(error); }}
+            try {{ require_error(io::println(2)); }} catch(error) {{ require_error(error); }}
         }}
     "#,
         file.literal(),
@@ -822,7 +822,7 @@ fn native_signature_diagnostics_accumulate_without_panicking() {
     let errors = project::compile_source(
         "bad.cog",
         r#"
-        include std; use io; use bytes;
+        @!include("std") use io; use bytes;
         fn main() { bytes::new("bad"); io::write(1, false, 0); const x = missing; }
     "#,
     )
@@ -862,10 +862,10 @@ fn host_native_signatures_check_numeric_arrays_and_named_arguments() {
     let errors = project::compile_source(
         "bad-host.cog",
         r#"
-        include std; use time; use entropy; use process;
+        @!include("std") use time; use entropy; use process;
         fn main() {
             time::sleep("bad");
-            process::run("unused", 1);
+            process::run_sync("unused", 1);
             entropy::bytes(false);
             time::sleep(seconds: 0);
             const x = missing;
@@ -874,7 +874,7 @@ fn host_native_signatures_check_numeric_arrays_and_named_arguments() {
     )
     .unwrap_err();
     for message in [
-        "expects int or float",
+        "expects int, uint, or float",
         "expects dynamic[]",
         "expects int",
         "positional arguments",
@@ -977,7 +977,7 @@ fn host_permissions_and_existing_errors_prevent_effects_and_are_catchable() {
             require_error(process::args());
             require_error(process::env("PATH"));
             const no_arguments: str[] = [];
-            require_error(process::run("unused", no_arguments));
+            require_error(process::run_sync("unused", no_arguments));
             require_error(process::shell({}));
             try {{ random::next(); crash("entropy permission ignored"); }}
             catch(e) {{
@@ -998,7 +998,7 @@ fn host_permissions_and_existing_errors_prevent_effects_and_are_catchable() {
         ("entropy::bytes", vec![error.clone()]),
         ("process::shell", vec![error.clone()]),
         (
-            "process::run",
+            "process::run_sync",
             vec![Value::Str("unused".into()), error.clone()],
         ),
     ] {
@@ -1008,7 +1008,7 @@ fn host_permissions_and_existing_errors_prevent_effects_and_are_catchable() {
     }
     context.capabilities.allow_exec = false;
     assert!(matches!(
-        NativeImport::named("process::run").unwrap().call(
+        NativeImport::named("process::run_sync").unwrap().call(
             &mut context,
             &[
                 Value::Str("unused".into()),
@@ -1125,14 +1125,14 @@ fn process_run_keeps_arguments_literal_and_reports_spawn_failure_as_error() {
         r#"
         use process; 
         fn main() {
-            const child = process::run("/bin/echo", ["a b; $(printf injected)"]);
+            const child = process::run_sync("/bin/echo", ["a b; $(printf injected)"]);
             require(child.success);
             require(child.exit_code == 0);
             require(bytes::to_str(child.stdout, 0, bytes::len(child.stdout)) == "a b; $(printf injected)\n");
             require(bytes::len(child.stderr) == 0);
             const no_arguments: str[] = [];
-            try { process::run("/cog/nonexistent/executable", no_arguments); crash("spawn error ignored"); }
-            catch(e) { match e { Error::IoFailure(op, message) => { require(op == "process::run"); require(message != ""); }, _ => { crash("wrong error"); } } }
+            try { process::run_sync("/cog/nonexistent/executable", no_arguments); crash("spawn error ignored"); }
+            catch(e) { match e { Error::IoFailure(op, message) => { require(op == "process::run_sync"); require(message != ""); }, _ => { crash("wrong error"); } } }
         }
     "#,
     );
@@ -1206,6 +1206,85 @@ fn dynamic_array_alias_mutation_is_rejected_without_mutation() {
     interpreter::run_with(&program, &mut Vec::new()).unwrap();
 }
 
+#[test]
+fn nested_array_type_depth_limit_is_a_catchable_runtime_error() {
+    let program = compile(
+        r#"
+        var value = nil;
+        fn main() {
+            var index = 0;
+            try {
+                while index < 64 {
+                    value = [value];
+                    index += 1;
+                }
+                crash("array type depth limit was ignored");
+            } catch(error) {
+                match error {
+                    Error::ResourceLimit(resource) => {
+                        require(resource == "array type depth");
+                    },
+                    _ => { crash("wrong nested array error"); }
+                }
+            }
+        }
+    "#,
+    );
+    interpreter::run_with(&program, &mut Vec::new()).unwrap();
+}
+
+#[test]
+fn nested_tuple_type_depth_limit_is_a_catchable_runtime_error() {
+    let program = compile(
+        r#"
+        fn descend(index, value) {
+            if index == 0 { return value; }
+            return descend(index - 1, (value, nil));
+        }
+        fn main() {
+            try {
+                descend(64, nil);
+                crash("tuple type depth limit was ignored");
+            } catch(error) {
+                match error {
+                    Error::ResourceLimit(resource) => {
+                        require(resource == "array type depth");
+                    },
+                    _ => { crash("wrong nested tuple error"); }
+                }
+            }
+        }
+    "#,
+    );
+    interpreter::run_with(&program, &mut Vec::new()).unwrap();
+}
+
+#[test]
+fn branching_tuple_type_node_limit_is_a_catchable_runtime_error() {
+    let program = compile(
+        r#"
+        fn expand(depth, value) {
+            if depth == 0 { return value; }
+            return expand(depth - 1, (value, value, value, value));
+        }
+        fn main() {
+            try {
+                expand(10, 0);
+                crash("tuple type node limit was ignored");
+            } catch(error) {
+                match error {
+                    Error::ResourceLimit(resource) => {
+                        require(resource == "array type nodes");
+                    },
+                    _ => { crash("wrong branching tuple error"); }
+                }
+            }
+        }
+    "#,
+    );
+    interpreter::run_with(&program, &mut Vec::new()).unwrap();
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn process_output_limit_kills_and_reaps_the_direct_child() {
@@ -1232,7 +1311,7 @@ fn process_output_limit_kills_and_reaps_the_direct_child() {
 }
 
 fn artifact(imports: &[(&str, u16, &[u8], u8)], instructions: &[u8], count: u32) -> Vec<u8> {
-    let mut bytes = b"COG\0\x0a\0\0\0".to_vec();
+    let mut bytes = bytecode::encode(&CompiledProgram::new(vec![I::Halt])).unwrap()[..8].to_vec();
     bytes.extend_from_slice(&(imports.len() as u32).to_le_bytes());
     for (name, version, params, result) in imports {
         bytes.extend_from_slice(&(name.len() as u32).to_le_bytes());
@@ -1241,6 +1320,7 @@ fn artifact(imports: &[(&str, u16, &[u8], u8)], instructions: &[u8], count: u32)
         bytes.extend_from_slice(&(params.len() as u32).to_le_bytes());
         bytes.extend_from_slice(params);
         bytes.push(*result);
+        bytes.push(0); // Synchronous import.
     }
     bytes.extend_from_slice(&0u32.to_le_bytes()); // No callable descriptors.
     bytes.extend_from_slice(&count.to_le_bytes());
@@ -1311,7 +1391,7 @@ fn loader_rejects_unknown_imports_versions_signatures_tags_duplicates_and_indice
     }
     for (name, parameters, result) in [
         ("time::sleep", vec![6], 5),
-        ("process::run", vec![2, 7], 8),
+        ("process::run_sync", vec![2, 7], 8),
         ("str::to_float", vec![0], 9),
         ("str::to_bool", vec![0], 10),
         ("str::builder", vec![], 11),
@@ -1363,6 +1443,22 @@ fn bytecode_imports_are_deterministic_and_runtime_values_are_not_constants() {
     context.finish().unwrap();
 }
 
+#[test]
+fn direct_native_managed_allocations_obey_the_context_heap_limit() {
+    let mut output = Vec::new();
+    let mut context = RuntimeContext::new(&mut output, VmCapabilities::default());
+    context.limits.max_heap_objects = Some(0);
+
+    let builder = NativeImport::named("str::builder").unwrap();
+    assert!(matches!(
+        builder.call(&mut context, &[]),
+        Err(RuntimeError::ResourceLimit {
+            resource: "VM heap objects"
+        })
+    ));
+    context.finish().unwrap();
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn failed_buffered_close_invalidates_the_handle_and_is_catchable() {
@@ -1391,7 +1487,7 @@ fn process_spawn_errors_preserve_os_causes() {
     let missing = file.0.with_extension("missing");
     let mut output = Vec::new();
     let mut context = RuntimeContext::new(&mut output, VmCapabilities::default());
-    let run = NativeImport::named("process::run").unwrap();
+    let run = NativeImport::named("process::run_sync").unwrap();
     let arguments = Value::Array(cog::heap::HeapRef::new(
         cog::value::ArrayValue::typed(vec![], cog::value::RuntimeType::Str).unwrap(),
     ));
@@ -1404,7 +1500,7 @@ fn process_spawn_errors_preserve_os_causes() {
         );
         match result {
             Err(RuntimeError::IoFailure {
-                op: "process::run",
+                op: "process::run_sync",
                 message,
             }) => {
                 assert_eq!(message, expected.to_string());

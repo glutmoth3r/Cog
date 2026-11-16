@@ -8,7 +8,7 @@ state are terminal outcomes.
 ## Error values and inspection
 
 ```cog
-include std;
+@!include("std")
 use io;
 use err::Error;
 
@@ -27,6 +27,14 @@ An `int` annotation describes the normal result; it does not turn every runtime
 failure into a compile error or excuse a normal type mismatch. Error patterns use
 the standard `err::Error` enum. Import it explicitly. Whole-type checks, specific
 variants, payloads, guards, and ordinary match arms work inside or outside catch.
+`Error::Cancelled` is returned when an async task accepts a cancellation request;
+it follows the same inspection, catch, and propagation rules as other recoverable
+errors. `Error::Timeout` is returned by `time::timeout` when its deadline
+expires; it does not cancel the source task. A structured parent still joins that
+source task and reports its later Error unless the source is observed separately.
+`task::select` and `task::select2` report the winning task index without observing its
+outcome; awaiting the selected handle is still required to observe its value or Error.
+Other spawned tasks remain joined by their parent, including when they later fail.
 
 Outside an observing boundary, Error can be stored, returned, or discarded. Strict
 binary operations evaluate both operands left to right once and preserve the first
@@ -45,13 +53,15 @@ when a value is otherwise stored, returned, or discarded without observation.
 
 A normal aggregate may contain an Error component: `[1 / 0, 7]` outside try is a
 normal array. Reading/using the first component observes Error; the whole array
-does not become recursively poisoned. Mutation is not a universal storage path
-for poisoned values: current indexed writes propagate Error without writing it.
+does not become recursively poisoned. Writing an Error into an array element,
+tuple position, record field, or collection stores it at that leaf. An Error in the
+assignment receiver or index still propagates without mutation. JSON serialization
+has no Error representation and returns an encountered Error unchanged.
 
 ## Lexical try/catch
 
 ```cog
-include std;
+@!include("std")
 use io;
 use err::Error;
 
@@ -75,12 +85,13 @@ boundary, runs cleanup for exited scopes, and enters catch with the original Err
 Earlier side effects are not rolled back. Reading an existing Error binding inside
 try also observes it; arguments can fail before the callee is entered.
 
-Handlers are lexical. A callee does not inherit its caller's handler: an Error
-discarded inside a callee outside its own try is not a caller exception. An Error
-returned from the callee is observed at the caller's call site. Explicit inspection
-with `when`, `match`, `err::kind()`, or `.error_kind()` receives the value before the
-surrounding handler; inspection
-does not clear an Error stored in a binding.
+Handlers are lexical. A callee does not inherit its caller's handler for its own
+operations. An unmarked Error returned from the callee remains a value and is
+observed at the caller's call site. A marked Error from `!!` reaches the caller's
+call site as propagation control: a lexical handler covering that call catches it;
+without one, the caller relays it through cleanup. Explicit inspection with
+`when`, `match`, `err::kind()`, or `.error_kind()` receives an Error value before
+the surrounding handler; inspection does not clear an Error stored in a binding.
 
 Catch is not protected by its own try. Errors in catch or a selected fallback can
 reach an outer handler. An Error in a pattern guard is not a pattern mismatch.
@@ -90,18 +101,28 @@ a local catch before returning.
 ## Explicit propagation with !!
 
 ```cog
-include std;
+@!include("std")
 use io;
 
 fn risky() -> int { 1 / 0 }
 
-fn work() -> int {
-    defer { io::println("Leaving work"); }
+fn parse() -> int {
+    defer { io::println("Leaving parse"); }
     try {
         risky()!!
     } catch(error) {
         crash("This local catch is bypassed by !!");
     }
+}
+
+fn middle() -> int {
+    defer { io::println("Leaving middle"); }
+    parse()
+}
+
+fn work() -> int {
+    defer { io::println("Leaving work"); }
+    middle()
 }
 
 fn main() -> nil {
@@ -113,9 +134,13 @@ fn main() -> nil {
 
 Postfix `!!` evaluates its operand once. A normal value, including nil, passes
 unchanged. Error exits the current function through LIFO cleanup, bypassing all
-of that function's local catches. The caller may handle the returned Error.
-`!!` requires an enclosing function and is invalid at a global initializer root.
-An explicit nested try inside the operand remains its own boundary.
+of that function's local catches. Synchronous callers relay the marked Error
+through their own cleanup until a caller's lexical `try` handles it or it reaches
+the VM/host. An async task is a propagation boundary: its Error becomes the result
+observed by `await`. `!!` requires an enclosing function and is invalid at a
+global initializer root. An explicit nested try inside the operand remains its
+own boundary. `!!` checks the expression result, not Error values stored inside
+aggregate leaves.
 
 `!!` preserves the normal type: `int?` remains `int?`. It is neither nil unwrapping
 nor a panic. In main, the same cleanup/propagation path returns Error to the VM/host,
@@ -125,7 +150,7 @@ Prefix `!!x` remains ordinary boolean double-negation, `!(!x)`.
 ## Lazy fallbacks
 
 ```cog
-include std;
+@!include("std")
 use io;
 
 fn choose(value: int?) -> int { value ?? 10 }
@@ -142,7 +167,7 @@ fn main() -> nil {
 | --- | --- | --- |
 | `value ?? fallback` | Left is normal nil | Normal non-nil and Error pass through |
 | `value ?! fallback` | Left is Error | All normal values, including nil, pass through |
-| `value!!` | No fallback | Error leaves the function; normal values pass through |
+| `value!!` | No fallback | Error propagates through synchronous callers; normal values pass through |
 
 The left operand evaluates once; the right evaluates only when selected, at most
 once per expression evaluation. Both fallbacks are right-associative with equal
@@ -155,8 +180,10 @@ right operand uses the surrounding lexical context, so its Error can enter catch
 checked for semantic errors.
 
 For `T? ?? T`, the normal result is T. `T? ?! T` still permits nil. This changes
-the expression result, not the original binding's declared type. General union
-inference and path-sensitive nullable refinement remain pending.
+the expression result, not the original binding's declared type. Control-flow
+checks can refine nullable values on paths that prove nil is absent; reassignment
+and calls that may mutate the binding invalidate those facts. General union
+inference remains pending.
 
 ## Defer and cleanup failures
 

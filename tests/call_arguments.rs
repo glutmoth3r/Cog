@@ -2,7 +2,7 @@ use cog::{bytecode, interpreter, project};
 
 fn compile(body: &str) -> cog::backend::CompiledProgram {
     let source = format!(
-        r#"include std; use io; use err::Error;
+        r#"@!include("std") use io; use err::Error;
         fn require(ok: bool) -> nil {{ if !ok {{ crash("assertion failed"); }} }}
         {body}"#
     );

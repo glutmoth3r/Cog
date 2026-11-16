@@ -8,6 +8,8 @@ use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
+type InputDirectory = Dir;
+
 const MAX_INPUT_BYTES: usize = 1_000_000;
 const MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_RECORD_BYTES: usize = 1024 * 1024;
@@ -30,7 +32,7 @@ struct Reads {
 pub struct BuildInputs {
     base: PathBuf,
     sources: BTreeMap<String, PathBuf>,
-    directories: BTreeMap<PathBuf, Rc<Dir>>,
+    directories: BTreeMap<PathBuf, Rc<InputDirectory>>,
     reads: Rc<RefCell<Reads>>,
 }
 
@@ -42,8 +44,8 @@ impl BuildInputs {
         let base = base
             .canonicalize()
             .map_err(|e| format!("cannot resolve build input base: {e}"))?;
-        let directory = Dir::open_ambient_dir(&base, cap_std::ambient_authority())
-            .map_err(|e| format!("cannot open build input base: {e}"))?;
+        let directory =
+            open_directory(&base).map_err(|e| format!("cannot open build input base: {e}"))?;
         Ok(Self {
             directories: BTreeMap::from([(base.clone(), Rc::new(directory))]),
             base,
@@ -64,7 +66,7 @@ impl BuildInputs {
             .canonicalize()
             .map_err(|e| format!("cannot resolve package input base: {e}"))?;
         if !self.directories.contains_key(&base) {
-            let directory = Dir::open_ambient_dir(&base, cap_std::ambient_authority())
+            let directory = open_directory(&base)
                 .map_err(|e| format!("cannot open package input base: {e}"))?;
             self.directories.insert(base.clone(), Rc::new(directory));
         }
@@ -125,8 +127,6 @@ impl BuildInputs {
             .directories
             .get(base)
             .ok_or("unregistered build input base")?;
-        // Both metadata and open use the pinned capability. A symlink swap cannot
-        // grant ambient filesystem authority between checking and opening.
         let result: io::Result<Vec<u8>> = (|| {
             if !directory.metadata(&normalized)?.is_file() {
                 return Err(io::Error::new(
@@ -135,6 +135,12 @@ impl BuildInputs {
                 ));
             }
             let file = directory.open(&normalized)?;
+            if !file.metadata()?.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "build input must be a regular file",
+                ));
+            }
             let mut bytes = Vec::new();
             file.take(MAX_INPUT_BYTES as u64 + 1)
                 .read_to_end(&mut bytes)?;
@@ -266,4 +272,8 @@ impl BuildInputs {
         }
         true
     }
+}
+
+fn open_directory(path: &Path) -> io::Result<InputDirectory> {
+    Dir::open_ambient_dir(path, cap_std::ambient_authority())
 }

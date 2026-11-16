@@ -2,7 +2,7 @@
 
 ## Declared build inputs
 
-`include std; use build;` exposes comptime-only `build::include_str(path)` and
+`@!include("std") use build;` exposes comptime-only `build::include_str(path)` and
 `build::include_bytes(path)`. The `try_include_str` and `try_include_bytes` variants
 return nil only when the file is absent. Read/UTF-8 failures are catchable Error
 values; unhandled Errors at mandatory comptime roots stop compilation.
@@ -15,7 +15,7 @@ remain usable after their source files are removed. See the
 [build-input contracts](SEMANTIC_CONTRACTS.md#implemented-declared-build-inputs).
 
 The project entry point must include the standard package with
-`include std;` before any source imports standard-library modules. Then
+`@!include("std")` before any source imports standard-library modules. Then
 import modules explicitly: `use io;`, `use str;`, or `use math::PI;`.
 The `clone`, `eq`, and `ord` modules define traits for generic code.
 Selective and wildcard imports work for public members. The ordinary prelude
@@ -24,7 +24,8 @@ contains `len(value)` and `exclusive(value)`. Imports do not grant host permissi
 not an ownership or mutation-capability guarantee.
 All functions can fail computationally; see [errors](ERRORS.md).
 Runtime byte and resource quotas are optional embedder settings on `RuntimeLimits`;
-`max_buffer_bytes` and `max_resources` default to `None`. Their documented limits
+`max_buffer_bytes`, `max_resources`, and `max_numeric_digits` default to `None`.
+Their documented limits
 apply when an embedder explicitly sets `Some(n)`. This does not cap total process
 memory or make OS allocation failures recoverable.
 
@@ -47,7 +48,7 @@ take positional arguments only. Source functions support named/default arguments
 | `str::replace(text, pattern, replacement)` | Replace all exact non-overlapping matches |
 | `str::split(text, separator)` | New array of strings; separator must be nonempty |
 | `str::join(parts, separator = "")` | Join an array of strings; empty array produces `""` |
-| `str::to_int(value)` / `str::to_float(value)` | Numeric conversion, also available through `as` and receiver methods |
+| `str::to_int(value)` / `str::to_uint(value)` / `str::to_bigint(value)` / `str::to_float(value)` | Checked numeric conversion, also available through `as` and receiver methods |
 | `str::to_bool(value)` / `str::to_str(value)` | Boolean / string conversion |
 | `str::compare(left, right)` | Lexicographic comparison; negative, zero, or positive int |
 | `str::builder()` | A new shared mutable string builder |
@@ -55,7 +56,7 @@ take positional arguments only. Source functions support named/default arguments
 | `str::build(builder)` | Immutable string snapshot of a builder |
 
 ```cog
-include std;
+@!include("std")
 use io;
 use str;
 use fmt;
@@ -79,9 +80,12 @@ separate from language interpolation. Failure preserves the builder's existing
 prefix through all aliases, including self-formatting. Buffer limits count UTF-8
 bytes; rendering has a traversal-depth limit of 64.
 
-Conversions propagate Error. `bytes::render` and library printing deliberately
-render errors for diagnostics. Float-to-int checks finite/i64 bounds; int-to-float
-can lose precision. Numeric string parsing uses the current Rust numeric parser;
+`str::to_bigint` accepts `int`, `uint`, `bigint`, or a signed decimal integer
+string. It observes `max_numeric_digits`; BigInt-to-int/uint conversions check
+the destination range. Conversions propagate Error. `bytes::render` and library printing deliberately
+render errors for diagnostics. Float-to-int and float-to-uint check finite and
+range bounds; integer conversions between `int` and `uint` are checked. Integer-
+to-float can lose precision. Numeric string parsing uses the current Rust parser;
 it is distinct from Cog's source literal grammar. Nonfinite float strings can be
 parsed, but converting their result to int produces Overflow.
 
@@ -106,7 +110,7 @@ replace, and split use a simple scan, with worst-case time proportional to text 
 times pattern size.
 
 ```cog
-include std;
+@!include("std")
 use io;
 use str;
 
@@ -156,10 +160,10 @@ through a read-only path. The existing conservative alias analysis applies.
 `.empty_like()` returns a fresh empty array with the receiver's recursive element
 type; it is used by the array utilities to preserve type information for empty results.
 `position` instead requires a statically known element type that implements `Eq[T]`;
-the built-in implementations cover int, float, bool, nil, and str. Programs can add
-`Eq[T]` implementations for their own types. `min` and `max` propagate errors found
-while reading the array and return the original selected element, preserving aliases
-for shared values. Structural `.clone()` creates an
+the built-in implementations cover int, uint, bigint, float, bool, char, nil, and str. Programs
+can add `Eq[T]` implementations for their own types. `min` and `max` propagate
+errors found while reading the array and return the original selected element,
+preserving aliases for shared values. Structural `.clone()` creates an
 independent array container and recursively copies nested arrays and tuples when all
 elements are supported primitive or nested container values. It does not share the
 mutability of the source container or its nested containers, while repeated nested
@@ -167,7 +171,7 @@ references within the source remain shared within the copy. Clone recursion is l
 to 64 nested arrays/tuples; deeper values return ResourceLimit.
 
 ```cog
-include std;
+@!include("std")
 use io;
 use array;
 
@@ -183,11 +187,16 @@ fn main() -> nil {
 ## Collections
 
 `collections` exposes one insertion-ordered hash table, `Map[K, V]`. Its
-constructor is `map_new[K, V]()`. `Map` supports `int`, `str`, and `bool` keys;
-custom key types implement `collections::Hashable`:
+empty constructor is `Map::new[K, V]()`. `Map::from(entries)` builds one from an
+array of `(key, value)` tuples and infers both types from that array. Duplicate keys
+follow `set` semantics: the last value wins and the first insertion position stays.
+An expected result type can also infer the arguments to `new`:
+`const scores: collections::Map[str, int] = collections::Map::new();`. `Map`
+supports `int`, `uint`, `bigint`, `str`, `bool`, and `char` keys. Custom key types implement
+`collections::Hashable`:
 
 ```cog
-include std;
+@!include("std")
 use collections;
 
 struct UserId { value: int }
@@ -200,7 +209,7 @@ extend UserId with collections::Hashable {
 }
 
 fn main() {
-    var users = collections::map_new[UserId, str]();
+    var users = collections::Map::new[UserId, str]();
     users.set(UserId(value: 7), "Ada");
 }
 ```
@@ -222,8 +231,8 @@ stable across processes and must not be persisted.
 | `.entries()`, `.keys()`, `.values()` | Insertion-ordered snapshots |
 
 For a nilable value type, `contains` reports presence independently of the value:
-declare a comptime alias such as `comptime MaybeInt: type = int?;`, then use
-`map_new[str, MaybeInt]()` and store `nil` under a key. `get` returns nil for that
+declare a comptime alias such as `@comptime const MaybeInt: type = int?;`, then use
+`Map::new[str, MaybeInt]()` and store `nil` under a key. `get` returns nil for that
 present key and `Error::MissingKey` for an absent key.
 
 `set`, `remove`, and `clear` declare `mut self`, so they require a mutable
@@ -241,12 +250,12 @@ value, and preserves insertion order. Snapshot arrays have independent outer
 storage; values otherwise follow normal Cog aliasing rules.
 
 ```cog
-include std;
+@!include("std")
 use collections;
 use io;
 
 fn main() -> nil {
-    var scores = collections::map_new[str, int]();
+    var scores = collections::Map::new[str, int]();
     scores.set("Ada", 10);
     scores.set("Lin", 8);
     scores.set("Ada", 12);
@@ -258,20 +267,24 @@ fn main() -> nil {
 
 The native `json` module provides `json::parse(text)` and
 `json::stringify(value)`. Parsing maps JSON `null` to `nil`, booleans and strings
-to their Cog counterparts, signed 64-bit integer tokens to `int`, and finite
-fractional/exponent tokens to `float`. Integer tokens outside the `int` range
-produce `Error::Overflow` instead of silently losing precision. The JSON token
+to their Cog counterparts, signed 64-bit integer tokens to `int`, positive integer
+tokens through `u64::MAX` to `uint`, and finite fractional/exponent tokens to
+`float`. Integer tokens outside the `int` and `uint` ranges parse as exact
+`bigint` values, subject to `max_numeric_digits`. The JSON token
 `-0` is kept as floating negative zero to preserve its sign. JSON arrays
 become mutable heterogeneous Cog arrays; objects become records with string
 field names. Duplicate object names are rejected as `Error::ParseFailure`. Decimal
-numbers are represented by IEEE 754 `float` values; integers outside `int` range
-are rejected rather than rounded into floats.
+numbers are represented by IEEE 754 `float` values. BigInt serialization uses
+exact decimal digits and observes `max_numeric_digits`.
 
-Stringification supports `nil`, bool, int, finite float, string, arrays, and
-records. Record fields are emitted in lexicographic key order, so equal records
-produce deterministic text. Strings use JSON escaping and preserve Unicode.
-Top-level Cog `Error` values propagate when passed directly; unsupported values
-(including nested Errors, bytes, handles, functions, variants, and iterators) produce
+Stringification supports `nil`, bool, int, uint, bigint, finite float, char, string, arrays,
+and records. A `char` serializes as a one-scalar JSON string; parsing it back
+produces `str`, since JSON has no character type. Record fields are emitted in
+lexicographic key order, so equal records produce deterministic text. Strings
+use JSON escaping and preserve Unicode.
+Top-level Cog `Error` values and Error leaves encountered inside arrays or records
+propagate unchanged; no partial JSON string is returned. Unsupported values
+(including bytes, handles, functions, variants, and iterators) produce
 `Error::TypeMismatch`. A non-finite float, cyclic array/record graph, or conflicting
 host borrow produces a catchable `Error` instead of panicking.
 
@@ -283,10 +296,14 @@ Both directions use the runtime `max_buffer_bytes` limit. Decoding also charges 
 conservative allocation budget for the created Cog value graph and limits nested
 values to 64 levels. Encoding is streamed through a bounded writer and uses the
 same depth limit. These limits bound this API's input/output and temporary JSON
-work; they are not a process-wide memory quota.
+work; they are not a process-wide memory quota. When `max_heap_objects` is set,
+decoding reserves one managed-object slot for each pending array or record before
+visiting its children. Reaching the quota produces a catchable
+`Error::ResourceLimit` with the `"VM heap objects"` resource payload; the parser
+may collect unreachable cycles once when the quota is reached.
 
 ```cog
-include std;
+@!include("std")
 use io;
 use json;
 
@@ -305,7 +322,7 @@ fn main() -> nil {
 | `math` constants | `PI`, `E`, `TAU`, `SQRT_2`, `SQRT_3`, `LN_2`, `LN_10`, `LOG2_E`, `LOG10_E`, `DEG_TO_RAD`, `RAD_TO_DEG` |
 | `sort` | `quick`, `stable`, `sorted`, `is_sorted`; `insertion`, `selection`, and `bubble` remain educational algorithms |
 | `search` | `binary`, `lower_bound`, `upper_bound`; inferred comptime type `T` must implement `Ord` |
-| `random` | `next()`, `range(lo, hi)`, `boolean()` |
+| `random` | `next()`, `range(lo, hi)`, `range_uint(lo, hi)`, `boolean()` |
 | `entropy` | `bytes(count)`, bytes from OS entropy |
 
 All sorting functions require elements implementing `Ord { compare(self, other: Self) -> int }`.
@@ -318,8 +335,8 @@ an insertion-sort cutoff, smaller-side recursion, and a heapsort fallback to bou
 worst-case time and stack depth. `sorted(items)` returns an independently cloned,
 sorted array and therefore requires both `Ord` and `Clone`; it leaves the input
 unchanged. `is_sorted(items)` checks ascending order without mutation.
-`quick` and `stable` use Rust's native sort for int, float, bool, and str arrays;
-other `Ord` implementations use the Cog algorithms.
+`quick` and `stable` use Rust's native sort for int, uint, bigint, float, bool, char, and str
+arrays; other `Ord` implementations use the Cog algorithms.
 
 `Ord.compare` uses a negative int for less-than, zero for equality, and a positive
 int for greater-than. It may return an Error; sorting, searching, `min`, and `max`
@@ -337,29 +354,30 @@ equal the array length when no element meets the condition. Empty arrays return
 `-1` from `binary` and `0` from both bound functions. These functions do not mutate
 the input.
 
-`Ord` is implemented for int, float, bool, and str. String comparison is lexicographic
-by UTF-8 bytes; valid UTF-8 preserves Unicode scalar ordering. User types can
-implement `Ord` to use sorting and selection functions. See the [language
+`Ord` is implemented for int, uint, bigint, float, bool, char, and str. String comparison is
+lexicographic by UTF-8 bytes; valid UTF-8 preserves Unicode scalar ordering. `char`
+comparison uses Unicode scalar values. User types can implement `Ord` to use
+sorting and selection functions. See the [language
 reference](LANGUAGE.md) for compile-time type parameters and trait syntax.
 `clone::Clone`, `eq::Eq[T]`, and `ord::Ord` are traits written in Cog; their
 implementations are checked statically.
 
-Math accepts int/float arguments; other normal values produce TypeMismatch. Existing
+Math accepts int/uint/bigint/float arguments; other normal values produce TypeMismatch. Existing
 Error values propagate unchanged. Primitive sorting uses Rust's standard slice
 sorts; custom `Ord` implementations use the Cog fallback algorithms.
 
 | Call | Result and limits |
 | --- | --- |
-| `math::abs(x)`, `math::min(a, b)`, `math::max(a, b)` | Numeric result; min/max retain the selected argument's type |
-| `math::floor(x)`, `math::ceil(x)` | int rounded toward negative/positive infinity |
-| `math::round(x)` | Nearest int; ties go toward positive infinity, so round(-1.5) is -1 |
-| `math::pow(base, exponent)` | Checked integer or floating power; exponent must be a nonnegative int |
+| `math::abs(x)`, `math::min(a, b)`, `math::max(a, b)` | int, uint, bigint, or float; min/max retain the selected argument's type |
+| `math::floor(x)`, `math::ceil(x)` | Integer inputs retain int/uint/bigint; floats produce int rounded toward negative/positive infinity |
+| `math::round(x)` | int/uint/bigint inputs are unchanged; floats round to int, with ties toward positive infinity |
+| `math::pow(base, exponent)` | Checked int, uint, bigint, or floating power; exponent must be a nonnegative int |
 | `math::sqrt(x)` | float square root; negative arguments produce InvalidArgument |
 | `math::ln(x)`, `math::log2(x)`, `math::log10(x)` | float logarithm; zero/negative arguments produce InvalidArgument |
 
 Integer arithmetic overflow and nonfinite/out-of-range integer rounding produce
-Overflow. Integer rounding preserves int inputs without converting them to float.
-`pow` uses exponentiation by squaring; a negative exponent produces InvalidArgument,
+Overflow. Integer rounding preserves int, uint, and bigint inputs without converting them to
+float. BigInt arithmetic and `pow` observe `max_numeric_digits`. `pow` uses exponentiation by squaring; a negative exponent produces InvalidArgument,
 and a non-int exponent produces TypeMismatch. Its result has the base's numeric type,
 including exponent zero; `pow(0, 0)` is 1. Square root and logarithms preserve NaN and
 positive infinity. Their finite calculations cover very small and very large inputs,
@@ -369,11 +387,12 @@ rounding. `abs` normalizes floating negative zero to positive zero.
 
 Random uses a 31-bit pseudorandom generator seeded once from OS entropy. `next()`
 returns an int in `[0, 2147483648)`; `boolean()` returns bool. `range(lo, hi)` takes
-int bounds and samples `[lo, hi)`, rejecting the incomplete remainder interval to
-avoid modulo bias. The range must be nonempty and its width at most `2147483648`;
-otherwise it produces InvalidArgument. A width that overflows int produces Overflow.
-Bounds are checked before requesting entropy. Entropy failures remain recoverable
-Error. This generator is not cryptographic. Seed/partition/recursive helpers are private.
+int bounds and samples `[lo, hi)`. `range_uint(lo, hi)` accepts uint bounds and
+returns uint. Both ranges reject empty intervals and widths above `2147483648`;
+`range` also returns Overflow if its signed width calculation overflows. Rejection
+sampling discards the incomplete remainder interval to avoid modulo bias. Bounds
+are checked before requesting entropy. Entropy failures remain recoverable Error.
+This generator is not cryptographic. Seed/partition/recursive helpers are private.
 
 ## Byte buffers
 
@@ -432,7 +451,7 @@ byte buffer; both that copy and the resulting buffer use the existing byte limit
 Encoding allocates output text using the same limit.
 
 ```cog
-include std;
+@!include("std")
 use io;
 use bytes;
 use hex;
@@ -464,6 +483,36 @@ permissions are checked before I/O. `read_into` mutates its second argument; imm
 handle tokens can be used without making their bindings var. Closing a handle
 invalidates all aliases, even if flushing fails. Stale/double-close/foreign-context
 handles produce InvalidResource; closed standard streams are not reopened.
+TCP stream handles also work with the generic synchronous read/write calls. Those
+calls can block the async executor; import `async::net` and use `net::read` and
+`net::write_all` in async code.
+
+File handles can be opened with `io::open` or `async::io::open`. Import `async::io`
+as `use async::io as aio;` to call `aio::open`, `aio::read`, `aio::write_all`,
+`aio::write`, `aio::read_exact`, `aio::read_all`, `aio::flush`, and `aio::seek`.
+Async tasks share each managed file handle with
+synchronous I/O and serialize operations on that file. Reads and writes
+obey the existing filesystem capabilities, handle mode, and runtime byte limit.
+`aio::read` accepts zero and returns an empty buffer; `aio::write` accepts an empty
+buffer and returns zero without I/O. `aio::write_all` snapshots and
+flushes its bytes before completing; `aio::write` makes one write and flushes the
+accepted bytes, returning the accepted count as `uint`; cancellation can be reported
+after a write side effect. `aio::read_all` reads from the current position through
+EOF and fails if the remaining content exceeds `max_buffer_bytes`;
+`aio::read_exact` returns exactly the requested byte count or `Error::IoFailure` on
+early EOF. `aio::seek` flushes buffered output first.
+`aio::open` creates a file handle on the worker pool using the same modes and buffer
+size rules as `io::open`. It checks capabilities and reserves a handle slot before
+opening, so concurrent opens obey `max_resources`. A host open cannot be interrupted;
+cancellation may leave a created or truncated file, but does not publish its handle.
+`aio::read`, `aio::read_exact`, and `aio::read_all` also accept `io::stdin()`;
+`aio::write`, `aio::write_all`, and `aio::flush` accept `io::stdout()`. Sync and
+async calls share the same buffered input and output writer, so input is not split
+between separate buffers. Standard-stream operations use `allow_read` and
+`allow_print`; managed files use the filesystem capabilities and handle modes.
+Blocking stdin reads cannot be interrupted while the host reader is waiting for
+input. Cancelling such a task takes effect after the read returns, and runtime
+shutdown waits for an in-flight blocking read to finish.
 
 Zero buffer size disables file output buffering. A positive size enables buffering
 for output, not read-ahead. Read/seek on a read-write file first flushes pending
@@ -482,25 +531,66 @@ documented project/dependency bases.
 
 ## Filesystem operations
 
+Asynchronous file operations live under `async::fs`. Import that namespace with
+`use async::fs;` to call them as `fs::read_text(path)`.
+
 | Call | Result / behavior |
 | --- | --- |
 | `fs::metadata(path)` | Record with `is_file`, `is_dir`, `is_readonly`, and OS-reported `len` fields |
+| `fs::metadata(path)` | Cold `Task[record]`; reads metadata on the async I/O worker pool |
 | `fs::read_dir(path)` | Array of immediate entry names, sorted lexically as UTF-8 strings |
+| `fs::read_dir(path)` | Cold `Task[str[]]`; returns sorted UTF-8 entry names |
+| `fs::read_bytes(path)` | Cold `Task[bytes]`; reads the file on the async I/O worker pool |
+| `fs::write_bytes(path, bytes)` | Cold `Task[nil]`; creates or truncates a file and writes the bytes |
+| `fs::read_text(path)` | Cold `Task[str]`; reads UTF-8 text on the async I/O worker pool |
+| `fs::write_text(path, text)` | Cold `Task[nil]`; creates or truncates a file and writes UTF-8 text |
+| `fs::read_lines(path)` | Cold `Task[str[]]`; reads UTF-8 lines, omitting line terminators |
+| `fs::append_bytes(path, bytes)` | Cold `Task[nil]`; creates a file if needed and appends bytes |
+| `fs::append_text(path, text)` | Cold `Task[nil]`; creates a file if needed and appends UTF-8 text |
+| `fs::copy(source, destination)` | Cold `Task[uint]`; copies a file and returns its byte count |
+| `fs::rename(source, destination)` | Cold `Task[nil]`; renames a file or directory |
 | `fs::create_dir(path)` / `fs::create_dir_all(path)` | Create a directory, or the directory tree |
-| `fs::remove_file(path)` | Remove one file entry using host OS semantics |
-| `fs::remove_dir(path)` | Remove an empty directory |
+| `fs::create_dir(path)` / `fs::create_dir_all(path)` | Cold `Task[nil]`; create a directory or directory tree on the worker pool |
+| `fs::remove_file(path)` / `fs::remove_dir(path)` | Remove one file, or an empty directory |
+| `fs::remove_file(path)` / `fs::remove_dir(path)` | Cold `Task[nil]`; remove a file or empty directory on the worker pool |
+| `aio::open(path, mode, buffer_size)` | Cold `Task[handle]`; opens a managed file on the worker pool using `io::open` modes |
+| `aio::read(handle, max_bytes)` | Cold `Task[bytes]`; reads an existing file handle, bounded by `max_buffer_bytes` |
+| `aio::read_exact(handle, size)` | Cold `Task[bytes]`; reads exactly `size` bytes or returns `Error::IoFailure` on early EOF |
+| `aio::read_all(handle)` | Cold `Task[bytes]`; reads from the current position through EOF, bounded by `max_buffer_bytes` |
+| `aio::write(handle, bytes)` | Cold `Task[uint]`; makes one write, flushes accepted bytes, and returns the accepted count |
+| `aio::write_all(handle, bytes)` | Cold `Task[nil]`; writes a byte snapshot and flushes before completion |
+| `aio::flush(handle)` | Cold `Task[nil]`; flushes an existing file handle |
+| `aio::seek(handle, offset, origin)` | Cold `Task[int]`; seeks an existing file handle using `"start"`, `"current"`, or `"end"` |
 
 Paths are interpreted from the process working directory. Metadata follows
 symbolic links; `is_readonly` reports the OS readonly attribute and is not a
-portable access check. Directory listing fails with `ParseFailure` if an entry
+portable access check. Async filesystem calls run on the bounded worker pool and
+check `allow_fs_read` or `allow_fs_write` when the task starts. File reads and writes
+obey the runtime buffer limit; async writes snapshot their bytes when the task
+starts, then create or truncate the target file. Append operations snapshot their
+input when the task starts and write at the end of the target without truncating it.
+Concurrent appends have no ordering or atomic-record guarantee; await them in sequence
+when order matters. A host write error can leave a partial append.
+Task cancellation is checked between 8 KiB read/write chunks and directory entries.
+A cancelled write or append can leave a partial file. An individual blocked filesystem
+call and `async::fs::copy` cannot be interrupted; they check cancellation before and after
+the host call, so a mutation may already have completed when `Error::Cancelled` is
+observed.
+`async::fs::read_lines` uses UTF-8 `str::lines` semantics: `\n` and `\r\n` terminators
+are removed, interior empty lines are kept, and a final terminator does not add an
+extra empty line. It returns `ParseFailure` for invalid UTF-8. Copy and rename operate on host
+paths without materializing file contents as Cog byte values, so the VM buffer
+limit does not apply to them. `async::fs::read_text` returns
+`ParseFailure` for invalid UTF-8. Directory listing fails with
+`ParseFailure` if an entry
 name cannot be represented as UTF-8, and does not return a partial result after an
 OS or resource error. Entries are sorted by UTF-8 byte order for deterministic
-results. The runtime buffer limit accounts for encoded entry-name bytes plus a
-fixed allowance per Cog value/string reference; it does not bound all allocator or
-process overhead. Filesystem failures produce `IoFailure` with the operation name and OS
-message. `allow_fs_read` gates metadata/listing, and `allow_fs_write` gates
-directory creation and removal. The CLI's ordinary runtime policy grants both;
-the restricted policy denies both.
+results. The runtime buffer limit accounts for encoded entry-name or line bytes plus
+a fixed allowance per Cog value/string reference; it does not bound all allocator or
+process overhead. Filesystem failures produce `IoFailure` with the operation name and
+OS message. `allow_fs_read` gates metadata/listing and file reads, and
+`allow_fs_write` gates file writes, directory creation, and removal. The CLI's
+ordinary runtime policy grants both; the restricted policy denies both.
 
 ## Paths
 
@@ -522,22 +612,51 @@ limit. File opening still uses the process working directory and OS permissions.
 `with_extension` returns `InvalidArgument` when the extension contains a path
 separator according to the host OS.
 
-## Time and processes
+## Async task selection
 
 | Call | Successful result / behavior |
 | --- | --- |
-| `time::sleep(seconds)` | nil; int/float duration with subsecond precision |
+| `task::select(tasks)` | Cold `Task[int]`; returns the index of the first completed task in a nonempty array of spawned siblings |
+| `task::select2(first, second)` | Cold `Task[int]`; two-task form of `task::select` |
+
+Every input must already be a spawned child of the same async scope. Await the
+selected handle to observe its result or Error; the structured parent still joins
+all remaining tasks. Cancelling the selector removes its waiters without cancelling
+the inputs.
+
+## Time and processes
+
+Asynchronous timers live under `async::time`; `use async::time;` gives the short
+local calls `time::sleep` and `time::timeout`. `process::run` returns cold tasks by
+default; use `process::run_sync` for blocking capture. Alongside the stdin and timeout
+forms below, `run` accepts a timeout and per-run output limit, or stdin, an optional
+timeout, and an output limit. Pass `nil` when setting a limit without a timeout.
+
+| Call | Successful result / behavior |
+| --- | --- |
+| `time::sleep(seconds)` | nil; int/uint/float duration with subsecond precision |
+| `time::sleep(seconds)` | Cold `Task[nil]`; timer completion does not block the executor |
+| `time::timeout(task, seconds)` | Cold `Task[T]`; returns the source result or `Error::Timeout`, without cancelling the source |
 | `time::now()` | Unix epoch seconds as int |
 | `time::now_nanos()` | Unix epoch nanoseconds as int |
 | `time::now_millis()` | Unix epoch milliseconds as int |
 | `time::monotonic_nanos()` | Monotonic nanoseconds with an unspecified origin; compare differences only |
 | `process::args()` | `str[]` containing program arguments, excluding the Cog executable |
 | `process::env(name)` | Environment value as str, or nil when the name is absent |
-| `process::run(program, arguments)` | Captured process result; argument array of strings, no shell expansion |
+| `process::run_sync(program, arguments)` | Captured process result; argument array of strings, no shell expansion |
+| `process::run(program, arguments)` | Cold `Task[record]`; capture runs on the async I/O worker pool; cancellation kills the Unix process group and reaps the direct child (direct child only on other platforms) |
+| `process::run(program, arguments, timeout_ms)` | Cold `Task[record]`; an int or uint third argument sets the process deadline |
+| `process::run(program, arguments, stdin)` | Cold `Task[record]`; a bytes third argument is written to child stdin while both output streams are captured |
+| `process::run(program, arguments, stdin, timeout_ms)` | Cold `Task[record]`; writes stdin and applies a process-specific deadline, or no deadline when `nil` |
+| `process::run(program, arguments, timeout_ms, max_output_bytes)` | Cold `Task[record]`; applies a deadline and a total stdout-plus-stderr capture limit |
+| `process::run(program, arguments, stdin, timeout_ms, max_output_bytes)` | Cold `Task[record]`; writes stdin, optionally applies a deadline, and limits total captured output |
 | `process::shell(command)` | Explicit `/bin/sh -c` on Unix; unsupported on other targets |
 
 Wall-clock results are not monotonic; use `monotonic_nanos` for elapsed-time
-measurements. Negative sleep yields NegativeSleep; nonfinite or unrepresentable
+measurements. `async::time::sleep` and `async::time::timeout` validate durations like `sleep`;
+an expired timeout produces `Error::Timeout` while its source task continues. If it is
+a structured child, its parent still joins it and reports a later unobserved failure.
+Negative sleep yields NegativeSleep; nonfinite or unrepresentable
 durations and pre-epoch clocks fail, and i64 overflow is reported. On Windows,
 durations that round to the OS `INFINITE` wait sentinel are rejected instead of
 blocking forever. OS scheduling does not guarantee precise wakeups.
@@ -558,21 +677,120 @@ Output exceeding the configured cap produces `Error::ResourceLimit`. Shell
 script text is not included in host-generated launch errors. Decode output
 explicitly with `bytes::to_str`.
 
-Run is synchronous, with null stdin and inherited cwd/environment. The argument
+`process::run_sync` is synchronous, with null stdin and inherited cwd/environment. The argument
 array is validated before spawn. Output streams are captured concurrently, with
 a separate buffer limit for each. On capture failure/limit, the direct child is
 killed and reaped without joining the other reader. A descendant retaining that
 pipe can keep the detached reader thread and pipe open until the descendant exits.
 On successful capture, descendants retaining pipes may delay EOF indefinitely.
-Timeouts, process-tree termination, streaming capture, and launch options are not
-implemented.
+`process::run` uses the same launch, capture, per-stream `max_buffer_bytes` limit, and
+`allow_exec` capability rules, and checks permission when its task starts. An explicit
+`max_output_bytes` adds a total cap shared by stdout and stderr; exceeding it terminates
+the child and returns `Error::ResourceLimit`. The value must be a nonnegative int or uint;
+zero permits no output. If omitted, the existing per-stream runtime limit applies; that
+runtime limit is unset by default, so pass this argument when output must be bounded.
+For example, `process::run(program, arguments, nil, 128 * 1024)` caps combined output at
+128 KiB without setting a deadline.
+The blocking process operation runs on the bounded async I/O worker pool. On Unix it
+starts the child in a new process group. Cancelling the task sends `SIGKILL` to that
+group and reaps the direct child; other platforms stop only the direct child.
+When the third `process::run` argument is an int or uint, it is a timeout in
+`1..=300000` milliseconds.
+If the direct child and both output streams finish before the deadline, it returns
+the same result record as `process::run`; otherwise it kills and reaps the direct child
+and returns `Error::Timeout`. On Unix timeout also kills members of the process group;
+other platforms stop only the direct child. The deadline starts when the worker begins
+the launch; time waiting in the worker queue is excluded. Descendants that create a
+separate session or process group can outlive cancellation or timeout. The operation
+still obeys `allow_exec` and the per-stream output limit. Streaming capture and launch
+options remain unavailable.
+
+When the third `process::run` argument is `bytes`, it is snapshotted when the task
+starts and obeys `max_buffer_bytes`; the child receives EOF after that snapshot is
+written. A child that closes stdin early may still return a normal result. Input is
+written concurrently with stdout/stderr capture, so a child can safely produce output
+before it finishes reading stdin. Output retains the existing independent per-stream
+limits. A per-run total output limit follows the timeout: use `nil` for no deadline,
+including in the five-argument stdin form. The timeout keeps its `1..=300000` ms range.
+Cancellation stops the Unix stdin writer cooperatively and terminates the process group;
+on other platforms, child termination is what releases a blocked stdin write.
+
+## Networking
+
+TCP tasks live under `async::net`. Import it with `use async::net;` to use short
+local names such as `net::connect`.
+
+| Call | Successful result / behavior |
+| --- | --- |
+| `net::exchange(host, port, payload, timeout_ms)` | Cold `Task[bytes]`; sends one request and reads the peer's response through EOF |
+| `net::listen(host, port)` | Cold `Task[handle]`; binds a nonblocking listener on a worker |
+| `net::accept(listener, accept_timeout_ms, stream_timeout_ms)` | Cold `Task[handle]`; accepts one connection and configures its socket timeout |
+| `net::connect(host, port, timeout_ms)` | Cold `Task[handle]`; opens a context-scoped TCP stream and applies the timeout to later socket operations |
+| `net::read(handle, max_bytes)` | Cold `Task[bytes]`; reads up to the requested byte count, with an empty buffer meaning peer EOF |
+| `net::read_exact(handle, size)` | Cold `Task[bytes]`; reads exactly `size` bytes or returns `Error::IoFailure` on early EOF |
+| `net::read_all(handle)` | Cold `Task[bytes]`; reads through peer EOF, bounded by `max_buffer_bytes` and the stream timeout |
+| `net::write(handle, bytes)` | Cold `Task[uint]`; makes one write and returns the accepted byte count |
+| `net::write_all(handle, bytes)` | Cold `Task[nil]`; snapshots and writes the entire byte buffer |
+| `net::shutdown_write(handle)` | Cold `Task[nil]`; half-closes the write side and leaves the read side open |
+
+`port` accepts an int or uint in `1..=65535`. `timeout_ms` accepts an int or uint in
+`1..=300000`. For `async::net::exchange`, the deadline starts before DNS lookup and
+bounds connect and transfer after resolution; DNS itself is synchronous and may
+outlast the deadline. The exchange sends the payload, half-closes its write side, and
+reads until peer EOF, subject to the runtime byte limit.
+
+`async::net::listen` binds the requested nonzero port on the host worker pool. It
+returns a listener handle scoped to the current runtime context, counts against
+`max_resources`, and must be released with `io::close(handle)`. `async::net::accept`
+accepts one connection with an `accept_timeout_ms` in `1..=300000` and sets its
+read/write timeout from `stream_timeout_ms` in the same range. Only one accept may be
+active per listener; an overlapping accept returns `Error::IoFailure`.
+
+`async::net::connect` uses the same port and timeout ranges and returns a resource
+handle scoped to the current runtime context. It counts against `max_resources` and
+must be released with `io::close(handle)`. The timeout becomes the socket timeout for
+each later read or write. `async::net::read` requires a positive `max_bytes` no larger
+than the configured runtime byte limit; it returns up to that many bytes, with an
+empty buffer representing EOF. `async::net::read_exact` accepts a nonnegative size up
+to `max_buffer_bytes` and either returns exactly that many bytes or `Error::IoFailure`
+if EOF arrives first. `async::net::read_all` holds the read side for the
+whole operation, accumulates until EOF, and returns `Error::ResourceLimit` if the
+stream exceeds `max_buffer_bytes`; its stream timeout bounds the entire operation.
+Timeout or cancellation during exact or read-all may consume a prefix without
+returning it. The over-limit read-all probe does not consume the next byte.
+`async::net::write` snapshots the bytes and attempts one write, returning zero for an
+empty buffer or the accepted count as `uint`; a short write is valid.
+`async::net::write_all` snapshots the bytes
+and retries until the complete buffer is sent. Both obey the byte limit. One read and
+one write may run concurrently on a handle; overlapping reads or writes fail with
+`Error::IoFailure`. The stream timeout bounds each write. Cancellation may happen
+after a partial transfer and hide the accepted count.
+`async::net::shutdown_write` half-closes only the local write direction.
+
+These operations run on the bounded async worker pool and require the host's
+`allow_network` capability; the CLI's `--restricted` mode denies them. Cancellation
+polls accept, read, read-all, write, and exchange data-transfer operations at short intervals;
+a cancelled write may already have sent a prefix. Queued connect, listen, and
+shutdown-write jobs check cancellation before starting. Running connect/listen jobs
+check again after DNS or the host call returns, so a cancelled task will not publish a
+new stream or listener handle. Submitted work retains a cloned socket or listener
+until it finishes or is cancelled, even if `io::close` has invalidated the Cog handle.
+DNS resolution remains synchronous inside workers and cannot be interrupted. On Unix,
+TCP connect attempts use nonblocking sockets and poll cancellation about every 10 ms;
+on other platforms the system connect call can delay cancellation until it returns or
+reaches the operation timeout. `async::net::exchange` includes DNS time in its deadline,
+but a resolver call can outlast that deadline. Listener name resolution uses the same
+synchronous host resolver and has no DNS deadline.
+Socket timeouts become `Error::Timeout`; other network failures become
+`Error::IoFailure`; invalid ranges become `Error::InvalidArgument`.
 
 ## Error names
 
-`err::Error` provides TypeMismatch, DivisionByZero, Overflow, NegativeSleep,
-ParseFailure, IndexOutOfBounds, MissingField, MissingKey, Unordered, PermissionDenied, ProcessFailed,
-IoReadFailed, IoWriteFailed, EntropyUnavailable, InvalidRangeStep, InvalidResource,
-InvalidArgument, ResourceLimit, and IoFailure. Their payload declarations are in
+`err::Error` provides TypeMismatch, DivisionByZero, Overflow, NegativeSleep, Timeout,
+ParseFailure, IndexOutOfBounds, MissingField, MissingKey, Unordered, PermissionDenied,
+ProcessFailed, IoReadFailed, IoWriteFailed, EntropyUnavailable, InvalidRangeStep,
+InvalidResource, InvalidArgument, Cancelled, ResourceLimit, and IoFailure. Their
+payload declarations are in
 [core/err.cog](../core/err.cog). `err::kind(value)` and `value.error_kind()` return
 the primary error kind as str, or `"ok"` for a normal value. `.unwrap()`
 and `.expect(message)` crash on Error. Prefer patterns and explicit recovery or

@@ -1,7 +1,7 @@
 use cog::{bytecode, interpreter, project};
 
 fn run(source: &str) -> Result<String, String> {
-    let source = format!("include std;\n{source}");
+    let source = format!("@!include(\"std\")\n{source}");
     let program = project::compile_source("generics.cog", &source)?;
     let program = bytecode::decode(&bytecode::encode(&program).map_err(|error| error.to_string())?)
         .map_err(|error| error.to_string())?;
@@ -253,14 +253,14 @@ fn generic_structs_diagnose_missing_or_inconsistent_type_arguments() {
 fn comptime_struct_type_parameters_work_in_the_program_shape_from_the_language_reference() {
     assert_eq!(
         run(r#"
-            include std;
+            @!include("std")
             use io;
-            comptime fn factorial(n: int) {
+            @comptime fn factorial(n: int) {
                 if n == 0 || n == 1 { return 1; }
                 return n * factorial(n - 1);
             }
-            comptime FACTORIAL = factorial(5);
-            comptime N: type = int;
+            @comptime const FACTORIAL = factorial(5);
+            @comptime const N: type = int;
             struct Integer { value: N }
             struct Box[T: type] { value: T }
             fn main() {
@@ -548,10 +548,10 @@ fn comptime_extend_can_implement_a_trait_for_a_resolved_type() {
             trait Format[Output: type] {
                 fn format(self) -> Output;
             }
-            comptime Scalar: type = int;
-            comptime Text: type = str;
+            @comptime const Scalar: type = int;
+            @comptime const Text: type = str;
 
-            comptime extend Scalar with Format[Text] {
+            @comptime extend Scalar with Format[Text] {
                 fn format(self) -> str { $"value {self}" }
             }
 
@@ -567,7 +567,7 @@ fn comptime_extend_can_implement_a_trait_for_a_resolved_type() {
 }
 
 #[test]
-fn obsolete_generic_declarations_have_a_migration_diagnostic() {
+fn obsolete_generic_declarations_are_rejected() {
     for declaration in [
         "fn identity(comptime T: type, value: T) { value }",
         "struct Box(comptime T: type) { value: T }",
@@ -575,7 +575,7 @@ fn obsolete_generic_declarations_have_a_migration_diagnostic() {
         "fn identity<T>(value: T) { value }",
     ] {
         let error = run(&format!("{declaration} fn main() {{}}")).unwrap_err();
-        assert!(error.contains("[T: type]"), "{error}");
+        assert!(error.contains("error[E0002]"), "{error}");
     }
 }
 
@@ -607,7 +607,7 @@ fn explicit_generic_arguments_accept_array_types_and_comptime_type_aliases() {
     assert_eq!(
         run(r#"
         use io;
-        comptime Number: type = int;
+        @comptime const Number: type = int;
         fn identity[T: type](value: T) -> T { value }
         fn main() {
             const items = identity[int[]]([]);

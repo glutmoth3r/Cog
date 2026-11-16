@@ -1,5 +1,5 @@
 #!/usr/bin/env cog
-include std;
+@!include("std")
 use io;
 use str;
 use fmt;

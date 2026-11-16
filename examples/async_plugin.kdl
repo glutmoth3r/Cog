@@ -1,0 +1,6 @@
+plugin version=1 library="./libnative_async_plugin.so"
+function "host::delayed" result="int" {
+    param "int"
+    effect "output"
+    async
+}

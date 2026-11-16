@@ -1,5 +1,6 @@
 // Package identity. The name also determines the default artifact filename.
 // Syntax: package "name" version="value"; version is a property of this node.
+// The kind defaults to application. Libraries can set kind="library".
 {{package}}
 
 // Version is metadata recorded in cog.lock, not a dependency version constraint.

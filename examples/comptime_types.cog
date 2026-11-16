@@ -1,13 +1,13 @@
-include std;
+@!include("std")
 use io;
 
-comptime fn identity_type(value: type) -> type {
+@comptime fn identity_type(value: type) -> type {
     value
 }
 
-comptime Scalar: type = int;
-comptime Number: type = identity_type(Scalar);
-comptime Grid: type = Number[][];
+@comptime const Scalar: type = int;
+@comptime const Number: type = identity_type(Scalar);
+@comptime const Grid: type = Number[][];
 
 fn first(grid: Grid) -> Number {
     grid[0][0]

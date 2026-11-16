@@ -1,5 +1,5 @@
-include game;
-include std;
+@!include("game")
+@!include("std")
 
 use io;
 use random from game as game_random;

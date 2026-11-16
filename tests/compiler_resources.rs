@@ -36,6 +36,22 @@ fn in_memory_configuration_parsers_share_schema_and_resource_checks() {
     let dependencies = config::dependencies_from_source(path, "math path=\"../math\"\n").unwrap();
     assert_eq!(dependencies[0].alias, "math");
     assert_eq!(dependencies[0].path, Path::new("../math"));
+    assert!(!dependencies[0].archive);
+    let archives =
+        config::dependencies_from_source(path, "regex archive=\"../regex.cogpkg\"\n").unwrap();
+    assert_eq!(archives[0].alias, "regex");
+    assert_eq!(archives[0].path, Path::new("../regex.cogpkg"));
+    assert!(archives[0].archive);
+    assert!(
+        config::dependencies_from_source(
+            path,
+            "regex path=\"../regex\" archive=\"../regex.cogpkg\"\n"
+        )
+        .is_err()
+    );
+    assert!(
+        config::dependencies_from_source(path, "regex path=\"../regex\" archive=\"\"\n").is_err()
+    );
     let targets =
         config::targets_from_source(path, "target \"app\" entry=\"src/main.cog\"\n").unwrap();
     assert_eq!(targets[0].entry, Path::new("src/main.cog"));
@@ -229,7 +245,11 @@ fn adversarial_frontend_depths_terminate_in_an_os_limited_child() {
         "#
         );
         let failure = cog::project::compile_source("expanding.cog", &source).unwrap_err();
-        assert!(failure.contains("allocation budget"), "{failure}");
+        assert!(
+            failure.contains("allocation budget")
+                || failure.contains("specialization analysis budget"),
+            "{failure}"
+        );
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

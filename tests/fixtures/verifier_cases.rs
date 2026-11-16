@@ -133,6 +133,7 @@ pub fn structured(data: &[u8]) -> CompiledProgram {
     let typed = |parameter: T, result: Option<T>| CallableSignature {
         parameters: 1,
         captures: 0,
+        asynchronous: false,
         parameter_types: Some(vec![Some(parameter)]),
         result_type: result,
     };
@@ -157,6 +158,7 @@ pub fn structured(data: &[u8]) -> CompiledProgram {
                 CallableSignature {
                     parameters: 0,
                     captures: 1,
+                    asynchronous: false,
                     parameter_types: None,
                     result_type: Some(T::Bool),
                 },

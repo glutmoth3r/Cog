@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let program = engine.compile(
         "embedded.cog",
-        "include std; use io; use host; fn main() { io::println(host::double(21)); }",
+        "@!include(\"std\") use io; use host; fn main() { io::println(host::double(21)); }",
     )?;
     let program = engine.decode(&program.encode()?)?;
     drop(engine);

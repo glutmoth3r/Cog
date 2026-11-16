@@ -3,6 +3,9 @@ use super::RuntimeContext;
 use crate::error::RuntimeError;
 use crate::heap::HeapRef;
 use crate::value::Value;
+use num_bigint::BigInt;
+use num_traits::ToPrimitive;
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::fmt::Write;
 use std::rc::Rc;
@@ -10,6 +13,12 @@ use std::rc::Rc;
 pub(super) fn to_int(_: &mut RuntimeContext<'_>, args: &[Value]) -> Result<Value, RuntimeError> {
     Ok(match &args[0] {
         Value::Error(_) | Value::Int(_) => args[0].clone(),
+        Value::BigInt(value) => {
+            Value::Int(i64::try_from(value).map_err(|_| RuntimeError::Overflow)?)
+        }
+        Value::UInt(value) => {
+            Value::Int(i64::try_from(*value).map_err(|_| RuntimeError::Overflow)?)
+        }
         Value::Float(x) if x.is_finite() && *x >= i64::MIN as f64 && *x < -(i64::MIN as f64) => {
             Value::Int(*x as i64)
         }
@@ -22,10 +31,41 @@ pub(super) fn to_int(_: &mut RuntimeContext<'_>, args: &[Value]) -> Result<Value
     })
 }
 
+pub(super) fn to_uint(_: &mut RuntimeContext<'_>, args: &[Value]) -> Result<Value, RuntimeError> {
+    Ok(match &args[0] {
+        Value::Error(_) | Value::UInt(_) => args[0].clone(),
+        Value::BigInt(value) => {
+            Value::UInt(u64::try_from(value).map_err(|_| RuntimeError::Overflow)?)
+        }
+        Value::Int(value) => {
+            Value::UInt(u64::try_from(*value).map_err(|_| RuntimeError::Overflow)?)
+        }
+        Value::Float(value)
+            if value.is_finite() && *value >= 0.0 && *value < 18446744073709551616.0 =>
+        {
+            Value::UInt(*value as u64)
+        }
+        Value::Float(_) => return Err(RuntimeError::Overflow),
+        Value::Str(text) => Value::UInt(text.parse().map_err(|_| RuntimeError::ParseFailure {
+            from: "str",
+            to: "uint",
+        })?),
+        _ => return Err(RuntimeError::TypeMismatch { op: "str::to_uint" }),
+    })
+}
+
 pub(super) fn to_float(_: &mut RuntimeContext<'_>, args: &[Value]) -> Result<Value, RuntimeError> {
     Ok(match &args[0] {
         Value::Error(_) | Value::Float(_) => args[0].clone(),
         Value::Int(x) => Value::Float(*x as f64),
+        Value::UInt(x) => Value::Float(*x as f64),
+        Value::BigInt(x) => {
+            let value = x.to_f64().ok_or(RuntimeError::Overflow)?;
+            if !value.is_finite() {
+                return Err(RuntimeError::Overflow);
+            }
+            Value::Float(value)
+        }
         Value::Str(text) => Value::Float(text.parse().map_err(|_| RuntimeError::ParseFailure {
             from: "str",
             to: "float",
@@ -36,6 +76,50 @@ pub(super) fn to_float(_: &mut RuntimeContext<'_>, args: &[Value]) -> Result<Val
             });
         }
     })
+}
+
+pub(super) fn to_bigint(
+    context: &mut RuntimeContext<'_>,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
+    let value = match &args[0] {
+        Value::Error(_) | Value::BigInt(_) => args[0].clone(),
+        Value::Int(value) => Value::BigInt(BigInt::from(*value)),
+        Value::UInt(value) => Value::BigInt(BigInt::from(*value)),
+        Value::Str(text) => {
+            if let Some(limit) = context.limits.max_numeric_digits {
+                let digits = text
+                    .strip_prefix('-')
+                    .or_else(|| text.strip_prefix('+'))
+                    .unwrap_or(text)
+                    .trim_start_matches('0')
+                    .len()
+                    .max(1);
+                if digits > limit {
+                    return Err(RuntimeError::ResourceLimit {
+                        resource: "numeric digits",
+                    });
+                }
+            }
+            Value::BigInt(text.parse().map_err(|_| RuntimeError::ParseFailure {
+                from: "str",
+                to: "bigint",
+            })?)
+        }
+        _ => {
+            return Err(RuntimeError::TypeMismatch {
+                op: "str::to_bigint",
+            });
+        }
+    };
+    if let (Value::BigInt(value), Some(limit)) = (&value, context.limits.max_numeric_digits)
+        && crate::value::bigint_exceeds_decimal_digits(value, limit)
+    {
+        return Err(RuntimeError::ResourceLimit {
+            resource: "numeric digits",
+        });
+    }
+    Ok(value)
 }
 
 pub(super) fn to_bool(_: &mut RuntimeContext<'_>, args: &[Value]) -> Result<Value, RuntimeError> {
@@ -52,6 +136,29 @@ pub(super) fn to_bool(_: &mut RuntimeContext<'_>, args: &[Value]) -> Result<Valu
             }
         },
         _ => return Err(RuntimeError::TypeMismatch { op: "str::to_bool" }),
+    })
+}
+
+pub(super) fn to_char(_: &mut RuntimeContext<'_>, args: &[Value]) -> Result<Value, RuntimeError> {
+    Ok(match &args[0] {
+        Value::Error(_) | Value::Char(_) => args[0].clone(),
+        Value::Str(text) => {
+            let mut chars = text.chars();
+            let Some(character) = chars.next() else {
+                return Err(RuntimeError::ParseFailure {
+                    from: "str",
+                    to: "char",
+                });
+            };
+            if chars.next().is_some() {
+                return Err(RuntimeError::ParseFailure {
+                    from: "str",
+                    to: "char",
+                });
+            }
+            Value::Char(character)
+        }
+        _ => return Err(RuntimeError::TypeMismatch { op: "str::to_char" }),
     })
 }
 
@@ -130,23 +237,34 @@ pub(super) fn write(
         .buffer_limit()
         .checked_sub(length)
         .ok_or_else(|| limit("str"))?;
-    let (prefix, suffix, rendered) = if let Some(position) = template.find("{}") {
-        let literal_length = template.len() - 2;
-        let budget = remaining
-            .checked_sub(literal_length)
-            .ok_or_else(|| limit("str"))?;
-        // Render before mutably borrowing the target: it may be the value itself
-        // or appear inside a nested array/record. Failure leaves every alias intact.
-        (
-            &template[..position],
-            &template[position + 2..],
-            render(&args[2], budget, "str")?,
-        )
-    } else {
+    let Some(position) = template.find("{}") else {
         if template.len() > remaining {
             return Err(limit("str"));
         }
-        (template.as_ref(), "", String::new())
+        let mut text = buffer
+            .try_borrow_mut()
+            .map_err(|_| RuntimeError::InvalidArgument { op: "fmt::write" })?;
+        text.try_reserve(template.len()).map_err(|_| limit("str"))?;
+        text.push_str(template);
+        return Ok(args[0].clone());
+    };
+    let prefix = &template[..position];
+    let suffix = &template[position + 2..];
+    let literal_length = template.len() - 2;
+    let budget = remaining
+        .checked_sub(literal_length)
+        .ok_or_else(|| limit("str"))?;
+    // Simple scalars cannot alias the target builder, so render them into a
+    // fixed stack buffer and append only after all size checks succeed.
+    let mut inline = InlineText::default();
+    let rendered = match render_small_scalar(&args[2], &mut inline) {
+        Some(text) => {
+            if text.len() > budget {
+                return Err(limit("str"));
+            }
+            Cow::Borrowed(text)
+        }
+        None => Cow::Owned(render(&args[2], budget, "str")?),
     };
     let mut text = buffer
         .try_borrow_mut()
@@ -157,6 +275,42 @@ pub(super) fn write(
     text.push_str(&rendered);
     text.push_str(suffix);
     Ok(args[0].clone())
+}
+
+#[derive(Default)]
+struct InlineText {
+    bytes: [u8; 32],
+    length: usize,
+}
+
+impl InlineText {
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.length]).expect("formatting writes valid UTF-8")
+    }
+}
+
+impl Write for InlineText {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        if text.len() > self.bytes.len().saturating_sub(self.length) {
+            return Err(std::fmt::Error);
+        }
+        let end = self.length + text.len();
+        self.bytes[self.length..end].copy_from_slice(text.as_bytes());
+        self.length = end;
+        Ok(())
+    }
+}
+
+fn render_small_scalar<'a>(value: &'a Value, inline: &'a mut InlineText) -> Option<&'a str> {
+    match value {
+        Value::Int(_) | Value::UInt(_) | Value::Bool(_) | Value::Char(_) => {
+            write!(inline, "{value}").ok()?;
+            Some(inline.as_str())
+        }
+        Value::Nil => Some("nil"),
+        Value::Str(text) => Some(text),
+        _ => None,
+    }
 }
 
 /// One bounded renderer serves string conversion, builders and byte rendering.
@@ -241,7 +395,9 @@ impl RenderBuffer {
                 self.write_str("]")
             }
             Value::Record(fields) => {
-                let fields = fields.try_borrow().map_err(|_| self.borrow_error())?;
+                let fields = fields
+                    .try_borrow_fields()
+                    .map_err(|_| self.borrow_error())?;
                 self.write_str("{")?;
                 self.fields(&fields, depth)?;
                 self.write_str("}")

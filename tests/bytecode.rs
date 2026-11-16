@@ -4,7 +4,7 @@ use cog::{bytecode, interpreter, project};
 
 fn compile(source: &str) -> cog::backend::CompiledProgram {
     let source = format!(
-        "include std; use io::{{print, println, read_line}}; use time::sleep; use err::Error;\n{source}"
+        "@!include(\"std\") use io::{{print, println, read_line}}; use time::sleep; use err::Error;\n{source}"
     );
     project::compile_source("bytecode.cog", &source).unwrap_or_else(|e| panic!("{e}"))
 }
@@ -164,7 +164,7 @@ fn cli_runs_a_built_artifact_after_sources_are_removed() {
     let artifact = root.join("main.cogb");
     std::fs::write(
         &source,
-        "include std; use io; fn main() { io::println(\"from artifact\"); }",
+        "@!include(\"std\") use io; fn main() { io::println(\"from artifact\"); }",
     )
     .unwrap();
     let built = std::process::Command::new(env!("CARGO_BIN_EXE_cog"))

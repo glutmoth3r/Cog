@@ -22,15 +22,58 @@ pub enum InterpolationTokenPart {
     },
 }
 
-pub(crate) fn escape(c: char) -> Option<char> {
-    Some(match c {
-        '"' => '"',
+fn invalid_literal(quote: char, message: String) -> LexError {
+    if quote == '\'' {
+        LexError::InvalidChar(message)
+    } else {
+        LexError::InvalidString(message)
+    }
+}
+
+pub(crate) fn escape(chars: &mut std::str::Chars<'_>, quote: char) -> Result<char, LexError> {
+    let c = chars
+        .next()
+        .ok_or_else(|| invalid_literal(quote, "incomplete escape after `\\`".into()))?;
+    Ok(match c {
+        c if c == quote => quote,
         '\\' => '\\',
         'n' => '\n',
         't' => '\t',
         'r' => '\r',
         '0' => '\0',
-        _ => return None,
+        'x' => {
+            // Commit lookahead only on success, preserving quotes and braces
+            // for recovery when the escape is incomplete or malformed.
+            let mut digits = chars.clone();
+            let value = digits
+                .next()
+                .and_then(|c| c.to_digit(16))
+                .zip(digits.next().and_then(|c| c.to_digit(16)))
+                .map(|(high, low)| high * 16 + low)
+                .ok_or_else(|| {
+                    invalid_literal(
+                        quote,
+                        "expected two hexadecimal digits after `\\x`, for example `\\x1B`".into(),
+                    )
+                })?;
+            if value > 0x7f {
+                return Err(invalid_literal(
+                    quote,
+                    "hexadecimal escape is outside the ASCII range `\\x00`..`\\x7F`; use UTF-8 text for other characters".into(),
+                ));
+            }
+            *chars = digits;
+            char::from(value as u8)
+        }
+        _ => {
+            return Err(invalid_literal(
+                quote,
+                format!(
+                    "unknown escape `\\{}`; use `\\\\` for a literal backslash",
+                    c.escape_default()
+                ),
+            ));
+        }
     })
 }
 
@@ -86,13 +129,15 @@ fn scan(
                 );
             }
             '\\' => {
-                if let Some(c) = source[cursor..].chars().next() {
-                    cursor += c.len_utf8();
-                    line += usize::from(c == '\n');
-                    if let Some(c) = escape(c) {
-                        literal.push(c);
-                    } else {
-                        invalid.get_or_insert_with(|| LexError::InvalidString(format!("\\{c}")));
+                let mut chars = source[cursor..].chars();
+                let decoded = escape(&mut chars, '"');
+                let end = source.len() - chars.as_str().len();
+                line += source[cursor..end].bytes().filter(|b| *b == b'\n').count();
+                cursor = end;
+                match decoded {
+                    Ok(c) => literal.push(c),
+                    Err(error) => {
+                        invalid.get_or_insert(error);
                     }
                 }
             }
@@ -114,7 +159,10 @@ fn scan(
             '{' => {
                 text(&mut parts, &mut literal);
                 let start = cursor;
-                let mut lexer = Token::lexer_with_extras(&source[start..], context.clone());
+                let mut lexer = crate::lexer::TokenCursor::new(Token::lexer_with_extras(
+                    &source[start..],
+                    context.clone(),
+                ));
                 let mut tokens = vec![];
                 let mut errors = vec![];
                 let mut braces = 0usize;
@@ -124,9 +172,8 @@ fn scan(
                 let mut scanned = 0;
                 let mut token_line = line;
                 let mut closed = None;
-                while let Some(result) = lexer.next() {
-                    let range = lexer.span();
-                    if !lexer.extras.charge() {
+                while let Some((result, range)) = lexer.next() {
+                    if !lexer.charge() {
                         return (Err(LexError::ResourceLimit("token")), start + range.end);
                     }
                     // At the top level a quote after a complete operand cannot
@@ -181,6 +228,7 @@ fn scan(
                         Token::Int(_)
                         | Token::Float(_)
                         | Token::Str(_)
+                        | Token::Char(_)
                         | Token::Interpolated(_)
                         | Token::Ident(_)
                         | Token::True

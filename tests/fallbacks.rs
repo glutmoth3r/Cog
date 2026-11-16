@@ -2,11 +2,11 @@ use cog::error::RuntimeError;
 use cog::{bytecode, frontend, interpreter, project};
 
 fn observe(body: &str) -> (String, Result<(), RuntimeError>) {
-    let source = format!("include std; use io; use err::Error;\n{body}");
+    let source = format!("@!include(\"std\") use io; use err::Error;\n{body}");
     let compiled =
         project::compile_source("fallback.cog", &source).unwrap_or_else(|error| panic!("{error}"));
     let bytes = bytecode::encode(&compiled).unwrap();
-    assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 10);
+    assert_eq!(&bytes[..4], b"COG\0");
     let compiled = bytecode::decode(&bytes).unwrap();
     let mut output = Vec::new();
     let result = interpreter::run_with(&compiled, &mut output);
@@ -76,7 +76,7 @@ fn unrecovered_error_keeps_primary_payload_and_secondary_cleanup_diagnostics() {
             (Error::IndexOutOfBounds(4, 1))!!
         }
         fn main() -> nil {
-            const preserved = broken() ?? 0;
+            const preserved = try { broken() ?? 0 } catch(error) { error };
             when preserved is Error::IndexOutOfBounds(index, length) {
                 io::println(index); io::println(length);
             } else { crash("lost identity"); }

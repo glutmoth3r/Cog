@@ -45,7 +45,7 @@ pub struct Resolver {
     next_symbol: usize,
     poison: Vec<String>,
     entry: ModuleKey,
-    resolved_includes: BTreeSet<(String, Option<String>)>,
+    resolved_includes: BTreeSet<String>,
     references: BTreeMap<String, BTreeSet<String>>,
     current: Option<String>,
     generic_symbols: BTreeSet<String>,
@@ -65,6 +65,13 @@ impl Resolver {
     fn type_annotation(&mut self, ty: &mut TypeAnnotation, owner: &ModuleKey, scopes: &[Scope]) {
         match &mut ty.kind {
             TypeKind::Named(name) if name == "type" => {}
+            TypeKind::Named(name) if name == "Task" => {
+                let source = name.clone();
+                ty.kind = TypeKind::ResolvedName {
+                    source,
+                    symbol: "Task".to_owned(),
+                };
+            }
             TypeKind::Named(name) => {
                 let source = name.clone();
                 let symbol = self.name(name, owner, scopes, None);
@@ -72,7 +79,11 @@ impl Resolver {
             }
             TypeKind::Applied { source, arguments } => {
                 let source = source.clone();
-                let symbol = self.name(&source, owner, scopes, None);
+                let symbol = if source == "Task" {
+                    "Task".to_owned()
+                } else {
+                    self.name(&source, owner, scopes, None)
+                };
                 for argument in arguments.iter_mut() {
                     self.type_annotation(argument, owner, scopes);
                 }
@@ -126,10 +137,7 @@ impl Resolver {
     }
 
     /// Only the project loader may acknowledge entry-point inclusion declarations.
-    pub(crate) fn with_resolved_includes(
-        mut self,
-        includes: BTreeSet<(String, Option<String>)>,
-    ) -> Self {
+    pub(crate) fn with_resolved_includes(mut self, includes: BTreeSet<String>) -> Self {
         self.resolved_includes = includes;
         self
     }
@@ -324,25 +332,27 @@ impl Resolver {
                 self.ensure(&key);
                 let (first, rest) = tail.split_once("::").unwrap_or((tail, ""));
                 let child = (key.0, join(&key.1, first));
-                let found = if let Some(symbol) =
-                    self.symbols.get(&(key.clone(), first.into())).cloned()
-                {
-                    if !symbol.public && &symbol.owner != owner {
-                        self.error(
-                            format!("`{first}` is private to module `{}`", key.1),
-                            span.clone(),
-                        );
-                        return Some(Binding::Poison);
-                    }
-                    Some(Binding::Symbol(symbol))
-                } else {
-                    if key.0 == CORE && Builtin::from_name(&format!("{}::{first}", key.1)).is_some()
-                    {
-                        Some(Binding::Native(format!("{}::{first}", key.1)))
+                let found =
+                    if let Some(symbol) = self.symbols.get(&(key.clone(), first.into())).cloned() {
+                        if !symbol.public && &symbol.owner != owner {
+                            self.error(
+                                format!("`{first}` is private to module `{}`", key.1),
+                                span.clone(),
+                            );
+                            return Some(Binding::Poison);
+                        }
+                        Some(Binding::Symbol(symbol))
                     } else {
-                        self.module(child)
-                    }
-                };
+                        let native_path = format!("{}::{first}", key.1);
+                        if key.0 == CORE
+                            && (Builtin::from_name(&native_path).is_some()
+                                || crate::builtins::native_module(&native_path))
+                        {
+                            Some(Binding::Native(native_path))
+                        } else {
+                            self.module(child)
+                        }
+                    };
                 match (found, rest.is_empty()) {
                     (Some(found), true) => Some(found),
                     (Some(found), false) => self.member(found, rest, owner, span),
@@ -352,6 +362,8 @@ impl Resolver {
             Binding::Native(module) => {
                 let name = format!("{module}::{tail}");
                 if Builtin::from_name(&name).is_some() {
+                    Some(Binding::Native(name))
+                } else if crate::builtins::native_module(&name) {
                     Some(Binding::Native(name))
                 } else {
                     None
@@ -595,7 +607,9 @@ impl Resolver {
             })
             .or_else(|| {
                 Builtin::from_name(name)
-                    .filter(|_| matches!(name, "len" | "exclusive"))
+                    .filter(|_| {
+                        matches!(name, "len" | "exclusive" | "spawn" | "cancel" | "yield_now")
+                    })
                     .map(|_| Binding::Native(name.into()))
             });
         let result = match binding {
@@ -626,6 +640,55 @@ impl Resolver {
         }
     }
 
+    fn associated_target(
+        &mut self,
+        name: &str,
+        owner: &ModuleKey,
+        scopes: &[Scope],
+        span: Option<SourceSpan>,
+    ) -> Option<(TypeAnnotation, String)> {
+        let (target, method) = name.rsplit_once("::")?;
+        let (head, tail) = target.split_once("::").unwrap_or((target, ""));
+        let base = scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(head))
+            .cloned()
+            .or_else(|| {
+                self.symbols
+                    .get(&(owner.clone(), head.to_owned()))
+                    .cloned()
+                    .map(Binding::Symbol)
+            })
+            .or_else(|| {
+                (owner.1.rsplit("::").next() == Some(head) && !tail.is_empty())
+                    .then(|| Binding::Module(owner.clone()))
+            })?;
+        let binding = if tail.is_empty() {
+            Some(base)
+        } else {
+            self.member(base, tail, owner, span)
+        }?;
+        let Binding::Symbol(symbol) = binding else {
+            return None;
+        };
+        if symbol.variants.iter().any(|variant| variant == method) {
+            return None;
+        }
+        self.type_symbols.contains(&symbol.bound).then(|| {
+            (
+                TypeAnnotation {
+                    kind: TypeKind::ResolvedName {
+                        source: target.to_owned(),
+                        symbol: symbol.bound,
+                    },
+                    nilable: false,
+                },
+                method.to_owned(),
+            )
+        })
+    }
+
     fn expression_type(&self, expr: &Expr, scopes: &[Scope]) -> Option<TypeAnnotation> {
         if let Expr::TypeLiteral(ty) = expr.node() {
             return Some(ty.clone());
@@ -642,6 +705,7 @@ impl Resolver {
         }
         let kind = match name.as_str() {
             "int" => TypeKind::Primitive(VarType::Int),
+            "uint" => TypeKind::Primitive(VarType::UInt),
             "float" => TypeKind::Primitive(VarType::Float),
             "bool" => TypeKind::Primitive(VarType::Bool),
             "str" => TypeKind::Primitive(VarType::Str),
@@ -697,6 +761,26 @@ impl Resolver {
                     **callee = Expr::BracketApply(receiver.clone(), vec![*index.clone()]);
                 }
                 if let Expr::BracketApply(receiver, arguments) = callee.as_mut() {
+                    let associated_name = match receiver.node() {
+                        Expr::Ident(name) => Some(name.clone()),
+                        _ => None,
+                    };
+                    if let Some(name) = associated_name
+                        && let Some((target, method)) =
+                            self.associated_target(&name, owner, scopes, location.clone())
+                    {
+                        let types = self.explicit_types(arguments, owner, scopes, location.clone());
+                        for arg in args.iter_mut() {
+                            self.expr(&mut arg.value, owner, scopes, location.clone());
+                        }
+                        *expr = Expr::AssociatedCall {
+                            target,
+                            method,
+                            type_arguments: types,
+                            args: std::mem::take(args),
+                        };
+                        return;
+                    }
                     self.expr(receiver, owner, scopes, location.clone());
                     if let Expr::Ident(name) = receiver.node()
                         && self.generic_symbols.contains(name)
@@ -781,12 +865,40 @@ impl Resolver {
                     && !scopes.iter().rev().any(|s| s.contains_key(name)) => {}
             Expr::Ident(name) => *name = self.name(name, owner, scopes, location),
             Expr::Call(name, args) => {
+                if let Some((target, method)) =
+                    self.associated_target(name, owner, scopes, location.clone())
+                {
+                    for arg in args.iter_mut() {
+                        self.expr(&mut arg.value, owner, scopes, location.clone());
+                    }
+                    *expr = Expr::AssociatedCall {
+                        target,
+                        method,
+                        type_arguments: Vec::new(),
+                        args: std::mem::take(args),
+                    };
+                    return;
+                }
                 *name = self.name(name, owner, scopes, location.clone());
                 for arg in args {
                     self.expr(&mut arg.value, owner, scopes, location.clone());
                 }
             }
-            Expr::Array(xs) => {
+            Expr::AssociatedCall {
+                target,
+                type_arguments,
+                args,
+                ..
+            } => {
+                self.type_annotation(target, owner, scopes);
+                for ty in type_arguments {
+                    self.type_annotation(ty, owner, scopes);
+                }
+                for argument in args {
+                    self.expr(&mut argument.value, owner, scopes, location.clone());
+                }
+            }
+            Expr::Array(xs) | Expr::Tuple(xs) => {
                 for x in xs {
                     self.expr(x, owner, scopes, location.clone());
                 }
@@ -939,15 +1051,17 @@ impl Resolver {
                 };
                 self.import(&decl, owner, scopes.last_mut().unwrap(), location);
             }
-            Stmt::VarDecl { name, ty, value } | Stmt::Const { name, ty, value } => {
+            Stmt::VarDecl { pattern, ty, value } | Stmt::Const { pattern, ty, value } => {
                 if let Some(ty) = ty {
                     self.type_annotation(ty, owner, scopes);
                 }
                 self.expr(value, owner, scopes, location);
-                scopes
-                    .last_mut()
-                    .unwrap()
-                    .insert(name.clone(), Binding::Local);
+                pattern.visit_names(&mut |name| {
+                    scopes
+                        .last_mut()
+                        .unwrap()
+                        .insert(name.to_owned(), Binding::Local);
+                });
             }
             Stmt::Comptime { name, ty, value } => {
                 if let Some(ty) = ty {
@@ -1022,12 +1136,55 @@ impl Resolver {
                 scopes.pop();
             }
             Stmt::ForEach {
-                var,
+                pattern,
                 iterable,
                 body,
             } => {
                 self.expr(iterable, owner, scopes, location.clone());
-                scopes.push(BTreeMap::from([(var.clone(), Binding::Local)]));
+                let mut bindings = BTreeMap::new();
+                pattern.visit_names(&mut |name| {
+                    bindings.insert(name.to_owned(), Binding::Local);
+                });
+                scopes.push(bindings);
+                self.block(body, owner, scopes, location);
+                scopes.pop();
+            }
+            Stmt::ForZip { clauses, body } => {
+                for clause in clauses.iter_mut() {
+                    match clause {
+                        ForClause::Range {
+                            start, end, step, ..
+                        } => {
+                            self.expr(start, owner, scopes, location.clone());
+                            self.expr(end, owner, scopes, location.clone());
+                            if let Some(step) = step {
+                                self.expr(step, owner, scopes, location.clone());
+                            }
+                        }
+                        ForClause::Each { iterable, .. } => {
+                            self.expr(iterable, owner, scopes, location.clone());
+                        }
+                    }
+                }
+                scopes.push(BTreeMap::new());
+                for clause in clauses.iter() {
+                    match clause {
+                        ForClause::Range { var, .. } => {
+                            scopes
+                                .last_mut()
+                                .unwrap()
+                                .insert(var.clone(), Binding::Local);
+                        }
+                        ForClause::Each { pattern, .. } => {
+                            pattern.visit_names(&mut |name| {
+                                scopes
+                                    .last_mut()
+                                    .unwrap()
+                                    .insert(name.to_owned(), Binding::Local);
+                            });
+                        }
+                    }
+                }
                 self.block(body, owner, scopes, location);
                 scopes.pop();
             }
@@ -1263,20 +1420,13 @@ impl Resolver {
                         *visibility = Visibility::Public;
                     }
                     Item::Invalid { binding } => *binding = bound,
-                    Item::ComptimeInclude {
-                        package,
-                        path,
-                        span,
-                    } => {
+                    Item::ComptimeInclude { package, span } => {
                         let message = if owner != self.entry {
                             Some(
                                 "package inclusion is only supported in the project entry point"
                                     .into(),
                             )
-                        } else if !self
-                            .resolved_includes
-                            .contains(&(package.clone(), path.clone()))
-                        {
+                        } else if !self.resolved_includes.contains(package) {
                             Some(format!(
                                 "unresolved package inclusion `{package}`; source packages require project::load or project::prepare"
                             ))
@@ -1363,11 +1513,57 @@ fn item_span(item: &Item) -> Option<SourceSpan> {
     }
 }
 fn native_names(module: &str) -> Vec<String> {
-    ["err::kind".to_owned()]
-        .into_iter()
-        .chain(crate::runtime::names())
-        .filter(|name| name.starts_with(&format!("{module}::")))
-        .collect()
+    let async_names = [
+        "async::time::sleep",
+        "async::time::timeout",
+        "async::fs::metadata",
+        "async::fs::read_dir",
+        "async::fs::read_bytes",
+        "async::fs::write_bytes",
+        "async::fs::create_dir",
+        "async::fs::create_dir_all",
+        "async::fs::remove_file",
+        "async::fs::remove_dir",
+        "async::fs::read_text",
+        "async::fs::write_text",
+        "async::fs::read_lines",
+        "async::fs::append_bytes",
+        "async::fs::append_text",
+        "async::fs::copy",
+        "async::fs::rename",
+        "async::io::read",
+        "async::io::read_exact",
+        "async::io::read_all",
+        "async::io::write",
+        "async::io::open",
+        "async::io::write_all",
+        "async::io::flush",
+        "async::io::seek",
+        "async::net::exchange",
+        "async::net::listen",
+        "async::net::accept",
+        "async::net::connect",
+        "async::net::read",
+        "async::net::read_exact",
+        "async::net::read_all",
+        "async::net::write",
+        "async::net::write_all",
+        "async::net::shutdown_write",
+        "process::run",
+    ]
+    .into_iter()
+    .filter(|name| name.starts_with(&format!("{module}::")))
+    .map(str::to_owned);
+    [
+        "err::kind".to_owned(),
+        "task::select".to_owned(),
+        "task::select2".to_owned(),
+    ]
+    .into_iter()
+    .chain(async_names)
+    .chain(crate::runtime::names())
+    .filter(|name| name.starts_with(&format!("{module}::")))
+    .collect()
 }
 
 fn replace_self_type(ty: &mut TypeAnnotation, target: &TypeAnnotation) {

@@ -1,6 +1,7 @@
 use crate::ast::{
-    BinOp, Block, CallArgument, EnumVariant, Expr, FallbackKind, FunctionDecl, Item, MatchPattern,
-    Param, Program, Stmt, StringPart, TypeKind, UnOp, VarType, Visibility,
+    BinOp, BindingPattern, Block, CallArgument, EnumVariant, Expr, FallbackKind, ForClause,
+    FunctionDecl, InlineMode, Item, MatchPattern, Param, Program, Stmt, StringPart, TypeAnnotation,
+    TypeKind, UnOp, VarType, Visibility,
 };
 use crate::backend::{CompiledProgram, Emitter, Label};
 use crate::builtins::Builtin;
@@ -9,11 +10,230 @@ use crate::value::{RuntimeType, Value};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+const MAX_INLINE_BODY_NODES: usize = 32;
+const MAX_INLINE_NODES_PER_FUNCTION: usize = 256;
+const MAX_INLINE_PARAMETERS: usize = 8;
+const AUTO_INLINE_BODY_NODES: usize = 8;
+
 #[derive(Clone, Copy)]
 enum DeclaredCall {
     Function,
     Record,
     Variant,
+}
+
+#[derive(Clone)]
+struct InlineFunction {
+    parameters: Vec<Param>,
+    body: Expr,
+    nodes: usize,
+    mode: InlineMode,
+}
+
+fn collect_inline_functions(program: &Program) -> HashMap<String, InlineFunction> {
+    let mut functions = HashMap::new();
+    for item in &program.items {
+        let candidates: Vec<&FunctionDecl> = match item {
+            Item::Function(function) => vec![function],
+            Item::Extend(extension) => extension
+                .methods
+                .iter()
+                .map(|method| &method.function)
+                .collect(),
+            _ => Vec::new(),
+        };
+        for function in candidates {
+            if function.inline == InlineMode::Never
+                || function.comptime
+                || function.asynchronous
+                || !function.type_params.is_empty()
+                || function.params.len() > MAX_INLINE_PARAMETERS
+                || function.params.iter().any(|parameter| {
+                    parameter.default.is_some()
+                        || !parameter.ty.as_ref().is_some_and(is_inline_scalar_type)
+                })
+                || function
+                    .result_type
+                    .as_ref()
+                    .is_some_and(|ty| !is_inline_scalar_type(ty) && !is_nil_type(ty))
+            {
+                continue;
+            }
+
+            let body = match (
+                function.body.stmts.as_slice(),
+                function.body.tail.as_deref(),
+            ) {
+                ([], Some(expression)) => expression,
+                ([statement], None) => match statement.node() {
+                    Stmt::Return(Some(expression)) => expression,
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            let mut nodes = 0;
+            let parameter_names = function
+                .params
+                .iter()
+                .map(|parameter| parameter.name.clone())
+                .collect::<Vec<_>>();
+            if !is_inlineable_body(body, &parameter_names, &mut nodes) {
+                continue;
+            }
+            functions.insert(
+                function.name.clone(),
+                InlineFunction {
+                    parameters: function.params.clone(),
+                    body: body.clone(),
+                    nodes,
+                    mode: function.inline,
+                },
+            );
+        }
+    }
+    functions
+}
+
+fn is_inline_scalar_type(ty: &TypeAnnotation) -> bool {
+    !ty.nilable
+        && matches!(
+            runtime_type(ty),
+            Some(
+                RuntimeType::Int
+                    | RuntimeType::UInt
+                    | RuntimeType::BigInt
+                    | RuntimeType::Float
+                    | RuntimeType::Bool
+                    | RuntimeType::Char
+            )
+        )
+}
+
+fn is_nil_type(ty: &TypeAnnotation) -> bool {
+    !ty.nilable && matches!(runtime_type(ty), Some(RuntimeType::Nil))
+}
+
+fn is_inlineable_body(expr: &Expr, parameters: &[String], nodes: &mut usize) -> bool {
+    *nodes += 1;
+    if *nodes > MAX_INLINE_BODY_NODES {
+        return false;
+    }
+    match expr.node() {
+        Expr::Int(_)
+        | Expr::UInt(_)
+        | Expr::BigInt(_)
+        | Expr::Float(_)
+        | Expr::Char(_)
+        | Expr::Bool(_)
+        | Expr::Nil => true,
+        Expr::Ident(name) => parameters.iter().any(|parameter| parameter == name),
+        Expr::Unary(UnOp::Neg | UnOp::Not, value) => is_inlineable_body(value, parameters, nodes),
+        Expr::Binary(op, left, right)
+            if matches!(
+                op,
+                BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Div
+                    | BinOp::Mod
+                    | BinOp::Eq
+                    | BinOp::NotEq
+                    | BinOp::Lt
+                    | BinOp::LtEq
+                    | BinOp::Gt
+                    | BinOp::GtEq
+                    | BinOp::And
+                    | BinOp::Or
+                    | BinOp::Xor
+            ) =>
+        {
+            is_inlineable_body(left, parameters, nodes)
+                && is_inlineable_body(right, parameters, nodes)
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            is_inlineable_body(cond, parameters, nodes)
+                && is_inlineable_body(then_branch, parameters, nodes)
+                && else_branch
+                    .as_ref()
+                    .is_none_or(|branch| is_inlineable_body(branch, parameters, nodes))
+        }
+        _ => false,
+    }
+}
+
+fn substitute_constant_parameters(
+    expr: &Expr,
+    parameters: &[String],
+    values: &[Expr],
+) -> Option<Expr> {
+    Some(match expr {
+        Expr::Located(span, inner) => Expr::Located(
+            span.clone(),
+            Box::new(substitute_constant_parameters(inner, parameters, values)?),
+        ),
+        Expr::Ident(name) => values
+            .get(parameters.iter().position(|p| p == name)?)?
+            .clone(),
+        Expr::Int(_)
+        | Expr::UInt(_)
+        | Expr::BigInt(_)
+        | Expr::Float(_)
+        | Expr::Char(_)
+        | Expr::Bool(_)
+        | Expr::Nil => expr.clone(),
+        Expr::Unary(op @ (UnOp::Neg | UnOp::Not), value) => Expr::Unary(
+            *op,
+            Box::new(substitute_constant_parameters(value, parameters, values)?),
+        ),
+        Expr::Binary(op, left, right)
+            if matches!(
+                op,
+                BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Div
+                    | BinOp::Mod
+                    | BinOp::Eq
+                    | BinOp::NotEq
+                    | BinOp::Lt
+                    | BinOp::LtEq
+                    | BinOp::Gt
+                    | BinOp::GtEq
+                    | BinOp::And
+                    | BinOp::Or
+                    | BinOp::Xor
+            ) =>
+        {
+            Expr::Binary(
+                *op,
+                Box::new(substitute_constant_parameters(left, parameters, values)?),
+                Box::new(substitute_constant_parameters(right, parameters, values)?),
+            )
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => Expr::If {
+            cond: Box::new(substitute_constant_parameters(cond, parameters, values)?),
+            then_branch: Box::new(substitute_constant_parameters(
+                then_branch,
+                parameters,
+                values,
+            )?),
+            else_branch: match else_branch {
+                Some(branch) => Some(Box::new(substitute_constant_parameters(
+                    branch, parameters, values,
+                )?)),
+                None => None,
+            },
+        },
+        _ => return None,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -78,6 +298,7 @@ struct Scopes {
     modules: Vec<HashMap<String, String>>,
     // Binding properties use slot identity, so shadowing cannot leak constness or types.
     const_vars: std::collections::HashSet<usize>,
+    const_values: HashMap<usize, Value>,
     next_slot: usize,
 }
 
@@ -88,6 +309,7 @@ impl Scopes {
             imports: vec![HashMap::new()],
             modules: vec![HashMap::new()],
             const_vars: std::collections::HashSet::new(),
+            const_values: HashMap::new(),
             next_slot: 0,
         }
     }
@@ -143,13 +365,22 @@ impl Scopes {
     }
 
     fn define(&mut self, name: &str) -> usize {
+        let slot = self.reserve_slot();
+        self.bind_slot(name, slot);
+        slot
+    }
+
+    fn reserve_slot(&mut self) -> usize {
         let slot = self.next_slot;
         self.next_slot += 1;
+        slot
+    }
+
+    fn bind_slot(&mut self, name: &str, slot: usize) {
         self.stack
             .last_mut()
             .expect("scope stack is never empty")
             .insert(name.to_string(), slot);
-        slot
     }
 
     fn resolve(&self, name: &str) -> Option<usize> {
@@ -162,6 +393,7 @@ struct FunctionSig {
     params: Vec<Param>,
     visibility: Visibility,
     module: Option<String>,
+    asynchronous: bool,
 }
 
 #[derive(Clone)]
@@ -202,6 +434,57 @@ struct LoopTransfer {
     stack_depth: usize,
 }
 
+enum ForZipState {
+    Range {
+        var_slot: usize,
+        end_slot: usize,
+        step_slot: usize,
+    },
+    Each {
+        bindings: Vec<PatternBindingSlot>,
+        item_slot: usize,
+        iterator_slot: usize,
+    },
+}
+
+#[derive(Clone)]
+struct PatternBindingSlot {
+    name: String,
+    path: Vec<usize>,
+    slot: usize,
+}
+
+fn allocate_pattern_slots(
+    pattern: &BindingPattern,
+    scopes: &mut Scopes,
+) -> Vec<PatternBindingSlot> {
+    fn collect(
+        pattern: &BindingPattern,
+        path: &mut Vec<usize>,
+        scopes: &mut Scopes,
+        bindings: &mut Vec<PatternBindingSlot>,
+    ) {
+        match pattern {
+            BindingPattern::Name(name) => bindings.push(PatternBindingSlot {
+                name: name.clone(),
+                path: path.clone(),
+                slot: scopes.reserve_slot(),
+            }),
+            BindingPattern::Tuple(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    path.push(index);
+                    collect(item, path, scopes, bindings);
+                    path.pop();
+                }
+            }
+        }
+    }
+
+    let mut bindings = Vec::new();
+    collect(pattern, &mut Vec::new(), scopes, &mut bindings);
+    bindings
+}
+
 fn runtime_array_element_type(annotation: &crate::ast::TypeAnnotation) -> Option<RuntimeType> {
     if let crate::ast::TypeKind::Array(element) = &annotation.kind {
         runtime_type(element)
@@ -214,13 +497,21 @@ fn runtime_type(annotation: &crate::ast::TypeAnnotation) -> Option<RuntimeType> 
     use crate::ast::{TypeKind, VarType};
     let mut ty = match &annotation.kind {
         TypeKind::Primitive(VarType::Int) => RuntimeType::Int,
+        TypeKind::Primitive(VarType::UInt) => RuntimeType::UInt,
+        TypeKind::Primitive(VarType::BigInt) => RuntimeType::BigInt,
         TypeKind::Primitive(VarType::Float) => RuntimeType::Float,
         TypeKind::Primitive(VarType::Bool) => RuntimeType::Bool,
+        TypeKind::Primitive(VarType::Char) => RuntimeType::Char,
         TypeKind::Primitive(VarType::Str) => RuntimeType::Str,
         TypeKind::Primitive(VarType::Nil) => RuntimeType::Nil,
         TypeKind::Array(element) => RuntimeType::Array(Box::new(runtime_type(element)?)),
         TypeKind::Named(name) => RuntimeType::Nominal(name.clone()),
         TypeKind::ResolvedName { symbol, .. } => RuntimeType::Nominal(symbol.clone()),
+        TypeKind::Applied { source, .. } | TypeKind::ResolvedApplied { source, .. }
+            if source == "Task" =>
+        {
+            RuntimeType::Nominal("$core::Task".to_owned())
+        }
         TypeKind::Applied { .. } | TypeKind::ResolvedApplied { .. } => {
             RuntimeType::Nominal(annotation.canonical())
         }
@@ -240,6 +531,11 @@ struct Codegen<'a> {
     method_calls: &'a HashMap<crate::analysis::CallSite, String>,
     call_specializations: &'a HashMap<crate::analysis::CallSite, String>,
     struct_call_specializations: &'a HashMap<crate::analysis::CallSite, String>,
+    uint_literals: &'a std::collections::HashSet<usize>,
+    uint_expressions: &'a std::collections::HashSet<usize>,
+    bigint_literals: &'a std::collections::HashSet<usize>,
+    inline_functions: HashMap<String, InlineFunction>,
+    inline_nodes_remaining: usize,
     current_function: Option<String>,
     current_module: Option<String>,
     struct_defs: HashMap<String, Vec<crate::ast::StructField>>,
@@ -249,20 +545,27 @@ struct Codegen<'a> {
     globals: &'a HashMap<String, GlobalSig>,
     declaration_uses: &'a [crate::ast::UseDecl],
     global_indices: &'a HashMap<String, usize>,
+    global_constant_values: HashMap<String, Value>,
     out: Emitter,
     loop_end_stack: Vec<LoopTransfer>,
     loop_continue_stack: Vec<LoopTransfer>,
     active_defers: Vec<Deferred>,
     error_handler: Option<ErrorHandler>,
+    observed_propagation_call: Option<crate::analysis::CallSite>,
     // Snapshot normal result or primary Error while executing exited cleanup.
     cleanup_primary: Option<usize>,
     cleanup_boundary: Option<CleanupBoundary>,
     function_result_type: Option<crate::ast::TypeAnnotation>,
     in_function: bool,
+    in_async: bool,
 }
 
 pub fn compile(program: &Program) -> Result<CompiledProgram, CodegenError> {
     compile_with_modules(program, &HashMap::new())
+}
+
+pub(crate) fn compile_library(program: &Program) -> Result<CompiledProgram, CodegenError> {
+    compile_with_modules_and_entry(program, &HashMap::new(), false)
 }
 
 fn is_main_arguments_parameter(parameters: &[Param]) -> bool {
@@ -289,6 +592,14 @@ fn is_main_arguments_parameter(parameters: &[Param]) -> bool {
 pub fn compile_with_modules(
     program: &Program,
     function_modules: &HashMap<String, String>,
+) -> Result<CompiledProgram, CodegenError> {
+    compile_with_modules_and_entry(program, function_modules, true)
+}
+
+fn compile_with_modules_and_entry(
+    program: &Program,
+    function_modules: &HashMap<String, String>,
+    require_main: bool,
 ) -> Result<CompiledProgram, CodegenError> {
     let (program, checked) = crate::generics::expand(program, function_modules)
         .map_err(CodegenError::from_diagnostics)?;
@@ -330,6 +641,7 @@ pub fn compile_with_modules(
                                 .get(&f.name)
                                 .cloned()
                                 .or_else(|| f.name.rsplit_once("::").map(|(m, _)| m.to_string())),
+                            asynchronous: f.asynchronous,
                         },
                     )
                     .is_some()
@@ -355,6 +667,7 @@ pub fn compile_with_modules(
                                 .name
                                 .rsplit_once("::")
                                 .map(|(module, _)| module.to_owned()),
+                            asynchronous: function.asynchronous,
                         },
                     );
                 }
@@ -465,23 +778,30 @@ pub fn compile_with_modules(
         })
         .collect();
 
-    if !functions.contains_key("main") {
-        return Err(CodegenError::new(
-            "no entry point: expected a function named `main`",
-        ));
-    }
-    let main_parameters = &functions["main"].params;
-    if !main_parameters.is_empty() && !is_main_arguments_parameter(main_parameters) {
-        return Err(CodegenError::new(
-            "`main` must take no parameters or exactly `args: str[]`",
-        ));
+    if require_main {
+        let Some(main) = functions.get("main") else {
+            return Err(CodegenError::new(
+                "no entry point: expected a function named `main`",
+            ));
+        };
+        if !main.params.is_empty() && !is_main_arguments_parameter(&main.params) {
+            return Err(CodegenError::new(
+                "`main` must take no parameters or exactly `args: str[]`",
+            ));
+        }
     }
 
+    let inline_functions = collect_inline_functions(program);
     let mut cg = Codegen {
         functions: &functions,
         method_calls: &checked.method_calls,
         call_specializations: &checked.call_specializations,
         struct_call_specializations: &checked.struct_call_specializations,
+        uint_literals: &checked.uint_literals,
+        uint_expressions: &checked.uint_expressions,
+        bigint_literals: &checked.bigint_literals,
+        inline_functions,
+        inline_nodes_remaining: MAX_INLINE_NODES_PER_FUNCTION,
         current_function: None,
         current_module: None,
         struct_defs,
@@ -491,15 +811,18 @@ pub fn compile_with_modules(
         globals: &globals,
         declaration_uses: &top_level_uses,
         global_indices: &global_indices,
+        global_constant_values: HashMap::new(),
         out: Emitter::default(),
         loop_end_stack: Vec::new(),
         loop_continue_stack: Vec::new(),
         active_defers: Vec::new(),
         error_handler: None,
+        observed_propagation_call: None,
         cleanup_primary: None,
         cleanup_boundary: None,
         function_result_type: None,
         in_function: false,
+        in_async: false,
     };
 
     // The resolver orders global declarations by initialization dependencies.
@@ -516,6 +839,10 @@ pub fn compile_with_modules(
                     cg.apply_use_decl(decl, &mut init_scopes)?;
                 }
                 cg.current_module = globals.get(name).and_then(|g| g.module.clone());
+                let constant_value = globals
+                    .get(name)
+                    .filter(|global| !global.mutable)
+                    .and_then(|_| cg.fold_constant_expression(value, &init_scopes));
                 if let Some(ty) = ty.as_ref() {
                     cg.compile_expr_typed_array(value, ty, &mut init_scopes)?;
                 } else {
@@ -523,16 +850,32 @@ pub fn compile_with_modules(
                 }
                 let idx = *global_indices.get(name).expect("global index");
                 cg.out.emit(Instruction::StoreGlobal(idx));
+                if let Some(value) = constant_value {
+                    cg.global_constant_values.insert(name.clone(), value);
+                }
             }
             _ => {}
         }
     }
-    if !main_parameters.is_empty() {
-        let arguments =
-            crate::runtime::NativeImport::named("process::args").map_err(CodegenError::new)?;
-        cg.out.call_native(arguments);
+    if require_main {
+        let main_parameters = &functions["main"].params;
+        if !main_parameters.is_empty() {
+            let arguments =
+                crate::runtime::NativeImport::named("process::args").map_err(CodegenError::new)?;
+            cg.out.call_native(arguments);
+        }
+        if functions["main"].asynchronous {
+            cg.out.call_async("main", main_parameters.len());
+            cg.out.emit(Instruction::Await);
+        } else {
+            cg.out.call("main", main_parameters.len());
+            let returned_normally = cg.fresh_label("main_returned_normally");
+            cg.out
+                .jump(Instruction::JumpIfNoPropagation(0), returned_normally);
+            cg.out.emit(Instruction::Halt);
+            cg.out.bind(returned_normally);
+        }
     }
-    cg.out.call("main", main_parameters.len());
     cg.out.emit(Instruction::Halt);
     for item in &program.items {
         match item {
@@ -571,7 +914,10 @@ impl<'a> Codegen<'a> {
         global_imports: &HashMap<String, String>,
         top_level_uses: &[crate::ast::UseDecl],
     ) -> Result<(), CodegenError> {
+        self.inline_nodes_remaining = MAX_INLINE_NODES_PER_FUNCTION;
         self.current_function = Some(f.name.clone());
+        let saved_async = self.in_async;
+        self.in_async = f.asynchronous;
         let mut scopes = Scopes::new();
         scopes
             .imports
@@ -585,14 +931,19 @@ impl<'a> Codegen<'a> {
             scopes.define(&p.name);
         }
 
-        self.out.function_with_types(
-            &f.name,
-            f.params
-                .iter()
-                .map(|parameter| parameter.ty.as_ref().and_then(runtime_type))
-                .collect(),
-            f.result_type.as_ref().and_then(runtime_type),
-        );
+        let parameter_types = f
+            .params
+            .iter()
+            .map(|parameter| parameter.ty.as_ref().and_then(runtime_type))
+            .collect();
+        let result_type = f.result_type.as_ref().and_then(runtime_type);
+        if f.asynchronous {
+            self.out
+                .function_with_async_types(&f.name, parameter_types, result_type, true);
+        } else {
+            self.out
+                .function_with_types(&f.name, parameter_types, result_type);
+        }
         self.in_function = true;
         for i in (0..f.params.len()).rev() {
             self.out.emit(Instruction::Store(i));
@@ -609,6 +960,7 @@ impl<'a> Codegen<'a> {
         self.out.emit(Instruction::Return);
         self.function_result_type = None;
         self.in_function = false;
+        self.in_async = saved_async;
         Ok(())
     }
 
@@ -665,6 +1017,10 @@ impl<'a> Codegen<'a> {
                 }
                 _ => self.compile_stmt(stmt, scopes, &mut deferred)?,
             }
+            if !terminated_early {
+                self.active_defers = deferred.clone();
+                self.emit_cancellation_check(scopes)?;
+            }
         }
 
         if !terminated_early {
@@ -679,8 +1035,12 @@ impl<'a> Codegen<'a> {
                 } else {
                     self.compile_discarded_expr(tail, scopes)?;
                 }
+                self.emit_cancellation_check(scopes)?;
             } else if value {
                 self.out.emit(Instruction::Push(Value::Nil));
+                self.emit_cancellation_check(scopes)?;
+            } else {
+                self.emit_cancellation_check(scopes)?;
             }
             // Snapshot the result value, not the referenced object, before any
             // local cleanup. Cleanup may reassign bindings or use the stack.
@@ -800,24 +1160,11 @@ impl<'a> Codegen<'a> {
                     "internal error: invalid AST reached code generation",
                 ));
             }
-            Stmt::VarDecl { name, ty, value } => {
-                if let Some(ty) = ty {
-                    self.compile_expr_typed_array(value, ty, scopes)?;
-                } else {
-                    self.compile_expr(value, scopes)?;
-                }
-                let slot = scopes.define(name);
-                self.out.emit(Instruction::Store(slot));
+            Stmt::VarDecl { pattern, ty, value } => {
+                self.compile_local_binding(pattern, ty.as_ref(), value, false, scopes)?;
             }
-            Stmt::Const { name, ty, value } => {
-                if let Some(ty) = ty {
-                    self.compile_expr_typed_array(value, ty, scopes)?;
-                } else {
-                    self.compile_expr(value, scopes)?;
-                }
-                let slot = scopes.define(name);
-                scopes.mark_const(name);
-                self.out.emit(Instruction::Store(slot));
+            Stmt::Const { pattern, ty, value } => {
+                self.compile_local_binding(pattern, ty.as_ref(), value, true, scopes)?;
             }
             Stmt::Comptime { .. } => {
                 return Err(CodegenError::new(
@@ -910,6 +1257,14 @@ impl<'a> Codegen<'a> {
                 then_block,
                 else_block,
             } => {
+                if let Some(Value::Bool(value)) = self.fold_constant_expression(cond, scopes) {
+                    if value {
+                        self.compile_block_with_deferred(then_block, scopes, deferred.clone())?;
+                    } else if let Some(block) = else_block {
+                        self.compile_block_with_deferred(block, scopes, deferred.clone())?;
+                    }
+                    return Ok(());
+                }
                 let else_label = self.fresh_label("if_else");
                 let end_label = self.fresh_label("if_end");
                 self.compile_expr(cond, scopes)?;
@@ -955,6 +1310,12 @@ impl<'a> Codegen<'a> {
                 self.out.bind(end_label);
             }
             Stmt::While { cond, body } => {
+                if matches!(
+                    self.fold_constant_expression(cond, scopes),
+                    Some(Value::Bool(false))
+                ) {
+                    return Ok(());
+                }
                 let cond_label = self.fresh_label("while_cond");
                 let end_label = self.fresh_label("while_end");
                 self.out.bind(cond_label);
@@ -993,15 +1354,17 @@ impl<'a> Codegen<'a> {
                 let desc_label = self.fresh_label("for_desc");
                 let cmp_done_label = self.fresh_label("for_cmp_done");
                 scopes.push();
+                let start_zero = self.range_zero(start);
                 self.compile_expr(start, scopes)?;
                 self.out
-                    .extend([Instruction::Push(Value::Int(0)), Instruction::Sub]);
+                    .extend([Instruction::Push(start_zero), Instruction::Sub]);
                 self.propagate_control_error(scopes)?;
                 let var_slot = scopes.define(var);
                 self.out.emit(Instruction::Store(var_slot));
+                let end_zero = self.range_zero(end);
                 self.compile_expr(end, scopes)?;
                 self.out
-                    .extend([Instruction::Push(Value::Int(0)), Instruction::Sub]);
+                    .extend([Instruction::Push(end_zero), Instruction::Sub]);
                 self.propagate_control_error(scopes)?;
                 let end_slot = scopes.next_slot;
                 scopes.next_slot += 1;
@@ -1010,12 +1373,16 @@ impl<'a> Codegen<'a> {
                 // no `step` clause is present.
                 let step_slot = scopes.next_slot;
                 scopes.next_slot += 1;
+                let step_zero = step
+                    .as_ref()
+                    .map(|step| self.range_zero(step))
+                    .unwrap_or_else(|| self.range_zero(start));
                 match step {
                     Some(step_expr) => self.compile_expr(step_expr, scopes)?,
-                    None => self.out.emit(Instruction::Push(Value::Int(1))),
+                    None => self.out.emit(Instruction::Push(self.range_one(start))),
                 }
                 self.out
-                    .extend([Instruction::Push(Value::Int(0)), Instruction::Sub]);
+                    .extend([Instruction::Push(step_zero), Instruction::Sub]);
                 self.propagate_control_error(scopes)?;
                 self.out.emit(Instruction::Store(step_slot));
 
@@ -1086,7 +1453,7 @@ impl<'a> Codegen<'a> {
                 scopes.pop();
             }
             Stmt::ForEach {
-                var,
+                pattern,
                 iterable,
                 body,
             } => {
@@ -1099,7 +1466,11 @@ impl<'a> Codegen<'a> {
                 self.out.call_native(crate::runtime::iterator_new_import());
                 self.propagate_control_error(scopes)?;
                 self.out.emit(Instruction::Store(iterator_slot));
-                let value_slot = scopes.define(var);
+                let item_slot = scopes.reserve_slot();
+                let bindings = allocate_pattern_slots(pattern, scopes);
+                for binding in &bindings {
+                    scopes.bind_slot(&binding.name, binding.slot);
+                }
 
                 self.out.bind(condition_label);
                 self.out.emit(Instruction::Load(iterator_slot));
@@ -1109,7 +1480,8 @@ impl<'a> Codegen<'a> {
                 self.out.emit(Instruction::Load(iterator_slot));
                 self.out
                     .call_native(crate::runtime::iterator_current_import());
-                self.out.emit(Instruction::Store(value_slot));
+                self.out.emit(Instruction::Store(item_slot));
+                self.store_pattern_bindings(item_slot, &bindings);
 
                 let transfer = LoopTransfer {
                     label: end_label,
@@ -1129,10 +1501,312 @@ impl<'a> Codegen<'a> {
                 self.out.extend([
                     Instruction::Push(Value::Nil),
                     Instruction::Store(iterator_slot),
+                    Instruction::Push(Value::Nil),
+                    Instruction::Store(item_slot),
                 ]);
                 scopes.pop();
             }
+            Stmt::ForZip { clauses, body } => {
+                self.compile_for_zip(clauses, body, scopes, deferred)?;
+            }
         }
+        Ok(())
+    }
+
+    fn store_pattern_bindings(&mut self, item_slot: usize, bindings: &[PatternBindingSlot]) {
+        for binding in bindings {
+            self.out.emit(Instruction::Load(item_slot));
+            for index in &binding.path {
+                self.out.extend([
+                    Instruction::Push(Value::Int(*index as i64)),
+                    Instruction::Index,
+                ]);
+            }
+            self.out.emit(Instruction::Store(binding.slot));
+        }
+    }
+
+    fn range_zero(&self, expression: &Expr) -> Value {
+        if self
+            .uint_expressions
+            .contains(&crate::mutability::expr_id(expression))
+        {
+            Value::UInt(0)
+        } else {
+            Value::Int(0)
+        }
+    }
+
+    fn range_one(&self, expression: &Expr) -> Value {
+        if self
+            .uint_expressions
+            .contains(&crate::mutability::expr_id(expression))
+        {
+            Value::UInt(1)
+        } else {
+            Value::Int(1)
+        }
+    }
+
+    fn compile_local_binding(
+        &mut self,
+        pattern: &BindingPattern,
+        ty: Option<&TypeAnnotation>,
+        value: &Expr,
+        is_const: bool,
+        scopes: &mut Scopes,
+    ) -> Result<(), CodegenError> {
+        if let BindingPattern::Name(name) = pattern {
+            let constant_value = is_const
+                .then(|| self.fold_constant_expression(value, scopes))
+                .flatten();
+            if constant_value.is_none() {
+                if let Some(ty) = ty {
+                    self.compile_expr_typed_array(value, ty, scopes)?;
+                } else {
+                    self.compile_expr(value, scopes)?;
+                }
+            }
+            let slot = scopes.define(name);
+            if is_const {
+                scopes.mark_const(name);
+            }
+            if let Some(value) = constant_value {
+                scopes.const_values.insert(slot, value);
+            } else {
+                self.out.emit(Instruction::Store(slot));
+            }
+            return Ok(());
+        }
+
+        if let Some(ty) = ty {
+            self.compile_expr_typed_array(value, ty, scopes)?;
+        } else {
+            self.compile_expr(value, scopes)?;
+        }
+        let value_slot = scopes.reserve_slot();
+        self.out.emit(Instruction::Store(value_slot));
+        let bindings = allocate_pattern_slots(pattern, scopes);
+        for binding in &bindings {
+            scopes.bind_slot(&binding.name, binding.slot);
+            if is_const {
+                scopes.mark_const(&binding.name);
+            }
+        }
+        self.store_pattern_bindings(value_slot, &bindings);
+        // Do not keep an extra reference to the tuple alive after its fields
+        // have been stored in their local bindings.
+        self.out.extend([
+            Instruction::Push(Value::Nil),
+            Instruction::Store(value_slot),
+        ]);
+        Ok(())
+    }
+
+    fn compile_for_zip(
+        &mut self,
+        clauses: &[ForClause],
+        body: &Block,
+        scopes: &mut Scopes,
+        deferred: &mut Vec<Deferred>,
+    ) -> Result<(), CodegenError> {
+        let condition_label = self.fresh_label("for_zip_condition");
+        let next_label = self.fresh_label("for_zip_next");
+        let end_label = self.fresh_label("for_zip_end");
+        scopes.push();
+
+        let mut states = Vec::with_capacity(clauses.len());
+        for clause in clauses {
+            match clause {
+                ForClause::Range {
+                    start, end, step, ..
+                } => {
+                    let var_slot = scopes.reserve_slot();
+                    let start_zero = self.range_zero(start);
+                    self.compile_expr(start, scopes)?;
+                    self.out
+                        .extend([Instruction::Push(start_zero), Instruction::Sub]);
+                    self.propagate_control_error(scopes)?;
+                    self.out.emit(Instruction::Store(var_slot));
+
+                    let end_slot = scopes.reserve_slot();
+                    let end_zero = self.range_zero(end);
+                    self.compile_expr(end, scopes)?;
+                    self.out
+                        .extend([Instruction::Push(end_zero), Instruction::Sub]);
+                    self.propagate_control_error(scopes)?;
+                    self.out.emit(Instruction::Store(end_slot));
+
+                    let step_slot = scopes.reserve_slot();
+                    let step_zero = step
+                        .as_ref()
+                        .map(|step| self.range_zero(step))
+                        .unwrap_or_else(|| self.range_zero(start));
+                    match step {
+                        Some(step) => self.compile_expr(step, scopes)?,
+                        None => self.out.emit(Instruction::Push(self.range_one(start))),
+                    }
+                    self.out
+                        .extend([Instruction::Push(step_zero), Instruction::Sub]);
+                    self.propagate_control_error(scopes)?;
+                    self.out.emit(Instruction::Store(step_slot));
+
+                    let valid_step = self.fresh_label("for_zip_nonzero_step");
+                    self.out.extend([
+                        Instruction::Load(step_slot),
+                        Instruction::Push(Value::Int(0)),
+                        Instruction::Eq,
+                    ]);
+                    self.out.jump(Instruction::JumpIfFalse(0), valid_step);
+                    self.out.extend([
+                        Instruction::Push(Value::TypeTag(Rc::from(format!(
+                            "{}::InvalidRangeStep",
+                            crate::error::ERROR_TYPE
+                        )))),
+                        Instruction::Push(Value::Nil),
+                        Instruction::MakeRecord(1),
+                    ]);
+                    self.propagate_control_error(scopes)?;
+                    self.out.emit(Instruction::Pop);
+                    self.out.bind(valid_step);
+
+                    states.push(ForZipState::Range {
+                        var_slot,
+                        end_slot,
+                        step_slot,
+                    });
+                }
+                ForClause::Each { pattern, iterable } => {
+                    let bindings = allocate_pattern_slots(pattern, scopes);
+                    let item_slot = scopes.reserve_slot();
+                    let iterator_slot = scopes.reserve_slot();
+                    self.compile_expr(iterable, scopes)?;
+                    self.out.call_native(crate::runtime::iterator_new_import());
+                    self.propagate_control_error(scopes)?;
+                    self.out.emit(Instruction::Store(iterator_slot));
+                    states.push(ForZipState::Each {
+                        bindings,
+                        item_slot,
+                        iterator_slot,
+                    });
+                }
+            }
+        }
+
+        for (clause, state) in clauses.iter().zip(&states) {
+            match (clause, state) {
+                (ForClause::Range { var, .. }, ForZipState::Range { var_slot, .. }) => {
+                    scopes.bind_slot(var, *var_slot);
+                }
+                (ForClause::Each { .. }, ForZipState::Each { bindings, .. }) => {
+                    for binding in bindings {
+                        scopes.bind_slot(&binding.name, binding.slot);
+                    }
+                }
+                _ => unreachable!("for clause state matches its clause"),
+            }
+        }
+
+        self.out.bind(condition_label);
+        for state in &states {
+            match state {
+                ForZipState::Range {
+                    var_slot,
+                    end_slot,
+                    step_slot,
+                } => {
+                    let descending_label = self.fresh_label("for_zip_descending");
+                    let comparison_done = self.fresh_label("for_zip_comparison_done");
+                    self.out.extend([
+                        Instruction::Load(*step_slot),
+                        Instruction::Push(Value::Int(0)),
+                        Instruction::Lt,
+                    ]);
+                    self.propagate_control_error(scopes)?;
+                    self.out.jump(Instruction::JumpIfTrue(0), descending_label);
+                    self.out.extend([
+                        Instruction::Load(*var_slot),
+                        Instruction::Load(*end_slot),
+                        Instruction::Lt,
+                    ]);
+                    self.out.jump(Instruction::Jump(0), comparison_done);
+                    self.out.bind(descending_label);
+                    self.out.extend([
+                        Instruction::Load(*var_slot),
+                        Instruction::Load(*end_slot),
+                        Instruction::Gt,
+                    ]);
+                    self.out.bind(comparison_done);
+                    self.propagate_control_error(scopes)?;
+                    self.out.jump(Instruction::JumpIfFalse(0), end_label);
+                }
+                ForZipState::Each {
+                    bindings,
+                    item_slot,
+                    iterator_slot,
+                } => {
+                    self.out.emit(Instruction::Load(*iterator_slot));
+                    self.out.call_native(crate::runtime::iterator_next_import());
+                    self.propagate_control_error(scopes)?;
+                    self.out.jump(Instruction::JumpIfFalse(0), end_label);
+                    self.out.emit(Instruction::Load(*iterator_slot));
+                    self.out
+                        .call_native(crate::runtime::iterator_current_import());
+                    self.out.emit(Instruction::Store(*item_slot));
+                    self.store_pattern_bindings(*item_slot, bindings);
+                }
+            }
+        }
+
+        let transfer = LoopTransfer {
+            label: end_label,
+            defer_baseline: deferred.len(),
+            stack_depth: self.out.stack_depth(),
+        };
+        self.loop_end_stack.push(transfer);
+        self.loop_continue_stack.push(LoopTransfer {
+            label: next_label,
+            ..transfer
+        });
+        self.compile_block_with_deferred(body, scopes, deferred.clone())?;
+        self.loop_continue_stack.pop();
+        self.loop_end_stack.pop();
+
+        self.out.bind(next_label);
+        for state in &states {
+            if let ForZipState::Range {
+                var_slot,
+                step_slot,
+                ..
+            } = state
+            {
+                self.out.extend([
+                    Instruction::Load(*var_slot),
+                    Instruction::Load(*step_slot),
+                    Instruction::Add,
+                ]);
+                self.propagate_control_error(scopes)?;
+                self.out.emit(Instruction::Store(*var_slot));
+            }
+        }
+        self.out.jump(Instruction::Jump(0), condition_label);
+        self.out.bind(end_label);
+        for state in &states {
+            if let ForZipState::Each {
+                item_slot,
+                iterator_slot,
+                ..
+            } = state
+            {
+                self.out.extend([
+                    Instruction::Push(Value::Nil),
+                    Instruction::Store(*iterator_slot),
+                    Instruction::Push(Value::Nil),
+                    Instruction::Store(*item_slot),
+                ]);
+            }
+        }
+        scopes.pop();
         Ok(())
     }
 
@@ -1350,8 +2024,20 @@ impl<'a> Codegen<'a> {
         args: &[CallArgument],
         module: Option<String>,
         target: DeclaredCall,
+        call_site: crate::analysis::CallSite,
         scopes: &mut Scopes,
     ) -> Result<(), CodegenError> {
+        if matches!(target, DeclaredCall::Function) {
+            let expressions = args
+                .iter()
+                .map(|argument| argument.name.is_none().then_some(&argument.value))
+                .collect::<Option<Vec<_>>>();
+            if let Some(expressions) = expressions
+                && self.try_inline_expressions(name, &expressions, scopes)?
+            {
+                return Ok(());
+            }
+        }
         let bindings = crate::arguments::bind(name, fields, args);
         if let Some(error) = bindings.errors.first() {
             return Err(CodegenError::new(error.message.clone()));
@@ -1410,8 +2096,35 @@ impl<'a> Codegen<'a> {
             }
         }
         match target {
-            DeclaredCall::Function => self.out.call(name, fields.len()),
-            DeclaredCall::Record => self.out.emit(Instruction::MakeRecord(fields.len() + 1)),
+            DeclaredCall::Function => {
+                if self
+                    .functions
+                    .get(name)
+                    .is_some_and(|function| function.asynchronous)
+                {
+                    self.out.call_async(name, fields.len());
+                } else {
+                    self.out.call(name, fields.len());
+                    self.propagate_call_error(scopes, &call_site)?;
+                }
+            }
+            DeclaredCall::Record => {
+                self.out.emit(Instruction::MakeRecord(fields.len() + 1));
+                let mut contracts = fields
+                    .iter()
+                    .filter_map(|field| {
+                        field
+                            .ty
+                            .as_ref()
+                            .and_then(runtime_type)
+                            .map(|ty| (field.name.clone(), ty))
+                    })
+                    .collect::<Vec<_>>();
+                contracts.sort_by(|left, right| left.0.cmp(&right.0));
+                if !contracts.is_empty() {
+                    self.out.emit(Instruction::ConstrainRecordFields(contracts));
+                }
+            }
             DeclaredCall::Variant => self.out.emit(Instruction::MakeRecord(fields.len() + 1)),
         }
         Ok(())
@@ -1424,6 +2137,7 @@ impl<'a> Codegen<'a> {
         receiver: &Expr,
         args: &[Expr],
         module: Option<String>,
+        call_site: crate::analysis::CallSite,
         scopes: &mut Scopes,
     ) -> Result<(), CodegenError> {
         let Some(receiver_param) = params.first() else {
@@ -1436,6 +2150,12 @@ impl<'a> Codegen<'a> {
             return Err(CodegenError::new(format!(
                 "method `{name}` expects at most {maximum_arguments} argument(s)"
             )));
+        }
+        let mut expressions = Vec::with_capacity(args.len() + 1);
+        expressions.push(receiver);
+        expressions.extend(args.iter());
+        if self.try_inline_expressions(name, &expressions, scopes)? {
+            return Ok(());
         }
         self.compile_call_argument(receiver, receiver_param.ty.as_ref(), scopes)?;
         for (index, parameter) in params.iter().enumerate().skip(1) {
@@ -1450,7 +2170,16 @@ impl<'a> Codegen<'a> {
                 )));
             }
         }
-        self.out.call(name, params.len());
+        if self
+            .functions
+            .get(name)
+            .is_some_and(|function| function.asynchronous)
+        {
+            self.out.call_async(name, params.len());
+        } else {
+            self.out.call(name, params.len());
+            self.propagate_call_error(scopes, &call_site)?;
+        }
         Ok(())
     }
 
@@ -1478,11 +2207,15 @@ impl<'a> Codegen<'a> {
         args: &[CallArgument],
         scopes: &mut Scopes,
     ) -> Result<(), CodegenError> {
-        if args.len() != builtin.arity() {
+        if !builtin.accepts_arity(args.len()) {
+            let expected = if matches!(builtin, Builtin::ProcessRunAsync) {
+                "2, 3, 4, or 5".to_owned()
+            } else {
+                builtin.arity().to_string()
+            };
             return Err(CodegenError::new(format!(
-                "`{}` expects {} argument(s), got {}",
-                format!("{:?}", builtin.instruction()).to_lowercase(),
-                builtin.arity(),
+                "`{}` expects {expected} argument(s), got {}",
+                format!("{:?}", builtin.instruction_for_arity(args.len())).to_lowercase(),
                 args.len()
             )));
         }
@@ -1500,9 +2233,11 @@ impl<'a> Codegen<'a> {
                     "build input calls must be evaluated at comptime",
                 ));
             }
-            _ => self
-                .out
-                .emit(builtin.instruction().expect("VM builtin instruction")),
+            _ => self.out.emit(
+                builtin
+                    .instruction_for_arity(args.len())
+                    .expect("VM builtin instruction"),
+            ),
         }
         Ok(())
     }
@@ -1573,6 +2308,7 @@ impl<'a> Codegen<'a> {
         method: &str,
         args: &[Expr],
         extension: Option<&str>,
+        call_site: crate::analysis::CallSite,
         scopes: &mut Scopes,
     ) -> Result<(), CodegenError> {
         if let Some(name) = extension {
@@ -1594,6 +2330,7 @@ impl<'a> Codegen<'a> {
                 receiver,
                 args,
                 sig.module,
+                call_site,
                 scopes,
             );
         }
@@ -1633,7 +2370,7 @@ impl<'a> Codegen<'a> {
                 self.compile_expr(receiver, scopes)?;
                 self.out.emit(Instruction::Len);
             }
-            "to_int" | "to_float" | "to_bool" | "to_str" => {
+            "to_int" | "to_float" | "to_bool" | "to_char" | "to_str" => {
                 if !args.is_empty() {
                     return Err(CodegenError::new(format!(
                         "method `{method}()` expects 0 arguments"
@@ -1644,6 +2381,7 @@ impl<'a> Codegen<'a> {
                     "to_int" => "str::to_int",
                     "to_float" => "str::to_float",
                     "to_bool" => "str::to_bool",
+                    "to_char" => "str::to_char",
                     _ => "str::to_str",
                 };
                 self.out.call_native(
@@ -1973,7 +2711,13 @@ impl<'a> Codegen<'a> {
                 for (item, ty) in items.iter().zip(types) {
                     self.compile_expr_typed_array(item, ty, scopes)?;
                 }
-                self.out.emit(Instruction::MakeTuple(items.len()));
+                let expected = types.iter().map(runtime_type).collect::<Option<Vec<_>>>();
+                if let Some(expected) = expected {
+                    self.out
+                        .emit(Instruction::MakeTypedTuple(items.len(), expected));
+                } else {
+                    self.out.emit(Instruction::MakeTuple(items.len()));
+                }
                 Ok(())
             }
             _ => {
@@ -1999,15 +2743,239 @@ impl<'a> Codegen<'a> {
         }
     }
 
+    fn try_inline_expressions(
+        &mut self,
+        name: &str,
+        arguments: &[&Expr],
+        scopes: &mut Scopes,
+    ) -> Result<bool, CodegenError> {
+        if !self.in_function || self.in_async {
+            return Ok(false);
+        }
+        let Some(function) = self.inline_functions.get(name).cloned() else {
+            return Ok(false);
+        };
+        if function.mode == InlineMode::Never
+            || (function.mode == InlineMode::Auto && function.nodes > AUTO_INLINE_BODY_NODES)
+            || function.nodes > self.inline_nodes_remaining
+            || arguments.len() != function.parameters.len()
+        {
+            return Ok(false);
+        }
+
+        let mut slots = Vec::with_capacity(arguments.len());
+        for (argument, parameter) in arguments.iter().zip(&function.parameters) {
+            self.compile_call_argument(argument, parameter.ty.as_ref(), scopes)?;
+            let slot = scopes.reserve_slot();
+            self.out.emit(Instruction::Store(slot));
+            slots.push(slot);
+        }
+
+        self.inline_nodes_remaining -= function.nodes;
+        scopes.push();
+        for (parameter, slot) in function.parameters.iter().zip(slots) {
+            scopes.bind_slot(&parameter.name, slot);
+        }
+        let result = self.compile_expr(&function.body, scopes);
+        scopes.pop();
+        result?;
+        Ok(true)
+    }
+
+    fn fold_constant_expression(&self, expr: &Expr, scopes: &Scopes) -> Option<Value> {
+        let mut nodes = 0;
+        let expression = self.constant_expression(expr, scopes, &mut nodes, true)?;
+        crate::comptime::fold_constant_expression(&expression).map(|value| {
+            if self
+                .uint_expressions
+                .contains(&crate::mutability::expr_id(expr))
+                || self
+                    .uint_literals
+                    .contains(&crate::mutability::expr_id(expr))
+            {
+                if let Value::Int(value) = value {
+                    if let Ok(value) = u64::try_from(value) {
+                        return Value::UInt(value);
+                    }
+                    return Value::Int(value);
+                }
+            }
+            value
+        })
+    }
+
+    fn constant_expression(
+        &self,
+        expr: &Expr,
+        scopes: &Scopes,
+        nodes: &mut usize,
+        allow_constant_calls: bool,
+    ) -> Option<Expr> {
+        *nodes += 1;
+        if *nodes > 64 {
+            return None;
+        }
+        if self
+            .bigint_literals
+            .contains(&crate::mutability::expr_id(expr))
+        {
+            match expr.node() {
+                Expr::Int(value) => return Some(Expr::BigInt((*value).into())),
+                Expr::UInt(value) => return Some(Expr::BigInt((*value).into())),
+                _ => {}
+            }
+        }
+        if self
+            .uint_literals
+            .contains(&crate::mutability::expr_id(expr))
+            && let Expr::Int(value) = expr.node()
+        {
+            return Some(Expr::UInt(u64::try_from(*value).ok()?));
+        }
+
+        match expr {
+            Expr::Located(span, inner) => Some(Expr::Located(
+                span.clone(),
+                Box::new(self.constant_expression(inner, scopes, nodes, allow_constant_calls)?),
+            )),
+            Expr::Int(_)
+            | Expr::UInt(_)
+            | Expr::BigInt(_)
+            | Expr::Float(_)
+            | Expr::Char(_)
+            | Expr::Bool(_)
+            | Expr::Nil => Some(expr.clone()),
+            Expr::Ident(name) => {
+                Self::constant_value_expression(&self.constant_value(name, scopes)?)
+            }
+            Expr::Call(name, args) if allow_constant_calls => Self::constant_value_expression(
+                &self.fold_constant_call(name, args, scopes, nodes)?,
+            ),
+            Expr::Unary(UnOp::Neg | UnOp::Not, value) => Some(Expr::Unary(
+                match expr.node() {
+                    Expr::Unary(op, _) => *op,
+                    _ => unreachable!(),
+                },
+                Box::new(self.constant_expression(value, scopes, nodes, allow_constant_calls)?),
+            )),
+            Expr::Binary(op, left, right)
+                if matches!(
+                    op,
+                    BinOp::Add
+                        | BinOp::Sub
+                        | BinOp::Mul
+                        | BinOp::Div
+                        | BinOp::Mod
+                        | BinOp::Eq
+                        | BinOp::NotEq
+                        | BinOp::Lt
+                        | BinOp::LtEq
+                        | BinOp::Gt
+                        | BinOp::GtEq
+                        | BinOp::And
+                        | BinOp::Or
+                        | BinOp::Xor
+                ) =>
+            {
+                let left = self.constant_expression(left, scopes, nodes, allow_constant_calls)?;
+                if let Some(Value::Bool(value)) = crate::comptime::fold_scalar_expression(&left) {
+                    if (*op == BinOp::And && !value) || (*op == BinOp::Or && value) {
+                        return Some(Expr::Bool(value));
+                    }
+                }
+                Some(Expr::Binary(
+                    *op,
+                    Box::new(left),
+                    Box::new(self.constant_expression(
+                        right,
+                        scopes,
+                        nodes,
+                        allow_constant_calls,
+                    )?),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    fn fold_constant_call(
+        &self,
+        name: &str,
+        args: &[CallArgument],
+        scopes: &Scopes,
+        nodes: &mut usize,
+    ) -> Option<Value> {
+        if args.iter().any(|argument| argument.name.is_some()) {
+            return None;
+        }
+        let resolved = self.resolve_function_name(name, scopes).ok()?;
+        let function = self.inline_functions.get(&resolved)?;
+        if args.len() != function.parameters.len() || nodes.saturating_add(function.nodes) > 64 {
+            return None;
+        }
+
+        let mut values = Vec::with_capacity(args.len());
+        for argument in args {
+            let expression = self.constant_expression(&argument.value, scopes, nodes, false)?;
+            let value = crate::comptime::fold_constant_expression(&expression)?;
+            values.push(Self::constant_value_expression(&value)?);
+        }
+        *nodes += function.nodes;
+        let parameter_names = function
+            .parameters
+            .iter()
+            .map(|parameter| parameter.name.clone())
+            .collect::<Vec<_>>();
+        let expression = substitute_constant_parameters(&function.body, &parameter_names, &values)?;
+        crate::comptime::fold_constant_expression(&expression)
+    }
+
+    fn constant_value(&self, name: &str, scopes: &Scopes) -> Option<Value> {
+        if let Some(slot) = scopes.resolve(name) {
+            return scopes.const_values.get(&slot).cloned();
+        }
+        let resolved = scopes
+            .resolve_import(name)
+            .unwrap_or_else(|| name.to_owned());
+        let candidate = self.resolve_global_name(&resolved, Some(scopes)).ok()?;
+        if self
+            .globals
+            .get(&candidate)
+            .is_some_and(|global| !global.mutable)
+        {
+            self.global_constant_values.get(&candidate).cloned()
+        } else {
+            None
+        }
+    }
+
+    fn constant_value_expression(value: &Value) -> Option<Expr> {
+        Some(match value {
+            Value::Int(value) => Expr::Int(*value),
+            Value::UInt(value) => Expr::UInt(*value),
+            Value::BigInt(value) => Expr::BigInt(value.clone()),
+            Value::Float(value) => Expr::Float(*value),
+            Value::Bool(value) => Expr::Bool(*value),
+            Value::Char(value) => Expr::Char(*value),
+            Value::Nil => Expr::Nil,
+            _ => return None,
+        })
+    }
+
     fn compile_expr(&mut self, expr: &Expr, scopes: &mut Scopes) -> Result<(), CodegenError> {
         let saved_source = self.out.enter_source(expr.span());
         let result = (|| {
+            if let Some(value) = self.fold_constant_expression(expr, scopes) {
+                self.out.emit(Instruction::Push(value));
+                return Ok(());
+            }
             self.compile_expr_inner(expr, scopes)
                 .map_err(|e| e.at(expr.span()))?;
             if matches!(
                 expr.node(),
                 Expr::Int(_)
                     | Expr::Float(_)
+                    | Expr::Char(_)
                     | Expr::Str(_)
                     | Expr::Bool(_)
                     | Expr::Nil
@@ -2028,7 +2996,19 @@ impl<'a> Codegen<'a> {
     ) -> Result<(), CodegenError> {
         let saved = self.error_handler.take();
         let boundary = self.cleanup_boundary.take();
+        let observed_call = self.observed_propagation_call.clone();
+        self.observed_propagation_call = match expr.node() {
+            Expr::Call(..)
+            | Expr::SpecializedCall(..)
+            | Expr::MethodCall(..)
+            | Expr::AssociatedCall { .. } => Some(crate::analysis::expression_site(
+                self.current_function.as_deref(),
+                expr,
+            )),
+            _ => observed_call.clone(),
+        };
         let result = self.compile_expr(expr, scopes);
+        self.observed_propagation_call = observed_call;
         self.error_handler = saved;
         self.cleanup_boundary = boundary;
         result
@@ -2078,6 +3058,33 @@ impl<'a> Codegen<'a> {
         Ok(())
     }
 
+    fn propagate_call_error(
+        &mut self,
+        scopes: &mut Scopes,
+        call_site: &crate::analysis::CallSite,
+    ) -> Result<(), CodegenError> {
+        if self.observed_propagation_call.as_ref() == Some(call_site) {
+            // A direct inspection (`when`, `match`, `?!`, `!!`, or an error
+            // accessor) consumes the marker while keeping the Error value for
+            // the inspecting expression. Both edges meet at the next bytecode
+            // instruction; JumpIfNoPropagation also clears the VM marker.
+            let observed = self.fresh_label("propagation_observed");
+            self.out.jump(Instruction::JumpIfNoPropagation(0), observed);
+            self.out.bind(observed);
+            return Ok(());
+        }
+        let returned_normally = self.fresh_label("call_returned_normally");
+        self.out
+            .jump(Instruction::JumpIfNoPropagation(0), returned_normally);
+        if self.error_handler.is_some() || self.cleanup_boundary.is_some() {
+            self.guard_error(scopes)?;
+        } else {
+            self.propagate_error(scopes)?;
+        }
+        self.out.bind(returned_normally);
+        Ok(())
+    }
+
     // A failed statement condition/range cannot choose a meaningful branch.
     // Return its error to the caller (or the surrounding try); ordinary value
     // expressions outside try still produce errors without early propagation.
@@ -2085,12 +3092,30 @@ impl<'a> Codegen<'a> {
         if self.error_handler.is_some() || self.cleanup_boundary.is_some() {
             return self.guard_error(scopes);
         }
-        self.propagate_error(scopes)
+        self.exit_with_error_value(scopes, false)
     }
 
-    // Explicit ReturnError edge. Local handlers/boundaries are disabled only
-    // on this edge; nested try inside the operand/cleanup still works normally.
+    fn emit_cancellation_check(&mut self, scopes: &mut Scopes) -> Result<(), CodegenError> {
+        if !self.in_async || self.cleanup_primary.is_some() || self.cleanup_boundary.is_some() {
+            return Ok(());
+        }
+        self.out.emit(Instruction::CheckCancel);
+        self.propagate_control_error(scopes)?;
+        self.out.emit(Instruction::Pop);
+        Ok(())
+    }
+
+    // A propagating return bypasses handlers in this frame. Caller call sites
+    // consume the marker and route the Error to their own lexical handler.
     fn propagate_error(&mut self, scopes: &mut Scopes) -> Result<(), CodegenError> {
+        self.exit_with_error_value(scopes, true)
+    }
+
+    fn exit_with_error_value(
+        &mut self,
+        scopes: &mut Scopes,
+        propagates: bool,
+    ) -> Result<(), CodegenError> {
         let ok = self.fresh_label("control_checked");
         self.out
             .extend([Instruction::Dup, Instruction::IsType(ValueType::Error)]);
@@ -2115,11 +3140,14 @@ impl<'a> Codegen<'a> {
         self.cleanup_boundary = boundary;
         self.error_handler = handler;
         self.out.emit(Instruction::Load(result_slot));
-        self.out.emit(if self.in_function {
-            Instruction::Return
-        } else {
+        let exit = if !self.in_function {
             Instruction::Halt
-        });
+        } else if propagates {
+            Instruction::ReturnPropagate
+        } else {
+            Instruction::Return
+        };
+        self.out.emit(exit);
         self.out.bind(ok);
         Ok(())
     }
@@ -2136,6 +3164,7 @@ impl<'a> Codegen<'a> {
         scopes: &mut Scopes,
         deferred: &[Deferred],
     ) -> Result<(), CodegenError> {
+        self.emit_cancellation_check(scopes)?;
         if !deferred.is_empty() {
             let result_slot = scopes.next_slot;
             scopes.next_slot += 1;
@@ -2217,8 +3246,32 @@ impl<'a> Codegen<'a> {
                 ));
             }
             Expr::Located(_, _) => unreachable!("node removes locations"),
+            Expr::Int(n)
+                if self
+                    .bigint_literals
+                    .contains(&crate::mutability::expr_id(expr)) =>
+            {
+                self.out.emit(Instruction::Push(Value::BigInt((*n).into())))
+            }
+            Expr::Int(n)
+                if self
+                    .uint_literals
+                    .contains(&crate::mutability::expr_id(expr)) =>
+            {
+                self.out.emit(Instruction::Push(Value::UInt(*n as u64)))
+            }
             Expr::Int(n) => self.out.emit(Instruction::Push(Value::Int(*n))),
+            Expr::UInt(n)
+                if self
+                    .bigint_literals
+                    .contains(&crate::mutability::expr_id(expr)) =>
+            {
+                self.out.emit(Instruction::Push(Value::BigInt((*n).into())))
+            }
+            Expr::UInt(n) => self.out.emit(Instruction::Push(Value::UInt(*n))),
+            Expr::BigInt(n) => self.out.emit(Instruction::Push(Value::BigInt(n.clone()))),
             Expr::Float(n) => self.out.emit(Instruction::Push(Value::Float(*n))),
+            Expr::Char(c) => self.out.emit(Instruction::Push(Value::Char(*c))),
             Expr::Bytes(bytes) => {
                 let mut hex = byte_literal_buffer(bytes.len())?;
                 use std::fmt::Write;
@@ -2303,7 +3356,7 @@ impl<'a> Codegen<'a> {
                     .get(&site)
                     .or_else(|| self.method_calls.get(&site))
                     .map(String::as_str);
-                self.compile_method_call(receiver, method, args, extension, scopes)?;
+                self.compile_method_call(receiver, method, args, extension, site, scopes)?;
             }
             Expr::Call(name, args) | Expr::SpecializedCall(name, _, args) => {
                 let site = crate::analysis::expression_site(self.current_function.as_deref(), expr);
@@ -2324,6 +3377,7 @@ impl<'a> Codegen<'a> {
                         args,
                         module,
                         DeclaredCall::Record,
+                        site.clone(),
                         scopes,
                     )?;
                 } else if let Some(variant) = self.enum_defs.get(&resolved).cloned() {
@@ -2333,6 +3387,7 @@ impl<'a> Codegen<'a> {
                         args,
                         module,
                         DeclaredCall::Variant,
+                        site.clone(),
                         scopes,
                     )?;
                 } else if let Some(sig) = self.functions.get(&resolved).cloned() {
@@ -2342,6 +3397,7 @@ impl<'a> Codegen<'a> {
                         args,
                         sig.module,
                         DeclaredCall::Function,
+                        site.clone(),
                         scopes,
                     )?;
                 } else if let Some(builtin) = Builtin::from_name(&resolved) {
@@ -2350,12 +3406,46 @@ impl<'a> Codegen<'a> {
                     return Err(CodegenError::new(format!("unknown function `{name}`")));
                 }
             }
+            Expr::AssociatedCall { method, args, .. } => {
+                let site = crate::analysis::expression_site(self.current_function.as_deref(), expr);
+                let resolved = self
+                    .call_specializations
+                    .get(&site)
+                    .or_else(|| self.method_calls.get(&site))
+                    .cloned()
+                    .ok_or_else(|| {
+                        CodegenError::new(format!("unresolved associated function `{method}()`"))
+                    })?;
+                let Some(sig) = self.functions.get(&resolved).cloned() else {
+                    return Err(CodegenError::new(format!(
+                        "unknown associated function `{method}()`"
+                    )));
+                };
+                self.compile_declared_call(
+                    &resolved,
+                    &sig.params,
+                    args,
+                    sig.module,
+                    DeclaredCall::Function,
+                    site,
+                    scopes,
+                )?;
+            }
             Expr::Index(arr, idx) => {
                 self.compile_expr(arr, scopes)?;
                 self.compile_expr(idx, scopes)?;
                 self.out.emit(Instruction::Index);
             }
             Expr::Binary(op @ (BinOp::And | BinOp::Or), l, r) => {
+                if let Some(Value::Bool(value)) = self.fold_constant_expression(l, scopes) {
+                    if (*op == BinOp::And && !value) || (*op == BinOp::Or && value) {
+                        self.out.emit(Instruction::Push(Value::Bool(value)));
+                    } else {
+                        self.compile_expr(r, scopes)?;
+                        self.out.extend([Instruction::Not, Instruction::Not]);
+                    }
+                    return Ok(());
+                }
                 let error_label = self.fresh_label("logical_error");
                 let end_label = self.fresh_label("logical_end");
                 self.compile_expr(l, scopes)?;
@@ -2398,12 +3488,20 @@ impl<'a> Codegen<'a> {
                 self.compile_expr(e, scopes)?;
                 self.out.emit(Instruction::Sub);
             }
+            Expr::Unary(UnOp::Await, e) => {
+                self.compile_expr(e, scopes)?;
+                self.out.emit(Instruction::Await);
+                self.emit_cancellation_check(scopes)?;
+            }
             Expr::Cast(inner, ty) => {
                 self.compile_expr(inner, scopes)?;
                 let name = match ty {
                     VarType::Int => "str::to_int",
+                    VarType::UInt => "str::to_uint",
+                    VarType::BigInt => "str::to_bigint",
                     VarType::Float => "str::to_float",
                     VarType::Bool => "str::to_bool",
+                    VarType::Char => "str::to_char",
                     VarType::Str => "str::to_str",
                     VarType::Nil => {
                         return Err(CodegenError::new("casts to nil are not supported"));
@@ -2435,6 +3533,19 @@ impl<'a> Codegen<'a> {
                         self.out.extend([
                             Instruction::Load(value_slot),
                             Instruction::Push(Value::Str(Rc::from(value.as_str()))),
+                            Instruction::Eq,
+                        ]);
+                        self.out.jump(Instruction::JumpIfFalse(0), next);
+                    }
+                    if let MatchPattern::CharacterLiteral(value) = &arm.pattern {
+                        self.out.extend([
+                            Instruction::Load(value_slot),
+                            Instruction::IsType(ValueType::Char),
+                        ]);
+                        self.out.jump(Instruction::JumpIfFalse(0), next);
+                        self.out.extend([
+                            Instruction::Load(value_slot),
+                            Instruction::Push(Value::Char(*value)),
                             Instruction::Eq,
                         ]);
                         self.out.jump(Instruction::JumpIfFalse(0), next);
@@ -2495,6 +3606,16 @@ impl<'a> Codegen<'a> {
                 then_branch,
                 else_branch,
             } => {
+                if let Some(Value::Bool(value)) = self.fold_constant_expression(cond, scopes) {
+                    if value {
+                        self.compile_expr(then_branch, scopes)?;
+                    } else if let Some(branch) = else_branch {
+                        self.compile_expr(branch, scopes)?;
+                    } else {
+                        self.out.emit(Instruction::Push(Value::Nil));
+                    }
+                    return Ok(());
+                }
                 let else_label = self.fresh_label("if_else");
                 let end_label = self.fresh_label("if_end");
                 self.compile_expr(cond, scopes)?;
@@ -2525,6 +3646,14 @@ impl<'a> Codegen<'a> {
                 then_branch,
                 else_branch,
             } => {
+                if let Some(Value::Bool(value)) = self.fold_constant_expression(cond, scopes) {
+                    if value {
+                        self.compile_discarded_expr(then_branch, scopes)?;
+                    } else if let Some(branch) = else_branch {
+                        self.compile_discarded_expr(branch, scopes)?;
+                    }
+                    return Ok(());
+                }
                 let otherwise = self.fresh_label("if_else");
                 let end = self.fresh_label("if_end");
                 self.compile_expr(cond, scopes)?;
@@ -2648,6 +3777,8 @@ mod tests {
                 Item::Function(FunctionDecl {
                     owner: None,
                     comptime: false,
+                    asynchronous: false,
+                    inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -2662,6 +3793,8 @@ mod tests {
                 Item::Function(FunctionDecl {
                     owner: None,
                     comptime: false,
+                    asynchronous: false,
+                    inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -2685,6 +3818,8 @@ mod tests {
             items: vec![Item::Function(FunctionDecl {
                 owner: None,
                 comptime: false,
+                asynchronous: false,
+                inline: InlineMode::Auto,
                 type_params: vec![],
                 result_type: None,
                 result_span: None,
@@ -2708,6 +3843,8 @@ mod tests {
             items: vec![Item::Function(FunctionDecl {
                 owner: None,
                 comptime: false,
+                asynchronous: false,
+                inline: InlineMode::Auto,
                 type_params: vec![],
                 result_type: None,
                 result_span: None,
@@ -2718,7 +3855,7 @@ mod tests {
                     tail: None,
                     stmts: vec![
                         Stmt::Const {
-                            name: "MAX".to_string(),
+                            pattern: BindingPattern::Name("MAX".to_string()),
                             ty: None,
                             value: Expr::Int(10),
                         },
@@ -2742,6 +3879,8 @@ mod tests {
             items: vec![Item::Function(FunctionDecl {
                 owner: None,
                 comptime: false,
+                asynchronous: false,
+                inline: InlineMode::Auto,
                 type_params: vec![],
                 result_type: None,
                 result_span: None,
@@ -2753,7 +3892,7 @@ mod tests {
                     stmts: vec![
                         Stmt::VarDecl {
                             ty: None,
-                            name: "x".to_string(),
+                            pattern: BindingPattern::Name("x".to_string()),
                             value: Expr::Int(1),
                         },
                         Stmt::Assign {
@@ -2777,6 +3916,8 @@ mod tests {
             items: vec![Item::Function(FunctionDecl {
                 owner: None,
                 comptime: false,
+                asynchronous: false,
+                inline: InlineMode::Auto,
                 type_params: vec![],
                 result_type: None,
                 result_span: None,
@@ -2802,6 +3943,8 @@ mod tests {
             items: vec![Item::Function(FunctionDecl {
                 owner: None,
                 comptime: false,
+                asynchronous: false,
+                inline: InlineMode::Auto,
                 type_params: vec![],
                 result_type: None,
                 result_span: None,
@@ -2828,6 +3971,8 @@ mod tests {
             items: vec![Item::Function(FunctionDecl {
                 owner: None,
                 comptime: false,
+                asynchronous: false,
+                inline: InlineMode::Auto,
                 type_params: vec![],
                 result_type: None,
                 result_span: None,
@@ -2839,7 +3984,7 @@ mod tests {
                     stmts: vec![
                         Stmt::VarDecl {
                             ty: None,
-                            name: "arr".to_string(),
+                            pattern: BindingPattern::Name("arr".to_string()),
                             value: Expr::Array(vec![Expr::Int(1)]),
                         },
                         Stmt::Assign {
@@ -2875,6 +4020,8 @@ mod tests {
                 Item::Function(FunctionDecl {
                     owner: None,
                     comptime: false,
+                    asynchronous: false,
+                    inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -2912,6 +4059,8 @@ mod tests {
                 Item::Function(FunctionDecl {
                     owner: None,
                     comptime: false,
+                    asynchronous: false,
+                    inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -2953,6 +4102,8 @@ mod tests {
                 Item::Function(FunctionDecl {
                     owner: None,
                     comptime: false,
+                    asynchronous: false,
+                    inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -2970,6 +4121,8 @@ mod tests {
                 Item::Function(FunctionDecl {
                     owner: None,
                     comptime: false,
+                    asynchronous: false,
+                    inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -3008,6 +4161,8 @@ mod tests {
                 Item::Function(FunctionDecl {
                     owner: None,
                     comptime: false,
+                    asynchronous: false,
+                    inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -3028,7 +4183,7 @@ mod tests {
     #[test]
     fn defer_block_runs_before_return() {
         let program = crate::project::compile_source("cleanup.cog",
-            "include std; use io; fn work() { defer { io::println(1); } return 2; } fn main() { io::println(work()); }")
+            "@!include(\"std\") use io; fn work() { defer { io::println(1); } return 2; } fn main() { io::println(work()); }")
             .expect("should compile");
         let program = crate::bytecode::decode(&crate::bytecode::encode(&program).unwrap()).unwrap();
         let mut output = Vec::new();
@@ -3040,7 +4195,7 @@ mod tests {
     fn defer_block_runs_at_scope_end() {
         let compiled = crate::project::compile_source(
             "defer.cog",
-            "include std; use io; fn main() { defer { io::println(9); } io::println(7); }",
+            "@!include(\"std\") use io; fn main() { defer { io::println(9); } io::println(7); }",
         )
         .unwrap();
         let decoded =
@@ -3075,6 +4230,8 @@ mod tests {
                 Item::Function(FunctionDecl {
                     owner: None,
                     comptime: false,
+                    asynchronous: false,
+                    inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -3119,6 +4276,8 @@ mod tests {
             items: vec![Item::Function(FunctionDecl {
                 owner: None,
                 comptime: false,
+                asynchronous: false,
+                inline: InlineMode::Auto,
                 type_params: vec![],
                 result_type: None,
                 result_span: None,
@@ -3130,7 +4289,7 @@ mod tests {
                     stmts: vec![
                         Stmt::VarDecl {
                             ty: None,
-                            name: "arr".to_string(),
+                            pattern: BindingPattern::Name("arr".to_string()),
                             value: Expr::Array(vec![]),
                         },
                         Stmt::Expr(Expr::Binary(
@@ -3160,6 +4319,8 @@ mod tests {
                 Item::Function(FunctionDecl {
                     owner: None,
                     comptime: false,
+                    asynchronous: false,
+                    inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -3193,6 +4354,8 @@ mod tests {
                 Item::Function(FunctionDecl {
                     owner: None,
                     comptime: false,
+                    asynchronous: false,
+                    inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -3222,6 +4385,8 @@ mod tests {
                 Item::Function(FunctionDecl {
                     owner: None,
                     comptime: false,
+                    asynchronous: false,
+                    inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -3249,6 +4414,8 @@ mod tests {
                 Item::Function(FunctionDecl {
                     owner: None,
                     comptime: false,
+                    asynchronous: false,
+                    inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -3276,6 +4443,8 @@ mod tests {
                 Item::Function(FunctionDecl {
                     owner: None,
                     comptime: false,
+                    asynchronous: false,
+                    inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -3295,6 +4464,8 @@ mod tests {
                 Item::Function(FunctionDecl {
                     owner: None,
                     comptime: false,
+                    asynchronous: false,
+                    inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -3322,6 +4493,8 @@ mod tests {
                 Item::Function(FunctionDecl {
                     owner: None,
                     comptime: false,
+                    asynchronous: false,
+                    inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -3349,6 +4522,8 @@ mod tests {
                 Item::Function(FunctionDecl {
                     owner: None,
                     comptime: false,
+                    asynchronous: false,
+                    inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -3376,7 +4551,7 @@ mod tests {
     fn error_pattern_compiles_to_a_generic_runtime_predicate() {
         let compiled = crate::project::compile_source(
             "types.cog",
-            "include std; use str; use err::Error; fn main() { when str::to_int(\"abc\") is Error {} else { crash(\"expected Error\"); } }",
+            "@!include(\"std\") use str; use err::Error; fn main() { when str::to_int(\"abc\") is Error {} else { crash(\"expected Error\"); } }",
         )
         .unwrap();
         assert!(
@@ -3394,6 +4569,8 @@ mod tests {
             items: vec![Item::Function(FunctionDecl {
                 owner: None,
                 comptime: false,
+                asynchronous: false,
+                inline: InlineMode::Auto,
                 type_params: vec![],
                 result_type: None,
                 result_span: None,
@@ -3429,6 +4606,8 @@ mod tests {
                 Item::Function(FunctionDecl {
                     owner: None,
                     comptime: false,
+                    asynchronous: false,
+                    inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -3448,6 +4627,8 @@ mod tests {
                 Item::Function(FunctionDecl {
                     owner: None,
                     comptime: false,
+                    asynchronous: false,
+                    inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -3475,6 +4656,8 @@ mod tests {
             items: vec![Item::Function(FunctionDecl {
                 owner: None,
                 comptime: false,
+                asynchronous: false,
+                inline: InlineMode::Auto,
                 type_params: vec![],
                 result_type: None,
                 result_span: None,
@@ -3497,6 +4680,8 @@ mod tests {
             items: vec![Item::Function(FunctionDecl {
                 owner: None,
                 comptime: false,
+                asynchronous: false,
+                inline: InlineMode::Auto,
                 type_params: vec![],
                 result_type: None,
                 result_span: None,
@@ -3523,7 +4708,7 @@ mod tests {
     fn break_runs_defer_registered_inside_the_loop() {
         let program = crate::project::compile_source(
             "cleanup.cog",
-            "include std; use io; fn main() { while true { defer { io::println(1); } break; } io::println(2); }",
+            "@!include(\"std\") use io; fn main() { while true { defer { io::println(1); } break; } io::println(2); }",
         )
         .expect("should compile");
         let program = crate::bytecode::decode(&crate::bytecode::encode(&program).unwrap()).unwrap();
@@ -3537,7 +4722,7 @@ mod tests {
         // fn main() { defer { to_str(1); } while true { break; } return nil; }
         let compiled = crate::project::compile_source(
             "cleanup.cog",
-            "include std; use io; fn main() { defer { io::print(1); } while true { break; } return nil; }",
+            "@!include(\"std\") use io; fn main() { defer { io::print(1); } while true { break; } return nil; }",
         )
         .unwrap();
         let mut output = Vec::new();
@@ -3551,6 +4736,8 @@ mod tests {
             items: vec![Item::Function(FunctionDecl {
                 owner: None,
                 comptime: false,
+                asynchronous: false,
+                inline: InlineMode::Auto,
                 type_params: vec![],
                 result_type: None,
                 result_span: None,
@@ -3582,6 +4769,8 @@ mod tests {
                 Item::Function(FunctionDecl {
                     owner: None,
                     comptime: false,
+                    asynchronous: false,
+                    inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -3599,6 +4788,8 @@ mod tests {
                 Item::Function(FunctionDecl {
                     owner: None,
                     comptime: false,
+                    asynchronous: false,
+                    inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -3635,6 +4826,8 @@ mod tests {
                 Item::Function(FunctionDecl {
                     owner: None,
                     comptime: false,
+                    asynchronous: false,
+                    inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -3652,6 +4845,8 @@ mod tests {
                 Item::Function(FunctionDecl {
                     owner: None,
                     comptime: false,
+                    asynchronous: false,
+                    inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -3714,6 +4909,8 @@ mod tests {
                 Item::Function(FunctionDecl {
                     owner: None,
                     comptime: false,
+                    asynchronous: false,
+                    inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -3759,6 +4956,8 @@ mod tests {
                 Item::Function(FunctionDecl {
                     owner: None,
                     comptime: false,
+                    asynchronous: false,
+                    inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -3860,6 +5059,8 @@ mod tests {
                 Item::Function(FunctionDecl {
                     owner: None,
                     comptime: false,
+                    asynchronous: false,
+                    inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -3901,6 +5102,8 @@ mod tests {
                 Item::Function(FunctionDecl {
                     owner: None,
                     comptime: false,
+                    asynchronous: false,
+                    inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,

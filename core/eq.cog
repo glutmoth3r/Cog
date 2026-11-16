@@ -7,12 +7,24 @@ extend int with Eq[int] {
     fn equals(self, other: int) -> bool { self == other }
 }
 
+extend uint with Eq[uint] {
+    fn equals(self, other: uint) -> bool { self == other }
+}
+
+extend bigint with Eq[bigint] {
+    fn equals(self, other: bigint) -> bool { self == other }
+}
+
 extend float with Eq[float] {
     fn equals(self, other: float) -> bool { self == other }
 }
 
 extend bool with Eq[bool] {
     fn equals(self, other: bool) -> bool { self == other }
+}
+
+extend char with Eq[char] {
+    fn equals(self, other: char) -> bool { self == other }
 }
 
 extend nil with Eq[nil] {

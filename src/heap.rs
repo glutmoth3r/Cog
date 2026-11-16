@@ -8,6 +8,7 @@
 
 use std::any::Any;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::rc::{Rc, Weak};
@@ -39,22 +40,38 @@ pub(crate) struct ObjectId {
     generation: u64,
 }
 
+#[derive(Clone)]
 pub(crate) struct ObjectKey {
     registry: Rc<RefCell<Registry>>,
     id: ObjectId,
 }
 
+pub(crate) struct TaskRootSet<'a> {
+    pub id: usize,
+    pub strong_count: usize,
+    pub values: Vec<&'a Value>,
+}
+
+struct TaskGraphNode {
+    task_id: Option<usize>,
+    object: Option<ObjectKey>,
+    strong_count: usize,
+    incoming: usize,
+    edges: Vec<usize>,
+}
+
 struct Slot {
     generation: u64,
+    active_index: usize,
     object: Option<Weak<dyn HeapObject>>,
 }
 
 #[derive(Default)]
 struct Registry {
     slots: Vec<Slot>,
+    active_slots: Vec<usize>,
     free: Vec<usize>,
     allocations_since_collection: usize,
-    live: usize,
     collection_threshold: usize,
 }
 
@@ -65,7 +82,12 @@ impl Registry {
             return;
         }
         slot.object = None;
-        self.live -= 1;
+        let active_index = slot.active_index;
+        self.active_slots.swap_remove(active_index);
+        if let Some(&moved) = self.active_slots.get(active_index) {
+            self.slots[moved].active_index = active_index;
+        }
+        let slot = &mut self.slots[id.slot];
         if let Some(generation) = slot.generation.checked_add(1) {
             slot.generation = generation;
             // A failed free-list growth only prevents reuse of this dead slot.
@@ -79,6 +101,45 @@ impl Registry {
 thread_local! {
     static REGISTRY: Rc<RefCell<Registry>> = Rc::default();
     static COLLECTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // Mirrors registry counters so each VM step avoids borrowing REGISTRY.
+    static COLLECTION_DUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ACTIVE_OBJECT_LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static SNAPSHOT_SLOT_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Temporarily enforce the strictest active managed-object limit on this
+/// thread. Nested executions share the thread-local heap, so an inner context
+/// must not relax an outer execution's configured cap.
+pub(crate) struct ObjectLimitGuard(Option<Option<usize>>);
+
+#[inline]
+pub(crate) fn limit_object_allocations(limit: Option<usize>) -> ObjectLimitGuard {
+    let previous = ACTIVE_OBJECT_LIMIT.with(|active| {
+        let current = active.get();
+        let effective = match (current, limit) {
+            (Some(current), Some(limit)) => Some(current.min(limit)),
+            (Some(current), None) => Some(current),
+            (None, limit) => limit,
+        };
+        if current == effective {
+            return None;
+        }
+        active.set(effective);
+        Some(current)
+    });
+    ObjectLimitGuard(previous)
+}
+
+impl Drop for ObjectLimitGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.0 {
+            ACTIVE_OBJECT_LIMIT.with(|active| active.set(previous));
+        }
+    }
 }
 
 struct CollectionFlag;
@@ -122,21 +183,47 @@ impl<T: 'static> std::fmt::Debug for HeapRef<T> {
 
 #[allow(private_bounds)]
 impl<T: HeapObject> HeapRef<T> {
-    /// Allocate a runtime-managed object. Most embedders should obtain values
-    /// from Cog or the SDK constructors instead of building graph nodes by hand.
+    /// Allocate a runtime-managed object.
+    ///
+    /// # Panics
+    /// Panics if the active managed-object limit is reached or the heap registry
+    /// cannot grow. Use [`Self::try_new`] to handle these failures. Most
+    /// embedders should obtain values from Cog or the SDK constructors instead
+    /// of building graph nodes by hand.
     pub fn new(value: T) -> Self {
         Self::try_new(value).unwrap_or_else(|error| panic!("{error}"))
     }
 
-    /// Allocate a runtime-managed object, returning an error if the heap registry
-    /// cannot grow. The Rust standard library does not expose fallible `Rc`
-    /// allocation, so this does not convert host-wide out-of-memory into an
-    /// error.
+    /// Allocate a runtime-managed object, returning an error if the active
+    /// managed-object limit is reached or the heap registry cannot grow. The
+    /// Rust standard library does not expose fallible `Rc` allocation, so this
+    /// does not convert host-wide out-of-memory into an error.
     pub fn try_new(value: T) -> Result<Self, RuntimeError> {
         REGISTRY.with(|registry| Self::try_new_in(registry.clone(), value))
     }
 
     fn try_new_in(registry: Rc<RefCell<Registry>>, value: T) -> Result<Self, RuntimeError> {
+        let live_objects = || {
+            registry
+                .try_borrow()
+                .map(|state| state.active_slots.len())
+                .map_err(|_| RuntimeError::InvalidArgument {
+                    op: "VM heap allocation",
+                })
+        };
+        if let Some(limit) = ACTIVE_OBJECT_LIMIT.with(std::cell::Cell::get)
+            && live_objects()? >= limit
+        {
+            // Reclaim unreachable cycles before rejecting. The allocation is
+            // not attempted until a live registry slot is available.
+            collect(&[])?;
+            if live_objects()? >= limit {
+                return Err(RuntimeError::ResourceLimit {
+                    resource: "VM heap objects",
+                });
+            }
+        }
+
         let mut registry_state =
             registry
                 .try_borrow_mut()
@@ -151,6 +238,12 @@ impl<T: HeapObject> HeapRef<T> {
                     resource: "VM heap registry",
                 })?;
         }
+        registry_state
+            .active_slots
+            .try_reserve(1)
+            .map_err(|_| RuntimeError::ResourceLimit {
+                resource: "VM heap registry",
+            })?;
 
         // Reserve registry storage before allocating the Rc so a failed slot
         // growth cannot leave an unregistered managed object behind.
@@ -162,14 +255,20 @@ impl<T: HeapObject> HeapRef<T> {
         registry_state.allocations_since_collection = registry_state
             .allocations_since_collection
             .saturating_add(1);
+        let collection_due = registry_state.allocations_since_collection
+            >= registry_state.collection_threshold.max(256);
+        COLLECTION_DUE.with(|due| due.set(collection_due));
+        let active_index = registry_state.active_slots.len();
         let id = if let Some(slot) = registry_state.free.pop() {
             let generation = registry_state.slots[slot].generation;
             registry_state.slots[slot].object = Some(weak);
+            registry_state.slots[slot].active_index = active_index;
             ObjectId { slot, generation }
         } else {
             let slot = registry_state.slots.len();
             registry_state.slots.push(Slot {
                 generation: 0,
+                active_index,
                 object: Some(weak),
             });
             ObjectId {
@@ -177,7 +276,7 @@ impl<T: HeapObject> HeapRef<T> {
                 generation: 0,
             }
         };
-        registry_state.live += 1;
+        registry_state.active_slots.push(id.slot);
         drop(registry_state);
 
         Ok(Self {
@@ -307,14 +406,281 @@ fn collect_on_drop<T: HeapObject>(value: &HeapRef<T>) {
 }
 
 pub(crate) fn collection_due() -> bool {
-    REGISTRY.with(|registry| {
-        let state = registry.borrow();
-        state.allocations_since_collection >= state.collection_threshold.max(256)
-    })
+    COLLECTION_DUE.with(std::cell::Cell::get)
 }
 
 pub(crate) fn live_objects() -> usize {
-    REGISTRY.with(|registry| registry.borrow().live)
+    REGISTRY.with(|registry| registry.borrow().active_slots.len())
+}
+
+/// Return cold task rows that have no path from a live handle or an externally
+/// held heap object. Task and heap references share one graph so cycles crossing
+/// the scheduler table and Cog aggregates are collected together.
+pub(crate) fn unreachable_task_roots(
+    roots: &[TaskRootSet<'_>],
+) -> Result<Vec<usize>, RuntimeError> {
+    let mut nodes = Vec::new();
+    nodes
+        .try_reserve_exact(roots.len())
+        .map_err(|_| RuntimeError::ResourceLimit {
+            resource: "async task roots",
+        })?;
+    let mut task_indices = HashMap::new();
+    task_indices
+        .try_reserve(roots.len())
+        .map_err(|_| RuntimeError::ResourceLimit {
+            resource: "async task roots",
+        })?;
+    for root in roots {
+        if task_indices.contains_key(&root.id) {
+            return Err(RuntimeError::InvalidArgument {
+                op: "async task roots",
+            });
+        }
+        let index = nodes.len();
+        nodes.push(TaskGraphNode {
+            task_id: Some(root.id),
+            object: None,
+            strong_count: root.strong_count,
+            incoming: 0,
+            edges: Vec::new(),
+        });
+        task_indices.insert(root.id, index);
+    }
+
+    let mut object_indices = HashMap::new();
+    object_indices
+        .try_reserve(roots.len())
+        .map_err(|_| RuntimeError::ResourceLimit {
+            resource: "async task roots",
+        })?;
+    for root in roots {
+        let from = task_indices[&root.id];
+        for value in &root.values {
+            add_task_value_edges(from, value, &task_indices, &mut nodes)?;
+            add_heap_value_edges(from, value, &mut nodes, &mut object_indices)?;
+        }
+    }
+
+    let mut index = roots.len();
+    while index < nodes.len() {
+        let Some(key) = nodes[index].object.clone() else {
+            index += 1;
+            continue;
+        };
+        if let Some(object) = upgrade_key(&key) {
+            let mut failure = None;
+            object.visit_values(&mut |value| {
+                if failure.is_some() {
+                    return;
+                }
+                if let Err(error) = add_task_value_edges(index, value, &task_indices, &mut nodes) {
+                    failure = Some(error);
+                    return;
+                }
+                if let Err(error) =
+                    add_heap_value_edges(index, value, &mut nodes, &mut object_indices)
+                {
+                    failure = Some(error);
+                }
+            });
+            if let Some(error) = failure {
+                return Err(error);
+            }
+        }
+        index += 1;
+    }
+
+    for node in &mut nodes {
+        if let Some(key) = &node.object {
+            node.strong_count = key_strong_count(key);
+        }
+    }
+    let mut marked = Vec::new();
+    marked
+        .try_reserve_exact(nodes.len())
+        .map_err(|_| RuntimeError::ResourceLimit {
+            resource: "async task roots",
+        })?;
+    marked.resize(nodes.len(), false);
+    let mut work = Vec::new();
+    work.try_reserve_exact(nodes.len())
+        .map_err(|_| RuntimeError::ResourceLimit {
+            resource: "async task roots",
+        })?;
+    for (index, node) in nodes.iter().enumerate() {
+        if node.strong_count > node.incoming {
+            marked[index] = true;
+            work.push(index);
+        }
+    }
+    while let Some(index) = work.pop() {
+        for &child in &nodes[index].edges {
+            if !marked[child] {
+                marked[child] = true;
+                work.push(child);
+            }
+        }
+    }
+
+    let mut unreachable = Vec::new();
+    unreachable
+        .try_reserve(roots.len())
+        .map_err(|_| RuntimeError::ResourceLimit {
+            resource: "async task roots",
+        })?;
+    for (index, node) in nodes.iter().enumerate() {
+        if !marked[index]
+            && let Some(id) = node.task_id
+        {
+            unreachable.push(id);
+        }
+    }
+    Ok(unreachable)
+}
+
+fn add_task_value_edges(
+    from: usize,
+    value: &Value,
+    task_indices: &HashMap<usize, usize>,
+    nodes: &mut [TaskGraphNode],
+) -> Result<(), RuntimeError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve(1)
+        .map_err(|_| RuntimeError::ResourceLimit {
+            resource: "async task roots",
+        })?;
+    values.push(value);
+    let mut errors = Vec::new();
+    while !values.is_empty() || !errors.is_empty() {
+        while let Some(value) = values.pop() {
+            match value {
+                Value::Task(task) => {
+                    if let Some(&target) = task_indices.get(&task.id()) {
+                        add_task_graph_edge(from, target, nodes)?;
+                    }
+                }
+                Value::Error(error) => {
+                    errors
+                        .try_reserve(1)
+                        .map_err(|_| RuntimeError::ResourceLimit {
+                            resource: "async task roots",
+                        })?;
+                    errors.push(error.as_ref());
+                }
+                _ => {}
+            }
+        }
+        let Some(error) = errors.pop() else {
+            continue;
+        };
+        match error {
+            RuntimeError::WithSuppressed {
+                primary,
+                suppressed,
+            } => {
+                errors
+                    .try_reserve(suppressed.len().saturating_add(1))
+                    .map_err(|_| RuntimeError::ResourceLimit {
+                        resource: "async task roots",
+                    })?;
+                errors.push(primary);
+                errors.extend(suppressed.iter());
+            }
+            RuntimeError::Crashed { value, .. } => {
+                values
+                    .try_reserve(1)
+                    .map_err(|_| RuntimeError::ResourceLimit {
+                        resource: "async task roots",
+                    })?;
+                values.push(value);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn add_heap_value_edges(
+    from: usize,
+    value: &Value,
+    nodes: &mut Vec<TaskGraphNode>,
+    object_indices: &mut HashMap<(usize, ObjectId), usize>,
+) -> Result<(), RuntimeError> {
+    let mut failure = None;
+    let traversal = value.visit_heap_objects(&mut |key| {
+        if failure.is_some() {
+            return;
+        }
+        let identity = (Rc::as_ptr(&key.registry) as usize, key.id);
+        let target = if let Some(index) = object_indices.get(&identity).copied() {
+            index
+        } else {
+            if nodes.try_reserve(1).is_err() || object_indices.try_reserve(1).is_err() {
+                failure = Some(RuntimeError::ResourceLimit {
+                    resource: "async task roots",
+                });
+                return;
+            }
+            let index = nodes.len();
+            nodes.push(TaskGraphNode {
+                task_id: None,
+                object: Some(key),
+                strong_count: 0,
+                incoming: 0,
+                edges: Vec::new(),
+            });
+            object_indices.insert(identity, index);
+            index
+        };
+        if let Err(error) = add_task_graph_edge(from, target, nodes) {
+            failure = Some(error);
+        }
+    });
+    traversal?;
+    failure.map_or(Ok(()), Err)
+}
+
+fn add_task_graph_edge(
+    from: usize,
+    to: usize,
+    nodes: &mut [TaskGraphNode],
+) -> Result<(), RuntimeError> {
+    nodes[from]
+        .edges
+        .try_reserve(1)
+        .map_err(|_| RuntimeError::ResourceLimit {
+            resource: "async task roots",
+        })?;
+    nodes[to].incoming = nodes[to]
+        .incoming
+        .checked_add(1)
+        .ok_or(RuntimeError::ResourceLimit {
+            resource: "async task roots",
+        })?;
+    nodes[from].edges.push(to);
+    Ok(())
+}
+
+fn upgrade_key(key: &ObjectKey) -> Option<Rc<dyn HeapObject>> {
+    let state = key.registry.borrow();
+    state
+        .slots
+        .get(key.id.slot)
+        .filter(|slot| slot.generation == key.id.generation)
+        .and_then(|slot| slot.object.as_ref())
+        .and_then(Weak::upgrade)
+}
+
+fn key_strong_count(key: &ObjectKey) -> usize {
+    let state = key.registry.borrow();
+    state
+        .slots
+        .get(key.id.slot)
+        .filter(|slot| slot.generation == key.id.generation)
+        .and_then(|slot| slot.object.as_ref())
+        .map_or(0, Weak::strong_count)
 }
 
 /// Collect unreachable managed cycles on the current thread's Cog heap.
@@ -339,20 +705,18 @@ fn collect_with_excluded(
     }
     let _collection_flag = CollectionFlag;
     let registry = REGISTRY.with(Rc::clone);
-    let (slot_count, snapshot) = {
+    let snapshot = {
         let state = registry.borrow();
-        let count = state
-            .slots
-            .iter()
-            .filter(|slot| slot.object.is_some())
-            .count();
         let mut snapshot = Vec::new();
         snapshot
-            .try_reserve_exact(count)
+            .try_reserve_exact(state.active_slots.len())
             .map_err(|_| RuntimeError::ResourceLimit {
                 resource: "VM heap",
             })?;
-        for (slot, entry) in state.slots.iter().enumerate() {
+        for &slot in &state.active_slots {
+            let entry = &state.slots[slot];
+            #[cfg(test)]
+            SNAPSHOT_SLOT_VISITS.with(|visits| visits.set(visits.get() + 1));
             if let Some(weak) = &entry.object {
                 snapshot.push((
                     ObjectId {
@@ -363,18 +727,19 @@ fn collect_with_excluded(
                 ));
             }
         }
-        (state.slots.len(), snapshot)
+        snapshot
     };
-    let mut slot_to_index = Vec::new();
-    slot_to_index
-        .try_reserve_exact(slot_count)
-        .map_err(|_| RuntimeError::ResourceLimit {
-            resource: "VM heap",
-        })?;
-    slot_to_index.resize(slot_count, None);
-    for (index, (id, _)) in snapshot.iter().enumerate() {
-        slot_to_index[id.slot] = Some(index);
-    }
+    // Active positions stay stable until tracing finishes. Generation checks
+    // still reject stale handles; retired slot capacity is not scanned or
+    // copied into collection scratch storage.
+    let snapshot_index = |id: ObjectId| {
+        let state = registry.borrow();
+        let index = state.slots.get(id.slot)?.active_index;
+        snapshot
+            .get(index)
+            .filter(|(current, _)| *current == id)
+            .map(|_| index)
+    };
 
     let mut incoming = Vec::new();
     incoming
@@ -401,11 +766,9 @@ fn collect_with_excluded(
                 return;
             }
             let result = value.visit_heap_objects(&mut |child| {
-                let child_index = slot_to_index.get(child.id.slot).and_then(|index| *index);
                 if Rc::ptr_eq(&registry, &child.registry)
-                    && child_index.is_some_and(|child_index| snapshot[child_index].0 == child.id)
+                    && let Some(child_index) = snapshot_index(child.id)
                 {
-                    let child_index = child_index.unwrap();
                     if edges[index].try_reserve(1).is_err() {
                         edge_allocation_failed = true;
                         return;
@@ -434,19 +797,15 @@ fn collect_with_excluded(
     discarded_counts.resize(snapshot.len(), 0usize);
     for value in discarded_values {
         value.visit_heap_objects(&mut |object| {
-            let index = slot_to_index.get(object.id.slot).and_then(|index| *index);
             if Rc::ptr_eq(&registry, &object.registry)
-                && index.is_some_and(|index| snapshot[index].0 == object.id)
+                && let Some(index) = snapshot_index(object.id)
             {
-                let index = index.unwrap();
                 discarded_counts[index] = discarded_counts[index].saturating_add(1);
             }
         })?;
     }
     for id in discarded_ids {
-        let index = slot_to_index.get(id.slot).and_then(|index| *index);
-        if index.is_some_and(|index| snapshot[index].0 == *id) {
-            let index = index.unwrap();
+        if let Some(index) = snapshot_index(*id) {
             discarded_counts[index] = discarded_counts[index].saturating_add(1);
         }
     }
@@ -532,7 +891,8 @@ fn collect_with_excluded(
         state.retire(id);
     }
     state.allocations_since_collection = 0;
-    state.collection_threshold = state.live.max(256);
+    state.collection_threshold = state.active_slots.len().max(256);
+    COLLECTION_DUE.with(|due| due.set(false));
     Ok(unreachable)
 }
 
@@ -542,6 +902,47 @@ mod tests {
 
     use super::*;
     use crate::value::{ArrayValue, ClosureCaptures, RecordValue};
+
+    #[test]
+    fn collection_work_ignores_retired_slots_after_a_heap_peak() {
+        collect_cycles().unwrap();
+        let mut roots = (0..4096)
+            .map(|index| {
+                HeapRef::new(RecordValue::new(HashMap::from([(
+                    "index".into(),
+                    Value::Int(index),
+                )])))
+            })
+            .collect::<Vec<_>>();
+        let last = roots.pop().unwrap();
+        let first = roots.swap_remove(0);
+        drop(roots);
+        assert_eq!(live_objects(), 2);
+
+        SNAPSHOT_SLOT_VISITS.with(|visits| visits.set(0));
+        assert_eq!(collect_cycles().unwrap(), 0);
+        assert_eq!(SNAPSHOT_SLOT_VISITS.with(|visits| visits.get()), 2);
+        assert!(matches!(
+            first.try_get_field("index").unwrap(),
+            Some(Value::Int(0))
+        ));
+        assert!(matches!(
+            last.try_get_field("index").unwrap(),
+            Some(Value::Int(4095))
+        ));
+
+        first
+            .try_set_field("peer", Value::Record(last.clone()))
+            .unwrap();
+        last.try_set_field("peer", Value::Record(first.clone()))
+            .unwrap();
+        drop(first);
+        drop(last);
+        SNAPSHOT_SLOT_VISITS.with(|visits| visits.set(0));
+        assert_eq!(collect_cycles().unwrap(), 2);
+        assert_eq!(SNAPSHOT_SLOT_VISITS.with(|visits| visits.get()), 2);
+        assert_eq!(live_objects(), 0);
+    }
 
     #[test]
     fn collection_intervals_grow_with_the_surviving_heap() {
@@ -606,11 +1007,64 @@ mod tests {
     }
 
     #[test]
+    fn object_quota_rejects_before_registering_an_over_limit_object() {
+        let before = live_objects();
+        let _limit = limit_object_allocations(Some(before + 1));
+        let first = HeapRef::try_new(RecordValue::new(HashMap::new())).unwrap();
+        assert_eq!(live_objects(), before + 1);
+
+        let error = HeapRef::try_new(RecordValue::new(HashMap::new())).unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::ResourceLimit {
+                resource: "VM heap objects"
+            }
+        ));
+        assert_eq!(live_objects(), before + 1);
+
+        drop(first);
+        assert_eq!(live_objects(), before);
+    }
+
+    #[test]
+    fn nested_object_limits_cannot_relax_an_outer_limit() {
+        let before = live_objects();
+        let _outer = limit_object_allocations(Some(before + 1));
+        let value = HeapRef::try_new(RecordValue::new(HashMap::new())).unwrap();
+        {
+            let _inner = limit_object_allocations(None);
+            assert!(matches!(
+                HeapRef::try_new(RecordValue::new(HashMap::new())),
+                Err(RuntimeError::ResourceLimit {
+                    resource: "VM heap objects"
+                })
+            ));
+        }
+        drop(value);
+        assert_eq!(live_objects(), before);
+    }
+
+    #[test]
+    fn object_quota_collects_unreachable_cycles_before_reusing_the_slot() {
+        let before = live_objects();
+        let _limit = limit_object_allocations(Some(before + 1));
+        let cell = HeapRef::try_new(RefCell::new(Value::Nil)).unwrap();
+        *cell.borrow_mut() = Value::Cell(cell.clone());
+        drop(cell);
+        assert_eq!(live_objects(), before + 1);
+
+        let next = HeapRef::try_new(RecordValue::new(HashMap::new())).unwrap();
+        assert_eq!(live_objects(), before + 1);
+        drop(next);
+        assert_eq!(live_objects(), before);
+    }
+
+    #[test]
     fn collection_breaks_cycles_and_reuses_slots_with_a_new_generation() {
         let value = HeapRef::new(RecordValue::new(HashMap::new()));
         value
-            .borrow_mut()
-            .insert("self".into(), Value::Record(value.clone()));
+            .try_set_field("self", Value::Record(value.clone()))
+            .unwrap();
         let before = value.id();
         assert_eq!(collect(&[]).unwrap(), 0);
         drop(value);
@@ -664,11 +1118,12 @@ mod tests {
     fn duplicated_edges_and_an_external_alias_are_counted_as_roots() {
         let record = HeapRef::new(RecordValue::new(HashMap::new()));
         let cell = HeapRef::new(RefCell::new(Value::Nil));
-        {
-            let mut fields = record.borrow_mut();
-            fields.insert("first".into(), Value::Cell(cell.clone()));
-            fields.insert("second".into(), Value::Cell(cell.clone()));
-        }
+        record
+            .try_set_field("first", Value::Cell(cell.clone()))
+            .unwrap();
+        record
+            .try_set_field("second", Value::Cell(cell.clone()))
+            .unwrap();
         *cell.borrow_mut() = Value::Record(record.clone());
 
         let root = cell.clone();

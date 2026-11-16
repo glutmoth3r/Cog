@@ -1,0 +1,30 @@
+@!include("std")
+use io;
+use async::time;
+use err::Error;
+
+@async fn worker() -> nil {
+    defer { io::println("worker cleanup")!!; }
+    while true {
+        await time::sleep(0.005);
+    }
+}
+
+@async fn cancel_after(task: Task[nil]) -> bool {
+    await time::sleep(0.02);
+    cancel(task)
+}
+
+@async fn main() -> nil {
+    const worker_task = spawn(worker());
+    const stopper = spawn(cancel_after(worker_task));
+    const accepted = await stopper;
+    io::println($"cancel accepted: {accepted}");
+
+    const outcome = await worker_task;
+    when outcome is Error::Cancelled {
+        io::println("worker cancelled")!!;
+    } else {
+        io::println($"unexpected result: {outcome}")!!;
+    }
+}

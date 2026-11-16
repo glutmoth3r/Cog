@@ -63,6 +63,7 @@ cargo run --locked --offline --release --bin bench_runtime
 cargo run --locked --offline --release --bin bench_strings -- 2000 5
 cargo run --locked --offline --release --bin bench_harness
 cargo run --locked --offline --release --bin bench_repeated -- 10000
+cargo run --locked --offline --release --bin bench_jit -- 1000000 7
 ```
 
 The Criterion suite measures arithmetic and array indexing. `bench_runtime`
@@ -71,6 +72,9 @@ compares identical interpolation/addition outputs without VM stdout and excludes
 compilation/linking/codec/warmup. Its arguments select strings per sample and sample
 count. The workloads stay within runtime limits so they compare successful results.
 `bench_harness` and `bench_repeated` isolate VM workloads and repeated invocation.
+`bench_jit` compares matched VM/JIT loop outputs, first-run cost, and retained-plan
+JIT-enabled runs for `int`, `uint`, and `float`; it writes its temporary profiles
+under `target/jit-bench/` and reports whether APE compiled and calibrated a loop.
 
 Results depend on the host, build mode, workload, sample count, and timing scope.
 These tools help compare changes locally; they do not establish a portable speedup.

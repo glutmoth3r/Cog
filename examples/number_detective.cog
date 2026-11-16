@@ -1,4 +1,4 @@
-include std;
+@!include("std")
 // Number detective: guess a number from 1 to 100.
 // Commands: stats for statistics, quit to leave the game.
 use io;

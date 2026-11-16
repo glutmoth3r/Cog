@@ -13,6 +13,16 @@ extend int with Hashable {
     fn equals(self, other: int) -> bool { self == other }
 }
 
+extend uint with Hashable {
+    fn hash_code(self) -> int { hash::of(self)!! }
+    fn equals(self, other: uint) -> bool { self == other }
+}
+
+extend bigint with Hashable {
+    fn hash_code(self) -> int { hash::of(self)!! }
+    fn equals(self, other: bigint) -> bool { self == other }
+}
+
 extend str with Hashable {
     fn hash_code(self) -> int { hash::of(self)!! }
     fn equals(self, other: str) -> bool { self == other }
@@ -21,6 +31,11 @@ extend str with Hashable {
 extend bool with Hashable {
     fn hash_code(self) -> int { hash::of(self)!! }
     fn equals(self, other: bool) -> bool { self == other }
+}
+
+extend char with Hashable {
+    fn hash_code(self) -> int { hash::of(self)!! }
+    fn equals(self, other: char) -> bool { self == other }
 }
 
 struct Slot[K: type, V: type] {
@@ -84,11 +99,15 @@ fn rebuild[K: type + Hashable, V: type](items: Map[K, V], capacity: int) {
     items.deleted = 0;
 }
 
-public fn map_new[K: type + Hashable, V: type]() -> Map[K, V] {
-    Map[K, V]()
-}
-
 extend[K: type + Hashable, V: type] Map[K, V] {
+    public fn new() -> Self { Map[K, V]() }
+
+    public fn from(entries: (K, V)[]) -> Self {
+        var result = Map[K, V]();
+        for entry in entries { result.set(entry.0, entry.1)!!; }
+        result
+    }
+
     public fn len(self) -> int { self.length }
 
     public fn capacity(self) -> int { self.buckets.len() }

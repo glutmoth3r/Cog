@@ -1,0 +1,16 @@
+@!include("std")
+use io;
+
+@async fn worker(name: str) -> nil {
+    for step in 0..3 {
+        io::println($"{name} step {step}")!!;
+        await yield_now();
+    }
+}
+
+@async fn main() -> nil {
+    const first = spawn(worker("first"));
+    const second = spawn(worker("second"));
+    await first;
+    await second;
+}

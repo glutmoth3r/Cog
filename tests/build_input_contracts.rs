@@ -32,7 +32,7 @@ impl Inputs {
     }
 
     fn text(&self, body: &str) -> String {
-        format!("include std; use build; use io; use bytes; use err::Error;\n{body}")
+        format!("@!include(\"std\") use build; use io; use bytes; use err::Error;\n{body}")
     }
 
     fn compile(&self, body: &str) -> cog::backend::CompiledProgram {
@@ -122,7 +122,7 @@ impl Inputs {
         self.write(
             "main.cog",
             self.text(&format!(
-                "comptime VALUE = build::{operation}({}){fallback}; fn main() {{ io::println(VALUE); }}",
+                "@comptime const VALUE = build::{operation}({}){fallback}; fn main() {{ io::println(VALUE); }}",
                 self.literal("input.txt")
             ))
             .as_bytes(),
@@ -150,10 +150,10 @@ fn build_01_comptime_include_str_leaves_a_standalone_artifact() {
     inputs.write("input.txt", "Hello, Cog Ω".as_bytes());
     let compiled = inputs.compile(&format!(
         r#"
-        comptime fn ct_read_input(path: str) -> str {{
+        @comptime fn ct_read_input(path: str) -> str {{
             return build::include_str(path);
         }}
-        comptime MESSAGE = ct_read_input({}) + "!";
+        @comptime const MESSAGE = ct_read_input({}) + "!";
         fn main() {{ io::println(MESSAGE); }}
         "#,
         inputs.literal("input.txt")
@@ -171,8 +171,8 @@ fn build_02_binary_and_empty_inputs_materialize_without_runtime_filesystem() {
     inputs.write("empty.bin", &[]);
     let compiled = inputs.compile(&format!(
         r#"
-        comptime DATA = build::include_bytes({});
-        comptime EMPTY = build::include_bytes({});
+        @comptime const DATA = build::include_bytes({});
+        @comptime const EMPTY = build::include_bytes({});
         fn main() {{
             io::println(bytes::len(DATA));
             io::println(bytes::get(DATA, 0)); io::println(bytes::get(DATA, 1));
@@ -195,13 +195,13 @@ fn build_03_required_read_and_decode_errors_can_be_recovered_in_comptime() {
     inputs.write("invalid.txt", &[255]);
     let compiled = inputs.compile(&format!(
         r#"
-        comptime fn ct_read_input(path: str) -> str {{
+        @comptime fn ct_read_input(path: str) -> str {{
             const text = build::include_str(path);
             when text is Error {{ return "recovered"; }}
             return text;
         }}
-        comptime MISSING = ct_read_input({});
-        comptime INVALID = ct_read_input({});
+        @comptime const MISSING = ct_read_input({});
+        @comptime const INVALID = ct_read_input({});
         fn main() {{ io::println(MISSING); io::println(INVALID); }}
         "#,
         inputs.literal("missing.txt"),
@@ -220,7 +220,7 @@ fn build_04_required_input_errors_cannot_become_runtime_constants() {
     for name in ["missing.txt", "invalid.txt"] {
         inputs.rejects_semantically(
             &format!(
-                "comptime TEXT = build::include_str({}); fn main() {{ io::println(TEXT); }}",
+                "@comptime const TEXT = build::include_str({}); fn main() {{ io::println(TEXT); }}",
                 inputs.literal(name)
             ),
             &["comptime"],
@@ -235,11 +235,11 @@ fn build_05_optional_missing_and_empty_inputs_remain_distinct() {
     inputs.write("present.txt", b"present");
     let compiled = inputs.compile(&format!(
         r#"
-        comptime MISSING = build::try_include_str({}) ?? "fallback";
-        comptime EMPTY = build::try_include_str({}) ?? "wrong";
-        comptime PRESENT = build::try_include_str({}) ?? "wrong";
-        comptime NO_BYTES = build::try_include_bytes({});
-        comptime EMPTY_BYTES = build::try_include_bytes({});
+        @comptime const MISSING = build::try_include_str({}) ?? "fallback";
+        @comptime const EMPTY = build::try_include_str({}) ?? "wrong";
+        @comptime const PRESENT = build::try_include_str({}) ?? "wrong";
+        @comptime const NO_BYTES = build::try_include_bytes({});
+        @comptime const EMPTY_BYTES = build::try_include_bytes({});
         fn main() {{
             io::println(MISSING); io::println(EMPTY); io::println(PRESENT);
             io::println(NO_BYTES == nil); io::println(EMPTY_BYTES == nil);
@@ -264,18 +264,18 @@ fn build_06_optional_decode_and_read_failures_stay_errors() {
     std::fs::create_dir(inputs.0.join("directory")).unwrap();
     let compiled = inputs.compile(&format!(
         r#"
-        comptime fn text(path: str) -> str {{
+        @comptime fn text(path: str) -> str {{
             const value = build::try_include_str(path);
             when value is Error {{ return "decode error"; }}
             return value ?? "absent";
         }}
-        comptime fn binary(path: str) -> str {{
+        @comptime fn binary(path: str) -> str {{
             const value = build::try_include_bytes(path);
             when value is Error {{ return "read error"; }}
             return "wrong";
         }}
-        comptime TEXT = text({});
-        comptime DATA = binary({});
+        @comptime const TEXT = text({});
+        @comptime const DATA = binary({});
         fn main() {{ io::println(TEXT); io::println(DATA); }}
         "#,
         inputs.literal("invalid.txt"),
@@ -294,12 +294,12 @@ fn build_07_runtime_path_cannot_enter_a_comptime_initializer() {
     // A successful include first establishes module resolution and comptime
     // support; an undeclared build module cannot satisfy the rejection below.
     inputs.compile(&format!(
-        "comptime TEXT = build::include_str({}); fn main() {{ io::println(TEXT); }}",
+        "@comptime const TEXT = build::include_str({}); fn main() {{ io::println(TEXT); }}",
         inputs.literal("input.txt")
     ));
     inputs.rejects_semantically(
         &format!(
-            "fn load(path: str) {{ comptime TEXT = build::include_str(path); }} fn main() {{ load({}); }}",
+            "fn load(path: str) {{ @comptime const TEXT = build::include_str(path); }} fn main() {{ load({}); }}",
             inputs.literal("input.txt")
         ),
         &["runtime", "comptime"],
@@ -414,11 +414,11 @@ fn build_input_paths_in_dependencies_use_the_dependency_root() {
     inputs.write("dep/input.txt", b"dependency");
     inputs.write(
         "dep/lib.cog",
-        b"use build; public comptime MESSAGE = build::include_str(\"input.txt\");",
+        b"use build; @public @comptime const MESSAGE = build::include_str(\"input.txt\");",
     );
     inputs.write(
         "main.cog",
-        b"include std; use io; use dep; fn main() { io::println(dep::MESSAGE); }",
+        b"@!include(\"std\") use io; use dep; fn main() { io::println(dep::MESSAGE); }",
     );
     let output = inputs.cli("run");
     success(&output);
@@ -435,10 +435,10 @@ fn absolute_and_parent_escape_paths_are_static_errors_even_when_caught() {
         "a/../../outside",
     ] {
         inputs.rejects_semantically(&format!(r#"
-            comptime fn load() -> str {{
+            @comptime fn load() -> str {{
                 try {{ return build::try_include_str({path:?}) ?? "absent"; }} catch (e) {{ return "caught"; }}
             }}
-            comptime TEXT = load(); fn main() {{}}
+            @comptime const TEXT = load(); fn main() {{}}
         "#), &["comptime", "escape"]);
     }
 }

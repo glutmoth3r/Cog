@@ -4,19 +4,20 @@ use bytes;
 
 // A 31-bit linear congruential generator, seeded once from OS entropy.
 const MODULUS = 2147483648;
+const UINT_MODULUS: uint = 2147483648;
 var state = 0;
 var initialized = false;
 
 fn ensure_seeded() {
     if !initialized {
         const raw = entropy::bytes(4)!!;
-        state = bytes_to_uint(raw)!! % MODULUS;
+        state = seed_from_bytes(raw)!! % MODULUS;
         initialized = true;
     }
     return nil;
 }
 
-fn bytes_to_uint(raw) {
+fn seed_from_bytes(raw) {
     var acc = 0;
     var i = 0;
     while i < bytes::len(raw) {
@@ -43,6 +44,22 @@ public fn range(lo, hi) {
     var value = next()!!;
     while value >= limit { value = next()!!; }
     return low + value % width;
+}
+
+public fn range_uint(lo: uint, hi: uint) -> uint {
+    if hi <= lo { return Error::InvalidArgument("random::range_uint"); }
+    const width = (hi - lo)!!;
+    if width > UINT_MODULUS {
+        return Error::InvalidArgument("random::range_uint");
+    }
+    const limit = UINT_MODULUS - UINT_MODULUS % width;
+    const initial = next()!!;
+    var value: uint = (initial as uint)!!;
+    while value >= limit {
+        const sample = next()!!;
+        value = (sample as uint)!!;
+    }
+    lo + value % width
 }
 
 fn range_bound(value) {

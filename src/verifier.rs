@@ -58,24 +58,28 @@ struct CallableTarget {
     captures: usize,
 }
 
-const TYPE_INT: u16 = 1 << 0;
-const TYPE_FLOAT: u16 = 1 << 1;
-const TYPE_BOOL: u16 = 1 << 2;
-const TYPE_NIL: u16 = 1 << 3;
-const TYPE_STR: u16 = 1 << 4;
-const TYPE_ARRAY: u16 = 1 << 5;
-const TYPE_TUPLE: u16 = 1 << 6;
-const TYPE_RECORD: u16 = 1 << 7;
-const TYPE_VARIANT: u16 = 1 << 8;
-const TYPE_FUNCTION: u16 = 1 << 9;
-const TYPE_OTHER: u16 = 1 << 10;
-const TYPE_STRBUF: u16 = 1 << 11;
-const TYPE_TYPE_TAG: u16 = 1 << 12;
-const ALL_VALUE_TYPES: u16 = (1 << 13) - 1;
+const TYPE_INT: u32 = 1 << 0;
+const TYPE_FLOAT: u32 = 1 << 1;
+const TYPE_BOOL: u32 = 1 << 2;
+const TYPE_NIL: u32 = 1 << 3;
+const TYPE_STR: u32 = 1 << 4;
+const TYPE_ARRAY: u32 = 1 << 5;
+const TYPE_TUPLE: u32 = 1 << 6;
+const TYPE_RECORD: u32 = 1 << 7;
+const TYPE_VARIANT: u32 = 1 << 8;
+const TYPE_FUNCTION: u32 = 1 << 9;
+const TYPE_OTHER: u32 = 1 << 10;
+const TYPE_STRBUF: u32 = 1 << 11;
+const TYPE_TYPE_TAG: u32 = 1 << 12;
+const TYPE_CHAR: u32 = 1 << 13;
+const TYPE_UINT: u32 = 1 << 14;
+const TYPE_BIGINT: u32 = 1 << 15;
+const TYPE_TASK: u32 = 1 << 16;
+const ALL_VALUE_TYPES: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FlowValue {
-    normal_types: u16,
+    normal_types: u32,
     may_error: bool,
     callable: Option<CallableTarget>,
     // TypeTag is constructor metadata; it is not a tagged Variant value.
@@ -110,7 +114,7 @@ impl FlowValue {
         known_string: None,
     };
 
-    const fn normal(normal_types: u16) -> Self {
+    const fn normal(normal_types: u32) -> Self {
         Self {
             normal_types,
             may_error: false,
@@ -123,7 +127,7 @@ impl FlowValue {
         }
     }
 
-    const fn recoverable(normal_types: u16) -> Self {
+    const fn recoverable(normal_types: u32) -> Self {
         Self {
             normal_types,
             may_error: true,
@@ -342,14 +346,54 @@ pub(crate) fn verify(program: &CompiledProgram) -> Result<(), String> {
         match instruction {
             Instruction::Call(target, parameters) => {
                 let callable = signature(program, *target)?;
-                if callable.parameters != *parameters || callable.captures != 0 {
+                if callable.parameters != *parameters
+                    || callable.captures != 0
+                    || callable.asynchronous
+                {
                     return Err(failure(pc, "direct call signature mismatch"));
                 }
             }
-            Instruction::MakeClosure(target, captures)
-                if signature(program, *target)?.captures != *captures =>
+            Instruction::CallAsync(target, parameters) => {
+                let callable = signature(program, *target)?;
+                if callable.parameters != *parameters
+                    || callable.captures != 0
+                    || !callable.asynchronous
+                {
+                    return Err(failure(pc, "async call signature mismatch"));
+                }
+            }
+            Instruction::Await
+                if program
+                    .callables
+                    .range(..=pc)
+                    .next_back()
+                    .is_some_and(|(_, callable)| !callable.asynchronous) =>
             {
-                return Err(failure(pc, "closure capture signature mismatch"));
+                return Err(failure(pc, "await in synchronous callable"));
+            }
+            Instruction::Spawn
+                if program
+                    .callables
+                    .range(..=pc)
+                    .next_back()
+                    .is_none_or(|(_, callable)| !callable.asynchronous) =>
+            {
+                return Err(failure(pc, "spawn outside async callable"));
+            }
+            Instruction::CheckCancel
+                if program
+                    .callables
+                    .range(..=pc)
+                    .next_back()
+                    .is_none_or(|(_, callable)| !callable.asynchronous) =>
+            {
+                return Err(failure(pc, "cancellation check outside async callable"));
+            }
+            Instruction::MakeClosure(target, captures)
+                if signature(program, *target)?.captures != *captures
+                    || signature(program, *target)?.asynchronous =>
+            {
+                return Err(failure(pc, "closure capture or async signature mismatch"));
             }
             Instruction::MakeClosure(_, _) => {}
             Instruction::Push(value) => function_constant(program, value)?,
@@ -380,6 +424,7 @@ pub(crate) fn verify(program: &CompiledProgram) -> Result<(), String> {
     // callable regions until stable. All sweeps share the verifier work budgets.
     loop {
         let mut next_capture_facts = BTreeMap::new();
+        let mut first_error = None;
         let mut start = 0;
         let mut parameters = 0;
         let mut captures = 0;
@@ -395,7 +440,12 @@ pub(crate) fn verify(program: &CompiledProgram) -> Result<(), String> {
                 fact_work: &mut fact_work,
                 visits: &mut visits,
             };
-            region(&context, start, end, parameters, captures, &mut flow)?;
+            if let Err(error) = region(&context, start, end, parameters, captures, &mut flow) {
+                // Capture facts from this sweep are inputs to the next one. An
+                // unknown capture can make an infeasible path appear invalid
+                // before those facts arrive, so defer errors until convergence.
+                first_error.get_or_insert(error);
+            }
             start = end;
             if let Some(callable) = next {
                 parameters = callable.parameters;
@@ -403,11 +453,13 @@ pub(crate) fn verify(program: &CompiledProgram) -> Result<(), String> {
             }
         }
         if next_capture_facts == capture_facts {
-            break;
+            // Failed regions can emit only a prefix of their capture facts.
+            // Accept a fixed point only if every region completed its checks
+            // in this sweep; stable partial output must never imply success.
+            return first_error.map_or(Ok(()), Err);
         }
         capture_facts = next_capture_facts;
     }
-    Ok(())
 }
 
 fn intern_instruction_strings(
@@ -570,7 +622,7 @@ fn callable_result_summaries(
                     break;
                 }
                 match instruction {
-                    Instruction::Return => {
+                    Instruction::Return | Instruction::ReturnPropagate => {
                         let value = flow_at(&state.stack_values, state.height - 1);
                         let value = if let Some(expected) = &callable.result_type {
                             if normal_type_may_match_runtime_type(
@@ -596,6 +648,7 @@ fn callable_result_summaries(
                     Instruction::Jump(_)
                     | Instruction::JumpIfFalse(_)
                     | Instruction::JumpIfTrue(_)
+                    | Instruction::JumpIfNoPropagation(_)
                     | Instruction::Halt
                     | Instruction::Crash(_) => break,
                     _ => {}
@@ -644,6 +697,7 @@ fn region(
             Instruction::Jump(target)
             | Instruction::JumpIfFalse(target)
             | Instruction::JumpIfTrue(target)
+            | Instruction::JumpIfNoPropagation(target)
                 if !(start..end).contains(&target) =>
             {
                 return Err(failure(pc, "branch crosses a callable region"));
@@ -651,7 +705,7 @@ fn region(
             Instruction::LoadCapture(index) if index >= captures => {
                 return Err(failure(pc, "capture index exceeds callable signature"));
             }
-            Instruction::Return if start == 0 => {
+            Instruction::Return | Instruction::ReturnPropagate if start == 0 => {
                 return Err(failure(pc, "return outside a callable"));
             }
             _ => {}
@@ -755,7 +809,10 @@ fn region(
         )?;
         let mut successors = [None, None];
         match instruction {
-            Instruction::Return | Instruction::Halt | Instruction::Crash(_) => {}
+            Instruction::Return
+            | Instruction::ReturnPropagate
+            | Instruction::Halt
+            | Instruction::Crash(_) => {}
             Instruction::Jump(target) => successors[0] = Some(*target),
             Instruction::JumpIfFalse(target) | Instruction::JumpIfTrue(target) => {
                 let jump_taken = branch_condition.is_some_and(|condition| match instruction {
@@ -768,6 +825,9 @@ fn region(
                 } else {
                     successors = [Some(*target), Some(pc + 1)];
                 }
+            }
+            Instruction::JumpIfNoPropagation(target) => {
+                successors = [Some(*target), Some(pc + 1)];
             }
             _ => successors[0] = Some(pc + 1),
         }
@@ -861,11 +921,14 @@ fn region(
 
 fn stack_successors(instruction: &Instruction, pc: usize) -> [Option<usize>; 2] {
     match instruction {
-        Instruction::Return | Instruction::Halt | Instruction::Crash(_) => [None, None],
+        Instruction::Return
+        | Instruction::ReturnPropagate
+        | Instruction::Halt
+        | Instruction::Crash(_) => [None, None],
         Instruction::Jump(target) => [Some(*target), None],
-        Instruction::JumpIfFalse(target) | Instruction::JumpIfTrue(target) => {
-            [Some(*target), Some(pc + 1)]
-        }
+        Instruction::JumpIfFalse(target)
+        | Instruction::JumpIfTrue(target)
+        | Instruction::JumpIfNoPropagation(target) => [Some(*target), Some(pc + 1)],
         _ => [Some(pc + 1), None],
     }
 }
@@ -1104,13 +1167,21 @@ fn flow_at(facts: &BTreeMap<usize, FlowValue>, slot: usize) -> FlowValue {
 
 fn aggregate_index_flow(state: &State, old_height: usize) -> FlowValue {
     let aggregate_slot = old_height - 2;
+    let aggregate = flow_at(&state.stack_values, aggregate_slot);
     let key = flow_at(&state.stack_values, old_height - 1);
     if let Some(index) = key.known_int {
         return if let Some(shape) = state.aggregate_shapes.get(&aggregate_slot) {
-            usize::try_from(index)
+            let element = usize::try_from(index)
                 .ok()
                 .and_then(|index| shape.get(index).copied())
-                .unwrap_or(FlowValue::ERROR)
+                .unwrap_or(FlowValue::ERROR);
+            // Shapes describe successful construction. Integer indexing of a
+            // constructor Error propagates that Error instead of an element.
+            if aggregate.may_error {
+                element.join(FlowValue::ERROR)
+            } else {
+                element
+            }
         } else if state.record_shapes.contains_key(&aggregate_slot) {
             FlowValue::ERROR
         } else {
@@ -1121,7 +1192,13 @@ fn aggregate_index_flow(state: &State, old_height: usize) -> FlowValue {
         return if let Some(shape) = state.record_shapes.get(&aggregate_slot) {
             shape.get(&field).copied().unwrap_or(FlowValue::ERROR)
         } else if state.aggregate_shapes.contains_key(&aggregate_slot) {
-            FlowValue::ERROR
+            // Arrays reject string keys, but a constructor Error can expose
+            // fields such as TypeMismatch.op or ResourceLimit.resource.
+            if aggregate.may_error {
+                FlowValue::UNKNOWN
+            } else {
+                FlowValue::ERROR
+            }
         } else {
             FlowValue::UNKNOWN
         };
@@ -1132,8 +1209,11 @@ fn aggregate_index_flow(state: &State, old_height: usize) -> FlowValue {
 fn value_flow(value: &Value, string_id: Option<u32>) -> FlowValue {
     match value {
         Value::Int(value) => FlowValue::integer(*value),
+        Value::UInt(_) => FlowValue::normal(TYPE_UINT),
+        Value::BigInt(_) => FlowValue::normal(TYPE_BIGINT),
         Value::Float(_) => FlowValue::normal(TYPE_FLOAT),
         Value::Bool(value) => FlowValue::boolean(*value),
+        Value::Char(_) => FlowValue::normal(TYPE_CHAR),
         Value::Nil => FlowValue::normal(TYPE_NIL),
         Value::Error(_) => FlowValue::ERROR,
         Value::Str(_) => string_id
@@ -1162,7 +1242,8 @@ fn value_flow(value: &Value, string_id: Option<u32>) -> FlowValue {
             known_int: None,
             known_string: None,
         },
-        Value::Closure(_, _) => FlowValue::normal(TYPE_FUNCTION),
+        Value::BoundFunction(_) | Value::Closure(_, _) => FlowValue::normal(TYPE_FUNCTION),
+        Value::Task(_) => FlowValue::normal(TYPE_TASK),
         Value::TypeTag(_) => {
             let mut flow = FlowValue::type_tag();
             flow.known_tag = string_id;
@@ -1178,13 +1259,16 @@ fn runtime_type_mask(
     ty: &crate::value::RuntimeType,
     fact_work: &mut usize,
     pc: usize,
-) -> Result<u16, String> {
+) -> Result<u32, String> {
     use crate::value::RuntimeType;
     charge(fact_work, 1, pc)?;
     Ok(match ty {
         RuntimeType::Int => TYPE_INT,
+        RuntimeType::UInt => TYPE_UINT,
+        RuntimeType::BigInt => TYPE_BIGINT,
         RuntimeType::Float => TYPE_FLOAT,
         RuntimeType::Bool => TYPE_BOOL,
+        RuntimeType::Char => TYPE_CHAR,
         RuntimeType::Nil => TYPE_NIL,
         // Runtime `str` contracts also accept the internal mutable string
         // builder, while `IsType(str)` intentionally matches only Value::Str.
@@ -1196,6 +1280,7 @@ fn runtime_type_mask(
         RuntimeType::Variant(_) => TYPE_VARIANT | TYPE_TYPE_TAG,
         RuntimeType::Function => TYPE_FUNCTION,
         RuntimeType::Other => TYPE_OTHER,
+        RuntimeType::Nominal(name) if name == "$core::Task" => TYPE_TASK,
         RuntimeType::Nominal(_) => TYPE_RECORD | TYPE_VARIANT | TYPE_TYPE_TAG,
         RuntimeType::Nullable(inner) => runtime_type_mask(inner, fact_work, pc)? | TYPE_NIL,
     })
@@ -1251,8 +1336,11 @@ fn normal_type_may_match_runtime_type(
     }
     Ok(match expected {
         RuntimeType::Int => value.normal_types & TYPE_INT != 0,
+        RuntimeType::UInt => value.normal_types & TYPE_UINT != 0,
+        RuntimeType::BigInt => value.normal_types & TYPE_BIGINT != 0,
         RuntimeType::Float => value.normal_types & TYPE_FLOAT != 0,
         RuntimeType::Bool => value.normal_types & TYPE_BOOL != 0,
+        RuntimeType::Char => value.normal_types & TYPE_CHAR != 0,
         RuntimeType::Nil => value.normal_types & TYPE_NIL != 0,
         RuntimeType::Str => value.normal_types & (TYPE_STR | TYPE_STRBUF) != 0,
         RuntimeType::Error(_) => false,
@@ -1270,6 +1358,7 @@ fn normal_type_may_match_runtime_type(
         }
         RuntimeType::Function => value.normal_types & TYPE_FUNCTION != 0,
         RuntimeType::Other => value.normal_types & TYPE_OTHER != 0,
+        RuntimeType::Nominal(name) if name == "$core::Task" => value.normal_types & TYPE_TASK != 0,
         RuntimeType::Nominal(name) => {
             let record_matches = value.normal_types & TYPE_RECORD != 0
                 && tag.is_none_or(|tag| {
@@ -1322,8 +1411,11 @@ fn normal_type_definitely_matches_runtime_type(
     }
     Ok(match expected {
         RuntimeType::Int => value.normal_types == TYPE_INT,
+        RuntimeType::UInt => value.normal_types == TYPE_UINT,
+        RuntimeType::BigInt => value.normal_types == TYPE_BIGINT,
         RuntimeType::Float => value.normal_types == TYPE_FLOAT,
         RuntimeType::Bool => value.normal_types == TYPE_BOOL,
+        RuntimeType::Char => value.normal_types == TYPE_CHAR,
         RuntimeType::Nil => value.normal_types == TYPE_NIL,
         RuntimeType::Str => value.normal_types & !(TYPE_STR | TYPE_STRBUF) == 0,
         RuntimeType::Error(_) => false,
@@ -1339,6 +1431,7 @@ fn normal_type_definitely_matches_runtime_type(
         },
         RuntimeType::Function => value.normal_types == TYPE_FUNCTION,
         RuntimeType::Other => value.normal_types == TYPE_OTHER,
+        RuntimeType::Nominal(name) if name == "$core::Task" => value.normal_types == TYPE_TASK,
         RuntimeType::Nominal(name) => match value.normal_types {
             TYPE_RECORD => {
                 tag.is_some_and(|tag| tag.strip_prefix("@struct::") == Some(name.as_str()))
@@ -1415,14 +1508,16 @@ fn normal_type_may_match_native(value: FlowValue, expected: crate::runtime::Nati
     let mask = match expected {
         NativeType::Any => return true,
         NativeType::Int => TYPE_INT,
+        NativeType::UInt => TYPE_UINT,
         NativeType::Str => TYPE_STR,
         NativeType::Bytes | NativeType::Handle => TYPE_OTHER,
         NativeType::Nil => TYPE_NIL,
-        NativeType::Number => TYPE_INT | TYPE_FLOAT,
+        NativeType::Number => TYPE_INT | TYPE_UINT | TYPE_FLOAT,
         NativeType::Array => TYPE_ARRAY | TYPE_TUPLE,
         NativeType::Record => TYPE_RECORD,
         NativeType::Float => TYPE_FLOAT,
         NativeType::Bool => TYPE_BOOL,
+        NativeType::Char => TYPE_CHAR,
         NativeType::StrBuf => TYPE_STRBUF,
     };
     value.normal_types & mask != 0
@@ -1462,6 +1557,7 @@ fn native_result_flow(
         NativeResultContract::StructuralClone => Some(
             first_argument.normal_types
                 & (TYPE_INT
+                    | TYPE_UINT
                     | TYPE_FLOAT
                     | TYPE_BOOL
                     | TYPE_NIL
@@ -1477,12 +1573,14 @@ fn native_result_flow(
     let mask = match import.result() {
         NativeType::Any => return FlowValue::UNKNOWN,
         NativeType::Int => TYPE_INT,
+        NativeType::UInt => TYPE_UINT,
         NativeType::Float => TYPE_FLOAT,
         NativeType::Bool => TYPE_BOOL,
+        NativeType::Char => TYPE_CHAR,
         NativeType::Str => TYPE_STR,
         NativeType::StrBuf => TYPE_STRBUF,
         NativeType::Nil => TYPE_NIL,
-        NativeType::Number => TYPE_INT | TYPE_FLOAT,
+        NativeType::Number => TYPE_INT | TYPE_UINT | TYPE_FLOAT,
         NativeType::Array => TYPE_ARRAY | TYPE_TUPLE,
         NativeType::Record => TYPE_RECORD,
         NativeType::Bytes | NativeType::Handle => TYPE_OTHER,
@@ -1490,7 +1588,7 @@ fn native_result_flow(
     FlowValue::recoverable(mask)
 }
 
-fn primitive_type_test(value: FlowValue, expected: u16) -> Option<bool> {
+fn primitive_type_test(value: FlowValue, expected: u32) -> Option<bool> {
     if value.normal_types & expected == 0 {
         // Error values do not match primitive type predicates.
         Some(false)
@@ -1524,8 +1622,11 @@ fn type_test_flow(
     }
     let known = match expected {
         ValueType::Int => primitive_type_test(value, TYPE_INT),
+        ValueType::UInt => primitive_type_test(value, TYPE_UINT),
+        ValueType::BigInt => primitive_type_test(value, TYPE_BIGINT),
         ValueType::Float => primitive_type_test(value, TYPE_FLOAT),
         ValueType::Bool => primitive_type_test(value, TYPE_BOOL),
+        ValueType::Char => primitive_type_test(value, TYPE_CHAR),
         ValueType::Str => primitive_type_test(value, TYPE_STR),
         ValueType::Nil => primitive_type_test(value, TYPE_NIL),
         ValueType::Error if value.normal_types == 0 && value.may_error => Some(true),
@@ -1654,6 +1755,54 @@ fn produced_flow(
                 .copied()
                 .unwrap_or(FlowValue::UNKNOWN),
         ),
+        Instruction::CallAsync(_, _) => Some(FlowValue::recoverable(TYPE_TASK)),
+        Instruction::SleepAsync
+        | Instruction::ReadBytesAsync
+        | Instruction::ProcessRunAsync
+        | Instruction::ProcessRunTimeoutAsync
+        | Instruction::ProcessRunInputAsync
+        | Instruction::ProcessRunInputTimeoutAsync
+        | Instruction::ProcessRunInputTimeoutOutputLimitAsync
+        | Instruction::NetworkExchangeAsync
+        | Instruction::TcpListenAsync
+        | Instruction::TcpAcceptAsync
+        | Instruction::TcpConnectAsync
+        | Instruction::TcpReadAsync
+        | Instruction::TcpReadExactAsync
+        | Instruction::TcpReadAllAsync
+        | Instruction::TcpWriteAsync
+        | Instruction::TcpWriteAllAsync
+        | Instruction::TcpShutdownWriteAsync
+        | Instruction::FsMetadataAsync
+        | Instruction::FsReadDirAsync
+        | Instruction::FsWriteBytesAsync
+        | Instruction::FsCreateDirAsync
+        | Instruction::FsCreateDirAllAsync
+        | Instruction::FsRemoveFileAsync
+        | Instruction::FsRemoveDirAsync
+        | Instruction::FsReadTextAsync
+        | Instruction::FsWriteTextAsync
+        | Instruction::FsReadLinesAsync
+        | Instruction::FsAppendBytesAsync
+        | Instruction::FsAppendTextAsync
+        | Instruction::FsCopyAsync
+        | Instruction::FsRenameAsync
+        | Instruction::AsyncIoRead
+        | Instruction::AsyncIoReadExact
+        | Instruction::AsyncIoReadAll
+        | Instruction::AsyncIoOpen
+        | Instruction::AsyncIoWrite
+        | Instruction::AsyncIoWriteAll
+        | Instruction::AsyncIoFlush
+        | Instruction::AsyncIoSeek => Some(FlowValue::recoverable(TYPE_TASK)),
+        Instruction::Await => Some(FlowValue::UNKNOWN),
+        Instruction::Spawn => Some(FlowValue::recoverable(TYPE_TASK)),
+        Instruction::Cancel => Some(FlowValue::recoverable(TYPE_BOOL)),
+        Instruction::CheckCancel => Some(FlowValue::recoverable(TYPE_NIL)),
+        Instruction::YieldNow => Some(FlowValue::recoverable(TYPE_TASK)),
+        Instruction::TimeoutAsync => Some(FlowValue::recoverable(TYPE_TASK)),
+        Instruction::Select2 => Some(FlowValue::recoverable(TYPE_TASK)),
+        Instruction::Select => Some(FlowValue::recoverable(TYPE_TASK)),
         Instruction::Call(target, arity) => Some(callable_result_flow(
             context,
             *target,
@@ -1664,14 +1813,18 @@ fn produced_flow(
         Instruction::CallValue(arity) => {
             let callee = flow_at(&state.stack_values, old_height - 1);
             if let Some(target) = callee.callable {
-                Some(callable_result_flow(
-                    context,
-                    target.entry,
-                    (old_height - arity - 1..old_height - 1)
-                        .map(|slot| flow_at(&state.stack_values, slot)),
-                    pc,
-                    fact_work,
-                )?)
+                if signature(program, target.entry)?.asynchronous {
+                    Some(FlowValue::ERROR)
+                } else {
+                    Some(callable_result_flow(
+                        context,
+                        target.entry,
+                        (old_height - arity - 1..old_height - 1)
+                            .map(|slot| flow_at(&state.stack_values, slot)),
+                        pc,
+                        fact_work,
+                    )?)
+                }
             } else {
                 Some(FlowValue::UNKNOWN)
             }
@@ -1685,6 +1838,8 @@ fn produced_flow(
                 fact_work,
             )? {
                 FlowValue::ERROR
+            } else if import.is_async() {
+                FlowValue::recoverable(TYPE_TASK)
             } else {
                 native_result_flow(import, flow_at(&state.stack_values, first))
             }
@@ -1747,7 +1902,10 @@ fn produced_flow(
         Instruction::MakeArray(_) | Instruction::MakeTypedArray(_, _) => {
             Some(recoverable(TYPE_ARRAY))
         }
-        Instruction::MakeTuple(_) => Some(FlowValue::normal(TYPE_TUPLE)),
+        Instruction::ConstrainRecordFields(_) => Some(recoverable(TYPE_RECORD)),
+        Instruction::MakeTuple(_) | Instruction::MakeTypedTuple(_, _) => {
+            Some(recoverable(TYPE_TUPLE))
+        }
         Instruction::ConstrainArrayType(_) | Instruction::ArrayEmptyLike => {
             Some(recoverable(TYPE_ARRAY))
         }
@@ -1780,8 +1938,10 @@ fn produced_flow(
         | Instruction::Jump(_)
         | Instruction::JumpIfFalse(_)
         | Instruction::JumpIfTrue(_)
+        | Instruction::JumpIfNoPropagation(_)
         | Instruction::Halt
         | Instruction::Return
+        | Instruction::ReturnPropagate
         | Instruction::Crash(_) => None,
     })
 }
@@ -1800,6 +1960,8 @@ fn update_value_facts(
         Instruction::CallValue(_) => flow_at(&state.stack_values, old_height - 1)
             .callable
             .is_some_and(|target| context.write_free_callables.contains(&target.entry)),
+        // Await may run an async body that mutates any global slot.
+        Instruction::Await => false,
         // Native callbacks cannot reassign the interpreter's global slots.
         _ => true,
     };
@@ -1850,6 +2012,28 @@ fn update_value_facts(
                 FlowValue::recoverable(mask)
             };
             Some(Rc::new(vec![element; *count]))
+        }
+        Instruction::MakeTypedTuple(count, expected)
+            if *count <= MAX_TRACKED_AGGREGATE_ITEMS
+                && expected.len() == *count
+                && state.aggregate_shapes.len() + state.record_shapes.len()
+                    < MAX_TRACKED_AGGREGATES =>
+        {
+            charge(fact_work, *count + 1, pc)?;
+            let mut values = Vec::new();
+            values
+                .try_reserve_exact(*count)
+                .map_err(|_| format!("verifier resource limit at instruction {pc}"))?;
+            let first = old_height - *count;
+            for (index, ty) in expected.iter().enumerate() {
+                let mask = runtime_type_mask(ty, fact_work, pc)?;
+                values.push(FlowValue {
+                    normal_types: mask,
+                    may_error: true,
+                    ..flow_at(&state.stack_values, first + index)
+                });
+            }
+            Some(Rc::new(values))
         }
         _ => None,
     };
@@ -2289,11 +2473,13 @@ mod tests {
         let function = Rc::new(RegisteredNative {
             source_name: "host::dynamic".into(),
             identity: "$native::test::host::dynamic".into(),
-            version: 1,
+            version: crate::sdk::ABI_VERSION,
             parameters: vec![NativeType::Any],
             result: NativeType::Any,
             mutating_parameters: Vec::new(),
+            asynchronous: false,
             invoke: None,
+            async_factory: None,
         });
         let mut registry = NativeRegistry::default();
         registry
@@ -2401,6 +2587,7 @@ mod tests {
         let callable = CallableSignature {
             parameters: 128,
             captures: 0,
+            asynchronous: false,
             parameter_types: Some(types),
             result_type: None,
         };
@@ -2432,6 +2619,7 @@ mod tests {
             CallableSignature {
                 parameters: 0,
                 captures: 0,
+                asynchronous: false,
                 parameter_types: None,
                 result_type: Some(result),
             },

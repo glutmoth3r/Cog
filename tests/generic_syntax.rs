@@ -30,8 +30,8 @@ fn empty_brackets_in_expressions_form_types_and_never_empty_indices() {
     let accepted = project::compile_source(
         "types.cog",
         r#"
-        comptime fn keep(value: type) -> type { value }
-        comptime Items: type = keep(int[]);
+        @comptime fn keep(value: type) -> type { value }
+        @comptime const Items: type = keep(int[]);
         fn main() { const items: Items = [1, 2]; len(items); }
     "#,
     );
@@ -45,7 +45,7 @@ fn empty_brackets_in_expressions_form_types_and_never_empty_indices() {
 
 #[test]
 fn redundant_comptime_and_unsupported_value_parameters_are_diagnostics() {
-    for header in ["[comptime T: type]", "[N: int]", "[]"] {
+    for header in ["[@comptime const T: type]", "[N: int]", "[]"] {
         let parsed = frontend::parse(
             "invalid.cog",
             format!("fn item{header}() {{}} fn main() {{}}"),

@@ -5,7 +5,46 @@ use cog::value::{RuntimeType, Value};
 use cog::{bytecode, interpreter, project};
 
 #[test]
-fn typed_callable_contracts_round_trip_in_bytecode_v10() {
+fn typed_callable_boundaries_preserve_owned_function_references() {
+    use Instruction as I;
+    let mut program = CompiledProgram::new(vec![
+        I::Push(Value::Function(12)),
+        I::Call(9, 1),
+        I::CallValue(0),
+        I::Push(Value::Int(42)),
+        I::Eq,
+        I::JumpIfTrue(8),
+        I::Push(Value::Str("unexpected callable result".into())),
+        I::Crash(None),
+        I::Halt,
+        I::Store(0),
+        I::Load(0),
+        I::Return,
+        I::Push(Value::Int(42)),
+        I::Return,
+    ]);
+    program.callables.insert(
+        9,
+        CallableSignature {
+            parameters: 1,
+            captures: 0,
+            asynchronous: false,
+            parameter_types: Some(vec![Some(RuntimeType::Function)]),
+            result_type: Some(RuntimeType::Function),
+        },
+    );
+    program
+        .callables
+        .insert(12, CallableSignature::dynamic(0, 0));
+
+    let bytes = bytecode::encode(&program).unwrap();
+    assert_eq!(&bytes[..4], b"COG\0");
+    let decoded = bytecode::decode(&bytes).unwrap();
+    interpreter::run_with(&decoded, &mut Vec::new()).unwrap();
+}
+
+#[test]
+fn typed_callable_contracts_round_trip_in_bytecode() {
     let program = project::compile_source(
         "callable_types.cog",
         "fn identity(value: int) -> int { value }\nfn main() { identity(7); }\n",
@@ -21,13 +60,14 @@ fn typed_callable_contracts_round_trip_in_bytecode_v10() {
         CallableSignature {
             parameters: 1,
             captures: 0,
+            asynchronous: false,
             parameter_types: Some(vec![Some(RuntimeType::Int)]),
             result_type: Some(RuntimeType::Int),
         }
     );
 
     let bytes = bytecode::encode(&program).unwrap();
-    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 10);
+    assert_eq!(&bytes[..4], b"COG\0");
     let decoded = bytecode::decode(&bytes).unwrap();
     assert_eq!(decoded.callables, program.callables);
 }
@@ -71,6 +111,7 @@ fn tuple_mutation_preserves_the_contract_at_a_typed_call_boundary() {
         CallableSignature {
             parameters: 1,
             captures: 0,
+            asynchronous: false,
             parameter_types: Some(vec![Some(tuple_type)]),
             result_type: Some(RuntimeType::Bool),
         },
@@ -94,6 +135,7 @@ fn runtime_rejects_mismatched_typed_arguments_and_results() {
         CallableSignature {
             parameters: 1,
             captures: 0,
+            asynchronous: false,
             parameter_types: Some(vec![Some(RuntimeType::Int)]),
             result_type: Some(RuntimeType::Int),
         },
@@ -116,6 +158,7 @@ fn runtime_rejects_mismatched_typed_arguments_and_results() {
         CallableSignature {
             parameters: 0,
             captures: 0,
+            asynchronous: false,
             parameter_types: None,
             result_type: Some(RuntimeType::Int),
         },
@@ -140,6 +183,7 @@ fn runtime_rejects_mismatched_typed_arguments_and_results() {
         CallableSignature {
             parameters: 1,
             captures: 0,
+            asynchronous: false,
             parameter_types: Some(vec![Some(RuntimeType::Int)]),
             result_type: Some(RuntimeType::Int),
         },
@@ -166,6 +210,196 @@ fn typed_boundaries_preserve_existing_error_value_propagation() {
 }
 
 #[test]
+fn tuple_call_boundaries_preserve_nested_error_values() {
+    for source in [
+        "fn first(pair: (int, str)) -> int { pair.0 } fn main() { first((1 / 0, \"kept\")) }",
+        "fn make_pair() -> (int, str) { (1 / 0, \"kept\") } fn main() { const pair = make_pair(); pair.0 }",
+        "fn first(pair: ((int, str), bool)) -> int { (pair.0).0 } fn main() { first(((1 / 0, \"kept\"), true)) }",
+    ] {
+        let program = project::compile_source("tuple_errors.cog", source).unwrap();
+        let decoded = bytecode::decode(&bytecode::encode(&program).unwrap()).unwrap();
+        for artifact in [&program, &decoded] {
+            let result = interpreter::run_with(artifact, &mut Vec::new());
+            assert!(
+                matches!(result, Err(RuntimeError::DivisionByZero)),
+                "original tuple component Error was replaced: {result:?}; {source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn typed_tuple_boundaries_do_not_poison_unrelated_components() {
+    let program = project::compile_source(
+        "tuple_component.cog",
+        r#"
+        @!include("std") use io; use err::Error;
+        fn first(pair: (int, str)) -> int { pair.0 }
+        fn second(pair: (int, str)) -> str { pair.1 }
+        fn make_pair() -> (int, str) { (1 / 0, "returned") }
+        fn main() {
+            io::println(second((1 / 0, "argument")));
+            io::println(make_pair().1);
+            const failure = first((Error::MissingField("sentinel"), "kept"));
+            when failure is Error::MissingField { io::println(failure.field); }
+            else { crash("tuple boundary replaced the Error payload"); }
+        }
+        "#,
+    )
+    .unwrap();
+    let decoded = bytecode::decode(&bytecode::encode(&program).unwrap()).unwrap();
+    for artifact in [&program, &decoded] {
+        let mut output = Vec::new();
+        interpreter::run_with(artifact, &mut output).unwrap();
+        assert_eq!(output, b"argument\nreturned\nsentinel\n");
+    }
+}
+
+#[test]
+fn indirect_tuple_boundaries_preserve_component_errors() {
+    use Instruction as I;
+    let tuple_type = RuntimeType::Tuple(vec![RuntimeType::Int, RuntimeType::Str]);
+    for returns_tuple in [false, true] {
+        let mut instructions = vec![
+            I::Push(Value::Int(1)),
+            I::Push(Value::Int(0)),
+            I::Div,
+            I::Push(Value::Str("kept".into())),
+            I::MakeTuple(2),
+            I::Push(Value::Nil),
+            I::CallValue(1),
+        ];
+        if returns_tuple {
+            instructions.extend([I::Push(Value::Int(0)), I::Index]);
+        }
+        instructions.push(I::Halt);
+        let entry = instructions.len();
+        instructions[5] = I::Push(Value::Function(entry));
+        instructions.extend([I::Store(0), I::Load(0)]);
+        if !returns_tuple {
+            instructions.extend([I::Push(Value::Int(0)), I::Index]);
+        }
+        instructions.push(I::Return);
+        let mut program = CompiledProgram::new(instructions);
+        program.callables.insert(
+            entry,
+            CallableSignature {
+                parameters: 1,
+                captures: 0,
+                asynchronous: false,
+                parameter_types: Some(vec![Some(tuple_type.clone())]),
+                result_type: Some(if returns_tuple {
+                    tuple_type.clone()
+                } else {
+                    RuntimeType::Int
+                }),
+            },
+        );
+        let decoded = bytecode::decode(&bytecode::encode(&program).unwrap()).unwrap();
+        for artifact in [&program, &decoded] {
+            let result = interpreter::run_with(artifact, &mut Vec::new());
+            assert!(
+                matches!(result, Err(RuntimeError::DivisionByZero)),
+                "{result:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn tuple_call_contracts_reject_wrong_shapes_and_invariant_array_types() {
+    use Instruction as I;
+    use RuntimeType as T;
+    let scalar_tuple = T::Tuple(vec![T::Int, T::Str]);
+    for (argument, expected) in [
+        (
+            vec![
+                I::Push(Value::Bool(false)),
+                I::Push(Value::Str("kept".into())),
+                I::MakeTuple(2),
+            ],
+            scalar_tuple.clone(),
+        ),
+        (
+            vec![
+                I::Push(Value::Int(1)),
+                I::Push(Value::Int(0)),
+                I::Div,
+                I::Push(Value::Bool(true)),
+                I::MakeTuple(2),
+            ],
+            scalar_tuple.clone(),
+        ),
+        (
+            vec![I::Push(Value::Int(1)), I::MakeTuple(1)],
+            scalar_tuple.clone(),
+        ),
+        (vec![I::MakeTypedArray(0, T::Int)], scalar_tuple),
+        (
+            vec![
+                I::MakeTypedArray(0, T::Nullable(Box::new(T::Int))),
+                I::Push(Value::Str("kept".into())),
+                I::MakeTuple(2),
+            ],
+            T::Tuple(vec![T::Array(Box::new(T::Int)), T::Str]),
+        ),
+    ] {
+        let mut instructions = argument;
+        let entry = instructions.len() + 2;
+        instructions.extend([
+            I::Call(entry, 1),
+            I::Halt,
+            I::Pop,
+            I::Push(Value::Nil),
+            I::Return,
+        ]);
+        let mut program = CompiledProgram::new(instructions);
+        program.callables.insert(
+            entry,
+            CallableSignature {
+                parameters: 1,
+                captures: 0,
+                asynchronous: false,
+                parameter_types: Some(vec![Some(expected)]),
+                result_type: None,
+            },
+        );
+        let decoded = bytecode::decode(&bytecode::encode(&program).unwrap()).unwrap();
+        for artifact in [&program, &decoded] {
+            let result = interpreter::run_with(artifact, &mut Vec::new());
+            assert!(
+                matches!(result, Err(RuntimeError::TypeMismatch { op: "call" })),
+                "{result:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn tuple_call_contracts_accept_normal_nullable_components() {
+    let program = project::compile_source(
+        "tuple_nullable.cog",
+        r#"
+        @!include("std") use io;
+        fn first(pair: (int?, str)) -> int? { pair.0 }
+        fn make_pair() -> (int?, str) { (7, "kept") }
+        fn main() {
+            io::println(first((nil, "nil")));
+            io::println(first((7, "int")));
+            io::println(make_pair().0);
+        }
+        "#,
+    )
+    .unwrap();
+    let decoded = bytecode::decode(&bytecode::encode(&program).unwrap()).unwrap();
+    for artifact in [&program, &decoded] {
+        let mut output = Vec::new();
+        interpreter::run_with(artifact, &mut output).unwrap();
+        assert_eq!(output, b"nil\n7\n7\n");
+    }
+}
+
+#[test]
 fn encoder_rejects_inconsistent_callable_type_vector_lengths() {
     let mut program = CompiledProgram::new(vec![
         Instruction::Halt,
@@ -177,6 +411,7 @@ fn encoder_rejects_inconsistent_callable_type_vector_lengths() {
         CallableSignature {
             parameters: 2,
             captures: 0,
+            asynchronous: false,
             parameter_types: Some(vec![Some(RuntimeType::Int)]),
             result_type: None,
         },
@@ -190,14 +425,16 @@ fn encoder_rejects_inconsistent_callable_type_vector_lengths() {
 
 #[test]
 fn decoder_rejects_unknown_callable_type_presence_tags() {
-    let mut bytes = b"COG\0\x0a\0\0\0".to_vec();
-    bytes.extend_from_slice(&0u32.to_le_bytes()); // No imports.
-    bytes.extend_from_slice(&1u32.to_le_bytes()); // One callable.
-    bytes.extend_from_slice(&1u32.to_le_bytes()); // Entry.
-    bytes.extend_from_slice(&0u32.to_le_bytes()); // Parameters.
-    bytes.extend_from_slice(&0u32.to_le_bytes()); // Captures.
-    bytes.push(0); // No parameter type table.
-    bytes.push(2); // Invalid result-type presence tag.
+    let mut program = CompiledProgram::new(vec![
+        Instruction::Halt,
+        Instruction::Push(Value::Nil),
+        Instruction::Return,
+    ]);
+    program
+        .callables
+        .insert(1, CallableSignature::dynamic(0, 0));
+    let mut bytes = bytecode::encode(&program).unwrap();
+    bytes[30] = 2; // Invalid result-type presence tag.
     assert!(
         bytecode::decode(&bytes)
             .unwrap_err()

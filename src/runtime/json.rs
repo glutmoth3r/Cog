@@ -3,6 +3,8 @@ use super::RuntimeContext;
 use crate::error::RuntimeError;
 use crate::heap::HeapRef;
 use crate::value::{ArrayValue, RecordValue, Value};
+use num_bigint::BigInt;
+use num_traits::ToPrimitive;
 use serde::de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
 use serde::ser::{Error as _, SerializeMap, SerializeSeq};
 use serde::{Deserializer, Serialize, Serializer};
@@ -13,6 +15,8 @@ use std::rc::Rc;
 
 const MAX_DEPTH: usize = 64;
 const RESOURCE: &str = "$cog:resource";
+const HEAP_RESOURCE: &str = "$cog:heap-resource";
+const HEAP_FAILURE: &str = "$cog:heap-failure";
 const DEPTH: &str = "$cog:depth";
 const OVERFLOW: &str = "$cog:overflow";
 const DUPLICATE: &str = "$cog:duplicate";
@@ -20,6 +24,7 @@ const CYCLE: &str = "$cog:cycle";
 const BORROW: &str = "$cog:borrow";
 const TYPE: &str = "$cog:type";
 const INVALID: &str = "$cog:invalid";
+const NUMERIC: &str = "$cog:numeric";
 
 pub(super) fn parse(
     context: &mut RuntimeContext<'_>,
@@ -31,12 +36,18 @@ pub(super) fn parse(
     if text.len() > context.limits.buffer_limit() {
         return Err(RuntimeError::ResourceLimit { resource: "bytes" });
     }
+    let (prepared, number_marker) = prepare_json_numbers(text, context.limits.buffer_limit())?;
 
     let mut budget = Budget {
         used: 0,
         limit: context.limits.buffer_limit(),
+        heap_limit: context.limits.max_heap_objects,
+        numeric_limit: context.limits.max_numeric_digits,
+        number_marker,
+        heap_collection_attempted: false,
+        reserved_heap_objects: 0,
     };
-    let mut deserializer = serde_json::Deserializer::from_str(text);
+    let mut deserializer = serde_json::Deserializer::from_str(&prepared);
     let value = ValueSeed {
         budget: &mut budget,
         depth: 0,
@@ -44,58 +55,7 @@ pub(super) fn parse(
     .deserialize(&mut deserializer)
     .map_err(parse_error)?;
     deserializer.end().map_err(parse_error)?;
-    validate_integer_tokens(text)?;
     Ok(value)
-}
-
-// Serde's f64 visitor also receives integer tokens outside u64/i64. Inspect
-// their original spelling after syntax validation so those tokens cannot be
-// silently rounded. This scan allocates nothing and ignores quoted strings.
-fn validate_integer_tokens(text: &str) -> Result<(), RuntimeError> {
-    let mut bytes = text.bytes().peekable();
-    while let Some(byte) = bytes.next() {
-        if byte == b'"' {
-            while let Some(byte) = bytes.next() {
-                match byte {
-                    b'\\' => {
-                        bytes.next();
-                    }
-                    b'"' => break,
-                    _ => {}
-                }
-            }
-        } else if byte == b'-' || byte.is_ascii_digit() {
-            let mut magnitude = u64::from(byte.saturating_sub(b'0'));
-            let negative = byte == b'-';
-            if negative {
-                magnitude = 0;
-            }
-            let mut overflow = false;
-            let mut fractional = false;
-            while let Some(&byte) = bytes.peek() {
-                if !(byte.is_ascii_digit() || matches!(byte, b'.' | b'e' | b'E' | b'+' | b'-')) {
-                    break;
-                }
-                bytes.next();
-                if byte.is_ascii_digit() {
-                    match magnitude
-                        .checked_mul(10)
-                        .and_then(|n| n.checked_add(u64::from(byte - b'0')))
-                    {
-                        Some(n) => magnitude = n,
-                        None => overflow = true,
-                    }
-                } else {
-                    fractional = true;
-                }
-            }
-            let limit = (i64::MAX as u64) + u64::from(negative);
-            if !fractional && (overflow || magnitude > limit) {
-                return Err(RuntimeError::Overflow);
-            }
-        }
-    }
-    Ok(())
 }
 
 pub(super) fn stringify(
@@ -109,17 +69,22 @@ pub(super) fn stringify(
     let state = Rc::new(SerializeState {
         depth: Cell::new(0),
         active: RefCell::new(HashSet::new()),
+        error: RefCell::new(None),
         allocation_limit: context.limits.buffer_limit(),
+        numeric_limit: context.limits.max_numeric_digits,
     });
     let result = {
         let mut serializer = serde_json::Serializer::new(&mut writer);
         JsonValue {
             value: &args[0],
-            state,
+            state: state.clone(),
         }
         .serialize(&mut serializer)
     };
     if result.is_err() {
+        if let Some(error) = state.error.borrow_mut().take() {
+            return Ok(Value::Error(Box::new(error)));
+        }
         return Err(writer.error().unwrap_or_else(|| {
             result.err().map_or(
                 RuntimeError::InvalidArgument {
@@ -137,9 +102,21 @@ pub(super) fn stringify(
 struct Budget {
     used: usize,
     limit: usize,
+    heap_limit: Option<usize>,
+    numeric_limit: Option<usize>,
+    number_marker: String,
+    heap_collection_attempted: bool,
+    reserved_heap_objects: usize,
 }
 
 impl Budget {
+    fn numeric_digits<E: serde::de::Error>(&self, digits: usize) -> Result<(), E> {
+        if self.numeric_limit.is_some_and(|limit| digits > limit) {
+            return Err(E::custom(NUMERIC));
+        }
+        Ok(())
+    }
+
     fn charge<E: serde::de::Error>(&mut self, amount: usize) -> Result<(), E> {
         self.used = self
             .used
@@ -154,6 +131,30 @@ impl Budget {
         // bookkeeping. The input byte limit alone would allow tiny JSON tokens
         // to expand into a much larger object graph.
         self.charge(2 * std::mem::size_of::<Value>() + 2 * std::mem::size_of::<usize>())
+    }
+
+    fn reserve_heap_object<E: serde::de::Error>(&mut self) -> Result<(), E> {
+        if self.heap_limit.is_some_and(|limit| {
+            !self.heap_collection_attempted
+                && crate::heap::live_objects().saturating_add(self.reserved_heap_objects) >= limit
+        }) {
+            crate::heap::collect(&[]).map_err(|_| E::custom(HEAP_FAILURE))?;
+            self.heap_collection_attempted = true;
+        }
+        if self.heap_limit.is_some_and(|limit| {
+            crate::heap::live_objects().saturating_add(self.reserved_heap_objects) >= limit
+        }) {
+            return Err(E::custom(HEAP_RESOURCE));
+        }
+        self.reserved_heap_objects = self
+            .reserved_heap_objects
+            .checked_add(1)
+            .ok_or_else(|| E::custom(HEAP_RESOURCE))?;
+        Ok(())
+    }
+
+    fn release_heap_object(&mut self) {
+        self.reserved_heap_objects = self.reserved_heap_objects.saturating_sub(1);
     }
 }
 
@@ -208,17 +209,64 @@ impl<'de> Visitor<'de> for ValueVisitor<'_> {
 
     fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Value, E> {
         let mut this = self;
+        let magnitude = value.unsigned_abs();
+        this.budget.numeric_digits(if magnitude == 0 {
+            1
+        } else {
+            magnitude.ilog10() as usize + 1
+        })?;
         this.charge_node()?;
         Ok(Value::Int(value))
     }
 
-    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Value, E> {
-        if value > i64::MAX as u64 {
-            return Err(E::custom(OVERFLOW));
-        }
+    fn visit_i128<E: serde::de::Error>(self, value: i128) -> Result<Value, E> {
         let mut this = self;
+        let magnitude = value.unsigned_abs();
+        this.budget.numeric_digits(if magnitude == 0 {
+            1
+        } else {
+            magnitude.ilog10() as usize + 1
+        })?;
         this.charge_node()?;
-        Ok(Value::Int(value as i64))
+        if let Ok(value) = i64::try_from(value) {
+            Ok(Value::Int(value))
+        } else {
+            Ok(Value::BigInt(BigInt::from(value)))
+        }
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Value, E> {
+        let mut this = self;
+        this.budget.numeric_digits(if value == 0 {
+            1
+        } else {
+            value.ilog10() as usize + 1
+        })?;
+        this.charge_node()?;
+        if value <= i64::MAX as u64 {
+            Ok(Value::Int(value as i64))
+        } else {
+            Ok(Value::UInt(value))
+        }
+    }
+
+    fn visit_u128<E: serde::de::Error>(self, value: u128) -> Result<Value, E> {
+        let mut this = self;
+        this.budget.numeric_digits(if value == 0 {
+            1
+        } else {
+            value.ilog10() as usize + 1
+        })?;
+        this.charge_node()?;
+        if let Ok(value) = u64::try_from(value) {
+            if value <= i64::MAX as u64 {
+                Ok(Value::Int(value as i64))
+            } else {
+                Ok(Value::UInt(value))
+            }
+        } else {
+            Ok(Value::BigInt(BigInt::from(value)))
+        }
     }
 
     fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Value, E> {
@@ -233,6 +281,9 @@ impl<'de> Visitor<'de> for ValueVisitor<'_> {
     fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Value, E> {
         let mut this = self;
         this.charge_node()?;
+        if let Some(raw) = value.strip_prefix(&this.budget.number_marker) {
+            return parse_marked_number(raw, this.budget);
+        }
         this.budget.charge(value.len())?;
         Ok(Value::Str(Rc::from(value)))
     }
@@ -240,63 +291,298 @@ impl<'de> Visitor<'de> for ValueVisitor<'_> {
     fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Value, E> {
         let mut this = self;
         this.charge_node()?;
+        if let Some(raw) = value.strip_prefix(&this.budget.number_marker) {
+            return parse_marked_number(raw, this.budget);
+        }
         this.budget.charge(value.len())?;
         Ok(Value::Str(Rc::from(value)))
     }
 
     fn visit_seq<A: SeqAccess<'de>>(mut self, mut sequence: A) -> Result<Value, A::Error> {
         self.charge_node()?;
-        self.budget.charge(std::mem::size_of::<ArrayValue>())?;
-        let mut values = Vec::new();
-        while let Some(value) = sequence.next_element_seed(ValueSeed {
-            budget: &mut *self.budget,
-            depth: self.depth + 1,
-        })? {
-            values
-                .try_reserve(1)
-                .map_err(|_| A::Error::custom(RESOURCE))?;
-            values.push(value);
-        }
-        let array = HeapRef::try_new(ArrayValue::dynamic(values)).map_err(|error| match error {
-            RuntimeError::ResourceLimit { .. } => A::Error::custom(RESOURCE),
-            RuntimeError::InvalidArgument { .. } => A::Error::custom(BORROW),
-            _ => A::Error::custom(INVALID),
-        })?;
-        Ok(Value::Array(array))
+        self.budget.reserve_heap_object::<A::Error>()?;
+        let result = (|| {
+            self.budget.charge(std::mem::size_of::<ArrayValue>())?;
+            let mut values = Vec::new();
+            while let Some(value) = sequence.next_element_seed(ValueSeed {
+                budget: &mut *self.budget,
+                depth: self.depth + 1,
+            })? {
+                values
+                    .try_reserve(1)
+                    .map_err(|_| A::Error::custom(RESOURCE))?;
+                values.push(value);
+            }
+            let array =
+                HeapRef::try_new(ArrayValue::dynamic(values)).map_err(|error| match error {
+                    RuntimeError::ResourceLimit { .. } => A::Error::custom(RESOURCE),
+                    RuntimeError::InvalidArgument { .. } => A::Error::custom(BORROW),
+                    _ => A::Error::custom(INVALID),
+                })?;
+            Ok(Value::Array(array))
+        })();
+        self.budget.release_heap_object();
+        result
     }
 
     fn visit_map<A: MapAccess<'de>>(mut self, mut object: A) -> Result<Value, A::Error> {
         self.charge_node()?;
-        self.budget.charge(std::mem::size_of::<RecordValue>())?;
-        let mut fields = HashMap::new();
-        while let Some(key) = object.next_key::<String>()? {
-            self.budget
-                .charge(key.len().saturating_add(4 * std::mem::size_of::<usize>()))?;
-            if fields.contains_key(&key) {
-                return Err(A::Error::custom(DUPLICATE));
+        let mut first_key = object.next_key::<String>()?;
+        self.budget.reserve_heap_object::<A::Error>()?;
+        let result = (|| {
+            self.budget.charge(std::mem::size_of::<RecordValue>())?;
+            let mut fields = HashMap::new();
+            let mut next_key = first_key.take();
+            while let Some(key) = next_key {
+                self.budget
+                    .charge(key.len().saturating_add(4 * std::mem::size_of::<usize>()))?;
+                if fields.contains_key(&key) {
+                    return Err(A::Error::custom(DUPLICATE));
+                }
+                fields
+                    .try_reserve(1)
+                    .map_err(|_| A::Error::custom(RESOURCE))?;
+                let value = object.next_value_seed(ValueSeed {
+                    budget: &mut *self.budget,
+                    depth: self.depth + 1,
+                })?;
+                fields.insert(key, value);
+                next_key = object.next_key::<String>()?;
             }
-            fields
-                .try_reserve(1)
-                .map_err(|_| A::Error::custom(RESOURCE))?;
-            let value = object.next_value_seed(ValueSeed {
-                budget: &mut *self.budget,
-                depth: self.depth + 1,
-            })?;
-            fields.insert(key, value);
+            let record =
+                HeapRef::try_new(RecordValue::new(fields)).map_err(|error| match error {
+                    RuntimeError::ResourceLimit { .. } => A::Error::custom(RESOURCE),
+                    RuntimeError::InvalidArgument { .. } => A::Error::custom(BORROW),
+                    _ => A::Error::custom(INVALID),
+                })?;
+            Ok(Value::Record(record))
+        })();
+        self.budget.release_heap_object();
+        result
+    }
+}
+
+fn parse_marked_number<E: serde::de::Error>(raw: &str, budget: &mut Budget) -> Result<Value, E> {
+    let digits = raw
+        .strip_prefix('-')
+        .unwrap_or(raw)
+        .trim_start_matches('0')
+        .len()
+        .max(1);
+    budget.numeric_digits(digits)?;
+    budget.charge(raw.len())?;
+    parse_json_number(raw)
+}
+
+fn prepare_json_numbers(text: &str, limit: usize) -> Result<(String, String), RuntimeError> {
+    let marker = unique_json_number_marker(text);
+    let mut output_len = text.len();
+    let mut index = 0usize;
+    while index < text.len() {
+        let byte = text.as_bytes()[index];
+        if byte == b'"' {
+            index = json_string_end(text, index);
+        } else if byte == b'-' || byte.is_ascii_digit() {
+            if let Some(end) = json_number_end(text.as_bytes(), index) {
+                let raw = &text[index..end];
+                if marked_json_integer(raw) {
+                    let replacement_len = marker.len().saturating_add(2);
+                    output_len = if replacement_len >= raw.len() {
+                        output_len.checked_add(replacement_len - raw.len())
+                    } else {
+                        output_len.checked_sub(raw.len() - replacement_len)
+                    }
+                    .ok_or(RuntimeError::ResourceLimit { resource: "bytes" })?;
+                }
+                index = end;
+            } else {
+                index += text[index..].chars().next().unwrap().len_utf8();
+            }
+        } else {
+            index += text[index..].chars().next().unwrap().len_utf8();
         }
-        let record = HeapRef::try_new(RecordValue::new(fields)).map_err(|error| match error {
-            RuntimeError::ResourceLimit { .. } => A::Error::custom(RESOURCE),
-            RuntimeError::InvalidArgument { .. } => A::Error::custom(BORROW),
-            _ => A::Error::custom(INVALID),
-        })?;
-        Ok(Value::Record(record))
+    }
+    if output_len > limit {
+        return Err(RuntimeError::ResourceLimit { resource: "bytes" });
+    }
+    let mut prepared = String::new();
+    prepared
+        .try_reserve_exact(output_len)
+        .map_err(|_| RuntimeError::ResourceLimit { resource: "bytes" })?;
+
+    index = 0;
+    while index < text.len() {
+        let byte = text.as_bytes()[index];
+        if byte == b'"' {
+            let end = json_string_end(text, index);
+            prepared.push_str(&text[index..end]);
+            index = end;
+        } else if byte == b'-' || byte.is_ascii_digit() {
+            if let Some(end) = json_number_end(text.as_bytes(), index) {
+                let raw = &text[index..end];
+                if marked_json_integer(raw) {
+                    prepared.push('"');
+                    prepared.push_str(&marker);
+                    prepared.push_str(raw);
+                    prepared.push('"');
+                } else {
+                    prepared.push_str(raw);
+                }
+                index = end;
+            } else {
+                let next = index + text[index..].chars().next().unwrap().len_utf8();
+                prepared.push_str(&text[index..next]);
+                index = next;
+            }
+        } else {
+            let next = index + text[index..].chars().next().unwrap().len_utf8();
+            prepared.push_str(&text[index..next]);
+            index = next;
+        }
+    }
+    Ok((prepared, marker))
+}
+
+fn unique_json_number_marker(text: &str) -> String {
+    let seed = (text.as_ptr() as usize) ^ text.len();
+    let mut attempt = 0usize;
+    loop {
+        let marker = format!("__COG_BIGINT_{seed:x}_{attempt:x}__");
+        if !json_strings_contain(text, &marker) {
+            return marker;
+        }
+        attempt = attempt.wrapping_add(1);
+    }
+}
+
+fn json_strings_contain(text: &str, needle: &str) -> bool {
+    let mut index = 0usize;
+    while index < text.len() {
+        if text.as_bytes()[index] != b'"' {
+            index += text[index..].chars().next().unwrap().len_utf8();
+            continue;
+        }
+        let end = json_string_end(text, index);
+        if let Ok(value) = serde_json::from_str::<String>(&text[index..end])
+            && value.contains(needle)
+        {
+            return true;
+        }
+        index = end;
+    }
+    false
+}
+
+fn json_string_end(text: &str, start: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index = (index + 2).min(bytes.len()),
+            b'"' => return index + 1,
+            _ => index += 1,
+        }
+    }
+    bytes.len()
+}
+
+fn json_number_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut index = start;
+    if bytes.get(index) == Some(&b'-') {
+        index += 1;
+    }
+    match bytes.get(index).copied()? {
+        b'0' => index += 1,
+        b'1'..=b'9' => {
+            index += 1;
+            while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+                index += 1;
+            }
+        }
+        _ => return None,
+    }
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        let fraction_start = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        if index == fraction_start {
+            return None;
+        }
+    }
+    if matches!(bytes.get(index), Some(b'e' | b'E')) {
+        index += 1;
+        if matches!(bytes.get(index), Some(b'+' | b'-')) {
+            index += 1;
+        }
+        let exponent_start = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        if index == exponent_start {
+            return None;
+        }
+    }
+    Some(index)
+}
+
+fn marked_json_integer(raw: &str) -> bool {
+    if raw == "-0" {
+        return true;
+    }
+    if raw.contains(['.', 'e', 'E']) {
+        return false;
+    }
+    let negative = raw.starts_with('-');
+    let digits = raw.strip_prefix('-').unwrap_or(raw);
+    let digits = digits.trim_start_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    let bound = if negative {
+        "9223372036854775808"
+    } else {
+        "18446744073709551615"
+    };
+    digits.len() > bound.len() || (digits.len() == bound.len() && digits > bound)
+}
+
+fn parse_json_number<E: serde::de::Error>(raw: &str) -> Result<Value, E> {
+    if raw == "-0" {
+        return Ok(Value::Float(-0.0));
+    }
+    if raw.contains(['.', 'e', 'E']) {
+        let value = raw.parse::<f64>().map_err(|_| E::custom(OVERFLOW))?;
+        return value
+            .is_finite()
+            .then_some(Value::Float(value))
+            .ok_or_else(|| E::custom(OVERFLOW));
+    }
+    let number = raw.parse::<BigInt>().map_err(|_| E::custom(OVERFLOW))?;
+    if let Some(value) = number.to_i64() {
+        Ok(Value::Int(value))
+    } else if let Some(value) = number.to_u64() {
+        Ok(Value::UInt(value))
+    } else {
+        Ok(Value::BigInt(number))
     }
 }
 
 fn parse_error(error: serde_json::Error) -> RuntimeError {
     let message = error.to_string();
-    if message.contains(RESOURCE) {
+    if message.contains(HEAP_FAILURE) {
+        RuntimeError::ResourceLimit {
+            resource: "VM heap",
+        }
+    } else if message.contains(HEAP_RESOURCE) {
+        RuntimeError::ResourceLimit {
+            resource: "VM heap objects",
+        }
+    } else if message.contains(RESOURCE) {
         RuntimeError::ResourceLimit { resource: "bytes" }
+    } else if message.contains(NUMERIC) {
+        RuntimeError::ResourceLimit {
+            resource: "numeric digits",
+        }
     } else if message.contains(DEPTH) {
         RuntimeError::ResourceLimit {
             resource: "JSON nesting",
@@ -366,7 +652,9 @@ impl Write for BoundedWriter {
 struct SerializeState {
     depth: Cell<usize>,
     active: RefCell<HashSet<(u8, usize)>>,
+    error: RefCell<Option<RuntimeError>>,
     allocation_limit: usize,
+    numeric_limit: Option<usize>,
 }
 
 struct ValueGuard {
@@ -432,8 +720,36 @@ impl Serialize for JsonValue<'_> {
             Value::Nil => serializer.serialize_unit(),
             Value::Bool(value) => serializer.serialize_bool(*value),
             Value::Int(value) => serializer.serialize_i64(*value),
+            Value::UInt(value) => serializer.serialize_u64(*value),
+            Value::BigInt(value) => {
+                if self
+                    .state
+                    .numeric_limit
+                    .is_some_and(|limit| crate::value::bigint_exceeds_decimal_digits(value, limit))
+                {
+                    *self.state.error.borrow_mut() = Some(RuntimeError::ResourceLimit {
+                        resource: "numeric digits",
+                    });
+                    return Err(S::Error::custom(NUMERIC));
+                }
+                let digits = value.bits().saturating_mul(30_103).saturating_add(99_999) / 100_000;
+                let bytes = usize::try_from(digits)
+                    .unwrap_or(usize::MAX)
+                    .max(1)
+                    .saturating_add(usize::from(value.sign() == num_bigint::Sign::Minus));
+                if bytes > self.state.allocation_limit {
+                    *self.state.error.borrow_mut() =
+                        Some(RuntimeError::ResourceLimit { resource: "bytes" });
+                    return Err(S::Error::custom(RESOURCE));
+                }
+                let text = value.to_str_radix(10);
+                // BigInt's radix formatter emits a canonical JSON integer token.
+                let number = unsafe { serde_json::value::RawValue::from_string_unchecked(text) };
+                number.serialize(serializer)
+            }
             Value::Float(value) if value.is_finite() => serializer.serialize_f64(*value),
             Value::Float(_) => Err(S::Error::custom(INVALID)),
+            Value::Char(value) => serializer.serialize_char(*value),
             Value::Str(value) => serializer.serialize_str(value),
             Value::Array(array) => {
                 let values = array.try_borrow().map_err(|_| S::Error::custom(BORROW))?;
@@ -472,6 +788,17 @@ impl Serialize for JsonValue<'_> {
                     )?;
                 }
                 object.end()
+            }
+            Value::Error(error) => {
+                let mut first_error = self
+                    .state
+                    .error
+                    .try_borrow_mut()
+                    .map_err(|_| S::Error::custom(BORROW))?;
+                if first_error.is_none() {
+                    *first_error = Some((**error).clone());
+                }
+                Err(S::Error::custom(TYPE))
             }
             _ => Err(S::Error::custom(TYPE)),
         }
@@ -527,8 +854,101 @@ mod tests {
         context.limits.max_buffer_bytes = Some(1024);
         assert!(matches!(
             parse(&mut context, &[Value::Str(Rc::from("9223372036854775808"))]),
-            Err(RuntimeError::Overflow)
+            Ok(Value::UInt(9_223_372_036_854_775_808))
         ));
+    }
+
+    #[test]
+    fn parser_respects_the_live_heap_object_limit_and_cleans_up_partial_values() {
+        let mut output = Vec::new();
+        let mut context = RuntimeContext::new(&mut output, VmCapabilities::restricted());
+        let baseline = crate::heap::live_objects();
+
+        assert!(matches!(
+            parse(&mut context, &[Value::Str(Rc::from("[{},]"))]),
+            Err(RuntimeError::ParseFailure { .. })
+        ));
+        assert_eq!(crate::heap::live_objects(), baseline);
+
+        context.limits.max_heap_objects = Some(baseline);
+        let error = parse(&mut context, &[Value::Str(Rc::from("[]"))]).unwrap_err();
+        assert!(error.is_recoverable());
+        assert!(matches!(
+            error,
+            RuntimeError::ResourceLimit {
+                resource: "VM heap objects"
+            }
+        ));
+        assert_eq!(crate::heap::live_objects(), baseline);
+
+        // The enclosing array reserves its object slot before decoding the
+        // child, so the nested array must be rejected before either is made.
+        context.limits.max_heap_objects = Some(baseline + 1);
+        let error = parse(&mut context, &[Value::Str(Rc::from("[[]]"))]).unwrap_err();
+        assert!(error.is_recoverable());
+        assert!(matches!(
+            error,
+            RuntimeError::ResourceLimit {
+                resource: "VM heap objects"
+            }
+        ));
+        assert_eq!(crate::heap::live_objects(), baseline);
+
+        let error = parse(&mut context, &[Value::Str(Rc::from(r#"{"a":[]}"#))]).unwrap_err();
+        assert!(error.is_recoverable());
+        assert!(matches!(
+            error,
+            RuntimeError::ResourceLimit {
+                resource: "VM heap objects"
+            }
+        ));
+        assert_eq!(crate::heap::live_objects(), baseline);
+
+        context.limits.max_heap_objects = Some(baseline + 2);
+        let value = parse(&mut context, &[Value::Str(Rc::from("[[]]"))]).unwrap();
+        assert_eq!(crate::heap::live_objects(), baseline + 2);
+        drop(value);
+        assert_eq!(crate::heap::live_objects(), baseline);
+    }
+
+    #[test]
+    fn parser_collects_unreachable_cycles_before_using_the_heap_quota() {
+        let mut output = Vec::new();
+        let mut context = RuntimeContext::new(&mut output, VmCapabilities::restricted());
+        let cycle = HeapRef::try_new(RecordValue::new(HashMap::new())).unwrap();
+        cycle
+            .try_set_field("self", Value::Record(cycle.clone()))
+            .unwrap();
+        drop(cycle);
+        assert_eq!(crate::heap::live_objects(), 1);
+
+        context.limits.max_heap_objects = Some(1);
+        let value = parse(&mut context, &[Value::Str(Rc::from("[]"))]).unwrap();
+        assert_eq!(crate::heap::live_objects(), 1);
+        drop(value);
+        assert_eq!(crate::heap::live_objects(), 0);
+    }
+
+    #[test]
+    fn heap_quota_error_from_parse_stays_catchable_in_the_vm() {
+        let mut program = crate::backend::CompiledProgram::new(vec![
+            crate::instruction::Instruction::Push(Value::Str(Rc::from("[[]]"))),
+            crate::instruction::Instruction::CallNative(0),
+            crate::instruction::Instruction::IsType(crate::instruction::ValueType::Error),
+            crate::instruction::Instruction::JumpIfFalse(5),
+            crate::instruction::Instruction::Halt,
+            crate::instruction::Instruction::Push(Value::Str(Rc::from("not an Error"))),
+            crate::instruction::Instruction::Crash(None),
+        ]);
+        program
+            .imports
+            .push(crate::runtime::NativeImport::named("json::parse").unwrap());
+
+        let mut output = Vec::new();
+        let mut context = RuntimeContext::new(&mut output, VmCapabilities::restricted());
+        context.limits.max_heap_objects = Some(1);
+        crate::interpreter::run_with_context(&program, &mut context).unwrap();
+        context.finish().unwrap();
     }
 
     #[test]

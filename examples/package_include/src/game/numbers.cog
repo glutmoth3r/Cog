@@ -1,6 +1,6 @@
-comptime Scalar: type = int;
+@comptime const Scalar: type = int;
 
-comptime extend Scalar {
+@comptime extend Scalar {
     fn squared(self) -> int {
         self * self
     }

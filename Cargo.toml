@@ -9,14 +9,10 @@ license = "MPL-2.0 OR Apache-2.0"
 readme = "README.md"
 exclude = [
     "/dev_docs/**",
-    "/.claude/**",
     "/.codex/**",
-    "/.agents/**",
     "/.idea/**",
     "/AGENTS.md",
     "/CLAUDE.md",
-    "/graphify-out/**",
-    "/cogvm.zip",
     "**/*.cogb",
     "**/target/**",
 ]
@@ -41,13 +37,26 @@ debug = true
 
 [dependencies]
 blake3 = "1.8.7"
+cranelift-codegen = "=0.135.2"
+cranelift-frontend = "=0.135.2"
+cranelift-jit = "=0.135.2"
+cranelift-module = "=0.135.2"
+cranelift-native = "=0.135.2"
 logos = "0.16.1"
 kdl = { version = "6.7.1", default-features = false, features = ["span"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["raw_value"] }
+num-bigint = "0.4.8"
+num-traits = "0.2.19"
+
 getrandom = "0.3.4"
 cap-std = "4.0.3"
-serde = "1.0.229"
-serde_json = "1.0.151"
 libloading = "0.8.9"
+tar = { version = "0.4.46", default-features = false }
+zstd = "0.13.3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
 
 [dev-dependencies]
 criterion = "0.5"

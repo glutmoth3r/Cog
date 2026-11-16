@@ -37,7 +37,7 @@ fn cog_string(value: &str) -> String {
 
 fn execute(source: &str, capabilities: VmCapabilities) {
     let source = format!(
-        "include std; use fs; use err::Error;\nfn require(condition: bool) {{ if !condition {{ crash(\"assertion failed\"); }} }}\n{source}"
+        "@!include(\"std\") use fs; use err::Error;\nfn require(condition: bool) {{ if !condition {{ crash(\"assertion failed\"); }} }}\n{source}"
     );
     let program =
         project::compile_source("fs-module.cog", &source).unwrap_or_else(|error| panic!("{error}"));
@@ -138,7 +138,7 @@ fn directory_listing_obeys_its_aggregate_buffer_limit() {
     std::fs::write(temp.0.join("a"), b"").unwrap();
     let source = format!(
         r#"
-        include std;
+        @!include("std")
         use fs;
         use err::Error;
         fn main() {{

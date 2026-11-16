@@ -7,12 +7,24 @@ extend int with Clone {
     fn clone(self) -> int { self }
 }
 
+extend uint with Clone {
+    fn clone(self) -> uint { self }
+}
+
+extend bigint with Clone {
+    fn clone(self) -> bigint { self }
+}
+
 extend float with Clone {
     fn clone(self) -> float { self }
 }
 
 extend bool with Clone {
     fn clone(self) -> bool { self }
+}
+
+extend char with Clone {
+    fn clone(self) -> char { self }
 }
 
 extend nil with Clone {

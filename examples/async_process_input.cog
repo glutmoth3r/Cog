@@ -1,0 +1,27 @@
+@!include("std")
+use bytes;
+use err::Error;
+use io;
+use process;
+use async::time;
+
+@async fn main() -> nil {
+    const input = bytes::from_str("sent through child stdin\n")!!;
+    const arguments: str[] = [];
+    const result = await process::run(
+        "/bin/cat", arguments, input, 5000
+    )!!;
+    io::println(bytes::to_str(result.stdout, 0, bytes::len(result.stdout)!!)!!);
+    io::println($"child succeeded: {result.success}");
+
+    const blocked_input = spawn(process::run(
+        "/bin/sh", ["-c", "sleep 5 & wait"], bytes::new(1048576)!!
+    ));
+    await time::sleep(0.02);
+    io::println($"input cancellation accepted: {cancel(blocked_input)}");
+    when await blocked_input is Error::Cancelled {
+        io::println("child and blocked stdin writer stopped");
+    } else {
+        crash("expected input task cancellation");
+    }
+}
