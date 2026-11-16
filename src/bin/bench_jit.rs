@@ -425,6 +425,94 @@ fn main() -> nil {{
     )
 }
 
+fn mandelbrot_render_source(_: u64) -> String {
+    r#"
+@!include("std")
+use bytes;
+use io;
+
+@comptime const WIDTH: int = 96;
+@comptime const HEIGHT: int = 64;
+@comptime const MAX_ITER: int = 64;
+@comptime const ROWS_PER_BATCH: int = 6;
+
+@inline("never")
+fn escape_steps(cr, ci, scale, escape_limit) -> int {
+    const max_iter = MAX_ITER;
+    const b2 = 2 as bigint;
+    const b4 = 4 as bigint;
+    const b16 = 16 as bigint;
+    const ci2 = ci * ci;
+    const dx = cr - scale / b4;
+    const q = dx * dx + ci2;
+    if b4 * q * (q + dx * scale) <= ci2 * scale * scale {
+        return max_iter;
+    }
+    const bx = cr + scale;
+    if b16 * (bx * bx + ci2) <= scale * scale {
+        return max_iter;
+    }
+
+    var zr = 0 as bigint;
+    var zi = 0 as bigint;
+    var steps = 0;
+    while steps < max_iter {
+        const zr2 = zr * zr;
+        const zi2 = zi * zi;
+        if zr2 + zi2 > escape_limit {
+            return steps;
+        }
+        const next_zr = (zr2 - zi2) / scale + cr;
+        zi = (b2 * zr * zi) / scale + ci;
+        zr = next_zr;
+        steps += 1;
+    }
+    max_iter
+}
+
+fn render_rows(frame, center_x, center_y, span, scale,
+               first_row: int, last_row: int) -> nil {
+    const denominator = (2 as bigint) * (WIDTH as bigint);
+    const escape_limit = (4 as bigint) * scale * scale;
+    for y in first_row..last_row {
+        const ci = center_y + ((2 * y - HEIGHT) as bigint) * span / denominator;
+        for x in 0..WIDTH {
+            const cr = center_x + ((2 * x - WIDTH) as bigint) * span / denominator;
+            const steps = escape_steps(cr, ci, scale, escape_limit)!!;
+            bytes::set(frame, y * WIDTH + x, steps)!!;
+        }
+    }
+}
+
+fn render_checksum() -> int {
+    const scale = (1 as bigint)
+        * (1_000_000_000_000_000_000 as bigint)
+        * (1_000_000_000_000 as bigint);
+    const span = (3 as bigint) * scale;
+    const center_x = -((3 as bigint) * scale / (5 as bigint));
+    const center_y = 0 as bigint;
+    var frame = bytes::new(WIDTH * HEIGHT)!!;
+    var first_row = 0;
+    while first_row < HEIGHT {
+        var last_row = first_row + ROWS_PER_BATCH;
+        if last_row > HEIGHT { last_row = HEIGHT; }
+        render_rows(frame, center_x, center_y, span, scale, first_row, last_row)!!;
+        first_row = last_row;
+    }
+    var checksum = 0;
+    for index in 0..(WIDTH * HEIGHT) {
+        checksum += bytes::get(frame, index)!!;
+    }
+    checksum
+}
+
+fn main() -> nil {
+    io::println(render_checksum())!!;
+}
+"#
+    .to_owned()
+}
+
 fn run(program: &Program, jit: bool, profile: Option<&Path>) -> Result<(Duration, String), String> {
     let mut output = Vec::new();
     let mut context = RunContext::new(&mut output).with_jit(jit);
@@ -540,6 +628,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Case {
             name: "bigint-mixed-overflow",
             source: bigint_mixed_overflow_source,
+        },
+        Case {
+            name: "mandelbrot-render",
+            source: mandelbrot_render_source,
         },
     ];
 

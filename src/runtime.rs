@@ -2121,6 +2121,39 @@ fn bytes_set(_: &mut RuntimeContext<'_>, args: &[Value]) -> Result<Value, Runtim
     bytes[span.start] = value;
     Ok(Value::Nil)
 }
+
+/// Fast path used by Cog's JIT for the checked, synchronous `bytes::set` ABI.
+/// Returning false leaves the arguments untouched so the VM can reproduce the
+/// exact diagnostic and error-propagation behavior.
+pub(crate) fn jit_bytes_set(arguments: &[Value]) -> bool {
+    let [Value::Bytes(buffer), Value::Int(offset), Value::Int(value)] = arguments else {
+        return false;
+    };
+    let Ok(offset) = usize::try_from(*offset) else {
+        return false;
+    };
+    let Ok(value) = u8::try_from(*value) else {
+        return false;
+    };
+    let Ok(mut bytes) = buffer.try_borrow_mut() else {
+        return false;
+    };
+    let Some(slot) = bytes.get_mut(offset) else {
+        return false;
+    };
+    *slot = value;
+    true
+}
+
+/// Read-only companion fast path for the checked `bytes::get` ABI.
+pub(crate) fn jit_bytes_get(arguments: &[Value]) -> Option<u8> {
+    let [Value::Bytes(buffer), Value::Int(offset)] = arguments else {
+        return None;
+    };
+    let offset = usize::try_from(*offset).ok()?;
+    let bytes = buffer.try_borrow().ok()?;
+    bytes.get(offset).copied()
+}
 fn stdout(context: &mut RuntimeContext<'_>, _: &[Value]) -> Result<Value, RuntimeError> {
     Ok(Value::Handle(context.handle(0)))
 }

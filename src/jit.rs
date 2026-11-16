@@ -5,19 +5,23 @@
 //! operation outside the lowered subset returns to the VM at that exact PC.
 
 use crate::backend::CompiledProgram;
+use crate::error::RuntimeError;
 use crate::instruction::{Instruction, ValueType};
 use crate::value::Value;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::Ieee64;
-use cranelift_codegen::ir::{AbiParam, BlockArg, InstBuilder, MemFlagsData, UserFuncName, types};
+use cranelift_codegen::ir::{
+    AbiParam, BlockArg, FuncRef, InstBuilder, MemFlagsData, UserFuncName, types,
+};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{
     JITBuilder, JITMemoryKind, JITMemoryProvider, JITModule, SystemMemoryProvider,
 };
-use cranelift_module::{Linkage, Module, default_libcall_names};
-use num_traits::ToPrimitive;
+use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
+use num_traits::{ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -33,7 +37,8 @@ const MAX_STACK: usize = 256;
 const MAX_JIT_FUNCTIONS: usize = 128;
 const MAX_JIT_CODE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_JIT_ENUM_VARIANTS: usize = 32;
-const MAX_FRAME_ROOTS: usize = MAX_LOCALS + MAX_STACK;
+const MAX_JIT_ROOTS: usize = 65_536;
+const MAX_JIT_CALL_ARGS: usize = 16;
 const MAX_BOOTSTRAP_PROBES: usize = 3;
 const WINDOW_BACKEDGES: u64 = 256;
 const REQUIRED_WINDOWS: u32 = 3;
@@ -42,7 +47,7 @@ const MAX_ACTIVITY_GAP_NS: u64 = 1_000_000_000;
 const TOKEN_CAPACITY_NS: u64 = 20_000_000;
 const TOKEN_REFILL_PER_NS: f64 = 0.02;
 const MAX_PROFILE_METRIC_NS: u64 = 60_000_000_000;
-const APE_VERSION: u32 = 14;
+const APE_VERSION: u32 = 15;
 static PROFILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const EXIT_COMPLETED: i32 = 0;
@@ -93,14 +98,81 @@ struct JitSlot {
 struct JitFrame {
     locals: *mut JitSlot,
     stack: *mut JitSlot,
+    roots: *mut Vec<Value>,
+    runtime_context: *mut std::ffi::c_void,
     pc: u64,
     stack_len: u64,
+    propagation_pending: u64,
     backedge_budget: u64,
     backedge_count: u64,
     exit_reason: i64,
 }
 
 type JitEntry = unsafe extern "C" fn(*mut JitFrame) -> i32;
+
+#[derive(Clone)]
+struct JitCallable {
+    entry: JitEntry,
+    plan: Arc<FunctionPlan>,
+}
+
+struct JitCallFrame {
+    frame: JitFrame,
+    locals: Vec<JitSlot>,
+    stack: Vec<JitSlot>,
+    roots: Vec<Value>,
+}
+
+impl JitCallFrame {
+    fn new(runtime_context: *mut std::ffi::c_void) -> Self {
+        let mut locals = Vec::new();
+        let mut stack = Vec::new();
+        let roots = Vec::new();
+        let frame = JitFrame {
+            locals: locals.as_mut_ptr(),
+            stack: stack.as_mut_ptr(),
+            roots: std::ptr::null_mut(),
+            runtime_context,
+            pc: 0,
+            stack_len: 0,
+            propagation_pending: 0,
+            backedge_budget: 0,
+            backedge_count: 0,
+            exit_reason: REASON_NORMAL,
+        };
+        Self {
+            frame,
+            locals,
+            stack,
+            roots,
+        }
+    }
+
+    fn prepare(&mut self, plan: &FunctionPlan, runtime_context: *mut std::ffi::c_void) {
+        self.locals.resize(plan.local_count, JitSlot::default());
+        self.locals.fill(JitSlot::default());
+        self.stack.resize(plan.max_stack.max(1), JitSlot::default());
+        self.stack.fill(JitSlot::default());
+        self.roots.clear();
+        self.frame.locals = self.locals.as_mut_ptr();
+        self.frame.stack = self.stack.as_mut_ptr();
+        self.frame.roots = &mut self.roots;
+        self.frame.runtime_context = runtime_context;
+        self.frame.pc = plan.entry as u64;
+        self.frame.stack_len = 0;
+        self.frame.propagation_pending = 0;
+        self.frame.backedge_budget = 0;
+        self.frame.backedge_count = 0;
+        self.frame.exit_reason = REASON_NORMAL;
+    }
+}
+
+struct JitExecutionContext<'a> {
+    artifact: &'a CompiledProgram,
+    variant_tags: &'a VariantTags,
+    callables: HashMap<usize, JitCallable>,
+    call_frame: Option<Box<JitCallFrame>>,
+}
 
 #[derive(Clone)]
 struct FunctionPlan {
@@ -114,6 +186,7 @@ struct FunctionPlan {
     max_stack: usize,
     stack_depths: Vec<Option<usize>>,
     osr_entries: Vec<usize>,
+    callable_from_jit: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -493,6 +566,7 @@ impl JitState {
         bp: usize,
         stack: &mut Vec<Value>,
         operand_base: usize,
+        propagation_pending: &mut bool,
         debug: bool,
     ) -> Option<JitExit> {
         let plan = Arc::clone(self.plans.get(&entry)?);
@@ -661,6 +735,34 @@ impl JitState {
             }
             (compiled.entry, compiled.probe_pending)
         };
+        let callables = self
+            .candidates
+            .iter()
+            .filter_map(|(&candidate_entry, candidate)| {
+                let compiled = candidate.compiled.as_ref()?;
+                let plan = Arc::clone(self.plans.get(&candidate_entry)?);
+                (plan.callable_from_jit
+                    && !compiled.probe_pending
+                    && !candidate.disabled
+                    && candidate.profile.calibrated
+                    && candidate.profile.total_backedges >= candidate.retry_after_backedges
+                    && adaptive_gain(candidate) > 0.0)
+                    .then_some((
+                        candidate_entry,
+                        JitCallable {
+                            entry: compiled.entry,
+                            plan,
+                        },
+                    ))
+            })
+            .collect();
+        let mut runtime = JitExecutionContext {
+            artifact,
+            variant_tags: &self.variant_tags,
+            callables,
+            call_frame: None,
+        };
+        let runtime_context = (&mut runtime as *mut JitExecutionContext<'_>).cast();
         let mut roots = Vec::new();
         let mut jit_locals = vec![JitSlot::default(); plan.local_count];
         for (index, slot) in jit_locals.iter_mut().enumerate() {
@@ -678,8 +780,11 @@ impl JitState {
         let mut frame = JitFrame {
             locals: jit_locals.as_mut_ptr(),
             stack: jit_stack.as_mut_ptr(),
+            roots: &mut roots,
+            runtime_context,
             pc: target as u64,
             stack_len: remaining as u64,
+            propagation_pending: u64::from(*propagation_pending),
             backedge_budget: if probe_pending { WINDOW_BACKEDGES } else { 0 },
             backedge_count: 0,
             exit_reason: REASON_NORMAL,
@@ -688,6 +793,7 @@ impl JitState {
         // The entry pointer remains owned by compiler.module for this plan's lifetime.
         let status = unsafe { (entry_function)(&mut frame) };
         let elapsed = nanos(started.elapsed());
+        drop(runtime);
         let exit = match decode_exit(&plan, artifact, &frame, status) {
             Ok(exit) => exit,
             Err(()) => {
@@ -730,6 +836,7 @@ impl JitState {
             return Some(JitExit::ResumeAt { pc: target });
         }
         *pc = frame.pc as usize;
+        *propagation_pending = frame.propagation_pending != 0;
 
         let backedges = frame.backedge_count;
         if debug {
@@ -1182,6 +1289,48 @@ fn analyze_function(
         .collect();
     osr_entries.sort_unstable();
     osr_entries.dedup();
+    let callable_from_jit = (entry..end).all(|pc| {
+        let instruction = &artifact.instructions[pc];
+        matches!(
+            instruction,
+            Instruction::Push(_)
+                | Instruction::PushArray(_)
+                | Instruction::Load(_)
+                | Instruction::Store(_)
+                | Instruction::Add
+                | Instruction::Sub
+                | Instruction::Mul
+                | Instruction::Div
+                | Instruction::Mod
+                | Instruction::Eq
+                | Instruction::Ne
+                | Instruction::Lt
+                | Instruction::Le
+                | Instruction::Gt
+                | Instruction::Ge
+                | Instruction::Jump(_)
+                | Instruction::JumpIfFalse(_)
+                | Instruction::JumpIfTrue(_)
+                | Instruction::JumpIfNoPropagation(_)
+                | Instruction::IsType(_)
+                | Instruction::And
+                | Instruction::Or
+                | Instruction::Xor
+                | Instruction::Not
+                | Instruction::Dup
+                | Instruction::Pop
+                | Instruction::Swap
+                | Instruction::StackTruncate(_)
+                | Instruction::MakeRecord(_)
+                | Instruction::MakeArray(_)
+                | Instruction::MakeTuple(_)
+                | Instruction::MakeTypedTuple(_, _)
+                | Instruction::MakeTypedArray(_, _)
+                | Instruction::Return
+                | Instruction::Crash(_)
+        ) || matches!(instruction, Instruction::CallNative(index)
+            if artifact.imports.get(*index).is_some_and(|import| import.name() == "str::to_bigint"))
+    });
     Some(FunctionPlan {
         entry,
         end,
@@ -1193,6 +1342,7 @@ fn analyze_function(
         max_stack,
         stack_depths: depths,
         osr_entries,
+        callable_from_jit,
     })
 }
 
@@ -1206,6 +1356,23 @@ struct JitCompiler {
     cache_full: Arc<AtomicBool>,
     functions: usize,
     pointer_type: cranelift_codegen::ir::Type,
+    helpers: JitHelpers,
+}
+
+#[derive(Clone, Copy)]
+struct JitHelpers {
+    bigint_binary: FuncId,
+    bigint_compare: FuncId,
+    direct_call: FuncId,
+    native_call: FuncId,
+}
+
+#[derive(Clone, Copy)]
+struct JitHelperRefs {
+    bigint_binary: FuncRef,
+    bigint_compare: FuncRef,
+    direct_call: FuncRef,
+    native_call: FuncRef,
 }
 
 impl JitCompiler {
@@ -1234,19 +1401,47 @@ impl JitCompiler {
         let code_bytes = Arc::new(AtomicUsize::new(0));
         let cache_full = Arc::new(AtomicBool::new(false));
         let mut builder = JITBuilder::with_isa(isa, default_libcall_names());
+        builder.symbol("cog_jit_bigint_binary", jit_bigint_binary as *const u8);
+        builder.symbol("cog_jit_bigint_compare", jit_bigint_compare as *const u8);
+        builder.symbol("cog_jit_direct_call", jit_direct_call as *const u8);
+        builder.symbol("cog_jit_native_call", jit_native_call as *const u8);
         builder.memory_provider(Box::new(CountingMemoryProvider {
             inner: SystemMemoryProvider::new(),
             code_bytes: Arc::clone(&code_bytes),
             cache_full: Arc::clone(&cache_full),
             limit: MAX_JIT_CODE_BYTES,
         }));
+        let mut module = JITModule::new(builder);
+        let helpers = JitHelpers {
+            bigint_binary: declare_helper(
+                &mut module,
+                "cog_jit_bigint_binary",
+                &[types::I64, types::I64, types::I32],
+            )?,
+            bigint_compare: declare_helper(
+                &mut module,
+                "cog_jit_bigint_compare",
+                &[types::I64, types::I64, types::I32],
+            )?,
+            direct_call: declare_helper(
+                &mut module,
+                "cog_jit_direct_call",
+                &[types::I64, types::I64, types::I64, types::I64, types::I64],
+            )?,
+            native_call: declare_helper(
+                &mut module,
+                "cog_jit_native_call",
+                &[types::I64, types::I64, types::I64, types::I64],
+            )?,
+        };
         Ok((
             Self {
-                module: JITModule::new(builder),
+                module,
                 code_bytes,
                 cache_full,
                 functions: 0,
                 pointer_type,
+                helpers,
             },
             host,
         ))
@@ -1280,6 +1475,7 @@ impl JitCompiler {
             plan,
             artifact,
             variant_tags,
+            self.helpers,
         )?;
         self.module
             .define_function(function_id, &mut context)
@@ -1301,6 +1497,21 @@ impl JitCompiler {
         signature.returns.push(AbiParam::new(types::I32));
         signature
     }
+}
+
+fn declare_helper(
+    module: &mut JITModule,
+    name: &str,
+    parameters: &[cranelift_codegen::ir::Type],
+) -> Result<FuncId, String> {
+    let mut signature = module.make_signature();
+    signature
+        .params
+        .extend(parameters.iter().copied().map(AbiParam::new));
+    signature.returns.push(AbiParam::new(types::I32));
+    module
+        .declare_function(name, Linkage::Import, &signature)
+        .map_err(|error| error.to_string())
 }
 
 struct CountingMemoryProvider {
@@ -1400,7 +1611,7 @@ fn small_bigint_slot(
         (TAG_BIGINT_SMALL_UNSIGNED_BASE, integer.to_u64()?)
     };
     let index = roots.len();
-    if index >= MAX_FRAME_ROOTS {
+    if index >= MAX_JIT_ROOTS {
         return None;
     }
     let tag = base.checked_add(u64::try_from(index).ok()?)?;
@@ -1410,7 +1621,7 @@ fn small_bigint_slot(
 
 fn rooted_tag_index(tag: u64, base: u64) -> Option<usize> {
     let index = usize::try_from(tag.checked_sub(base)?).ok()?;
-    (index < MAX_FRAME_ROOTS).then_some(index)
+    (index < MAX_JIT_ROOTS).then_some(index)
 }
 
 fn from_slot(
@@ -1492,6 +1703,405 @@ fn from_slot(
     Ok(Some(value))
 }
 
+fn bigint_from_slot<'a>(slot: JitSlot, roots: &'a [Value]) -> Option<Cow<'a, num_bigint::BigInt>> {
+    match slot.tag {
+        TAG_BIGINT => match roots.get(slot.payload as usize)? {
+            Value::BigInt(value) => Some(Cow::Borrowed(value)),
+            _ => None,
+        },
+        TAG_BIGINT_JIT_SIGNED => Some(Cow::Owned(num_bigint::BigInt::from(slot.payload as i64))),
+        TAG_BIGINT_JIT_UNSIGNED => Some(Cow::Owned(num_bigint::BigInt::from(slot.payload))),
+        tag if rooted_tag_index(tag, TAG_BIGINT_SMALL_SIGNED_BASE).is_some() => {
+            let index = rooted_tag_index(tag, TAG_BIGINT_SMALL_SIGNED_BASE)?;
+            let Value::BigInt(value) = roots.get(index)? else {
+                return None;
+            };
+            value
+                .to_i64()
+                .filter(|value| *value as u64 == slot.payload)
+                .map(|_| Cow::Borrowed(value))
+        }
+        tag if rooted_tag_index(tag, TAG_BIGINT_SMALL_UNSIGNED_BASE).is_some() => {
+            let index = rooted_tag_index(tag, TAG_BIGINT_SMALL_UNSIGNED_BASE)?;
+            let Value::BigInt(value) = roots.get(index)? else {
+                return None;
+            };
+            value
+                .to_u64()
+                .filter(|value| *value == slot.payload)
+                .map(|_| Cow::Borrowed(value))
+        }
+        _ => None,
+    }
+}
+
+fn append_owned_value(
+    value: Value,
+    roots: &mut Vec<Value>,
+    variant_tags: &VariantTags,
+) -> Option<JitSlot> {
+    match value {
+        Value::Int(value) => Some(JitSlot {
+            tag: TAG_INT,
+            payload: value as u64,
+        }),
+        Value::UInt(value) => Some(JitSlot {
+            tag: TAG_UINT,
+            payload: value,
+        }),
+        Value::Float(value) => Some(JitSlot {
+            tag: TAG_FLOAT,
+            payload: value.to_bits(),
+        }),
+        Value::Bool(value) => Some(JitSlot {
+            tag: TAG_BOOL,
+            payload: u64::from(value),
+        }),
+        Value::Char(value) => Some(JitSlot {
+            tag: TAG_CHAR,
+            payload: value as u32 as u64,
+        }),
+        Value::Nil => Some(JitSlot {
+            tag: TAG_NIL,
+            payload: 0,
+        }),
+        Value::BigInt(integer) => {
+            if let Some(value) = integer.to_i64() {
+                Some(JitSlot {
+                    tag: TAG_BIGINT_JIT_SIGNED,
+                    payload: value as u64,
+                })
+            } else if let Some(value) = integer.to_u64() {
+                Some(JitSlot {
+                    tag: TAG_BIGINT_JIT_UNSIGNED,
+                    payload: value,
+                })
+            } else {
+                push_root(Value::BigInt(integer), roots, TAG_BIGINT)
+            }
+        }
+        value => {
+            let tag = match &value {
+                Value::Str(_) => TAG_STR,
+                Value::Error(_) => TAG_ERROR,
+                Value::Array(_) => TAG_ARRAY,
+                Value::Variant(name, _) => variant_tags.slot_tag(name).unwrap_or(TAG_OPAQUE),
+                _ => TAG_OPAQUE,
+            };
+            push_root(value, roots, tag)
+        }
+    }
+}
+
+fn push_root(value: Value, roots: &mut Vec<Value>, tag: u64) -> Option<JitSlot> {
+    if roots.len() >= MAX_JIT_ROOTS || roots.try_reserve(1).is_err() {
+        return None;
+    }
+    let index = roots.len();
+    roots.push(value);
+    Some(JitSlot {
+        tag,
+        payload: index as u64,
+    })
+}
+
+unsafe extern "C" fn jit_bigint_binary(frame: *mut JitFrame, depth: u64, operation: i32) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        jit_bigint_binary_inner(frame, depth, operation)
+    }))
+    .unwrap_or(false) as i32
+}
+
+unsafe fn jit_bigint_binary_inner(frame: *mut JitFrame, depth: u64, operation: i32) -> bool {
+    let Some(frame) = (unsafe { frame.as_ref() }) else {
+        return false;
+    };
+    let Ok(depth) = usize::try_from(depth) else {
+        return false;
+    };
+    if depth < 2 || depth > MAX_STACK || frame.stack.is_null() || frame.roots.is_null() {
+        return false;
+    }
+    let left_slot = unsafe { *frame.stack.add(depth - 2) };
+    let right_slot = unsafe { *frame.stack.add(depth - 1) };
+    let result = {
+        let roots = unsafe { &*frame.roots };
+        let Some(left) = bigint_from_slot(left_slot, roots) else {
+            return false;
+        };
+        let Some(right) = bigint_from_slot(right_slot, roots) else {
+            return false;
+        };
+        match operation {
+            0 => left.as_ref() + right.as_ref(),
+            1 => left.as_ref() - right.as_ref(),
+            2 => left.as_ref() * right.as_ref(),
+            3 if !right.is_zero() => left.as_ref() / right.as_ref(),
+            4 if !right.is_zero() => left.as_ref() % right.as_ref(),
+            _ => return false,
+        }
+    };
+    let roots = unsafe { &mut *frame.roots };
+    let Some(slot) = append_owned_value(Value::BigInt(result), roots, &VariantTags::default())
+    else {
+        return false;
+    };
+    unsafe { *frame.stack.add(depth - 2) = slot };
+    true
+}
+
+unsafe extern "C" fn jit_bigint_compare(frame: *mut JitFrame, depth: u64, operation: i32) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        jit_bigint_compare_inner(frame, depth, operation)
+    }))
+    .unwrap_or(false) as i32
+}
+
+unsafe fn jit_bigint_compare_inner(frame: *mut JitFrame, depth: u64, operation: i32) -> bool {
+    let Some(frame) = (unsafe { frame.as_ref() }) else {
+        return false;
+    };
+    let Ok(depth) = usize::try_from(depth) else {
+        return false;
+    };
+    if depth < 2 || depth > MAX_STACK || frame.stack.is_null() || frame.roots.is_null() {
+        return false;
+    }
+    let left_slot = unsafe { *frame.stack.add(depth - 2) };
+    let right_slot = unsafe { *frame.stack.add(depth - 1) };
+    let result = {
+        let roots = unsafe { &*frame.roots };
+        let Some(left) = bigint_from_slot(left_slot, roots) else {
+            return false;
+        };
+        let Some(right) = bigint_from_slot(right_slot, roots) else {
+            return false;
+        };
+        let ordering = left.cmp(&right);
+        match operation {
+            0 => ordering.is_eq(),
+            1 => !ordering.is_eq(),
+            2 => ordering.is_lt(),
+            3 => ordering.is_le(),
+            4 => ordering.is_gt(),
+            5 => ordering.is_ge(),
+            _ => return false,
+        }
+    };
+    unsafe {
+        *frame.stack.add(depth - 2) = JitSlot {
+            tag: TAG_BOOL,
+            payload: u64::from(result),
+        };
+    }
+    true
+}
+
+unsafe extern "C" fn jit_native_call(
+    frame: *mut JitFrame,
+    pc: u64,
+    depth: u64,
+    import_index: u64,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        jit_native_call_inner(frame, pc, depth, import_index)
+    }))
+    .unwrap_or(false) as i32
+}
+
+unsafe fn jit_native_call_inner(
+    frame: *mut JitFrame,
+    pc: u64,
+    depth: u64,
+    import_index: u64,
+) -> bool {
+    let Some(frame_ref) = (unsafe { frame.as_ref() }) else {
+        return false;
+    };
+    if frame_ref.runtime_context.is_null() || frame_ref.stack.is_null() || frame_ref.roots.is_null()
+    {
+        return false;
+    }
+    let Ok(pc) = usize::try_from(pc) else {
+        return false;
+    };
+    let Ok(depth) = usize::try_from(depth) else {
+        return false;
+    };
+    let Ok(import_index) = usize::try_from(import_index) else {
+        return false;
+    };
+    let context = unsafe { &mut *frame_ref.runtime_context.cast::<JitExecutionContext<'_>>() };
+    let Some(Instruction::CallNative(actual_import)) = context.artifact.instructions.get(pc) else {
+        return false;
+    };
+    if *actual_import != import_index {
+        return false;
+    }
+    let Some(import) = context.artifact.imports.get(import_index) else {
+        return false;
+    };
+    let arity = import.parameters().len();
+    let Some(base) = depth.checked_sub(arity) else {
+        return false;
+    };
+    if depth > MAX_STACK || arity > 3 {
+        return false;
+    }
+    let mut arguments = std::array::from_fn::<_, 3, _>(|_| Value::Nil);
+    let roots = unsafe { &*frame_ref.roots };
+    for index in base..depth {
+        let slot = unsafe { *frame_ref.stack.add(index) };
+        let Ok(Some(value)) = from_slot(slot, roots, context.variant_tags) else {
+            return false;
+        };
+        arguments[index - base] = value;
+    }
+    let arguments = &arguments[..arity];
+    let result = match import.name() {
+        "bytes::get" => match crate::runtime::jit_bytes_get(arguments) {
+            Some(value) => Value::Int(i64::from(value)),
+            None => return false,
+        },
+        "bytes::set" if crate::runtime::jit_bytes_set(arguments) => Value::Nil,
+        "str::to_bigint" => match arguments.first() {
+            Some(Value::Error(_)) | Some(Value::BigInt(_)) => arguments[0].clone(),
+            Some(Value::Int(value)) => Value::BigInt((*value).into()),
+            Some(Value::UInt(value)) => Value::BigInt((*value).into()),
+            _ => return false,
+        },
+        _ => return false,
+    };
+    let roots = unsafe { &mut *frame_ref.roots };
+    let Some(slot) = append_owned_value(result, roots, context.variant_tags) else {
+        return false;
+    };
+    unsafe { *frame_ref.stack.add(base) = slot };
+    true
+}
+
+unsafe extern "C" fn jit_direct_call(
+    frame: *mut JitFrame,
+    pc: u64,
+    depth: u64,
+    target: u64,
+    arity: u64,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        jit_direct_call_inner(frame, pc, depth, target, arity)
+    }))
+    .unwrap_or(false) as i32
+}
+
+unsafe fn jit_direct_call_inner(
+    frame: *mut JitFrame,
+    pc: u64,
+    depth: u64,
+    target: u64,
+    arity: u64,
+) -> bool {
+    let Some(frame_ref) = (unsafe { frame.as_ref() }) else {
+        return false;
+    };
+    if frame_ref.runtime_context.is_null() || frame_ref.stack.is_null() || frame_ref.roots.is_null()
+    {
+        return false;
+    }
+    let (Ok(pc), Ok(depth), Ok(target), Ok(arity)) = (
+        usize::try_from(pc),
+        usize::try_from(depth),
+        usize::try_from(target),
+        usize::try_from(arity),
+    ) else {
+        return false;
+    };
+    if depth > MAX_STACK || arity > depth {
+        return false;
+    }
+    let context = unsafe { &mut *frame_ref.runtime_context.cast::<JitExecutionContext<'_>>() };
+    if !matches!(
+        context.artifact.instructions.get(pc),
+        Some(Instruction::Call(actual_target, actual_arity))
+            if *actual_target == target && *actual_arity == arity
+    ) {
+        return false;
+    }
+    let Some(signature) = context.artifact.callables.get(&target) else {
+        return false;
+    };
+    if signature.asynchronous || signature.captures != 0 || signature.parameters != arity {
+        return false;
+    }
+    let Some(callable) = context.callables.get(&target).cloned() else {
+        return false;
+    };
+    let base = depth - arity;
+    let roots = unsafe { &*frame_ref.roots };
+    if arity > MAX_JIT_CALL_ARGS {
+        return false;
+    }
+    let mut arguments = std::array::from_fn::<_, MAX_JIT_CALL_ARGS, _>(|_| Value::Nil);
+    for index in base..depth {
+        let slot = unsafe { *frame_ref.stack.add(index) };
+        let Ok(Some(value)) = from_slot(slot, roots, context.variant_tags) else {
+            return false;
+        };
+        if matches!(value, Value::Error(_)) {
+            return false;
+        }
+        arguments[index - base] = value;
+    }
+    if !crate::interpreter::call_arguments_match(signature, &arguments[..arity]) {
+        return false;
+    }
+    if context.call_frame.is_none() {
+        context.call_frame = Some(Box::new(JitCallFrame::new(frame_ref.runtime_context)));
+    }
+    let Some(child) = context.call_frame.as_mut() else {
+        return false;
+    };
+    child.prepare(&callable.plan, frame_ref.runtime_context);
+    for (index, value) in arguments.iter_mut().take(arity).enumerate() {
+        let value = std::mem::replace(value, Value::Nil);
+        let Some(slot) = append_owned_value(value, &mut child.roots, context.variant_tags) else {
+            return false;
+        };
+        child.stack[index] = slot;
+    }
+    child.frame.stack_len = arity as u64;
+    let status = unsafe { (callable.entry)(&mut child.frame) };
+    let Ok(JitExit::Completed) =
+        decode_exit(&callable.plan, context.artifact, &child.frame, status)
+    else {
+        return false;
+    };
+    let Ok(result_depth) = usize::try_from(child.frame.stack_len) else {
+        return false;
+    };
+    let Some(result_index) = result_depth.checked_sub(1) else {
+        return false;
+    };
+    let Some(result_slot) = child.stack.get(result_index).copied() else {
+        return false;
+    };
+    let Ok(Some(mut result)) = from_slot(result_slot, &child.roots, context.variant_tags) else {
+        return false;
+    };
+    if signature
+        .result_type
+        .as_ref()
+        .is_some_and(|expected| !crate::interpreter::matches_runtime_type(expected, &result))
+    {
+        result = Value::Error(Box::new(RuntimeError::TypeMismatch { op: "return" }));
+    }
+    let roots = unsafe { &mut *frame_ref.roots };
+    let Some(slot) = append_owned_value(result, roots, context.variant_tags) else {
+        return false;
+    };
+    unsafe { *frame_ref.stack.add(base) = slot };
+    true
+}
+
 fn decode_exit(
     plan: &FunctionPlan,
     artifact: &CompiledProgram,
@@ -1503,6 +2113,7 @@ fn decode_exit(
     let instruction = artifact.instructions.get(pc).ok_or(())?;
     if !(plan.entry..plan.end).contains(&pc)
         || plan.stack_depths.get(pc - plan.entry).copied().flatten() != Some(depth)
+        || frame.propagation_pending > 1
     {
         return Err(());
     }
@@ -1658,6 +2269,8 @@ fn jit_reachable_pcs(
     let count = plan.end - plan.entry;
     let mut reachable = vec![false; count];
     let mut queue = VecDeque::new();
+    reachable[0] = true;
+    queue.push_back(plan.entry);
     for &entry in &plan.osr_entries {
         if (plan.entry..plan.end).contains(&entry) && !reachable[entry - plan.entry] {
             reachable[entry - plan.entry] = true;
@@ -1676,6 +2289,7 @@ fn jit_reachable_pcs(
             }
             Instruction::Load(_)
             | Instruction::Store(_)
+            | Instruction::Call(_, _)
             | Instruction::Add
             | Instruction::Sub
             | Instruction::Mul
@@ -1695,6 +2309,16 @@ fn jit_reachable_pcs(
             | Instruction::Pop
             | Instruction::Swap
             | Instruction::ConstrainArrayFrom => next.into_iter().collect(),
+            Instruction::CallNative(index)
+                if artifact.imports.get(*index).is_some_and(|import| {
+                    matches!(
+                        import.name(),
+                        "bytes::get" | "bytes::set" | "str::to_bigint"
+                    )
+                }) =>
+            {
+                next.into_iter().collect()
+            }
             Instruction::IsType(value_type)
                 if type_tag(value_type).is_some()
                     || variant_tags.variant_tags(value_type).is_some() =>
@@ -1743,8 +2367,15 @@ fn lower_function(
     plan: &FunctionPlan,
     artifact: &CompiledProgram,
     variant_tags: &VariantTags,
+    helpers: JitHelpers,
 ) -> Result<(), String> {
     let mut builder = FunctionBuilder::new(&mut context.func, builder_context);
+    let helpers = JitHelperRefs {
+        bigint_binary: module.declare_func_in_func(helpers.bigint_binary, &mut builder.func),
+        bigint_compare: module.declare_func_in_func(helpers.bigint_compare, &mut builder.func),
+        direct_call: module.declare_func_in_func(helpers.direct_call, &mut builder.func),
+        native_call: module.declare_func_in_func(helpers.native_call, &mut builder.func),
+    };
     let dispatch = builder.create_block();
     let exit_block = builder.create_block();
     builder.append_block_param(exit_block, types::I32);
@@ -1788,6 +2419,16 @@ fn lower_function(
         builder.def_var(*tag_variable, tag);
         builder.def_var(*payload_variable, payload);
     }
+    let entry_pc = builder
+        .ins()
+        .icmp_imm_s(IntCC::Equal, start_pc, plan.entry as i64);
+    let entry_block = blocks
+        .get(&plan.entry)
+        .copied()
+        .ok_or("function entry has no bytecode block")?;
+    let next = builder.create_block();
+    builder.ins().brif(entry_pc, entry_block, &[], next, &[]);
+    builder.switch_to_block(next);
     for target in &plan.osr_entries {
         let target_block = blocks
             .get(target)
@@ -1876,6 +2517,7 @@ fn lower_function(
                     depth,
                     next.ok_or("binary fallthrough is missing")?,
                     &artifact.instructions[pc],
+                    helpers,
                 );
             }
             Instruction::Eq
@@ -1892,7 +2534,53 @@ fn lower_function(
                     depth,
                     next.ok_or("comparison fallthrough is missing")?,
                     &artifact.instructions[pc],
+                    helpers,
                 );
+            }
+            Instruction::Call(target, arity) => {
+                emit_helper_call(
+                    &mut builder,
+                    frame,
+                    &local_state,
+                    pc,
+                    depth,
+                    *target,
+                    *arity,
+                    helpers.direct_call,
+                    next.ok_or("call fallthrough is missing")?,
+                )?;
+            }
+            Instruction::CallNative(index) => {
+                let import = artifact.imports.get(*index);
+                if import.is_some_and(|import| {
+                    matches!(
+                        import.name(),
+                        "bytes::get" | "bytes::set" | "str::to_bigint"
+                    )
+                }) {
+                    let arity = import.map_or(0, |import| import.parameters().len());
+                    emit_native_call(
+                        &mut builder,
+                        frame,
+                        &local_state,
+                        pc,
+                        depth,
+                        *index,
+                        arity,
+                        helpers.native_call,
+                        next.ok_or("native-call fallthrough is missing")?,
+                    );
+                } else {
+                    emit_exit(
+                        &mut builder,
+                        frame,
+                        &local_state,
+                        pc,
+                        depth,
+                        EXIT_RESUME,
+                        REASON_NORMAL,
+                    );
+                }
             }
             Instruction::Jump(target) => {
                 let target_block = blocks
@@ -1908,6 +2596,44 @@ fn lower_function(
                     plan.stack_depths[*target - plan.entry].ok_or("invalid jump stack")?,
                     target_block,
                 );
+            }
+            Instruction::JumpIfNoPropagation(target) => {
+                let target_block = blocks
+                    .get(target)
+                    .copied()
+                    .ok_or("propagation target has no bytecode block")?;
+                let fallthrough = next.ok_or("propagation fallthrough is missing")?;
+                let pending = load_frame(
+                    &mut builder,
+                    frame,
+                    offset_of!(JitFrame, propagation_pending) as i32,
+                    types::I64,
+                );
+                let no_pending = builder.ins().icmp_imm_s(IntCC::Equal, pending, 0);
+                let take_target = builder.create_block();
+                let clear_pending = builder.create_block();
+                builder
+                    .ins()
+                    .brif(no_pending, take_target, &[], clear_pending, &[]);
+                builder.switch_to_block(take_target);
+                emit_jump(
+                    &mut builder,
+                    frame,
+                    &local_state,
+                    pc,
+                    *target,
+                    plan.stack_depths[*target - plan.entry].ok_or("invalid propagation stack")?,
+                    target_block,
+                );
+                builder.switch_to_block(clear_pending);
+                store_frame_i64(
+                    &mut builder,
+                    frame,
+                    offset_of!(JitFrame, propagation_pending) as i32,
+                    0,
+                );
+                set_stack_len(&mut builder, frame, depth);
+                builder.ins().jump(fallthrough, &[]);
             }
             Instruction::JumpIfFalse(target) | Instruction::JumpIfTrue(target) => {
                 emit_conditional_jump(
@@ -2228,6 +2954,19 @@ fn constant_slot(value: &Value) -> Option<JitSlot> {
             tag: TAG_FLOAT,
             payload: value.to_bits(),
         },
+        Value::BigInt(value) => {
+            if let Some(value) = value.to_i64() {
+                JitSlot {
+                    tag: TAG_BIGINT_JIT_SIGNED,
+                    payload: value as u64,
+                }
+            } else {
+                JitSlot {
+                    tag: TAG_BIGINT_JIT_UNSIGNED,
+                    payload: value.to_u64()?,
+                }
+            }
+        }
         Value::Bool(value) => JitSlot {
             tag: TAG_BOOL,
             payload: u64::from(*value),
@@ -2402,6 +3141,7 @@ fn emit_numeric_binary(
     depth: usize,
     next: cranelift_codegen::ir::Block,
     instruction: &Instruction,
+    helpers: JitHelperRefs,
 ) {
     let left_tag = load_slot_field(builder, frame, true, depth - 2, 0);
     let right_tag = load_slot_field(builder, frame, true, depth - 1, 0);
@@ -2512,12 +3252,33 @@ fn emit_numeric_binary(
     }
     if let Some(bigint_check) = bigint_check {
         builder.switch_to_block(bigint_check);
-        let left_bigint = small_bigint_tag_test(builder, left_tag);
-        let right_bigint = small_bigint_tag_test(builder, right_tag);
+        let left_bigint = bigint_tag_test(builder, left_tag);
+        let right_bigint = bigint_tag_test(builder, right_tag);
         let both_bigint = builder.ins().band(left_bigint, right_bigint);
         let bigint = builder.create_block();
         builder.ins().brif(both_bigint, bigint, &[], fallback, &[]);
         builder.switch_to_block(bigint);
+        let left_small = small_bigint_tag_test(builder, left_tag);
+        let right_small = small_bigint_tag_test(builder, right_tag);
+        let both_small = builder.ins().band(left_small, right_small);
+        let inline = builder.create_block();
+        let runtime = builder.create_block();
+        builder.ins().brif(both_small, inline, &[], runtime, &[]);
+        builder.switch_to_block(runtime);
+        let depth_value = iconst_i64(builder, depth as i64);
+        let operation_value = iconst_i32(builder, bigint_operation_code(instruction));
+        emit_runtime_helper(
+            builder,
+            frame,
+            local_state,
+            pc,
+            depth,
+            next,
+            helpers.bigint_binary,
+            &[depth_value, operation_value],
+            depth - 1,
+        );
+        builder.switch_to_block(inline);
         emit_bigint_binary(
             builder,
             frame,
@@ -2528,7 +3289,134 @@ fn emit_numeric_binary(
             instruction,
             left_tag,
             right_tag,
+            helpers.bigint_binary,
         );
+    }
+}
+
+fn emit_helper_call(
+    builder: &mut FunctionBuilder<'_>,
+    frame: cranelift_codegen::ir::Value,
+    local_state: &JitLocalState,
+    pc: usize,
+    depth: usize,
+    target: usize,
+    arity: usize,
+    helper: FuncRef,
+    next: cranelift_codegen::ir::Block,
+) -> Result<(), String> {
+    let values = [
+        iconst_i64(builder, pc as i64),
+        iconst_i64(builder, depth as i64),
+        iconst_i64(builder, target as i64),
+        iconst_i64(builder, arity as i64),
+    ];
+    emit_runtime_helper(
+        builder,
+        frame,
+        local_state,
+        pc,
+        depth,
+        next,
+        helper,
+        &values,
+        depth - arity + 1,
+    );
+    Ok(())
+}
+
+fn emit_native_call(
+    builder: &mut FunctionBuilder<'_>,
+    frame: cranelift_codegen::ir::Value,
+    local_state: &JitLocalState,
+    pc: usize,
+    depth: usize,
+    import: usize,
+    consumed: usize,
+    helper: FuncRef,
+    next: cranelift_codegen::ir::Block,
+) {
+    let values = [
+        iconst_i64(builder, pc as i64),
+        iconst_i64(builder, depth as i64),
+        iconst_i64(builder, import as i64),
+    ];
+    emit_runtime_helper(
+        builder,
+        frame,
+        local_state,
+        pc,
+        depth,
+        next,
+        helper,
+        &values,
+        depth - consumed + 1,
+    );
+}
+
+fn emit_runtime_helper(
+    builder: &mut FunctionBuilder<'_>,
+    frame: cranelift_codegen::ir::Value,
+    local_state: &JitLocalState,
+    pc: usize,
+    depth: usize,
+    next: cranelift_codegen::ir::Block,
+    helper: FuncRef,
+    arguments: &[cranelift_codegen::ir::Value],
+    result_depth: usize,
+) {
+    let mut call_arguments = Vec::with_capacity(arguments.len() + 1);
+    call_arguments.push(frame);
+    call_arguments.extend_from_slice(arguments);
+    let call = builder.ins().call(helper, &call_arguments);
+    let status = builder.inst_results(call)[0];
+    let succeeded = builder.ins().icmp_imm_s(IntCC::NotEqual, status, 0);
+    let success = builder.create_block();
+    let fallback = builder.create_block();
+    builder.ins().brif(succeeded, success, &[], fallback, &[]);
+    builder.switch_to_block(fallback);
+    emit_exit(
+        builder,
+        frame,
+        local_state,
+        pc,
+        depth,
+        EXIT_RESUME,
+        REASON_NORMAL,
+    );
+    builder.switch_to_block(success);
+    set_stack_len(builder, frame, result_depth);
+    builder.ins().jump(next, &[]);
+}
+
+fn iconst_i64(builder: &mut FunctionBuilder<'_>, value: i64) -> cranelift_codegen::ir::Value {
+    builder.ins().iconst(types::I64, value)
+}
+
+fn iconst_i32(builder: &mut FunctionBuilder<'_>, value: i32) -> cranelift_codegen::ir::Value {
+    builder.ins().iconst(types::I32, value as i64)
+}
+
+fn bigint_operation_code(instruction: &Instruction) -> i32 {
+    match instruction {
+        Instruction::Add => 0,
+        Instruction::Sub => 1,
+        Instruction::Mul => 2,
+        Instruction::Div => 3,
+        Instruction::Mod => 4,
+        _ => unreachable!("BigInt arithmetic helper only handles numeric operators"),
+    }
+}
+
+fn bigint_comparison_code(instruction: &Instruction) -> i32 {
+    match instruction {
+        Instruction::Eq => 0,
+        Instruction::Ne => 1,
+        Instruction::Lt => 2,
+        Instruction::Le => 3,
+        Instruction::Gt => 4,
+        Instruction::Ge => 5,
+        _ => unreachable!("BigInt comparison helper only handles comparisons"),
     }
 }
 
@@ -2542,6 +3430,7 @@ fn emit_bigint_binary(
     instruction: &Instruction,
     left_tag: cranelift_codegen::ir::Value,
     right_tag: cranelift_codegen::ir::Value,
+    helper: FuncRef,
 ) {
     let left_signed = small_bigint_signed_tag_test(builder, left_tag);
     let right_signed = small_bigint_signed_tag_test(builder, right_tag);
@@ -2593,15 +3482,7 @@ fn emit_bigint_binary(
             fallback,
         );
         builder.switch_to_block(mixed);
-        emit_exit(
-            builder,
-            frame,
-            local_state,
-            pc,
-            depth,
-            EXIT_RESUME,
-            REASON_NORMAL,
-        );
+        builder.ins().jump(fallback, &[]);
         builder.switch_to_block(fallback);
         emit_exit(
             builder,
@@ -2688,14 +3569,18 @@ fn emit_bigint_binary(
     );
 
     builder.switch_to_block(fallback);
-    emit_exit(
+    let depth_value = iconst_i64(builder, depth as i64);
+    let operation_value = iconst_i32(builder, bigint_operation_code(instruction));
+    emit_runtime_helper(
         builder,
         frame,
         local_state,
         pc,
         depth,
-        EXIT_RESUME,
-        REASON_NORMAL,
+        next,
+        helper,
+        &[depth_value, operation_value],
+        depth - 1,
     );
 }
 
@@ -3056,7 +3941,7 @@ fn tag_range_test(
     let upper = builder.ins().icmp_imm_s(
         IntCC::UnsignedLessThan,
         tag,
-        base.saturating_add(MAX_FRAME_ROOTS as u64) as i64,
+        base.saturating_add(MAX_JIT_ROOTS as u64) as i64,
     );
     builder.ins().band(lower, upper)
 }
@@ -3090,6 +3975,17 @@ fn small_bigint_tag_test(
     let signed = small_bigint_signed_tag_test(builder, tag);
     let unsigned = small_bigint_unsigned_tag_test(builder, tag);
     builder.ins().bor(signed, unsigned)
+}
+
+fn bigint_tag_test(
+    builder: &mut FunctionBuilder<'_>,
+    tag: cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    let rooted = builder
+        .ins()
+        .icmp_imm_s(IntCC::Equal, tag, TAG_BIGINT as i64);
+    let small = small_bigint_tag_test(builder, tag);
+    builder.ins().bor(rooted, small)
 }
 
 fn emit_integer_comparison(
@@ -3203,6 +4099,7 @@ fn emit_numeric_compare(
     depth: usize,
     next: cranelift_codegen::ir::Block,
     instruction: &Instruction,
+    helpers: JitHelperRefs,
 ) {
     let left_tag = load_slot_field(builder, frame, true, depth - 2, 0);
     let right_tag = load_slot_field(builder, frame, true, depth - 1, 0);
@@ -3300,6 +4197,11 @@ fn emit_numeric_compare(
     let left_small_bigint = small_bigint_tag_test(builder, left_tag);
     let right_small_bigint = small_bigint_tag_test(builder, right_tag);
     let both_small_bigint = builder.ins().band(left_small_bigint, right_small_bigint);
+    let left_bigint = bigint_tag_test(builder, left_tag);
+    let right_bigint = bigint_tag_test(builder, right_tag);
+    let both_bigint = builder.ins().band(left_bigint, right_bigint);
+    let needs_bigint_helper = builder.ins().icmp_imm_s(IntCC::Equal, both_small_bigint, 0);
+    let large_bigint_pair = builder.ins().band(both_bigint, needs_bigint_helper);
     let left_numeric = builder.ins().bor(left_is_int, left_is_uint);
     let left_numeric = builder.ins().bor(left_numeric, left_is_float);
     let right_numeric = builder.ins().bor(right_is_int, right_is_uint);
@@ -3308,6 +4210,30 @@ fn emit_numeric_compare(
     let right_bigint_pair = builder.ins().band(right_small_bigint, left_numeric);
     let bigint_pair = builder.ins().bor(left_bigint_pair, right_bigint_pair);
     let bigint_pair = builder.ins().bor(bigint_pair, both_small_bigint);
+    let bigint_helper_block = builder.create_block();
+    let bigint_fast_check = builder.create_block();
+    builder.ins().brif(
+        large_bigint_pair,
+        bigint_helper_block,
+        &[],
+        bigint_fast_check,
+        &[],
+    );
+    builder.switch_to_block(bigint_helper_block);
+    let depth_value = iconst_i64(builder, depth as i64);
+    let operation_value = iconst_i32(builder, bigint_comparison_code(instruction));
+    emit_runtime_helper(
+        builder,
+        frame,
+        local_state,
+        pc,
+        depth,
+        next,
+        helpers.bigint_compare,
+        &[depth_value, operation_value],
+        depth - 1,
+    );
+    builder.switch_to_block(bigint_fast_check);
     builder
         .ins()
         .brif(bigint_pair, bigint_block, &[], fallback, &[]);
@@ -4031,6 +4957,7 @@ mod tests {
             max_stack: 1,
             stack_depths: Vec::new(),
             osr_entries: vec![entry + 4],
+            callable_from_jit: false,
         };
         let stale_entry = entry + 100;
         let mut stale_candidate = candidate(
@@ -4125,6 +5052,7 @@ mod tests {
             max_stack: 1,
             stack_depths: Vec::new(),
             osr_entries: vec![entry + 4],
+            callable_from_jit: false,
         };
         let (compiler, _) = JitCompiler::new().expect("native JIT should initialize");
         let state = JitState {
@@ -4223,12 +5151,16 @@ mod tests {
             max_stack: 1,
             stack_depths: vec![Some(1)],
             osr_entries: Vec::new(),
+            callable_from_jit: false,
         };
         let frame = JitFrame {
             locals: std::ptr::null_mut(),
             stack: std::ptr::null_mut(),
+            roots: std::ptr::null_mut(),
+            runtime_context: std::ptr::null_mut(),
             pc: 0,
             stack_len: 1,
+            propagation_pending: 0,
             backedge_budget: 0,
             backedge_count: 0,
             exit_reason: REASON_NORMAL,
