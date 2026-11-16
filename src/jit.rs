@@ -42,7 +42,7 @@ const MAX_ACTIVITY_GAP_NS: u64 = 1_000_000_000;
 const TOKEN_CAPACITY_NS: u64 = 20_000_000;
 const TOKEN_REFILL_PER_NS: f64 = 0.02;
 const MAX_PROFILE_METRIC_NS: u64 = 60_000_000_000;
-const APE_VERSION: u32 = 12;
+const APE_VERSION: u32 = 13;
 static PROFILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const EXIT_COMPLETED: i32 = 0;
@@ -3220,6 +3220,7 @@ fn emit_numeric_compare(
     builder.switch_to_block(check_bigint);
     let left_small_bigint = small_bigint_tag_test(builder, left_tag);
     let right_small_bigint = small_bigint_tag_test(builder, right_tag);
+    let both_small_bigint = builder.ins().band(left_small_bigint, right_small_bigint);
     let left_numeric = builder.ins().bor(left_is_int, left_is_uint);
     let left_numeric = builder.ins().bor(left_numeric, left_is_float);
     let right_numeric = builder.ins().bor(right_is_int, right_is_uint);
@@ -3227,6 +3228,7 @@ fn emit_numeric_compare(
     let left_bigint_pair = builder.ins().band(left_small_bigint, right_numeric);
     let right_bigint_pair = builder.ins().band(right_small_bigint, left_numeric);
     let bigint_pair = builder.ins().bor(left_bigint_pair, right_bigint_pair);
+    let bigint_pair = builder.ins().bor(bigint_pair, both_small_bigint);
     builder
         .ins()
         .brif(bigint_pair, bigint_block, &[], fallback, &[]);
