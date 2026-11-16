@@ -273,7 +273,18 @@ impl Linter {
             }
             Stmt::While { cond, body } => {
                 self.expr(cond, report);
-                self.block(body, report);
+                let body_reachable = report && !matches!(cond.node(), Expr::Bool(false));
+                if report && !body_reachable {
+                    self.warnings.push(
+                        Diagnostic::warning(
+                            "W0006",
+                            "loop condition is always false; this loop body will never run",
+                            statement.span().cloned(),
+                        )
+                        .note("change the condition or remove the loop"),
+                    );
+                }
+                self.block(body, body_reachable);
             }
             Stmt::For {
                 var,
@@ -287,9 +298,24 @@ impl Linter {
                 if let Some(step) = step {
                     self.expr(step, report);
                 }
+                let empty_range = step.is_none()
+                    && matches!(
+                        (start.node(), end.node()),
+                        (Expr::Int(start), Expr::Int(end)) if start >= end
+                    );
+                if report && empty_range {
+                    self.warnings.push(
+                        Diagnostic::warning(
+                            "W0007",
+                            "range is statically empty; this loop body will never run",
+                            statement.span().cloned(),
+                        )
+                        .note("check the range bounds or remove the loop"),
+                    );
+                }
                 self.scopes.push(HashMap::new());
                 self.define(var, report, statement.span());
-                self.block(body, report);
+                self.block(body, report && !empty_range);
                 self.pop_scope();
             }
             Stmt::ForEach {

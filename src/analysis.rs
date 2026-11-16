@@ -2486,12 +2486,22 @@ impl<'a> Checker<'a> {
             );
             if let TypeKind::Primitive(base) = &expected.kind
                 && *base != VarType::Nil
-                && matches!(actual, Type::Dynamic | Type::Primitive(_, _))
             {
-                diagnostic = diagnostic.note(format!(
-                    "use `as {}` to request a checked conversion; it does not require try/catch",
-                    base.name()
-                ));
+                let nullable_actual = matches!(actual, Type::Nil)
+                    || matches!(actual, Type::Primitive(actual_base, true) if actual_base == *base);
+                if !expected.nilable && nullable_actual {
+                    let mut nullable_expected = expected.clone();
+                    nullable_expected.nilable = true;
+                    diagnostic = diagnostic.note(format!(
+                        "this value may be `nil`; check it before assignment or use `{}` if nil is valid",
+                        nullable_expected.display()
+                    ));
+                } else if matches!(actual, Type::Dynamic | Type::Primitive(_, _)) {
+                    diagnostic = diagnostic.note(format!(
+                        "use `as {}` to request a checked conversion; it does not require try/catch",
+                        base.name()
+                    ));
+                }
             }
             self.diagnostics.push(diagnostic);
         }
@@ -2529,16 +2539,35 @@ impl<'a> Checker<'a> {
                 );
             }
             Type::Dynamic | Type::Poison => {}
-            _ if type_compatible(&expected, &actual) => {}
-            _ => self.error(
-                "E2001",
-                format!(
-                    "type mismatch: {binding} declared as {} but given {}",
-                    expected.display(),
-                    actual.display()
-                ),
-                span,
-            ),
+            expected if type_compatible(&expected, &actual) => {}
+            expected => {
+                let mut diagnostic = Diagnostic::new(
+                    "E2001",
+                    format!(
+                        "type mismatch: {binding} declared as {} but given {}",
+                        expected.display(),
+                        actual.display()
+                    ),
+                    span.cloned().or_else(|| self.location.clone()),
+                );
+                match (&expected, &actual) {
+                    (Type::Array(expected), Type::Array(_)) => {
+                        diagnostic = diagnostic.note(format!(
+                            "array element types are invariant; make the elements match `{}` or convert them before assignment",
+                            expected.display()
+                        ));
+                    }
+                    (Type::Tuple(expected), Type::Tuple(actual))
+                        if expected.len() == actual.len() =>
+                    {
+                        diagnostic = diagnostic.note(
+                            "tuple element types are positional; check each element against its declared position",
+                        );
+                    }
+                    _ => {}
+                }
+                self.diagnostics.push(diagnostic);
+            }
         }
     }
 

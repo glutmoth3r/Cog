@@ -5,6 +5,20 @@ singleton value, not an Error. Compiler type/phase/name errors cannot be caught 
 source code. Recoverable runtime failures produce Error; `crash` and invalid VM
 state are terminal outcomes.
 
+## Runtime locations, warnings, and type hints
+
+The CLI reports the source file, line, and column for terminal runtime errors
+when the bytecode contains source maps. This applies to source projects,
+`.cogb` files, and installed `.cogpkg` applications. Embedders can read the same
+coordinate with `RunContext::last_source_location`; handled Error values do not
+set it.
+
+Compiler warnings are non-fatal. For example, `while false` and literal
+ascending ranges with no iterations report that their loop bodies never run.
+Type mismatch diagnostics may suggest a checked `as` conversion, a nullable
+destination such as `str?`, or the element positions that need attention in an
+array or tuple.
+
 ## Error values and inspection
 
 ```cog

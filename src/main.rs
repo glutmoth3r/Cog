@@ -361,18 +361,7 @@ fn command(color: &mut Color) -> Result<(), String> {
                     .ok_or("internal error: run has no compiled program")?,
                 &mut context,
             )
-            .map_err(|error| {
-                if let Some(location) = context.last_source_location() {
-                    format!(
-                        "runtime error at {}:{}:{}: {error}",
-                        location.file.escape_debug(),
-                        location.line,
-                        location.column
-                    )
-                } else {
-                    format!("runtime error: {error}")
-                }
-            })
+            .map_err(|error| format_runtime_error(&error, context.last_source_location()))
         }
         Mode::Build => {
             color.status(
@@ -423,18 +412,24 @@ fn eval_expression(expression: &str, options: &Options, color: &Color) -> Result
     };
     let mut stdout = std::io::stdout();
     let mut context = RuntimeContext::new(&mut stdout, capabilities);
-    interpreter::run_with_context(&compiled, &mut context).map_err(|error| {
-        if let Some(location) = context.last_source_location() {
-            format!(
-                "runtime error at {}:{}:{}: {error}",
-                location.file.escape_debug(),
-                location.line,
-                location.column
-            )
-        } else {
-            format!("runtime error: {error}")
-        }
-    })
+    interpreter::run_with_context(&compiled, &mut context)
+        .map_err(|error| format_runtime_error(&error, context.last_source_location()))
+}
+
+fn format_runtime_error(
+    error: &impl std::fmt::Display,
+    location: Option<&cog::diagnostic::SourceLocation>,
+) -> String {
+    if let Some(location) = location {
+        format!(
+            "runtime error at {}:{}:{}: {error}",
+            location.file.escape_debug(),
+            location.line,
+            location.column
+        )
+    } else {
+        format!("runtime error: {error}")
+    }
 }
 
 fn is_identifier(value: &str) -> bool {
@@ -687,7 +682,7 @@ fn command_with_plugins(
             context.set_process_arguments(options.program_args);
             program
                 .run_in(&mut context)
-                .map_err(|error| format!("runtime error: {error}"))
+                .map_err(|error| format_runtime_error(&error, context.last_source_location()))
         }
     }
 }
@@ -754,7 +749,7 @@ fn command_with_application(target: &Path, options: Options, color: &Color) -> R
     context.set_process_arguments(options.program_args);
     program
         .run_in(&mut context)
-        .map_err(|error| format!("runtime error: {error}"))
+        .map_err(|error| format_runtime_error(&error, context.last_source_location()))
 }
 
 fn jit_profile_path(target: &Path) -> PathBuf {
