@@ -42,7 +42,7 @@ const MAX_ACTIVITY_GAP_NS: u64 = 1_000_000_000;
 const TOKEN_CAPACITY_NS: u64 = 20_000_000;
 const TOKEN_REFILL_PER_NS: f64 = 0.02;
 const MAX_PROFILE_METRIC_NS: u64 = 60_000_000_000;
-const APE_VERSION: u32 = 13;
+const APE_VERSION: u32 = 14;
 static PROFILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const EXIT_COMPLETED: i32 = 0;
@@ -2552,6 +2552,7 @@ fn emit_bigint_binary(
     let signed = builder.create_block();
     let check_unsigned = builder.create_block();
     let unsigned = builder.create_block();
+    let mixed = builder.create_block();
     builder
         .ins()
         .brif(both_signed, signed, &[], check_unsigned, &[]);
@@ -2560,9 +2561,7 @@ fn emit_bigint_binary(
     let left_unsigned = small_bigint_unsigned_tag_test(builder, left_tag);
     let right_unsigned = small_bigint_unsigned_tag_test(builder, right_tag);
     let both_unsigned = builder.ins().band(left_unsigned, right_unsigned);
-    builder
-        .ins()
-        .brif(both_unsigned, unsigned, &[], fallback, &[]);
+    builder.ins().brif(both_unsigned, unsigned, &[], mixed, &[]);
 
     if matches!(instruction, Instruction::Div | Instruction::Mod) {
         builder.switch_to_block(signed);
@@ -2592,6 +2591,16 @@ fn emit_bigint_binary(
             right,
             false,
             fallback,
+        );
+        builder.switch_to_block(mixed);
+        emit_exit(
+            builder,
+            frame,
+            local_state,
+            pc,
+            depth,
+            EXIT_RESUME,
+            REASON_NORMAL,
         );
         builder.switch_to_block(fallback);
         emit_exit(
@@ -2664,6 +2673,20 @@ fn emit_bigint_binary(
         emit_bigint_result(builder, frame, depth, next, result, TAG_BIGINT_JIT_UNSIGNED);
     }
 
+    builder.switch_to_block(mixed);
+    emit_bigint_mixed_arithmetic(
+        builder,
+        frame,
+        depth,
+        next,
+        instruction,
+        left,
+        right,
+        left_signed,
+        right_signed,
+        fallback,
+    );
+
     builder.switch_to_block(fallback);
     emit_exit(
         builder,
@@ -2674,6 +2697,62 @@ fn emit_bigint_binary(
         EXIT_RESUME,
         REASON_NORMAL,
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_bigint_mixed_arithmetic(
+    builder: &mut FunctionBuilder<'_>,
+    frame: cranelift_codegen::ir::Value,
+    depth: usize,
+    next: cranelift_codegen::ir::Block,
+    instruction: &Instruction,
+    left: cranelift_codegen::ir::Value,
+    right: cranelift_codegen::ir::Value,
+    left_signed: cranelift_codegen::ir::Value,
+    right_signed: cranelift_codegen::ir::Value,
+    fallback: cranelift_codegen::ir::Block,
+) {
+    // Exactly one operand is signed i64 and the other is unsigned u64. Their
+    // sum, difference, and product fit in i128, so range-checking the final
+    // result before reducing it is exact.
+    let signed_left = builder.ins().sextend(types::I128, left);
+    let unsigned_left = builder.ins().uextend(types::I128, left);
+    let left = builder
+        .ins()
+        .select(left_signed, signed_left, unsigned_left);
+    let signed_right = builder.ins().sextend(types::I128, right);
+    let unsigned_right = builder.ins().uextend(types::I128, right);
+    let right = builder
+        .ins()
+        .select(right_signed, signed_right, unsigned_right);
+
+    let result = match instruction {
+        Instruction::Add => builder.ins().iadd(left, right),
+        Instruction::Sub => builder.ins().isub(left, right),
+        Instruction::Mul => builder.ins().imul(left, right),
+        _ => unreachable!("mixed BigInt lowering handles add, subtract, and multiply"),
+    };
+    let payload = builder.ins().ireduce(types::I64, result);
+    let signed_roundtrip = builder.ins().sextend(types::I128, payload);
+    let signed_fits = builder.ins().icmp(IntCC::Equal, result, signed_roundtrip);
+    let unsigned_roundtrip = builder.ins().uextend(types::I128, payload);
+    let unsigned_fits = builder.ins().icmp(IntCC::Equal, result, unsigned_roundtrip);
+    let zero_i64 = builder.ins().iconst(types::I64, 0);
+    let zero = builder.ins().uextend(types::I128, zero_i64);
+    let negative = builder.ins().icmp(IntCC::SignedLessThan, result, zero);
+    let fits = builder.ins().select(negative, signed_fits, unsigned_fits);
+    let safe = builder.create_block();
+    builder.ins().brif(fits, safe, &[], fallback, &[]);
+    builder.switch_to_block(safe);
+
+    let signed_tag = builder
+        .ins()
+        .iconst(types::I64, TAG_BIGINT_JIT_SIGNED as i64);
+    let unsigned_tag = builder
+        .ins()
+        .iconst(types::I64, TAG_BIGINT_JIT_UNSIGNED as i64);
+    let result_tag = builder.ins().select(negative, signed_tag, unsigned_tag);
+    emit_bigint_dynamic_result(builder, frame, depth, next, payload, result_tag);
 }
 
 #[allow(clippy::too_many_arguments)]
