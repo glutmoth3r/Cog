@@ -441,6 +441,12 @@ impl<'a> RunContext<'a> {
             inner: RuntimeContext::with_input(output, Box::new(input), VmCapabilities::default()),
         }
     }
+    /// Source coordinate of the last terminal runtime error, when the program
+    /// contains source-map metadata. Catchable errors handled by Cog are not
+    /// recorded here.
+    pub fn last_source_location(&self) -> Option<&crate::diagnostic::SourceLocation> {
+        self.inner.last_source_location()
+    }
     pub fn with_permissions(mut self, permissions: Permissions) -> Self {
         self.inner.capabilities = permissions.runtime();
         self
