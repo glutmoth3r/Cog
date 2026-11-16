@@ -42,7 +42,7 @@ const MAX_ACTIVITY_GAP_NS: u64 = 1_000_000_000;
 const TOKEN_CAPACITY_NS: u64 = 20_000_000;
 const TOKEN_REFILL_PER_NS: f64 = 0.02;
 const MAX_PROFILE_METRIC_NS: u64 = 60_000_000_000;
-const APE_VERSION: u32 = 11;
+const APE_VERSION: u32 = 12;
 static PROFILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const EXIT_COMPLETED: i32 = 0;
@@ -2434,7 +2434,11 @@ fn emit_numeric_binary(
     let fallback = builder.create_block();
     let bigint_check = matches!(
         instruction,
-        Instruction::Add | Instruction::Sub | Instruction::Mul
+        Instruction::Add
+            | Instruction::Sub
+            | Instruction::Mul
+            | Instruction::Div
+            | Instruction::Mod
     )
     .then(|| builder.create_block());
     builder
@@ -2453,6 +2457,10 @@ fn emit_numeric_binary(
             bigint_check.unwrap_or(fallback),
             &[],
         );
+    } else if let Some(bigint_check) = bigint_check {
+        builder
+            .ins()
+            .brif(both_float, fallback, &[], bigint_check, &[]);
     } else {
         emit_exit(
             builder,
@@ -2556,6 +2564,48 @@ fn emit_bigint_binary(
         .ins()
         .brif(both_unsigned, unsigned, &[], fallback, &[]);
 
+    if matches!(instruction, Instruction::Div | Instruction::Mod) {
+        builder.switch_to_block(signed);
+        emit_bigint_divmod(
+            builder,
+            frame,
+            local_state,
+            pc,
+            depth,
+            next,
+            instruction,
+            left,
+            right,
+            true,
+            fallback,
+        );
+        builder.switch_to_block(unsigned);
+        emit_bigint_divmod(
+            builder,
+            frame,
+            local_state,
+            pc,
+            depth,
+            next,
+            instruction,
+            left,
+            right,
+            false,
+            fallback,
+        );
+        builder.switch_to_block(fallback);
+        emit_exit(
+            builder,
+            frame,
+            local_state,
+            pc,
+            depth,
+            EXIT_RESUME,
+            REASON_NORMAL,
+        );
+        return;
+    }
+
     builder.switch_to_block(signed);
     let (result, overflow) = match instruction {
         Instruction::Add => {
@@ -2575,7 +2625,7 @@ fn emit_bigint_binary(
             (result, overflow)
         }
         Instruction::Mul => builder.ins().smul_overflow(left, right),
-        _ => unreachable!("BigInt fast path handles add, sub, and mul"),
+        _ => unreachable!("BigInt fast path handles arithmetic"),
     };
     let safe = builder.create_block();
     builder.ins().brif(overflow, fallback, &[], safe, &[]);
@@ -2587,7 +2637,7 @@ fn emit_bigint_binary(
         Instruction::Add => builder.ins().uadd_overflow(left, right),
         Instruction::Sub => builder.ins().usub_overflow(left, right),
         Instruction::Mul => builder.ins().umul_overflow(left, right),
-        _ => unreachable!("BigInt fast path handles add, sub, and mul"),
+        _ => unreachable!("BigInt fast path handles arithmetic"),
     };
     if matches!(instruction, Instruction::Sub) {
         let no_underflow = builder.ins().icmp_imm_s(IntCC::Equal, overflow, 0);
@@ -2623,6 +2673,67 @@ fn emit_bigint_binary(
         depth,
         EXIT_RESUME,
         REASON_NORMAL,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_bigint_divmod(
+    builder: &mut FunctionBuilder<'_>,
+    frame: cranelift_codegen::ir::Value,
+    local_state: &JitLocalState,
+    pc: usize,
+    depth: usize,
+    next: cranelift_codegen::ir::Block,
+    instruction: &Instruction,
+    left: cranelift_codegen::ir::Value,
+    right: cranelift_codegen::ir::Value,
+    signed: bool,
+    fallback: cranelift_codegen::ir::Block,
+) {
+    let zero = builder.ins().icmp_imm_s(IntCC::Equal, right, 0);
+    let fail = builder.create_block();
+    let nonzero = builder.create_block();
+    builder.ins().brif(zero, fail, &[], nonzero, &[]);
+    builder.switch_to_block(fail);
+    emit_exit(
+        builder,
+        frame,
+        local_state,
+        pc,
+        depth,
+        EXIT_FAULT,
+        REASON_NORMAL,
+    );
+    builder.switch_to_block(nonzero);
+
+    let safe = builder.create_block();
+    if signed {
+        let min = builder.ins().icmp_imm_s(IntCC::Equal, left, i64::MIN);
+        let minus_one = builder.ins().icmp_imm_s(IntCC::Equal, right, -1);
+        let min_overflow = builder.ins().band(min, minus_one);
+        builder.ins().brif(min_overflow, fallback, &[], safe, &[]);
+    } else {
+        builder.ins().jump(safe, &[]);
+    }
+    builder.switch_to_block(safe);
+    let result = match (instruction, signed) {
+        (Instruction::Div, true) => builder.ins().sdiv(left, right),
+        (Instruction::Div, false) => builder.ins().udiv(left, right),
+        (Instruction::Mod, true) => builder.ins().srem(left, right),
+        (Instruction::Mod, false) => builder.ins().urem(left, right),
+        _ => unreachable!("BigInt divmod lowering only handles div and mod"),
+    };
+    emit_bigint_result(
+        builder,
+        frame,
+        depth,
+        next,
+        result,
+        if signed {
+            TAG_BIGINT_JIT_SIGNED
+        } else {
+            TAG_BIGINT_JIT_UNSIGNED
+        },
     );
 }
 
