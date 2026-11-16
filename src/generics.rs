@@ -1,21 +1,35 @@
 //! Bounded monomorphization of generic functions after semantic inference.
 use crate::analysis::{self, CheckResult};
 use crate::ast::{
-    Block, Expr, FunctionDecl, Item, Program, Stmt, StringPart, TypeAnnotation, TypeKind,
+    Block, Expr, ForClause, FunctionDecl, Item, Program, Stmt, StringPart, TypeAnnotation, TypeKind,
 };
 use crate::diagnostic::Diagnostic;
 use std::collections::HashSet;
 
 const MAX_SPECIALIZATIONS: usize = 256;
+// Specialization discovery rechecks the expanded program once per round. Bound
+// the aggregate estimated AST work across those full-program passes as well as
+// bounding the AST clones themselves.
+const MAX_SPECIALIZATION_ANALYSIS_COST: usize = 8 * crate::ast_budget::MAX_COST;
 
 pub(crate) fn expand(
     source: &Program,
     function_modules: &std::collections::HashMap<String, String>,
 ) -> Result<(Program, CheckResult), Vec<Diagnostic>> {
+    expand_with_analysis_limit(source, function_modules, MAX_SPECIALIZATION_ANALYSIS_COST)
+}
+
+fn expand_with_analysis_limit(
+    source: &Program,
+    function_modules: &std::collections::HashMap<String, String>,
+    analysis_limit: usize,
+) -> Result<(Program, CheckResult), Vec<Diagnostic>> {
     let mut allocation_cost = crate::ast_budget::program(source).map_err(budget_error)?;
+    let mut analysis_cost = 0usize;
     let mut program = source.clone();
     let mut generated = HashSet::new();
     for _ in 0..MAX_SPECIALIZATIONS {
+        analysis_cost = check_analysis_cost(analysis_cost, allocation_cost, analysis_limit)?;
         let checked = analysis::check_with_methods(&program, function_modules);
         if !checked.diagnostics.is_empty() {
             return Err(checked.diagnostics);
@@ -147,6 +161,17 @@ fn check_allocation(current: usize, additional: usize) -> Result<usize, Vec<Diag
         .checked_add(additional)
         .filter(|cost| *cost <= crate::ast_budget::MAX_COST)
         .ok_or_else(|| budget_error("compiler specialization allocation budget exceeded".into()))
+}
+
+fn check_analysis_cost(
+    current: usize,
+    additional: usize,
+    limit: usize,
+) -> Result<usize, Vec<Diagnostic>> {
+    current
+        .checked_add(additional)
+        .filter(|cost| *cost <= limit)
+        .ok_or_else(|| budget_error("compiler specialization analysis budget exceeded".into()))
 }
 
 fn specialize_function(
@@ -281,6 +306,23 @@ fn substitute_stmt(
             substitute_expr(iterable, arguments);
             substitute_block(body, arguments);
         }
+        Stmt::ForZip { clauses, body } => {
+            for clause in clauses {
+                match clause {
+                    ForClause::Range {
+                        start, end, step, ..
+                    } => {
+                        substitute_expr(start, arguments);
+                        substitute_expr(end, arguments);
+                        if let Some(step) = step {
+                            substitute_expr(step, arguments);
+                        }
+                    }
+                    ForClause::Each { iterable, .. } => substitute_expr(iterable, arguments),
+                }
+            }
+            substitute_block(body, arguments);
+        }
         Stmt::Crash { value, .. } | Stmt::Expr(value) => substitute_expr(value, arguments),
         Stmt::Invalid { .. } | Stmt::Use { .. } | Stmt::Break | Stmt::Continue => {}
     }
@@ -305,6 +347,20 @@ fn substitute_expr(expr: &mut Expr, arguments: &std::collections::HashMap<String
         }
         Expr::SpecializedCall(_, types, call_args) => {
             for ty in types {
+                substitute_type(ty, arguments);
+            }
+            for argument in call_args {
+                substitute_expr(&mut argument.value, arguments);
+            }
+        }
+        Expr::AssociatedCall {
+            target,
+            type_arguments,
+            args: call_args,
+            ..
+        } => {
+            substitute_type(target, arguments);
+            for ty in type_arguments {
                 substitute_type(ty, arguments);
             }
             for argument in call_args {
@@ -379,11 +435,54 @@ fn substitute_expr(expr: &mut Expr, arguments: &std::collections::HashMap<String
             }
         }
         Expr::Int(_)
+        | Expr::UInt(_)
+        | Expr::BigInt(_)
         | Expr::Float(_)
+        | Expr::Char(_)
         | Expr::Str(_)
         | Expr::Bytes(_)
         | Expr::Bool(_)
         | Expr::Nil
         | Expr::Ident(_) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_analysis_cost, expand_with_analysis_limit};
+    use crate::ast_budget;
+    use std::collections::HashMap;
+
+    #[test]
+    fn generic_expansion_charges_each_full_program_analysis_pass() {
+        let parsed = crate::frontend::parse(
+            "generic-budget.cog",
+            "fn identity[T: type](value: T) -> T { value }\
+             fn main() { identity(1); }",
+        );
+        assert!(parsed.diagnostics.is_empty());
+        let source_cost = ast_budget::program(&parsed.program).unwrap();
+
+        let errors = match expand_with_analysis_limit(&parsed.program, &HashMap::new(), source_cost)
+        {
+            Err(errors) => errors,
+            Ok(_) => panic!("generic expansion exceeded the injected analysis budget"),
+        };
+        assert!(
+            errors[0]
+                .message
+                .contains("specialization analysis budget exceeded"),
+            "{}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn analysis_budget_rejects_overflow_and_excess_before_addition() {
+        assert_eq!(check_analysis_cost(3, 4, 7).unwrap(), 7);
+        let error = check_analysis_cost(usize::MAX, 1, usize::MAX).unwrap_err();
+        assert!(error[0].message.contains("specialization analysis budget"));
+        let error = check_analysis_cost(6, 2, 7).unwrap_err();
+        assert!(error[0].message.contains("specialization analysis budget"));
     }
 }

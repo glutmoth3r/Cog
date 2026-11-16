@@ -123,9 +123,9 @@ fn array_set_rejects_invalid_positions_without_panicking_or_mutation() {
 }
 
 #[test]
-fn vm_array_access_turns_host_borrow_conflicts_into_language_errors() {
+fn vm_array_reads_allow_an_active_host_shared_borrow() {
     let array = cog::heap::HeapRef::new(ArrayValue::new(vec![Value::Int(7)]).unwrap());
-    let _host_borrow = array.borrow_mut();
+    let host_borrow = array.borrow();
     let program = CompiledProgram::new(vec![
         Instruction::Push(Value::Array(array.clone())),
         Instruction::Len,
@@ -135,20 +135,15 @@ fn vm_array_access_turns_host_borrow_conflicts_into_language_errors() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         interpreter::run_with(&program, &mut Vec::new())
     }));
-    assert!(
-        result.is_ok(),
-        "array borrow conflict panicked inside the VM"
-    );
-    assert!(matches!(
-        result.unwrap(),
-        Err(RuntimeError::InvalidArgument { op: "len" })
-    ));
+    assert!(result.is_ok(), "shared array reads panicked inside the VM");
+    assert!(result.unwrap().is_ok());
+    assert!(matches!(host_borrow.as_slice(), [Value::Int(7)]));
 }
 
 #[test]
 fn vm_array_push_reports_a_borrow_conflict_as_invalid_argument() {
     let array = cog::heap::HeapRef::new(ArrayValue::new(vec![Value::Int(7)]).unwrap());
-    let borrow = array.borrow_mut();
+    let borrow = array.borrow();
     let program = CompiledProgram::new(vec![
         Instruction::Push(Value::Array(array.clone())),
         Instruction::Push(Value::Int(8)),
@@ -170,30 +165,8 @@ fn vm_array_push_reports_a_borrow_conflict_as_invalid_argument() {
 }
 
 #[test]
-fn vm_record_and_cell_access_turn_host_borrow_conflicts_into_errors() {
+fn vm_cell_access_turns_host_borrow_conflicts_into_errors() {
     use std::cell::RefCell;
-    use std::collections::HashMap;
-
-    let record = cog::heap::HeapRef::new(cog::value::RecordValue::new(HashMap::new()));
-    let _record_borrow = record.borrow_mut();
-    let record_program = CompiledProgram::new(vec![
-        Instruction::Push(Value::Record(record.clone())),
-        Instruction::Push(Value::Str("field".into())),
-        Instruction::Index,
-        Instruction::Halt,
-    ]);
-    let record_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        interpreter::run_with(&record_program, &mut Vec::new())
-    }));
-    assert!(
-        record_result.is_ok(),
-        "record borrow conflict panicked inside the VM"
-    );
-    assert!(matches!(
-        record_result.unwrap(),
-        Err(RuntimeError::InvalidArgument { op: "index" })
-    ));
-    drop(_record_borrow);
 
     let cell = cog::heap::HeapRef::new(RefCell::new(Value::Int(1)));
     let _cell_borrow = cell.borrow_mut();
@@ -212,6 +185,22 @@ fn vm_record_and_cell_access_turn_host_borrow_conflicts_into_errors() {
     assert!(matches!(
         cell_result.unwrap(),
         Err(RuntimeError::InvalidArgument { op: "cellget" })
+    ));
+}
+
+#[test]
+fn public_record_field_access_uses_checked_mutation_methods() {
+    use std::collections::HashMap;
+
+    use cog::value::RecordValue;
+
+    let record = cog::heap::HeapRef::new(RecordValue::new(HashMap::new()));
+    record.try_set_field("count", Value::Int(1)).unwrap();
+    assert!(record.try_contains_field("count").unwrap());
+    assert_eq!(record.try_fields_len().unwrap(), 1);
+    assert!(matches!(
+        record.try_get_field("count").unwrap(),
+        Some(Value::Int(1))
     ));
 }
 
@@ -246,7 +235,7 @@ fn native_bytes_access_turns_host_borrow_conflicts_into_errors() {
 #[test]
 fn array_mutators_report_host_borrow_conflicts_without_mutating() {
     let array = ArrayValue::new(vec![Value::Int(7)]).unwrap();
-    let _host_borrow = array.borrow_mut();
+    let _host_borrow = array.borrow();
     assert!(array.set(0, Value::Int(8)).is_err());
     assert!(array.push(Value::Int(9), false).is_err());
     assert!(array.append_all(&[Value::Int(10)]).is_err());
@@ -314,8 +303,8 @@ fn cyclic_diagnostics_terminate_in_a_process_with_os_resource_limits() {
         use std::collections::HashMap;
         let record = cog::heap::HeapRef::new(cog::value::RecordValue::new(HashMap::new()));
         record
-            .borrow_mut()
-            .insert("self".into(), Value::Record(record.clone()));
+            .try_set_field("self", Value::Record(record.clone()))
+            .unwrap();
         let cell = cog::heap::HeapRef::new(RefCell::new(Value::Nil));
         *cell.borrow_mut() = Value::Cell(cell.clone());
         for value in [Value::Record(record.clone()), Value::Cell(cell.clone())] {
@@ -332,7 +321,7 @@ fn cyclic_diagnostics_terminate_in_a_process_with_os_resource_limits() {
             assert!(diagnostic.len() < 1024);
         }
         // Remove the test-created cycles so the probe also exercises destruction.
-        record.borrow_mut().clear();
+        record.try_set_field("self", Value::Nil).unwrap();
         *cell.borrow_mut() = Value::Nil;
         return;
     }
@@ -383,14 +372,6 @@ fn impossible_aggregate_operands_fail_before_allocating() {
             Err(RuntimeError::StackUnderflow)
         ));
     }
-}
-
-#[test]
-fn diagnostics_handle_an_active_mutable_borrow() {
-    let array = cog::heap::HeapRef::new(ArrayValue::new(vec![Value::Int(1)]).unwrap());
-    let _borrow = array.borrow_mut();
-    let value = Value::Array(array.clone());
-    assert!(value.to_string().contains("unrenderable value"));
 }
 
 #[test]
@@ -516,12 +497,12 @@ fn embedder_heap_handles_are_roots_and_collect_cycles_on_request() {
         std::collections::HashMap::new(),
     ));
     record
-        .borrow_mut()
-        .insert("self".into(), Value::Record(record.clone()));
+        .try_set_field("self", Value::Record(record.clone()))
+        .unwrap();
     let alias = record.clone();
     drop(record);
     assert_eq!(cog::heap::collect_cycles().unwrap(), 0);
-    assert!(alias.borrow().contains_key("self"));
+    assert!(alias.try_contains_field("self").unwrap());
     drop(alias);
     assert_eq!(cog::heap::collect_cycles().unwrap(), 1);
 }
@@ -543,7 +524,7 @@ fn loop_transfers_restore_partial_aggregate_operands_and_preserve_enclosing_valu
     let program = cog::project::compile_source(
         "loop_cleanup.cog",
         r#"
-        include std; use io;
+        @!include("std") use io;
         fn main() {
             const result = 100 + (if true {
                 for i in 0..4 {

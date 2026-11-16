@@ -1,10 +1,10 @@
-include std;
+@!include("std")
 use build;
 use bytes;
 use io;
 
-comptime MESSAGE = build::include_str("message.txt");
-comptime DATA = build::include_bytes("message.txt");
+@comptime const MESSAGE = build::include_str("message.txt");
+@comptime const DATA = build::include_bytes("message.txt");
 
 fn main() -> nil {
     io::print(MESSAGE)!!;

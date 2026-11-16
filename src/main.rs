@@ -2,11 +2,17 @@ use cog::backend::CompiledProgram;
 use cog::runtime::{RuntimeContext, VmCapabilities};
 use cog::{build, bytecode, config, frontend, interpreter, parser, project};
 use std::ffi::{OsStr, OsString};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 mod cli_output;
 use cli_output::Color;
+
+#[allow(dead_code)]
+const NAME: &str = env!("CARGO_PKG_NAME");
+#[allow(dead_code)]
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -18,12 +24,15 @@ enum Mode {
 #[derive(Default)]
 struct Options {
     debug: bool,
+    jit: bool,
     allow_asm: bool,
     restricted: bool,
     target: Option<String>,
     use_modules: Vec<String>,
     locked: bool,
     output: Option<PathBuf>,
+    install_path: Option<PathBuf>,
+    init_library: bool,
     program_args: Vec<OsString>,
     program_args_separator: bool,
     plugins: Vec<PathBuf>,
@@ -39,8 +48,10 @@ fn main() {
 
 fn command(color: &mut Color) -> Result<(), String> {
     let mut options = Options::default();
-    let mut action = None;
-    let mut target = None;
+    let mut action: Option<String> = None;
+    let mut target: Option<OsString> = None;
+    let mut bytecode_input = false;
+    let mut package_build = false;
     let mut args = std::env::args_os().skip(1).peekable();
     while let Some(argument) = args.next() {
         if argument == OsStr::new("--") {
@@ -48,11 +59,38 @@ fn command(color: &mut Color) -> Result<(), String> {
             options.program_args = args.collect();
             break;
         }
+        let cli_word = argument.to_str().is_some_and(|word| {
+            word.starts_with('-')
+                || (action.is_none()
+                    && matches!(
+                        word,
+                        "init" | "check" | "run" | "build" | "eval" | "package" | "install"
+                    ))
+        });
+        if target.is_none()
+            && action
+                .as_deref()
+                .is_none_or(|action| matches!(action, "check" | "run" | "build"))
+            && !cli_word
+            && is_bytecode_path(Path::new(&argument))
+        {
+            bytecode_input = true;
+            target = Some(argument);
+            if action.is_none() {
+                // binfmt_misc invokes `cog <artifact> <arguments...>`. The
+                // complete tail belongs to the program, including `--` and
+                // names that are otherwise Cog options or subcommands.
+                options.program_args = args.collect();
+                break;
+            }
+            continue;
+        }
         let arg = argument
             .into_string()
             .map_err(|_| "CLI options and source paths before `--` must be UTF-8".to_owned())?;
         match arg.as_str() {
             "--debug" | "-v" => options.debug = true,
+            "--jit" => options.jit = true,
             "--allow-asm" => options.allow_asm = true,
             "--restricted" => options.restricted = true,
             "--target" => options.target = Some(required_cli_arg(&mut args, "--target")?),
@@ -60,6 +98,7 @@ fn command(color: &mut Color) -> Result<(), String> {
                 .use_modules
                 .push(required_cli_arg(&mut args, "--use")?),
             "--locked" => options.locked = true,
+            "--lib" => options.init_library = true,
             "--plugin" => options.plugins.push(
                 args.next()
                     .ok_or("--plugin requires a KDL manifest path")?
@@ -67,7 +106,13 @@ fn command(color: &mut Color) -> Result<(), String> {
             ),
             "--color" => *color = Color::parse(&required_cli_arg(&mut args, "--color")?)?,
             "--output" | "-o" => {
-                options.output = Some(args.next().ok_or("--output requires a .cogb path")?.into())
+                options.output = Some(args.next().ok_or("--output requires a path")?.into())
+            }
+            "--path" => {
+                if options.install_path.is_some() {
+                    return Err("--path may only be specified once".into());
+                }
+                options.install_path = Some(required_cli_arg(&mut args, "--path")?.into());
             }
             "--version" | "-V" => {
                 println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
@@ -77,13 +122,33 @@ fn command(color: &mut Color) -> Result<(), String> {
                 print_usage();
                 return Ok(());
             }
-            "init" | "check" | "run" | "build" | "eval" if action.is_none() => action = Some(arg),
+            "init" | "check" | "run" | "build" | "eval" | "package" | "install"
+                if action.is_none() =>
+            {
+                action = Some(arg)
+            }
+            "build" if action.as_deref() == Some("package") && !package_build => {
+                package_build = true;
+            }
+            _ if action.as_deref() == Some("package")
+                && !package_build
+                && !arg.starts_with('-') =>
+            {
+                return Err(format!("unknown package command `{arg}`; expected `build`"));
+            }
+            _ if action.as_deref() == Some("package")
+                && package_build
+                && target.is_none()
+                && !arg.starts_with('-') =>
+            {
+                target = Some(arg.into());
+            }
             _ if arg.starts_with('-')
                 && !(action.as_deref() == Some("eval") && target.is_none()) =>
             {
                 return Err(format!("unknown option `{arg}`"));
             }
-            _ if target.is_none() => target = Some(arg),
+            _ if target.is_none() => target = Some(arg.into()),
             _ => return Err(format!("unexpected argument `{arg}`")),
         }
     }
@@ -92,14 +157,94 @@ fn command(color: &mut Color) -> Result<(), String> {
         return Err("expected a command or a source/bytecode path".into());
     }
     let action = action.as_deref().unwrap_or("run");
+    if options.jit && action != "run" {
+        return Err("--jit is only valid with `run`".into());
+    }
     if options.program_args_separator && action != "run" {
         return Err("program arguments after `--` are only valid with `run`".into());
     }
-    if options.output.is_some() && action != "build" {
-        return Err("--output is only valid with `build`".into());
+    if options.output.is_some() && action != "build" && action != "package" {
+        return Err("--output is only valid with `build` or `package build`".into());
+    }
+    if options.install_path.is_some() && action != "install" {
+        return Err("--path is only valid with `install`".into());
+    }
+    if options.init_library && action != "init" {
+        return Err("--lib is only valid with `init`".into());
     }
     if !options.use_modules.is_empty() && action != "eval" {
         return Err("--use is only valid with `eval`".into());
+    }
+    if action == "install" {
+        let path = options
+            .install_path
+            .as_deref()
+            .ok_or("usage: cog install --path <project-directory>")?;
+        if target.is_some()
+            || options.debug
+            || options.allow_asm
+            || options.restricted
+            || options.target.is_some()
+            || !options.use_modules.is_empty()
+            || !options.plugins.is_empty()
+            || options.program_args_separator
+        {
+            return Err("usage: cog install --path <project-directory>".into());
+        }
+        let started = Instant::now();
+        let installed = cog::package::install_path(path, options.locked)?;
+        if !installed.warnings.is_empty() {
+            color.warning(&frontend::render(&installed.warnings));
+        }
+        color.status("installed", &installed.path, started.elapsed());
+        eprintln!(
+            "{} {} {} package, {} bytes",
+            installed.package_name,
+            installed.package_version,
+            match installed.kind {
+                config::PackageKind::Library => "library",
+                config::PackageKind::Application => "application",
+            },
+            installed.archive_bytes
+        );
+        return Ok(());
+    }
+    if action == "package" {
+        if !package_build {
+            return Err(
+                "usage: cog package build [project-directory] [--target <triple>] [-o archive.cogpkg]"
+                    .into(),
+            );
+        }
+        if !options.plugins.is_empty() {
+            return Err(
+                "--plugin is not valid with `package build`; declare plugins in package.kdl".into(),
+            );
+        }
+        if options.allow_asm {
+            return Err("--allow-asm is not valid with `package build`".into());
+        }
+        if options.restricted || options.debug {
+            return Err("--restricted and --debug are not valid with `package build`".into());
+        }
+        let project_path = Path::new(target.as_deref().unwrap_or(OsStr::new(".")));
+        let started = Instant::now();
+        let result = if let Some(target) = options.target.as_deref() {
+            cog::package::build_archive_for_target(
+                project_path,
+                options.output.as_deref(),
+                options.locked,
+                target,
+            )?
+        } else {
+            cog::package::build_archive(project_path, options.output.as_deref(), options.locked)?
+        };
+        if !result.warnings.is_empty() {
+            color.warning(&frontend::render(&result.warnings));
+        }
+        color.status("packed", &result.path, started.elapsed());
+        eprintln!("{} entries, {} bytes", result.entries, result.archive_bytes);
+        return Ok(());
     }
     if action == "eval" {
         if !options.plugins.is_empty() {
@@ -110,6 +255,7 @@ fn command(color: &mut Color) -> Result<(), String> {
         }
         let expression = target
             .as_deref()
+            .and_then(OsStr::to_str)
             .filter(|expression| !expression.trim().is_empty())
             .ok_or("eval requires one Cog expression; usage: cog eval [options] <expression>")?;
         return eval_expression(expression, &options, color);
@@ -122,22 +268,53 @@ fn command(color: &mut Color) -> Result<(), String> {
             .as_deref()
             .filter(|directory| !directory.is_empty())
             .ok_or("init requires a directory; usage: cog init <directory>")?;
-        return init_project(Path::new(directory));
+        return init_project(Path::new(directory), options.init_library);
     }
-    let target = Path::new(target.as_deref().unwrap_or("."));
+    let target = Path::new(target.as_deref().unwrap_or(OsStr::new(".")));
     let mode = match action {
         "check" => Mode::Check,
         "build" => Mode::Build,
         _ => Mode::Run,
     };
-    if !options.plugins.is_empty() {
-        return command_with_plugins(target, mode, options, color);
+    if target.extension() == Some(OsStr::new("cogpkg")) {
+        if mode != Mode::Run {
+            return Err(".cogpkg application archives can only be run".into());
+        }
+        return command_with_application(target, options, color);
     }
-    let bytecode_input =
-        !target.is_dir() && target.extension().and_then(|s| s.to_str()) == Some("cogb");
+    let bytecode_input = bytecode_input || is_bytecode_path(target);
     let started = Instant::now();
+    let source_input = !bytecode_input
+        && (target.is_dir() || target.extension().and_then(OsStr::to_str) == Some("cog"));
+    let prepared = if source_input {
+        Some(
+            project::prepare(target, options.target.as_deref(), options.locked).map_err(
+                |errors| {
+                    let action = if mode == Mode::Check {
+                        "check"
+                    } else {
+                        "build"
+                    };
+                    cli_output::preparation_error(
+                        frontend::render(&errors),
+                        action,
+                        target,
+                        started.elapsed(),
+                    )
+                },
+            )?,
+        )
+    } else {
+        None
+    };
+    let package_has_plugins = prepared
+        .as_ref()
+        .is_some_and(|prepared| !prepared.plugins.is_empty());
+    if !options.plugins.is_empty() || package_has_plugins {
+        return command_with_plugins(target, mode, options, color, prepared);
+    }
     let (compiled, reused, destination, warnings) =
-        prepare(target, mode, &options).map_err(|error| {
+        prepare(target, mode, &options, bytecode_input, prepared).map_err(|error| {
             let action = if bytecode_input {
                 "load"
             } else if mode == Mode::Check {
@@ -151,7 +328,9 @@ fn command(color: &mut Color) -> Result<(), String> {
     if !warnings.is_empty() {
         color.warning(&frontend::render(&warnings));
     }
-    if options.debug {
+    if options.debug
+        && let Some(compiled) = &compiled
+    {
         println!("bytecode\n{}", compiled.disassemble());
     }
     match mode {
@@ -174,8 +353,15 @@ fn command(color: &mut Color) -> Result<(), String> {
             };
             let mut stdout = std::io::stdout();
             let mut context = RuntimeContext::new(&mut stdout, capabilities);
+            context.configure_jit(options.jit, Some(&jit_profile_path(target)), options.debug);
             context.set_process_arguments(options.program_args);
-            interpreter::run_with_context(&compiled, &mut context).map_err(|error| {
+            interpreter::run_with_context(
+                compiled
+                    .as_ref()
+                    .ok_or("internal error: run has no compiled program")?,
+                &mut context,
+            )
+            .map_err(|error| {
                 if let Some(location) = context.last_source_location() {
                     format!(
                         "runtime error at {}:{}:{}: {error}",
@@ -200,7 +386,7 @@ fn command(color: &mut Color) -> Result<(), String> {
 }
 
 fn eval_expression(expression: &str, options: &Options, color: &Color) -> Result<(), String> {
-    let mut source = String::from("include std;\nuse io;\n");
+    let mut source = String::from("@!include(\"std\")\nuse io;\n");
     let mut imports: Vec<String> = Vec::new();
     for module in &options.use_modules {
         if !is_identifier(module) {
@@ -261,18 +447,21 @@ fn prepare(
     target: &Path,
     mode: Mode,
     options: &Options,
+    bytecode_input: bool,
+    prepared: Option<project::Prepared>,
 ) -> Result<
     (
-        CompiledProgram,
+        Option<CompiledProgram>,
         bool,
         PathBuf,
         Vec<cog::diagnostic::Diagnostic>,
     ),
     String,
 > {
-    let bytecode_input =
-        !target.is_dir() && target.extension().and_then(|s| s.to_str()) == Some("cogb");
-    let prepared = if target.is_dir() || target.extension().and_then(|s| s.to_str()) == Some("cog")
+    let prepared = if prepared.is_some() {
+        prepared
+    } else if !bytecode_input
+        && (target.is_dir() || target.extension().and_then(|s| s.to_str()) == Some("cog"))
     {
         Some(
             project::prepare(target, options.target.as_deref(), options.locked)
@@ -292,11 +481,20 @@ fn prepare(
             target.with_extension("cogb")
         }
     });
-    if mode == Mode::Build && destination.extension().and_then(|s| s.to_str()) != Some("cogb") {
-        return Err("bytecode output must have the .cogb extension".into());
-    }
     let (compiled, reused, warnings) = if let Some(prepared) = prepared {
-        if mode == Mode::Check {
+        if prepared.kind == config::PackageKind::Library {
+            if mode != Mode::Check {
+                return Err("library packages can be checked but not run or built yet".into());
+            }
+            let loaded = prepared.resolve();
+            let warnings = project::check_with_inputs_and_warnings(
+                loaded.program,
+                loaded.diagnostics,
+                &loaded.names,
+                &loaded.build_inputs,
+            )?;
+            (None, false, warnings)
+        } else if mode == Mode::Check {
             let loaded = prepared.resolve();
             let (compiled, warnings) = project::compile_with_inputs_and_warnings(
                 loaded.program,
@@ -304,36 +502,46 @@ fn prepare(
                 &loaded.names,
                 &loaded.build_inputs,
             )?;
-            (compiled, false, warnings)
+            (Some(compiled), false, warnings)
         } else {
             let (built, warnings) = build::project_with_warnings(prepared, &destination)?;
-            (built.program, built.reused, warnings)
+            (Some(built.program), built.reused, warnings)
         }
     } else {
-        let mut compiled = compile_file(target, options)?;
+        let mut compiled = compile_file(target, options, bytecode_input)?;
         if mode == Mode::Build || (mode == Mode::Run && !bytecode_input) {
             build::write_bytecode(&destination, &compiled)?;
             if mode == Mode::Run {
                 compiled = load_bytecode(&destination)?;
             }
         }
-        (compiled, false, Vec::new())
+        (Some(compiled), false, Vec::new())
     };
     Ok((compiled, reused, destination, warnings))
 }
 
 fn print_usage() {
     eprintln!("usage: cog [check|run|build] [path] [options] [-- program-arguments...]");
+    eprintln!(
+        "       cog package build [project-directory] [--target <triple>] [-o archive.cogpkg]"
+    );
+    eprintln!("       cog install --path <project-directory> [--locked]");
     eprintln!("       cog eval [--debug] [--restricted] [--use <module>]... <expression>");
+    eprintln!("       cog <bytecode-file> [program-arguments...]");
     eprintln!("       cog --version|-V");
-    eprintln!("       cog build <file.cog|project> [-o output.cogb]");
+    eprintln!("       cog build <file.cog|project> [-o output]");
     eprintln!("       cog run [file.cog|project]  (reuse or build .cogb, then execute it)");
     eprintln!("       cog run <file.cogb>  (no source files or compilation required)");
-    eprintln!("       cog init <directory>");
+    eprintln!("       --jit  enable experimental adaptive Cranelift JIT (run only)");
+    eprintln!("       cog init [--lib] <directory>");
     eprintln!("       eval compiles and runs one expression; --debug prints its bytecode");
+    eprintln!("       bytecode is recognized by its COG header regardless of the filename");
     eprintln!("       --allow-asm  enable the standalone assembler for VM diagnostics");
     eprintln!("       --restricted  allow only stdin/stdout runtime host effects");
-    eprintln!("       --plugin <manifest.kdl>  explicit trusted native plugin (repeatable)");
+    eprintln!(
+        "       --plugin <manifest.kdl>  explicit trusted plugin for standalone sources/bytecode (repeatable)"
+    );
+    eprintln!("       project plugins are declared in package.kdl and discovered automatically");
     eprintln!("       `--` passes the remaining arguments to process::args() during `run`");
     eprintln!("       --version, -V  print the Cog version");
     eprintln!("       --color <auto|always|never>  diagnostic and status colors (default: auto)");
@@ -344,10 +552,42 @@ fn command_with_plugins(
     mode: Mode,
     options: Options,
     color: &Color,
+    prepared: Option<project::Prepared>,
 ) -> Result<(), String> {
     use cog::sdk::{Engine, Permissions, PluginManifest, RunContext};
+    if mode == Mode::Run
+        && options.restricted
+        && (!options.plugins.is_empty()
+            || prepared
+                .as_ref()
+                .is_some_and(|prepared| !prepared.plugins.is_empty()))
+    {
+        return Err(
+            "--restricted cannot be combined with native plugins; it cannot constrain trusted native code"
+                .into(),
+        );
+    }
     let started = Instant::now();
     let mut engine = Engine::new();
+    if let Some(prepared) = &prepared {
+        if prepared.kind == config::PackageKind::Library && mode != Mode::Check {
+            return Err("library packages can be checked but not run or built yet".into());
+        }
+        for (package_root, manifest) in &prepared.plugins {
+            if mode == Mode::Run {
+                // Running a package loads its declared trusted native code with
+                // the same process authority as the Cog host.
+                unsafe {
+                    manifest.load_for_target(&mut engine, package_root, host_plugin_target()?)
+                }
+                .map_err(|error| error.to_string())?;
+            } else {
+                manifest
+                    .register_metadata(&mut engine)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+    }
     for path in &options.plugins {
         let manifest = PluginManifest::read(path).map_err(|error| error.to_string())?;
         if mode == Mode::Run {
@@ -361,7 +601,7 @@ fn command_with_plugins(
                 .map_err(|error| error.to_string())?;
         }
     }
-    let bytecode_input = !target.is_dir() && target.extension() == Some(OsStr::new("cogb"));
+    let bytecode_input = is_bytecode_path(target);
     let (program, reused, destination) = if bytecode_input {
         let file = std::fs::File::open(target).map_err(|error| error.to_string())?;
         let program = engine.read(file).map_err(|error| error.to_string())?;
@@ -370,9 +610,6 @@ fn command_with_plugins(
             .clone()
             .unwrap_or_else(|| target.to_path_buf());
         if mode == Mode::Build {
-            if destination.extension() != Some(OsStr::new("cogb")) {
-                return Err("bytecode output must have the .cogb extension".into());
-            }
             program
                 .write(&destination)
                 .map_err(|error| error.to_string())?;
@@ -380,10 +617,9 @@ fn command_with_plugins(
         (program, true, destination)
     } else {
         if !target.is_dir() && target.extension() != Some(OsStr::new("cog")) {
-            return Err("plugins require a .cog source, project directory or .cogb file".into());
+            return Err("plugins require a .cog source, project directory or bytecode file".into());
         }
-        let prepared = project::prepare(target, options.target.as_deref(), options.locked)
-            .map_err(|errors| frontend::render(&errors))?;
+        let prepared = prepared.ok_or_else(|| "project preparation is missing".to_owned())?;
         let destination = options.output.clone().unwrap_or_else(|| {
             if target.is_dir() {
                 target.join(format!("target/{}.cogb", prepared.artifact_name))
@@ -391,25 +627,27 @@ fn command_with_plugins(
                 target.with_extension("cogb")
             }
         });
+        if prepared.kind == config::PackageKind::Library {
+            let warnings = engine
+                .check_library_prepared(prepared)
+                .map_err(|error| error.to_string())?;
+            if !warnings.is_empty() {
+                color.warning(&frontend::render(&warnings));
+            }
+            color.status("checked", target, started.elapsed());
+            return Ok(());
+        }
         if mode == Mode::Check {
             (
                 engine
-                    .compile_project(target, options.target.as_deref(), options.locked)
+                    .compile_prepared(prepared)
                     .map_err(|error| error.to_string())?,
                 false,
                 destination,
             )
         } else {
-            if destination.extension() != Some(OsStr::new("cogb")) {
-                return Err("bytecode output must have the .cogb extension".into());
-            }
             let built = engine
-                .build_project(
-                    target,
-                    &destination,
-                    options.target.as_deref(),
-                    options.locked,
-                )
+                .build_prepared(prepared, &destination)
                 .map_err(|error| error.to_string())?;
             (built.program, built.reused, destination)
         }
@@ -435,7 +673,12 @@ fn command_with_plugins(
                 color.status("built", &destination, started.elapsed());
             }
             let mut stdout = std::io::stdout();
-            let mut context = RunContext::new(&mut stdout);
+            let mut context = RunContext::new(&mut stdout)
+                .with_jit(options.jit)
+                .with_jit_debug(options.debug);
+            if options.jit {
+                context = context.with_jit_profile_path(jit_profile_path(target));
+            }
             if options.restricted {
                 context = context.with_permissions(
                     Permissions::none().allow(cog::sdk::Effects::OUTPUT | cog::sdk::Effects::INPUT),
@@ -447,6 +690,91 @@ fn command_with_plugins(
                 .map_err(|error| format!("runtime error: {error}"))
         }
     }
+}
+
+fn command_with_application(target: &Path, options: Options, color: &Color) -> Result<(), String> {
+    use cog::sdk::{Engine, PluginManifest, RunContext};
+
+    if options.restricted && !options.plugins.is_empty() {
+        return Err(
+            "--restricted cannot be combined with native plugins; it cannot constrain trusted native code"
+                .into(),
+        );
+    }
+    let started = Instant::now();
+    // Extraction validates the COGPKG 3 marker, package graph and bytecode
+    // before any application or explicit plugin library is loaded.
+    let application = cog::package::open_application(target)?;
+    if options.restricted && !application.plugins.is_empty() {
+        return Err(
+            "--restricted cannot be combined with native plugins; it cannot constrain trusted native code"
+                .into(),
+        );
+    }
+    let mut engine = Engine::new();
+    let mut manifests = Vec::new();
+    for (root, manifest) in &application.plugins {
+        manifests.push((root.clone(), manifest.clone()));
+    }
+    let mut external = Vec::new();
+    for path in &options.plugins {
+        let manifest = PluginManifest::read(path).map_err(|error| error.to_string())?;
+        external.push((
+            path.parent().unwrap_or(Path::new(".")).to_path_buf(),
+            manifest,
+        ));
+    }
+    let host_target = if manifests.is_empty() {
+        None
+    } else {
+        Some(host_plugin_target()?)
+    };
+    // Load only after archive and bytecode validation has completed.
+    for (root, manifest) in manifests {
+        unsafe { manifest.load_for_target(&mut engine, &root, host_target.unwrap()) }
+            .map_err(|error| error.to_string())?;
+    }
+    for (root, manifest) in external {
+        unsafe { manifest.load(&mut engine, &root) }.map_err(|error| error.to_string())?;
+    }
+    let program = engine
+        .decode(&application.bytecode)
+        .map_err(|error| error.to_string())?;
+    if options.debug {
+        println!("bytecode\n{}", program.disassemble());
+    }
+    color.status("loaded", target, started.elapsed());
+    let mut stdout = std::io::stdout();
+    let mut context = RunContext::new(&mut stdout)
+        .with_jit(options.jit)
+        .with_jit_debug(options.debug);
+    if options.jit {
+        context = context.with_jit_profile_path(jit_profile_path(target));
+    }
+    context.set_process_arguments(options.program_args);
+    program
+        .run_in(&mut context)
+        .map_err(|error| format!("runtime error: {error}"))
+}
+
+fn jit_profile_path(target: &Path) -> PathBuf {
+    let root = if target.is_dir() {
+        target
+    } else {
+        target.parent().unwrap_or_else(|| Path::new("."))
+    };
+    root.join("target").join(".cog-ape-v2.json")
+}
+
+fn host_plugin_target() -> Result<&'static str, String> {
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu"))]
+    return Ok("x86_64-unknown-linux-gnu");
+    #[cfg(all(target_arch = "x86_64", target_os = "windows", target_env = "msvc"))]
+    return Ok("x86_64-pc-windows-msvc");
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    return Ok("aarch64-apple-darwin");
+    #[allow(unreachable_code)]
+    Err("native plugins are not available for this host target".into())
 }
 
 fn required_cli_arg(
@@ -461,17 +789,18 @@ fn required_cli_arg(
         .map_err(|_| format!("the value for {option} must be UTF-8"))
 }
 
-fn init_project(root: &Path) -> Result<(), String> {
-    if [
+fn init_project(root: &Path, library: bool) -> Result<(), String> {
+    let mut existing_files = vec![
         "package.kdl",
         "dependencies.kdl",
         "build.kdl",
         "main.cog",
         "src/main.cog",
-    ]
-    .iter()
-    .any(|p| root.join(p).exists())
-    {
+    ];
+    if library {
+        existing_files.extend(["src/lib.cog", "src/api.cog"]);
+    }
+    if existing_files.iter().any(|path| root.join(path).exists()) {
         return Err("init requires a new project; existing files were preserved".into());
     }
     std::fs::create_dir_all(root).map_err(|e| format!("cannot create project: {e}"))?;
@@ -486,21 +815,34 @@ fn init_project(root: &Path) -> Result<(), String> {
     let mut package = kdl::KdlNode::new("package");
     package.push(name);
     package.insert("version", "0.1.0");
+    if library {
+        package.insert("kind", "library");
+    }
     let manifest =
         include_str!("templates/package.kdl").replace("{{package}}", &package.to_string());
     std::fs::create_dir_all(root.join("src")).map_err(|e| format!("cannot create project: {e}"))?;
-    for (path, content) in [
+    let mut files = vec![
         ("package.kdl", manifest.as_str()),
         (
             "dependencies.kdl",
             include_str!("templates/dependencies.kdl"),
         ),
-        ("build.kdl", include_str!("templates/build.kdl")),
-        (
-            "src/main.cog",
-            "include std;\nuse io;\n\nfn main() -> nil {\n    io::println(\"Hello, Cog!\")!!;\n}\n",
-        ),
-    ] {
+    ];
+    if library {
+        files.extend([
+            ("src/lib.cog", "use api;\n"),
+            ("src/api.cog", "public fn answer() -> int {\n    42\n}\n"),
+        ]);
+    } else {
+        files.extend([
+            ("build.kdl", include_str!("templates/build.kdl")),
+            (
+                "src/main.cog",
+                "@!include(\"std\")\nuse io;\n\nfn main() -> nil {\n    io::println(\"Hello, Cog!\")!!;\n}\n",
+            ),
+        ]);
+    }
+    for (path, content) in files {
         use std::io::Write;
         let mut file = std::fs::File::create_new(root.join(path))
             .map_err(|e| format!("cannot create {path}: {e}"))?;
@@ -511,22 +853,46 @@ fn init_project(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn compile_file(path: &Path, options: &Options) -> Result<CompiledProgram, String> {
+fn is_bytecode_path(path: &Path) -> bool {
+    if path.is_dir() {
+        return false;
+    }
+    // Preserve bytecode diagnostics for corrupt or missing explicit .cogb files.
+    if path.extension() == Some(OsStr::new("cogb")) {
+        return true;
+    }
+    // Probe only regular files, reading a fixed-size signature. Actual loading
+    // still uses the bounded decoder and rechecks the complete artifact.
+    if !path.is_file() {
+        return false;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0; 4];
+    file.read_exact(&mut magic).is_ok() && &magic == b"COG\0"
+}
+
+fn compile_file(
+    path: &Path,
+    options: &Options,
+    bytecode_input: bool,
+) -> Result<CompiledProgram, String> {
     let extension = path.extension().and_then(|s| s.to_str());
-    if extension == Some("cogb") {
+    if bytecode_input {
         return load_bytecode(path);
     }
-    let bytes = cog::limits::read_source(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let source = String::from_utf8(bytes)
-        .map_err(|_| format!("source {} is not valid UTF-8", path.display()))?;
     match extension {
         Some("asm") if options.allow_asm => {
+            let bytes = cog::limits::read_source(path)
+                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+            let source = String::from_utf8(bytes)
+                .map_err(|_| format!("source {} is not valid UTF-8", path.display()))?;
             parser::assemble(&source).map_err(|e| format!("assembler error: {e}"))
         }
         Some("asm") => Err("standalone assembly requires --allow-asm".into()),
         _ => Err(format!(
-            "expected a .cog or .cogb file, got {}",
+            "expected a .cog source or a Cog bytecode file, got {}",
             path.display()
         )),
     }

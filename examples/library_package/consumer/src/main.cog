@@ -1,0 +1,8 @@
+@!include("std")
+@!include("arithmetic")
+use io;
+use integer_math from arithmetic;
+
+fn main() {
+    io::println(integer_math::square(12));
+}

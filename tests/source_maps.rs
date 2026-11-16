@@ -6,10 +6,10 @@ use cog::{bytecode, interpreter, project};
 
 #[test]
 fn source_maps_round_trip_and_locate_terminal_runtime_errors() {
-    let source = "include std;\nfn main() {\n    1 / 0\n}\n";
+    let source = "@!include(\"std\")\nfn main() {\n    1 / 0\n}\n";
     let program = project::compile_source("src/main.cog", source).unwrap();
     let encoded = bytecode::encode(&program).unwrap();
-    assert_eq!(u16::from_le_bytes(encoded[4..6].try_into().unwrap()), 10);
+    assert_eq!(&encoded[..4], b"COG\0");
 
     let decoded = bytecode::decode(&encoded).unwrap();
     assert_eq!(decoded.source_map, program.source_map);

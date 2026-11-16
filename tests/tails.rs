@@ -1,7 +1,7 @@
 use cog::{bytecode, frontend, interpreter, project};
 
 fn source(body: &str) -> String {
-    format!("include std; use io; use err::Error;\n{body}")
+    format!("@!include(\"std\") use io; use err::Error;\n{body}")
 }
 
 fn output(body: &str, expected: &str) {

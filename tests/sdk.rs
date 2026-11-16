@@ -13,7 +13,7 @@ fn registered_callbacks_round_trip_and_outlive_the_engine() {
     let program = engine
         .compile(
             "sdk.cog",
-            "include std; use io; use host; fn main() { io::println(host::add(20, 22)); }",
+            "@!include(\"std\") use io; use host; fn main() { io::println(host::add(20, 22)); }",
         )
         .unwrap();
     let encoded = program.encode().unwrap();
@@ -25,12 +25,188 @@ fn registered_callbacks_round_trip_and_outlive_the_engine() {
 }
 
 #[test]
+fn foreign_callable_cannot_invoke_same_entry_in_another_program() {
+    use cog::backend::{CallableSignature, CompiledProgram};
+    use cog::instruction::Instruction as I;
+    use cog::runtime::NativeImport;
+    use cog::template::{ArrayItem, ArrayTemplate};
+    use cog::value::Value as VmValue;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    // Preserve compiler-produced native metadata while constructing the
+    // low-level callable operations that Cog source does not yet expose.
+    fn import_section(bytes: &[u8]) -> (usize, Vec<String>) {
+        fn index(bytes: &[u8], offset: &mut usize) -> usize {
+            let value = u32::from_le_bytes(bytes[*offset..*offset + 4].try_into().unwrap());
+            *offset += 4;
+            value as usize
+        }
+        let mut offset = 8;
+        let count = index(bytes, &mut offset);
+        let mut names = Vec::new();
+        for _ in 0..count {
+            let length = index(bytes, &mut offset);
+            names.push(String::from_utf8(bytes[offset..offset + length].to_vec()).unwrap());
+            offset += length + 2;
+            let parameters = index(bytes, &mut offset);
+            offset += parameters + 2;
+        }
+        (offset, names)
+    }
+
+    for case in 0..3 {
+        let retained = Rc::new(RefCell::new(None::<Value>));
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let mut engine = Engine::new();
+        let saved = retained.clone();
+        engine
+            .register(
+                "host::save",
+                Signature::new(vec![Type::Any], Type::Any),
+                move |_, arguments| {
+                    let mut saved = saved.borrow_mut();
+                    if saved.is_none() {
+                        let value = if case == 2 {
+                            arguments[0].array_get(0)?.array_get(0)?
+                        } else {
+                            arguments[0].clone()
+                        };
+                        *saved = Some(value);
+                    }
+                    Ok(Value::nil())
+                },
+            )
+            .unwrap();
+        let saved = retained.clone();
+        engine
+            .register(
+                "host::load",
+                Signature::new(vec![Type::Any], Type::Any),
+                move |_, _| {
+                    let value = saved.borrow().as_ref().unwrap().clone();
+                    if case == 2 {
+                        Value::array(vec![Value::array(vec![value])?])
+                    } else {
+                        Ok(value)
+                    }
+                },
+            )
+            .unwrap();
+        let values = observed.clone();
+        engine
+            .register(
+                "host::observe",
+                Signature::new(vec![Type::Any], Type::Any),
+                move |_, arguments| {
+                    if arguments[0].is_error() {
+                        return Ok(arguments[0].clone());
+                    }
+                    values.borrow_mut().push(arguments[0].as_int()?);
+                    Ok(Value::nil())
+                },
+            )
+            .unwrap();
+        let metadata = engine
+            .compile(
+                "native-metadata.cog",
+                "@!include(\"std\") use host; fn main() { host::save(0); host::load(nil); host::observe(0); }",
+            )
+            .unwrap()
+            .encode()
+            .unwrap();
+        let (metadata_end, imports) = import_section(&metadata);
+        let import = |name: &str| {
+            imports
+                .iter()
+                .position(|identity| identity.ends_with(name))
+                .unwrap()
+        };
+        let program = |answer| {
+            let mut instructions = if case == 1 {
+                vec![I::Push(VmValue::Int(answer)), I::MakeClosure(0, 1)]
+            } else {
+                vec![I::Push(VmValue::Nil)]
+            };
+            instructions.extend([
+                I::CallNative(import("::host::save")),
+                I::Pop,
+                I::Push(VmValue::Nil),
+                I::CallNative(import("::host::load")),
+            ]);
+            if case == 2 {
+                instructions.extend([
+                    I::Push(VmValue::Int(0)),
+                    I::Index,
+                    I::Push(VmValue::Int(0)),
+                    I::Index,
+                ]);
+            }
+            instructions.extend([
+                I::CallValue(0),
+                I::CallNative(import("::host::observe")),
+                I::Halt,
+            ]);
+            let entry = instructions.len();
+            let captures = usize::from(case == 1);
+            if case == 1 {
+                instructions[1] = I::MakeClosure(entry, captures);
+                instructions.push(I::LoadCapture(0));
+            } else {
+                instructions[0] = if case == 2 {
+                    I::PushArray(ArrayTemplate::Array(vec![ArrayItem {
+                        template: ArrayTemplate::Array(vec![ArrayItem {
+                            template: ArrayTemplate::Scalar(VmValue::Function(entry)),
+                            repeat: 1,
+                        }]),
+                        repeat: 1,
+                    }]))
+                } else {
+                    I::Push(VmValue::Function(entry))
+                };
+                instructions.push(I::Push(VmValue::Int(answer)));
+            }
+            instructions.push(I::Return);
+            let mut artifact = CompiledProgram::new(instructions);
+            artifact
+                .callables
+                .insert(entry, CallableSignature::dynamic(0, captures));
+            artifact.imports = ["bytes::render", "hash::of", "str::to_str"]
+                .map(|name| NativeImport::named(name).unwrap())
+                .to_vec();
+            let encoded = cog::bytecode::encode(&artifact).unwrap();
+            let (imports_end, _) = import_section(&encoded);
+            let mut bytes = metadata[..metadata_end].to_vec();
+            bytes.extend_from_slice(&encoded[imports_end..]);
+            engine.decode(&bytes).unwrap()
+        };
+        let owner = program(11);
+        let same_bytes_other_program = engine.decode(&owner.encode().unwrap()).unwrap();
+        let recipient = program(22);
+
+        owner.run(&mut Vec::new()).unwrap();
+        owner.run(&mut Vec::new()).unwrap();
+        assert_eq!(*observed.borrow(), [11, 11], "callable case {case}");
+        observed.borrow_mut().clear();
+        drop(owner);
+        for foreign in [same_bytes_other_program, recipient] {
+            let error = foreign.run(&mut Vec::new()).unwrap_err();
+            assert!(
+                error.message().contains("foreign callable"),
+                "callable case {case}: {error}"
+            );
+            assert!(observed.borrow().is_empty(), "callable case {case}");
+        }
+    }
+}
+
+#[test]
 fn run_context_supplies_arguments_to_the_typed_main_entry_point() {
     let engine = Engine::new();
     let program = engine
         .compile(
             "sdk-args.cog",
-            "include std; use io; fn main(args: str[]) { io::println(args[0]); }",
+            "@!include(\"std\") use io; fn main(args: str[]) { io::println(args[0]); }",
         )
         .unwrap();
     let mut output = Vec::new();
@@ -53,14 +229,14 @@ fn registrations_are_engine_scoped_and_check_typed_arguments() {
             |_, arguments| Ok(arguments[0].clone()),
         )
         .unwrap();
-    let source = "include std; use host; fn main() { host::identity(1); }";
+    let source = "@!include(\"std\") use host; fn main() { host::identity(1); }";
     assert!(engine.compile("sdk.cog", source).is_ok());
     assert!(Engine::new().compile("sdk.cog", source).is_err());
     assert!(
         engine
             .compile(
                 "sdk.cog",
-                "include std; use host; fn main() { host::identity(\"bad\"); }"
+                "@!include(\"std\") use host; fn main() { host::identity(\"bad\"); }"
             )
             .is_err()
     );
@@ -78,7 +254,7 @@ fn callback_panics_become_catchable_native_failures() {
             },
         )
         .unwrap();
-    let program = engine.compile("panic.cog", "include std; use io; use host; use err; fn main() { try { host::fail(); } catch(e) { io::println(e.error_kind()); } }").unwrap();
+    let program = engine.compile("panic.cog", "@!include(\"std\") use io; use host; use err; fn main() { try { host::fail(); } catch(e) { io::println(e.error_kind()); } }").unwrap();
     let mut output = Vec::new();
     program.run(&mut output).unwrap();
     assert_eq!(output, b"NativeFailure\n");
@@ -87,7 +263,7 @@ fn callback_panics_become_catchable_native_failures() {
 #[test]
 fn metadata_cannot_execute_and_contract_changes_cannot_link() {
     use cog::sdk::Effects;
-    let source = "include std; use io; use host; fn main() { io::println(1); host::work(); }";
+    let source = "@!include(\"std\") use io; use host; fn main() { io::println(1); host::work(); }";
     let signature = Signature::new(vec![], Type::Nil);
     let mut compiler = Engine::new();
     compiler
@@ -138,7 +314,7 @@ fn wrong_results_and_callback_errors_follow_the_runtime_error_path() {
             Err(cog::sdk::Error::new("failed"))
         })
         .unwrap();
-    let source = "include std; use io; use host; use err; fn main() { try { host::wrong(); } catch(e) { io::println(e.error_kind()); } try { host::fail(); } catch(e) { io::println(e.error_kind()); } }";
+    let source = "@!include(\"std\") use io; use host; use err; fn main() { try { host::wrong(); } catch(e) { io::println(e.error_kind()); } try { host::fail(); } catch(e) { io::println(e.error_kind()); } }";
     let program = engine
         .decode(
             &engine
@@ -175,7 +351,7 @@ fn optional_effect_policy_checks_before_invoking_callbacks() {
     let program = engine
         .compile(
             "effects.cog",
-            "include std; use host; fn main() { host::write()!!; }",
+            "@!include(\"std\") use host; fn main() { host::write()!!; }",
         )
         .unwrap();
     let mut output = Vec::new();
@@ -215,7 +391,7 @@ fn reentry_is_rejected_and_callback_arguments_are_owned_roots() {
     engine
         .compile(
             "roots.cog",
-            "include std; use host; fn main() { host::retain([42]); }",
+            "@!include(\"std\") use host; fn main() { host::retain([42]); }",
         )
         .unwrap()
         .run(&mut Vec::new())
@@ -273,7 +449,7 @@ fn invalid_registration_is_rejected_without_losing_prior_entries() {
     engine
         .compile(
             "after.cog",
-            "include std; use host; fn main() { host::keep(); }",
+            "@!include(\"std\") use host; fn main() { host::keep(); }",
         )
         .unwrap()
         .run(&mut Vec::new())
@@ -297,7 +473,7 @@ fn typed_native_parameters_propagate_errors_and_any_can_handle_them() {
             |_, arguments| Ok(Value::boolean(arguments[0].is_error())),
         )
         .unwrap();
-    let source = "include std; use host; use io; use err; fn main() { try { host::typed(1 / 0); } catch(e) { io::println(e.error_kind()); } io::println(host::dynamic(1 / 0)); }";
+    let source = "@!include(\"std\") use host; use io; use err; fn main() { try { host::typed(1 / 0); } catch(e) { io::println(e.error_kind()); } io::println(host::dynamic(1 / 0)); }";
     let program = engine
         .decode(
             &engine
@@ -326,11 +502,11 @@ fn mutation_contracts_check_source_aliases_and_portable_identity() {
         engine
             .compile(
                 "const.cog",
-                "include std; use host; fn main() { const a = [1]; host::change(a); }"
+                "@!include(\"std\") use host; fn main() { const a = [1]; host::change(a); }"
             )
             .is_err()
     );
-    let source = "include std; use host; use io; fn main() { var a = [1]; host::change(a); io::println(a); }";
+    let source = "@!include(\"std\") use host; use io; fn main() { var a = [1]; host::change(a); io::println(a); }";
     let encoded = engine
         .compile("mutate.cog", source)
         .unwrap()
@@ -357,7 +533,7 @@ fn run_context_applies_optional_buffer_limits() {
     let program = Engine::new()
         .compile(
             "limits.cog",
-            "include std; use io; use bytes; fn main() { try { bytes::new(3)!!; io::println(\"ok\"); } catch(error) { io::println(\"R\"); } }",
+            "@!include(\"std\") use io; use bytes; fn main() { try { bytes::new(3)!!; io::println(\"ok\"); } catch(error) { io::println(\"R\"); } }",
         )
         .unwrap();
 

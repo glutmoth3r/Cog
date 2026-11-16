@@ -13,7 +13,7 @@ fn artifact(
         let text: String = (0..holes).map(|n| format!("v{n}={{i + {n}}};")).collect();
         format!("$\"{text}\"")
     } else {
-        (0..holes)
+        let pieces = (0..holes)
             .flat_map(|n| {
                 [
                     format!("\"v{n}=\""),
@@ -21,8 +21,8 @@ fn artifact(
                     "\";\"".into(),
                 ]
             })
-            .collect::<Vec<_>>()
-            .join(" + ")
+            .collect::<Vec<_>>();
+        balanced_concat(&pieces)
     };
     let expected: usize = (0..iterations)
         .map(|i| {
@@ -43,6 +43,21 @@ fn artifact(
     );
     let compiled = project::compile_source("bench_strings.cog", &source)?;
     Ok(bytecode::decode(&bytecode::encode(&compiled)?)?)
+}
+
+fn balanced_concat(pieces: &[String]) -> String {
+    match pieces.len() {
+        0 => "\"\"".to_owned(),
+        1 => pieces[0].clone(),
+        len => {
+            let middle = len / 2;
+            format!(
+                "({}) + ({})",
+                balanced_concat(&pieces[..middle]),
+                balanced_concat(&pieces[middle..])
+            )
+        }
+    }
 }
 
 fn execute(program: &CompiledProgram) -> Result<(), Box<dyn Error>> {

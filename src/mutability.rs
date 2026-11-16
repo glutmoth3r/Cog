@@ -38,6 +38,7 @@ pub(crate) struct Facts {
     pub mutating_calls: BTreeSet<usize>,
     pub structural_clones: BTreeSet<usize>,
     pub globals: HashMap<usize, String>,
+    pub symbol_names: HashMap<String, String>,
     pub invalid_bindings: BTreeSet<usize>,
     pub fallback_possible: HashMap<usize, bool>,
 }
@@ -248,9 +249,28 @@ struct Pass<'a> {
     location: Option<SourceSpan>,
     persistent: BTreeSet<Root>,
     observations: Vec<State<'a>>,
+    generic_mutating_targets: HashMap<String, BTreeSet<String>>,
+    generic_mutating_methods: HashMap<String, BTreeSet<String>>,
+    generic_template: bool,
 }
 
 pub(crate) fn check(program: &Program, facts: &Facts) -> Vec<Diagnostic> {
+    let generic_mutating_targets = program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Extend(extension) if !extension.type_params.is_empty() => {
+                let methods = extension
+                    .methods
+                    .iter()
+                    .filter(|method| method.mutating_receiver)
+                    .map(|method| method.name.clone())
+                    .collect::<BTreeSet<_>>();
+                (!methods.is_empty()).then(|| (extension.target.canonical(), methods))
+            }
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
     let functions: HashMap<_, _> = program
         .items
         .iter()
@@ -287,7 +307,14 @@ pub(crate) fn check(program: &Program, facts: &Facts) -> Vec<Diagnostic> {
     loop {
         let mut next = summaries.clone();
         for function in functions.values() {
-            let mut p = Pass::new(facts, &functions, &constructors, &summaries, false);
+            let mut p = Pass::new(
+                facts,
+                &functions,
+                &constructors,
+                &summaries,
+                &generic_mutating_targets,
+                false,
+            );
             p.globals(program);
             p.function(function);
             next.entry(function.name.clone())
@@ -304,7 +331,21 @@ pub(crate) fn check(program: &Program, facts: &Facts) -> Vec<Diagnostic> {
     let mut attempted = BTreeSet::new();
     let mut diagnostics = vec![];
     for function in functions.values() {
-        let mut p = Pass::new(facts, &functions, &constructors, &summaries, true);
+        // Generic templates need concrete type-checker facts before their
+        // method effects are validated. Their summaries still participate in
+        // interprocedural analysis, but diagnostics are emitted for concrete
+        // declarations after their effects can be resolved.
+        if !function.type_params.is_empty() {
+            continue;
+        }
+        let mut p = Pass::new(
+            facts,
+            &functions,
+            &constructors,
+            &summaries,
+            &generic_mutating_targets,
+            true,
+        );
         p.globals(program);
         p.function(function);
         diagnostics.extend(p.diagnostics);
@@ -313,7 +354,14 @@ pub(crate) fn check(program: &Program, facts: &Facts) -> Vec<Diagnostic> {
         attempted.extend(p.attempted);
     }
     // Also check defaults never used by a call and global initializer effects.
-    let mut p = Pass::new(facts, &functions, &constructors, &summaries, true);
+    let mut p = Pass::new(
+        facts,
+        &functions,
+        &constructors,
+        &summaries,
+        &generic_mutating_targets,
+        true,
+    );
     p.globals(program);
     for fields in constructors
         .values()
@@ -359,6 +407,7 @@ impl<'a> Pass<'a> {
         functions: &HashMap<String, &'a FunctionDecl>,
         constructors: &HashMap<String, &'a [StructField]>,
         summaries: &'a BTreeMap<String, Summary>,
+        generic_mutating_targets: &HashMap<String, BTreeSet<String>>,
         emit: bool,
     ) -> Self {
         Self {
@@ -377,6 +426,9 @@ impl<'a> Pass<'a> {
             location: None,
             persistent: BTreeSet::new(),
             observations: vec![],
+            generic_mutating_targets: generic_mutating_targets.clone(),
+            generic_mutating_methods: HashMap::new(),
+            generic_template: false,
         }
     }
     fn kind(&self, expr: &Expr) -> ValueKind {
@@ -393,6 +445,19 @@ impl<'a> Pass<'a> {
             .last_mut()
             .unwrap()
             .insert(name.into(), id);
+    }
+    fn define_pattern(&mut self, pattern: &BindingPattern, value: Access, mutable: bool) {
+        match pattern {
+            BindingPattern::Name(name) => {
+                self.define(name, name.as_ptr() as usize, mutable, value);
+            }
+            BindingPattern::Tuple(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    let projected = self.project(&value, &Key::Index(index as i64));
+                    self.define_pattern(item, projected, mutable);
+                }
+            }
+        }
     }
     fn local_id(&self, name: &str) -> Option<usize> {
         self.state
@@ -434,6 +499,19 @@ impl<'a> Pass<'a> {
         self.summary = Summary::default();
     }
     fn function(&mut self, f: &'a FunctionDecl) {
+        self.generic_template = !f.type_params.is_empty();
+        self.generic_mutating_methods.clear();
+        if self.generic_template {
+            for parameter in &f.params {
+                let Some(ty) = &parameter.ty else {
+                    continue;
+                };
+                if let Some(methods) = self.generic_mutating_targets.get(&ty.canonical()) {
+                    self.generic_mutating_methods
+                        .insert(parameter.name.clone(), methods.clone());
+                }
+            }
+        }
         self.state.scopes.push(HashMap::new());
         for (index, param) in f.params.iter().enumerate() {
             let value = if param.ty.as_ref().is_none_or(annotation_may_reference) {
@@ -639,25 +717,48 @@ impl<'a> Pass<'a> {
         let location = self.location.clone();
         self.location = stmt.span().cloned().or(location.clone());
         match stmt.node() {
-            Stmt::VarDecl { name, value, .. }
-            | Stmt::Const { name, value, .. }
-            | Stmt::Comptime { name, value, .. } => {
+            Stmt::VarDecl { pattern, value, .. } | Stmt::Const { pattern, value, .. } => {
                 let reachable = self.state.alive;
                 let access = self.expr(value);
                 let id = stmt_id(stmt);
                 let mutable = matches!(stmt.node(), Stmt::VarDecl { .. });
+                let valid = self.kind(value) != ValueKind::Invalid
+                    && !self.facts.invalid_bindings.contains(&id);
                 if mutable && reachable {
-                    self.locals.insert(
-                        id,
-                        Local {
-                            name: name.clone(),
-                            span: stmt.span().cloned(),
-                            valid: self.kind(value) != ValueKind::Invalid
-                                && !self.facts.invalid_bindings.contains(&id),
-                        },
-                    );
+                    match pattern {
+                        BindingPattern::Name(name) => {
+                            self.locals.insert(
+                                id,
+                                Local {
+                                    name: name.clone(),
+                                    span: stmt.span().cloned(),
+                                    valid,
+                                },
+                            );
+                        }
+                        BindingPattern::Tuple(_) => {
+                            pattern.visit_names(&mut |name| {
+                                self.locals.insert(
+                                    name.as_ptr() as usize,
+                                    Local {
+                                        name: name.to_owned(),
+                                        span: stmt.span().cloned(),
+                                        valid,
+                                    },
+                                );
+                            });
+                        }
+                    }
                 }
-                self.define(name, id, mutable, access);
+                if let BindingPattern::Name(name) = pattern {
+                    self.define(name, id, mutable, access);
+                } else {
+                    self.define_pattern(pattern, access, mutable);
+                }
+            }
+            Stmt::Comptime { name, value, .. } => {
+                let access = self.expr(value);
+                self.define(name, stmt_id(stmt), false, access);
             }
             Stmt::Assign { target, value } | Stmt::CompoundAssign { target, value, .. } => {
                 let compound = matches!(stmt.node(), Stmt::CompoundAssign { .. });
@@ -808,15 +909,58 @@ impl<'a> Pass<'a> {
                 self.state.scopes.pop();
             }
             Stmt::ForEach {
-                var,
+                pattern,
                 iterable,
                 body,
             } => {
                 let collection = self.expr(iterable);
                 let item = self.project(&collection, &Key::AnyIndex);
                 self.state.scopes.push(HashMap::new());
-                self.define(var, stmt_id(stmt), true, item);
+                self.define_pattern(pattern, item, true);
                 self.loop_body(None, body, None);
+                self.state.scopes.pop();
+            }
+            Stmt::ForZip { clauses, body } => {
+                let mut empty = Some(false);
+                let mut bindings = Vec::with_capacity(clauses.len());
+                for clause in clauses {
+                    match clause {
+                        ForClause::Range {
+                            start, end, step, ..
+                        } => {
+                            self.expr(start);
+                            self.expr(end);
+                            if let Some(step) = step {
+                                self.expr(step);
+                            }
+                            empty = match (empty, range_empty(start, end, step.as_ref())) {
+                                (Some(true), _) | (_, Some(true)) => Some(true),
+                                (Some(false), Some(false)) => Some(false),
+                                _ => None,
+                            };
+                            bindings.push((clause, Access::default()));
+                        }
+                        ForClause::Each { iterable, .. } => {
+                            let collection = self.expr(iterable);
+                            if empty != Some(true) {
+                                empty = None;
+                            }
+                            bindings.push((clause, self.project(&collection, &Key::AnyIndex)));
+                        }
+                    }
+                }
+                self.state.scopes.push(HashMap::new());
+                for (clause, value) in bindings {
+                    match clause {
+                        ForClause::Range { var, .. } => {
+                            self.define(var, clause as *const ForClause as usize, true, value);
+                        }
+                        ForClause::Each { pattern, .. } => {
+                            self.define_pattern(pattern, value, true);
+                        }
+                    }
+                }
+                self.loop_body(None, body, empty);
                 self.state.scopes.pop();
             }
             Stmt::Break => {
@@ -1089,6 +1233,13 @@ impl<'a> Pass<'a> {
                 if self.facts.structural_clones.contains(&expr_id(expr)) {
                     return self.allocate(Root::Fresh(expr_id(expr), 0));
                 }
+                let inferred_generic_mutation = self.generic_template
+                    && matches!(receiver.node(), Expr::Ident(name)
+                        if self.generic_mutating_methods
+                            .get(name)
+                            .is_some_and(|methods| methods.contains(method)));
+                let mutating_call =
+                    self.facts.mutating_calls.contains(&expr_id(expr)) || inferred_generic_mutation;
                 let specialized = self.facts.specializations.get(&expr_id(expr));
                 let pending_specialization =
                     specialized.is_some_and(|name| !self.summaries.contains_key(name));
@@ -1097,13 +1248,28 @@ impl<'a> Pass<'a> {
                         self.attempted.extend(&reference.locals);
                     }
                 }
+                if mutating_call
+                    && value.refs.is_empty()
+                    && let Expr::Ident(name) = receiver.node()
+                    && let Some(id) = self.local_id(name)
+                {
+                    if self.state.bindings[&id].mutable {
+                        self.mutated.insert(id);
+                    } else if self.emit {
+                        self.diagnostics.push(Diagnostic::new(
+                            "E1003",
+                            format!("cannot mutate through const/read-only access from `{name}`"),
+                            receiver.span().cloned().or_else(|| self.location.clone()),
+                        ));
+                    }
+                }
                 let target = specialized
                     .filter(|name| self.summaries.contains_key(*name))
                     .or_else(|| self.facts.calls.get(&expr_id(expr)));
                 if let Some(name) = target
                     && let Some(summary) = self.summaries.get(name).cloned()
                 {
-                    if self.facts.mutating_calls.contains(&expr_id(expr))
+                    if mutating_call
                         && !summary
                             .mutations
                             .iter()
@@ -1116,7 +1282,7 @@ impl<'a> Pass<'a> {
                     call_arguments.extend(arguments);
                     return self.apply_summary(expr, summary, &call_arguments);
                 }
-                if self.facts.mutating_calls.contains(&expr_id(expr)) {
+                if mutating_call {
                     self.mutate(&value, receiver);
                 }
                 match method.as_str() {
@@ -1135,6 +1301,7 @@ impl<'a> Pass<'a> {
             Expr::Call(name, args) | Expr::SpecializedCall(name, _, args) => {
                 self.call(expr, name, args)
             }
+            Expr::AssociatedCall { args, .. } => self.call(expr, "", args),
             Expr::Block(block) => self.block(block),
             Expr::If {
                 cond,
@@ -1226,6 +1393,7 @@ impl<'a> Pass<'a> {
                             _,
                             Expr::Int(_)
                             | Expr::Float(_)
+                            | Expr::Char(_)
                             | Expr::Bool(_)
                             | Expr::Str(_)
                             | Expr::Array(_)
@@ -1242,7 +1410,10 @@ impl<'a> Pass<'a> {
                 Access::default()
             }
             Expr::Int(_)
+            | Expr::UInt(_)
+            | Expr::BigInt(_)
             | Expr::Float(_)
+            | Expr::Char(_)
             | Expr::Str(_)
             | Expr::Bool(_)
             | Expr::Nil
@@ -1347,8 +1518,11 @@ impl<'a> Pass<'a> {
             return Access::default();
         }
         let specialized = self.facts.specializations.get(&expr_id(expr));
-        let specialized_summary = specialized.and_then(|name| self.summaries.get(name));
-        if specialized.is_some() && specialized_summary.is_none() {
+        let summary = specialized
+            .and_then(|name| self.summaries.get(name))
+            .or_else(|| self.summaries.get(&name))
+            .cloned();
+        if specialized.is_some() && summary.is_none() {
             for argument in &args {
                 for reference in &argument.refs {
                     self.attempted.extend(&reference.locals);
@@ -1363,7 +1537,12 @@ impl<'a> Pass<'a> {
             }
             return result;
         }
-        if let Ok(import) = crate::runtime::NativeImport::named(&name) {
+        let import_name = self
+            .facts
+            .symbol_names
+            .get(&name)
+            .map_or(name.as_str(), String::as_str);
+        if let Ok(import) = crate::runtime::NativeImport::named(import_name) {
             for index in import.mutating_parameters() {
                 if let Some(access) = args.get(*index) {
                     self.mutate(access, given.get(*index).map_or(expr, |arg| &arg.value));
@@ -1374,10 +1553,7 @@ impl<'a> Pass<'a> {
             }
             return self.allocate(Root::Fresh(expr_id(expr), 0));
         }
-        if let Some(summary) = specialized_summary
-            .or_else(|| self.summaries.get(&name))
-            .cloned()
-        {
+        if let Some(summary) = summary {
             return self.apply_summary(expr, summary, &args);
         }
         Access::default()

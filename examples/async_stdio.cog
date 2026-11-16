@@ -1,0 +1,25 @@
+@!include("std")
+use async::io as aio;
+use bytes;
+use io;
+use async::time;
+
+@async fn read_stdin() {
+    return await aio::read(io::stdin(), 256);
+}
+
+@async fn notify_while_reading() -> nil {
+    await time::sleep(0.05);
+    const message = bytes::from_str("the scheduler kept running while stdin was pending\n")!!;
+    await aio::write_all(io::stdout(), message);
+}
+
+@async fn main() -> nil {
+    io::print("Type a line: ")!!;
+    const input_task = spawn(read_stdin());
+    const notice_task = spawn(notify_while_reading());
+    const input = await input_task;
+    await notice_task;
+    const text = bytes::to_str(input, 0, bytes::len(input)!!)!!;
+    io::println($"received: {text}")!!;
+}

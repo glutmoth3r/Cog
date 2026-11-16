@@ -438,6 +438,13 @@ pub fn assemble(source: &str) -> Result<crate::backend::CompiledProgram, ParseEr
                 })?;
                 Instruction::JumpIfTrue(resolve_address(op, r.line, &labels)?)
             }
+            "jnp" => {
+                let op = r.operand.ok_or_else(|| ParseError::MissingOperand {
+                    line: r.line,
+                    instr: r.mnemonic.to_string(),
+                })?;
+                Instruction::JumpIfNoPropagation(resolve_address(op, r.line, &labels)?)
+            }
             "call" => {
                 let op = r.operand.ok_or_else(|| ParseError::MissingOperand {
                     line: r.line,
@@ -455,6 +462,7 @@ pub fn assemble(source: &str) -> Result<crate::backend::CompiledProgram, ParseEr
                 )
             }
             "ret" => require_no_operand(&r, Instruction::Return)?,
+            "retprop" => require_no_operand(&r, Instruction::ReturnPropagate)?,
             "is_type" => {
                 use crate::instruction::ValueType;
                 let operand = r.operand.ok_or_else(|| ParseError::MissingOperand {

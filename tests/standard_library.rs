@@ -3,8 +3,9 @@ use cog::runtime::VmCapabilities;
 use cog::{bytecode, interpreter, project};
 
 fn execute(source: &str, caps: VmCapabilities) -> (String, Result<(), RuntimeError>) {
-    let source =
-        format!("include std; use io; use math; use random; use sort; use err::Error;\n{source}");
+    let source = format!(
+        "@!include(\"std\") use io; use math; use random; use sort; use err::Error;\n{source}"
+    );
     let program = project::compile_source("standard-library.cog", &source)
         .unwrap_or_else(|error| panic!("{error}"));
     let program = bytecode::decode(&bytecode::encode(&program).unwrap()).unwrap();
@@ -112,6 +113,20 @@ fn math_preserves_integer_boundaries_rounding_and_checked_powers() {
 }
 
 #[test]
+fn math_power_preserves_arbitrary_precision_results() {
+    assert_eq!(
+        run(r#"
+        fn main() {
+            io::println(math::pow(2 as bigint, 100))!!;
+            io::println(math::pow(0 as bigint, 0))!!;
+            io::println(when math::pow(2 as bigint, 100) is bigint { true } else { false })!!;
+        }
+    "#),
+        "1267650600228229401496703205376\n1\ntrue\n"
+    );
+}
+
+#[test]
 fn square_roots_and_logs_cover_small_and_large_finite_values() {
     let inputs = [
         f64::from_bits(1),
@@ -213,7 +228,8 @@ fn in_place_sorts_return_nil_and_sorted_returns_an_independent_copy() {
                     io::println(values)!!;
                     io::println(copy)!!;
 
-                    var empty: int[] = [];
+                    var empty: int[] = [1];
+                    empty = [];
                     const empty_result: nil = sort::{algorithm}(empty);
                     if empty_result != nil || !sort::is_sorted(empty) {{ crash("empty sort failed"); }}
                     io::println(empty.len())!!;
@@ -233,7 +249,7 @@ fn in_place_sorts_return_nil_and_sorted_returns_an_independent_copy() {
 fn in_place_sorts_require_mutable_bindings() {
     for algorithm in ["insertion", "stable", "selection", "bubble", "quick"] {
         let source = format!(
-            "include std; use sort; fn main() {{ const values = [2, 1]; sort::{algorithm}(values); }}"
+            "@!include(\"std\") use sort; fn main() {{ const values = [2, 1]; sort::{algorithm}(values); }}"
         );
         let diagnostic = project::compile_source("readonly-sort.cog", &source)
             .unwrap_err()
@@ -608,7 +624,7 @@ fn maps_use_hashing_preserve_order_and_handle_tombstones_and_errors() {
             }
 
             var effects = 0;
-            comptime OptionalInt: type = int?;
+            @comptime const OptionalInt: type = int?;
             fn failing_key() -> str { Error::MissingKey() }
             fn effect_value() -> int {
                 effects += 1;
@@ -616,7 +632,7 @@ fn maps_use_hashing_preserve_order_and_handle_tombstones_and_errors() {
             }
 
             fn main() {
-                var numbers = collections::map_new[int, int]();
+                var numbers = collections::Map::new[int, int]();
                 require(numbers.is_empty());
                 require(numbers.capacity() == 8);
                 for index in 0..100 {
@@ -651,7 +667,7 @@ fn maps_use_hashing_preserve_order_and_handle_tombstones_and_errors() {
                 require(numbers.len() == 0);
                 require(numbers.is_empty());
 
-                var collisions = collections::map_new[CollisionKey, str]();
+                var collisions = collections::Map::new[CollisionKey, str]();
                 require(collisions.set(CollisionKey(value: 10), "ten"));
                 require(collisions.set(CollisionKey(value: 20), "twenty"));
                 require(collisions.set(CollisionKey(value: 30), "thirty"));
@@ -660,7 +676,7 @@ fn maps_use_hashing_preserve_order_and_handle_tombstones_and_errors() {
                 require(!collisions.contains(CollisionKey(value: 20)));
                 require(collisions.get(CollisionKey(value: 30)) == "thirty");
 
-                var words = collections::map_new[str, int]();
+                var words = collections::Map::new[str, int]();
                 require(words.set("é🦀", 0));
                 require(words.contains("é🦀"));
                 require(words.get("é🦀") == 0);
@@ -687,18 +703,18 @@ fn maps_use_hashing_preserve_order_and_handle_tombstones_and_errors() {
                     crash("remove did not return MissingKey");
                 }
 
-                var flags = collections::map_new[bool, str]();
+                var flags = collections::Map::new[bool, str]();
                 require(flags.set(false, "off"));
                 require(flags.set(true, "on"));
                 require(flags.get(false) == "off");
                 require(flags.get(true) == "on");
 
-                var optional = collections::map_new[str, OptionalInt]();
+                var optional = collections::Map::new[str, OptionalInt]();
                 require(optional.set("nil", nil));
                 require(optional.contains("nil"));
                 require(optional.get("nil") == nil);
 
-                var original = collections::map_new[str, int]();
+                var original = collections::Map::new[str, int]();
                 original.set("a", 1);
                 original.set("b", 2);
                 require(clone::value(original).get("a") == 1);
@@ -709,7 +725,7 @@ fn maps_use_hashing_preserve_order_and_handle_tombstones_and_errors() {
                 require(!original.contains("c"));
                 require(copied.keys()[0]!! == "a");
 
-                var many = collections::map_new[int, int]();
+                var many = collections::Map::new[int, int]();
                 for index in 0..100 { many.set(index, index); }
                 const many_copy = many.clone();
                 require(many_copy.len() == 100);
@@ -738,7 +754,7 @@ fn maps_use_hashing_preserve_order_and_handle_tombstones_and_errors() {
 
     let private_field = project::compile_source(
         "private-map-field.cog",
-        "include std; use collections; fn main() { const items = collections::map_new[str, int](); items.slots; }",
+        "@!include(\"std\") use collections; fn main() { const items = collections::Map::new[str, int](); items.slots; }",
     )
     .unwrap_err()
     .to_string();
@@ -746,7 +762,7 @@ fn maps_use_hashing_preserve_order_and_handle_tombstones_and_errors() {
 
     for method in ["set(\"key\", 1)", "remove(\"key\")", "clear()"] {
         let source = format!(
-            "include std; use collections; fn main() {{ const items = collections::map_new[str, int](); items.{method}; }}"
+            "@!include(\"std\") use collections; fn main() {{ const items = collections::Map::new[str, int](); items.{method}; }}"
         );
         let diagnostic = project::compile_source("readonly-map-method.cog", &source)
             .unwrap_err()
@@ -759,7 +775,7 @@ fn maps_use_hashing_preserve_order_and_handle_tombstones_and_errors() {
 
     let unsupported_key = project::compile_source(
         "unsupported-map-key.cog",
-        "include std; use collections; fn main() { collections::map_new[float, int](); }",
+        "@!include(\"std\") use collections; fn main() { collections::Map::new[float, int](); }",
     )
     .unwrap_err()
     .to_string();
@@ -770,7 +786,7 @@ fn maps_use_hashing_preserve_order_and_handle_tombstones_and_errors() {
 
     let non_clone_value = project::compile_source(
         "non-clone-map-value.cog",
-        "include std; use collections; struct NonClone { value: int } fn main() { const items = collections::map_new[int, NonClone](); items.clone(); }",
+        "@!include(\"std\") use collections; struct NonClone { value: int } fn main() { const items = collections::Map::new[int, NonClone](); items.clone(); }",
     )
     .unwrap_err()
     .to_string();
@@ -781,7 +797,7 @@ fn maps_use_hashing_preserve_order_and_handle_tombstones_and_errors() {
 
     let private_constructor = project::compile_source(
         "private-map-constructor.cog",
-        "include std; use collections; fn main() { collections::Map[str, int]([]); }",
+        "@!include(\"std\") use collections; fn main() { collections::Map[str, int]([]); }",
     )
     .unwrap_err()
     .to_string();
@@ -840,7 +856,7 @@ fn collection_iteration_evaluates_once_uses_unicode_scalars_and_detects_structur
 
     let not_iterable = project::compile_source(
         "not-iterable.cog",
-        "include std; fn main() { for value in 42 { io::println(value); } }",
+        "@!include(\"std\") fn main() { for value in 42 { io::println(value); } }",
     )
     .unwrap_err()
     .to_string();
@@ -848,7 +864,7 @@ fn collection_iteration_evaluates_once_uses_unicode_scalars_and_detects_structur
 
     let comptime_iteration = project::compile_source(
         "comptime-iteration.cog",
-        "include std; comptime fn first(items: int[]) { for value in items { return value; } return 0; } fn main() {}",
+        "@!include(\"std\") @comptime fn first(items: int[]) { for value in items { return value; } return 0; } fn main() {}",
     )
     .unwrap_err()
     .to_string();
@@ -977,7 +993,7 @@ fn random_seeds_once_and_boolean_does_not_use_the_alternating_low_bit() {
     std::fs::write(
         fixture.0.join("main.cog"),
         r#"
-        include std;
+        @!include("std")
         use io; use rng; use entropy_stub;
         fn main() {
             for i in 0..16 { io::println(rng::boolean()!!)!!; }
@@ -1042,9 +1058,9 @@ fn json_errors_are_catchable_and_reject_duplicate_names() {
                 when json::parse("{\"x\":1,\"x\":2}") is Error::ParseFailure(_, _) {
                     io::println("duplicate rejected")!!;
                 } else { crash("duplicate keys were accepted"); }
-                when json::parse("9223372036854775808") is Error::Overflow {
-                    io::println("overflow")!!;
-                } else { crash("out of range integer was accepted"); }
+                when json::parse("9223372036854775808") is uint {
+                    io::println("uint")!!;
+                } else { crash("unsigned integer did not preserve its type"); }
                 when json::stringify(bytes::new(0)!!) is Error::TypeMismatch(op) {
                     io::println(op)!!;
                 } else { crash("bytes unexpectedly serialized as JSON"); }
@@ -1061,7 +1077,7 @@ fn json_errors_are_catchable_and_reject_duplicate_names() {
     );
     assert_eq!(
         output,
-        "JSON\nCog value\nduplicate rejected\noverflow\njson::stringify\nname\n"
+        "JSON\nCog value\nduplicate rejected\nuint\njson::stringify\nname\n"
     );
 }
 
@@ -1082,18 +1098,19 @@ fn json_decoded_arrays_remain_heterogeneous_and_mutable() {
 }
 
 #[test]
-fn json_integer_tokens_never_fall_back_to_rounded_floats() {
+fn json_integer_tokens_preserve_exact_bigints_without_rounding() {
     assert_eq!(
         run(r#"
         use json;
-        fn overflow(text: str) {
-            when json::parse(text) is Error::Overflow {} else { crash(text); }
-        }
         fn main() {
-            overflow("18446744073709551616");
-            overflow("-9223372036854775809");
-            overflow("[184467440737095516160000000000000000000]");
-            overflow("{\"n\":-9223372036854775809}");
+            const positive = json::parse("18446744073709551616")!!;
+            const negative = json::parse("-9223372036854775809")!!;
+            io::println(when positive is bigint { true } else { false });
+            io::println(positive);
+            io::println(when negative is bigint { true } else { false });
+            io::println(negative);
+            io::println(json::stringify(json::parse("[184467440737095516160000000000000000000]")!!)!!);
+            io::println(json::stringify(json::parse("{\"n\":-9223372036854775809}")!!)!!);
             when json::parse("1e400") is Error::Overflow { io::println("float overflow"); }
             else { crash("non-finite JSON float was accepted"); }
             io::println(json::parse("-0")!!);
@@ -1106,7 +1123,7 @@ fn json_integer_tokens_never_fall_back_to_rounded_floats() {
             io::println(json::stringify(json::parse("{\"18446744073709551616\":true}")!!)!! == "{\"18446744073709551616\":true}");
         }
     "#),
-        "float overflow\n-0\n{\"$serde_json::private::Number\":\"18446744073709551616\"}\n9223372036854775807\n-9223372036854775808\ntrue\ntrue\n18446744073709551616\ntrue\n"
+        "true\n18446744073709551616\ntrue\n-9223372036854775809\n[184467440737095516160000000000000000000]\n{\"n\":-9223372036854775809}\nfloat overflow\n-0\n{\"$serde_json::private::Number\":\"18446744073709551616\"}\n9223372036854775807\n-9223372036854775808\ntrue\ntrue\n18446744073709551616\ntrue\n"
     );
 }
 

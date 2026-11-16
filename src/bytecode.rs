@@ -7,11 +7,11 @@ use crate::value::{RuntimeType, Value};
 use std::rc::Rc;
 
 const MAGIC: &[u8; 4] = b"COG\0";
-const VERSION: u16 = 10;
-pub(crate) const LIMIT: usize = 1_000_000;
-const MAX_DEPTH: usize = 64;
+pub(crate) const VERSION: u16 = 38;
+pub(crate) const LIMIT: usize = crate::value::MAX_RUNTIME_TYPE_NODES;
+const MAX_DEPTH: usize = crate::value::MAX_RUNTIME_TYPE_DEPTH;
 pub const MAX_FILE_BYTES: usize = 128 * 1024 * 1024;
-const MAX_STATIC_STRING_BYTES: usize = 64 * 1024 * 1024;
+const MAX_STATIC_STRING_BYTES: usize = crate::value::MAX_RUNTIME_TYPE_NAME_BYTES;
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -53,9 +53,19 @@ impl ConstantBudget {
         self.node(0)?;
         match value {
             Value::Str(text) | Value::TypeTag(text) => self.string(text.len()),
-            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Nil | Value::Function(_) => {
-                Ok(())
-            }
+            Value::BigInt(number) => self.string(
+                usize::try_from(number.bits().saturating_add(7) / 8)
+                    .unwrap_or(usize::MAX)
+                    .max(1),
+            ),
+            Value::Int(_)
+            | Value::UInt(_)
+            | Value::Float(_)
+            | Value::Bool(_)
+            | Value::Char(_)
+            | Value::Nil
+            | Value::Function(_) => Ok(()),
+            Value::Task(_) => Err("runtime objects cannot be stored as bytecode constants".into()),
             _ => Err("runtime objects cannot be stored as bytecode constants".into()),
         }
     }
@@ -137,12 +147,14 @@ pub fn encode(program: &CompiledProgram) -> Result<Vec<u8>> {
             w.byte(type_tag(*parameter))?;
         }
         w.byte(type_tag(import.result()))?;
+        w.byte(u8::from(import.is_async()))?;
     }
     w.index(program.callables.len())?;
     for (entry, signature) in &program.callables {
         w.index(*entry)?;
         w.index(signature.parameters)?;
         w.index(signature.captures)?;
+        w.byte(u8::from(signature.asynchronous))?;
         match &signature.parameter_types {
             Some(parameter_types) => {
                 w.byte(1)?;
@@ -174,10 +186,13 @@ pub fn encode(program: &CompiledProgram) -> Result<Vec<u8>> {
             Instruction::Ge => w.byte(12)?,
             Instruction::Halt => w.byte(18)?,
             Instruction::Return => w.byte(19)?,
+            Instruction::ReturnPropagate => w.byte(120)?,
             Instruction::IsType(ty) => {
                 w.byte(63)?;
                 match ty {
                     ValueType::Int => w.byte(0)?,
+                    ValueType::UInt => w.byte(9)?,
+                    ValueType::BigInt => w.byte(10)?,
                     ValueType::Float => w.byte(1)?,
                     ValueType::Bool => w.byte(2)?,
                     ValueType::Str => w.byte(3)?,
@@ -191,6 +206,7 @@ pub fn encode(program: &CompiledProgram) -> Result<Vec<u8>> {
                         w.byte(7)?;
                         w.string(name)?;
                     }
+                    ValueType::Char => w.byte(8)?,
                 }
             }
             Instruction::ErrorKind => w.byte(21)?,
@@ -246,11 +262,67 @@ pub fn encode(program: &CompiledProgram) -> Result<Vec<u8>> {
                 w.byte(54)?;
                 w.index(*value)?;
             }
+            Instruction::JumpIfNoPropagation(value) => {
+                w.byte(121)?;
+                w.index(*value)?;
+            }
             Instruction::Call(a, b) => {
                 w.byte(55)?;
                 w.index(*a)?;
                 w.index(*b)?;
             }
+            Instruction::CallAsync(a, b) => {
+                w.byte(72)?;
+                w.index(*a)?;
+                w.index(*b)?;
+            }
+            Instruction::Await => w.byte(73)?,
+            Instruction::Spawn => w.byte(74)?,
+            Instruction::Cancel => w.byte(89)?,
+            Instruction::CheckCancel => w.byte(90)?,
+            Instruction::YieldNow => w.byte(91)?,
+            Instruction::TimeoutAsync => w.byte(92)?,
+            Instruction::Select2 => w.byte(93)?,
+            Instruction::Select => w.byte(94)?,
+            Instruction::SleepAsync => w.byte(75)?,
+            Instruction::ReadBytesAsync => w.byte(76)?,
+            Instruction::ProcessRunAsync => w.byte(77)?,
+            Instruction::FsMetadataAsync => w.byte(78)?,
+            Instruction::FsReadDirAsync => w.byte(79)?,
+            Instruction::FsWriteBytesAsync => w.byte(80)?,
+            Instruction::FsCreateDirAsync => w.byte(81)?,
+            Instruction::FsCreateDirAllAsync => w.byte(82)?,
+            Instruction::FsRemoveFileAsync => w.byte(83)?,
+            Instruction::FsRemoveDirAsync => w.byte(84)?,
+            Instruction::FsReadTextAsync => w.byte(85)?,
+            Instruction::FsWriteTextAsync => w.byte(86)?,
+            Instruction::FsCopyAsync => w.byte(87)?,
+            Instruction::FsRenameAsync => w.byte(88)?,
+            Instruction::FsReadLinesAsync => w.byte(95)?,
+            Instruction::FsAppendBytesAsync => w.byte(96)?,
+            Instruction::FsAppendTextAsync => w.byte(97)?,
+            Instruction::NetworkExchangeAsync => w.byte(98)?,
+            Instruction::TcpConnectAsync => w.byte(99)?,
+            Instruction::TcpReadAsync => w.byte(100)?,
+            Instruction::TcpWriteAllAsync => w.byte(101)?,
+            Instruction::TcpShutdownWriteAsync => w.byte(102)?,
+            Instruction::TcpListenAsync => w.byte(103)?,
+            Instruction::TcpAcceptAsync => w.byte(104)?,
+            Instruction::ProcessRunTimeoutAsync => w.byte(105)?,
+            Instruction::ProcessRunInputAsync => w.byte(106)?,
+            Instruction::ProcessRunInputTimeoutAsync => w.byte(107)?,
+            Instruction::AsyncIoRead => w.byte(108)?,
+            Instruction::AsyncIoWriteAll => w.byte(109)?,
+            Instruction::AsyncIoFlush => w.byte(110)?,
+            Instruction::AsyncIoSeek => w.byte(111)?,
+            Instruction::AsyncIoOpen => w.byte(112)?,
+            Instruction::AsyncIoReadAll => w.byte(113)?,
+            Instruction::TcpReadAllAsync => w.byte(114)?,
+            Instruction::TcpReadExactAsync => w.byte(115)?,
+            Instruction::AsyncIoReadExact => w.byte(116)?,
+            Instruction::TcpWriteAsync => w.byte(117)?,
+            Instruction::AsyncIoWrite => w.byte(118)?,
+            Instruction::ProcessRunInputTimeoutOutputLimitAsync => w.byte(119)?,
             Instruction::CallValue(value) => {
                 w.byte(56)?;
                 w.index(*value)?;
@@ -278,6 +350,22 @@ pub fn encode(program: &CompiledProgram) -> Result<Vec<u8>> {
             }
             Instruction::ConstrainArrayFrom => w.byte(68)?,
             Instruction::ArrayEmptyLike => w.byte(69)?,
+            Instruction::MakeTypedTuple(count, types) => {
+                w.byte(70)?;
+                w.index(*count)?;
+                w.index(types.len())?;
+                for ty in types {
+                    w.runtime_type(ty, 0)?;
+                }
+            }
+            Instruction::ConstrainRecordFields(fields) => {
+                w.byte(71)?;
+                w.index(fields.len())?;
+                for (name, ty) in fields {
+                    w.string(name)?;
+                    w.runtime_type(ty, 0)?;
+                }
+            }
             Instruction::MakeClosure(a, b) => {
                 w.byte(59)?;
                 w.index(*a)?;
@@ -336,7 +424,7 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
         return Err("unsupported bytecode flags".into());
     }
     let import_count = r.index()?;
-    if import_count > 4096 || import_count > (bytes.len() - r.pos) / 11 {
+    if import_count > 4096 || import_count > (bytes.len() - r.pos) / 13 {
         return Err("invalid runtime import count".into());
     }
     let mut imports = Vec::new();
@@ -358,10 +446,21 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
             parameters.push(read_type(r.byte()?)?);
         }
         let result = read_type(r.byte()?)?;
-        imports.push(NativeImport::resolve(&name, version, &parameters, result)?);
+        let asynchronous = match r.byte()? {
+            0 => false,
+            1 => true,
+            _ => return Err("invalid native async marker".into()),
+        };
+        imports.push(NativeImport::resolve_with_async(
+            &name,
+            version,
+            &parameters,
+            result,
+            asynchronous,
+        )?);
     }
     let callable_count = r.index()?;
-    if callable_count > LIMIT || callable_count > (bytes.len() - r.pos) / 14 {
+    if callable_count > LIMIT || callable_count > (bytes.len() - r.pos) / 15 {
         return Err("invalid callable count".into());
     }
     let mut callables = std::collections::BTreeMap::new();
@@ -375,6 +474,11 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
         previous = Some(entry);
         let parameters = r.index()?;
         let captures = r.index()?;
+        let asynchronous = match r.byte()? {
+            0 => false,
+            1 => true,
+            _ => return Err("invalid callable async tag".into()),
+        };
         if parameters > LIMIT || captures > LIMIT {
             return Err("invalid callable descriptor size".into());
         }
@@ -408,6 +512,7 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
             CallableSignature {
                 parameters,
                 captures,
+                asynchronous,
                 parameter_types,
                 result_type: r.optional_runtime_type(0)?,
             },
@@ -437,6 +542,8 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
             12 => Instruction::Ge,
             18 => Instruction::Halt,
             19 => Instruction::Return,
+            120 => Instruction::ReturnPropagate,
+            121 => Instruction::JumpIfNoPropagation(r.index()?),
             63 => Instruction::IsType(match r.byte()? {
                 0 => ValueType::Int,
                 1 => ValueType::Float,
@@ -446,6 +553,9 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
                 5 => ValueType::Error,
                 6 => ValueType::Enum(r.string()?),
                 7 => ValueType::Variant(r.string()?),
+                8 => ValueType::Char,
+                9 => ValueType::UInt,
+                10 => ValueType::BigInt,
                 tag => return Err(format!("unknown type-test tag {tag}")),
             }),
             21 => Instruction::ErrorKind,
@@ -475,6 +585,54 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
             53 => Instruction::JumpIfFalse(r.index()?),
             54 => Instruction::JumpIfTrue(r.index()?),
             55 => Instruction::Call(r.index()?, r.index()?),
+            72 => Instruction::CallAsync(r.index()?, r.index()?),
+            73 => Instruction::Await,
+            74 => Instruction::Spawn,
+            89 => Instruction::Cancel,
+            90 => Instruction::CheckCancel,
+            91 => Instruction::YieldNow,
+            92 => Instruction::TimeoutAsync,
+            93 => Instruction::Select2,
+            94 => Instruction::Select,
+            75 => Instruction::SleepAsync,
+            76 => Instruction::ReadBytesAsync,
+            77 => Instruction::ProcessRunAsync,
+            78 => Instruction::FsMetadataAsync,
+            79 => Instruction::FsReadDirAsync,
+            80 => Instruction::FsWriteBytesAsync,
+            81 => Instruction::FsCreateDirAsync,
+            82 => Instruction::FsCreateDirAllAsync,
+            83 => Instruction::FsRemoveFileAsync,
+            84 => Instruction::FsRemoveDirAsync,
+            85 => Instruction::FsReadTextAsync,
+            86 => Instruction::FsWriteTextAsync,
+            87 => Instruction::FsCopyAsync,
+            88 => Instruction::FsRenameAsync,
+            95 => Instruction::FsReadLinesAsync,
+            96 => Instruction::FsAppendBytesAsync,
+            97 => Instruction::FsAppendTextAsync,
+            98 => Instruction::NetworkExchangeAsync,
+            99 => Instruction::TcpConnectAsync,
+            100 => Instruction::TcpReadAsync,
+            101 => Instruction::TcpWriteAllAsync,
+            102 => Instruction::TcpShutdownWriteAsync,
+            103 => Instruction::TcpListenAsync,
+            104 => Instruction::TcpAcceptAsync,
+            105 => Instruction::ProcessRunTimeoutAsync,
+            106 => Instruction::ProcessRunInputAsync,
+            107 => Instruction::ProcessRunInputTimeoutAsync,
+            108 => Instruction::AsyncIoRead,
+            109 => Instruction::AsyncIoWriteAll,
+            110 => Instruction::AsyncIoFlush,
+            111 => Instruction::AsyncIoSeek,
+            112 => Instruction::AsyncIoOpen,
+            113 => Instruction::AsyncIoReadAll,
+            114 => Instruction::TcpReadAllAsync,
+            115 => Instruction::TcpReadExactAsync,
+            116 => Instruction::AsyncIoReadExact,
+            117 => Instruction::TcpWriteAsync,
+            118 => Instruction::AsyncIoWrite,
+            119 => Instruction::ProcessRunInputTimeoutOutputLimitAsync,
             56 => Instruction::CallValue(r.index()?),
             57 => Instruction::MakeRecord(r.index()?),
             58 => Instruction::MakeArray(r.index()?),
@@ -483,6 +641,35 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
             67 => Instruction::ConstrainArrayType(r.runtime_type(0)?),
             68 => Instruction::ConstrainArrayFrom,
             69 => Instruction::ArrayEmptyLike,
+            70 => {
+                let count = r.index()?;
+                let type_count = r.index()?;
+                if type_count > 1024 {
+                    return Err("runtime tuple type is too large".into());
+                }
+                let mut types = Vec::new();
+                types
+                    .try_reserve_exact(type_count)
+                    .map_err(|_| "cannot allocate tuple type")?;
+                for _ in 0..type_count {
+                    types.push(r.runtime_type(0)?);
+                }
+                Instruction::MakeTypedTuple(count, types)
+            }
+            71 => {
+                let count = r.index()?;
+                if count > LIMIT {
+                    return Err("record field type count exceeds the format limit".into());
+                }
+                let mut fields = Vec::new();
+                fields
+                    .try_reserve_exact(count)
+                    .map_err(|_| "cannot allocate record types")?;
+                for _ in 0..count {
+                    fields.push((r.owned_string()?, r.runtime_type(0)?));
+                }
+                Instruction::ConstrainRecordFields(fields)
+            }
             59 => Instruction::MakeClosure(r.index()?, r.index()?),
             60 => Instruction::LoadCapture(r.index()?),
             62 => Instruction::StackTruncate(r.index()?),
@@ -605,6 +792,30 @@ pub fn validate(artifact: &CompiledProgram) -> Result<()> {
                 budget.runtime_type(ty, 0)?;
                 validate_runtime_type(ty, 0)?;
             }
+            Instruction::MakeTypedTuple(count, types) => {
+                if *count != types.len() || types.len() > 1024 {
+                    return Err("typed tuple value and type counts differ".into());
+                }
+                for ty in types {
+                    budget.runtime_type(ty, 0)?;
+                    validate_runtime_type(ty, 0)?;
+                }
+            }
+            Instruction::ConstrainRecordFields(fields) => {
+                if fields.len() > LIMIT {
+                    return Err("record field type count exceeds the format limit".into());
+                }
+                let mut previous = None;
+                for (name, ty) in fields {
+                    if name.is_empty() || previous.is_some_and(|old: &str| old >= name.as_str()) {
+                        return Err("record field types must be unique and sorted".into());
+                    }
+                    previous = Some(name.as_str());
+                    budget.string(name.len())?;
+                    budget.runtime_type(ty, 0)?;
+                    validate_runtime_type(ty, 0)?;
+                }
+            }
             Instruction::IsType(ValueType::Enum(name) | ValueType::Variant(name))
             | Instruction::Crash(Some(name)) => budget.string(name.len())?,
             _ => {}
@@ -613,7 +824,9 @@ pub fn validate(artifact: &CompiledProgram) -> Result<()> {
             Instruction::Jump(n)
             | Instruction::JumpIfFalse(n)
             | Instruction::JumpIfTrue(n)
+            | Instruction::JumpIfNoPropagation(n)
             | Instruction::Call(n, _)
+            | Instruction::CallAsync(n, _)
             | Instruction::MakeClosure(n, _)
             | Instruction::Push(Value::Function(n)) => Some(*n),
             _ => None,
@@ -656,10 +869,12 @@ pub fn validate(artifact: &CompiledProgram) -> Result<()> {
                 return Err(format!("bytecode slot {n} exceeds the format limit"));
             }
             Instruction::Call(_, n)
+            | Instruction::CallAsync(_, n)
             | Instruction::CallValue(n)
             | Instruction::MakeClosure(_, n)
             | Instruction::MakeArray(n)
             | Instruction::MakeTuple(n)
+            | Instruction::MakeTypedTuple(n, _)
             | Instruction::MakeTypedArray(n, _)
             | Instruction::MakeRecord(n)
                 if *n > LIMIT =>
@@ -748,6 +963,16 @@ impl Writer {
                 self.byte(0)?;
                 self.data(&n.to_le_bytes())?;
             }
+            Value::UInt(n) => {
+                self.byte(8)?;
+                self.data(&n.to_le_bytes())?;
+            }
+            Value::BigInt(n) => {
+                self.byte(9)?;
+                let bytes = n.to_signed_bytes_le();
+                self.index(bytes.len())?;
+                self.data(&bytes)?;
+            }
             Value::Float(n) => {
                 self.byte(1)?;
                 self.data(&n.to_le_bytes())?;
@@ -755,6 +980,10 @@ impl Writer {
             Value::Bool(b) => {
                 self.byte(2)?;
                 self.byte(u8::from(*b))?;
+            }
+            Value::Char(character) => {
+                self.byte(7)?;
+                self.data(&(*character as u32).to_le_bytes())?;
             }
             Value::Nil => self.byte(3)?,
             Value::Str(s) => {
@@ -812,6 +1041,9 @@ impl Writer {
             RuntimeType::Nominal(_) => 11,
             RuntimeType::Nullable(_) => 12,
             RuntimeType::Tuple(_) => 13,
+            RuntimeType::Char => 14,
+            RuntimeType::UInt => 15,
+            RuntimeType::BigInt => 16,
         };
         self.byte(tag)?;
         match ty {
@@ -893,12 +1125,27 @@ impl<'a> Reader<'a> {
         self.budget.node(0)?;
         Ok(match self.byte()? {
             0 => Value::Int(i64::from_le_bytes(self.take(8)?.try_into().unwrap())),
+            8 => Value::UInt(u64::from_le_bytes(self.take(8)?.try_into().unwrap())),
+            9 => {
+                let length = self.index()?;
+                self.budget.string(length)?;
+                let bytes = self.take(length)?;
+                let number = num_bigint::BigInt::from_signed_bytes_le(bytes);
+                if number.to_signed_bytes_le().as_slice() != bytes {
+                    return Err("noncanonical bytecode bigint".into());
+                }
+                Value::BigInt(number)
+            }
             1 => Value::Float(f64::from_le_bytes(self.take(8)?.try_into().unwrap())),
             2 => Value::Bool(match self.byte()? {
                 0 => false,
                 1 => true,
                 _ => return Err("invalid bytecode boolean".into()),
             }),
+            7 => {
+                let scalar = u32::from_le_bytes(self.take(4)?.try_into().unwrap());
+                Value::Char(char::from_u32(scalar).ok_or("invalid bytecode Unicode scalar")?)
+            }
             3 => Value::Nil,
             4 => Value::Str(self.string()?),
             5 => Value::Function(self.index()?),
@@ -939,6 +1186,9 @@ impl<'a> Reader<'a> {
                 }
                 RuntimeType::Tuple(items)
             }
+            14 => RuntimeType::Char,
+            15 => RuntimeType::UInt,
+            16 => RuntimeType::BigInt,
             tag => return Err(format!("invalid runtime type tag {tag}")),
         })
     }
@@ -1015,6 +1265,8 @@ fn type_tag(ty: NativeType) -> u8 {
         NativeType::Float => 9,
         NativeType::Bool => 10,
         NativeType::StrBuf => 11,
+        NativeType::Char => 13,
+        NativeType::UInt => 14,
     }
 }
 fn read_type(tag: u8) -> Result<NativeType> {
@@ -1031,6 +1283,8 @@ fn read_type(tag: u8) -> Result<NativeType> {
         9 => NativeType::Float,
         10 => NativeType::Bool,
         11 => NativeType::StrBuf,
+        13 => NativeType::Char,
+        14 => NativeType::UInt,
         _ => return Err(format!("unknown native ABI type tag {tag}")),
     })
 }

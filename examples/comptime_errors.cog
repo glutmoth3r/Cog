@@ -1,19 +1,19 @@
-include std;
+@!include("std")
 use io;
 
-comptime fn with_default(value: int?) -> int {
+@comptime fn with_default(value: int?) -> int {
     value ?? 5
 }
 
-comptime fn recover_division(value: int) -> int {
+@comptime fn recover_division(value: int) -> int {
     value ?! 9
 }
 
-comptime fn fail() -> int {
+@comptime fn fail() -> int {
     (1 / 0)!!
 }
 
-comptime fn recover_propagated_error() -> int {
+@comptime fn recover_propagated_error() -> int {
     try {
         fail();
     } catch (error) {
@@ -22,10 +22,10 @@ comptime fn recover_propagated_error() -> int {
     0
 }
 
-comptime EMPTY = with_default(nil);
-comptime PRESENT = with_default(4);
-comptime RECOVERED = recover_division(1 / 0);
-comptime PROPAGATED = recover_propagated_error();
+@comptime const EMPTY = with_default(nil);
+@comptime const PRESENT = with_default(4);
+@comptime const RECOVERED = recover_division(1 / 0);
+@comptime const PROPAGATED = recover_propagated_error();
 
 fn main() -> nil {
     io::println(EMPTY)!!;

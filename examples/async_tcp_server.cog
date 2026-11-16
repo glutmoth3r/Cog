@@ -1,0 +1,32 @@
+@!include("std")
+use bytes;
+use io;
+use async::net;
+
+@async fn client() -> nil {
+    const socket = await net::connect("127.0.0.1", 18767, 5000)!!;
+    const request = bytes::from_str("ping")!!;
+    await net::write_all(socket, request)!!;
+    await net::shutdown_write(socket)!!;
+
+    const response = await net::read_all(socket)!!;
+    io::println(bytes::to_str(response, 0, bytes::len(response)!!)!!);
+    io::close(socket)!!;
+}
+
+@async fn main() -> nil {
+    const listener = await net::listen("127.0.0.1", 18767)!!;
+    const accept_task = spawn(net::accept(listener, 5000, 5000));
+    const client_task = spawn(client());
+
+    const connection = await accept_task!!;
+    const request = await net::read_exact(connection, 4)!!;
+    const prefix = bytes::from_str("ack:")!!;
+    const response = bytes::concat(prefix, request)!!;
+    await net::write_all(connection, response)!!;
+    await net::shutdown_write(connection)!!;
+
+    await client_task!!;
+    io::close(connection)!!;
+    io::close(listener)!!;
+}

@@ -1,5 +1,6 @@
 use cog::{bytecode, config, frontend, interpreter, lockfile, project};
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -29,6 +30,12 @@ impl Fixture {
         let path = self.0.join(path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
+    }
+    fn dependency_alias(&self, alias: &str, path: &str) {
+        let manifest = self.0.join("dependencies.kdl");
+        let mut text = std::fs::read_to_string(&manifest).unwrap_or_default();
+        text.push_str(&format!("{alias} path={path:?}\n"));
+        std::fs::write(manifest, text).unwrap();
     }
     fn cli(&self, command: &str, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_cog"))
@@ -72,7 +79,7 @@ fn with_explicit_std_package(source: &str) -> String {
         "math", "ord", "process", "random", "sort", "str", "time",
     ];
 
-    let has_std_include = source.contains("include std;");
+    let has_std_include = source.contains("@!include(\"std\")");
     let is_entry = source.contains("fn main");
     let source_body = source
         .strip_prefix("#!")
@@ -98,10 +105,44 @@ fn with_explicit_std_package(source: &str) -> String {
     }
 
     if let Some((shebang, rest)) = source.split_once('\n').filter(|_| source.starts_with("#!")) {
-        format!("{shebang}\ninclude std;\n{rest}")
+        format!("{shebang}\n@!include(\"std\")\n{rest}")
     } else {
-        format!("include std;\n{source}")
+        format!("@!include(\"std\")\n{source}")
     }
+}
+
+fn read_cogpkg_tar(path: &Path) -> Vec<u8> {
+    zstd::stream::decode_all(std::fs::File::open(path).unwrap()).unwrap()
+}
+
+fn write_cogpkg_tar(path: &Path, tar_bytes: &[u8]) {
+    let mut output = std::fs::File::create(path).unwrap();
+    zstd::stream::copy_encode(tar_bytes, &mut output, 6).unwrap();
+}
+
+fn rewrite_cogpkg_file(archive: &Path, output: &Path, target: &str, replacement: &[u8]) {
+    let tar_bytes = read_cogpkg_tar(archive);
+    let mut rewritten = tar::Builder::new(Vec::new());
+    let mut replaced = false;
+    for item in tar::Archive::new(tar_bytes.as_slice()).entries().unwrap() {
+        let mut item = item.unwrap();
+        let path = item.path().unwrap().to_path_buf();
+        let mut contents = Vec::new();
+        item.read_to_end(&mut contents).unwrap();
+        if path == Path::new(target) {
+            contents = replacement.to_vec();
+            replaced = true;
+        }
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        rewritten
+            .append_data(&mut header, path, contents.as_slice())
+            .unwrap();
+    }
+    assert!(replaced, "missing package file {target}");
+    write_cogpkg_tar(output, &rewritten.into_inner().unwrap());
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -194,10 +235,10 @@ fn cli_check_prints_non_fatal_source_warnings() {
 #[test]
 fn public_comptime_values_import_and_materialize_across_modules() {
     let f = Fixture::new();
-    f.write("constants.cog", "public comptime BASE: int = 3;");
+    f.write("constants.cog", "@public @comptime const BASE: int = 3;");
     f.write(
         "main.cog",
-        "use constants; use io; comptime VALUE: int = constants::BASE * 2; fn main() { io::println(VALUE); }",
+        "use constants; use io; @comptime const VALUE: int = constants::BASE * 2; fn main() { io::println(VALUE); }",
     );
     assert_eq!(f.run(), "6\n");
 }
@@ -207,11 +248,11 @@ fn public_comptime_functions_import_and_materialize_across_modules() {
     let f = Fixture::new();
     f.write(
         "constants.cog",
-        "public comptime fn double(value: int) -> int { return value * 2; }",
+        "@public @comptime fn double(value: int) -> int { return value * 2; }",
     );
     f.write(
         "main.cog",
-        "use constants; use io; comptime VALUE: int = constants::double(21); fn main() { io::println(VALUE); }",
+        "use constants; use io; @comptime const VALUE: int = constants::double(21); fn main() { io::println(VALUE); }",
     );
     assert_eq!(f.run(), "42\n");
 }
@@ -373,12 +414,55 @@ fn selective_core_constant_alias_works_in_interpolation() {
 }
 
 #[test]
+fn tuple_elements_resolve_imports_generics_shadowing_and_visibility() {
+    let f = Fixture::new();
+    f.write(
+        "model.cog",
+        r#"
+        public const BASE: int = 7;
+        public fn identity[T: type](value: T) -> T { value }
+        public struct Box[T: type] { value: T }
+        fn hidden() -> int { 99 }
+        "#,
+    );
+    f.write(
+        "main.cog",
+        r#"
+        use io; use model::{BASE as base, identity as keep, Box as Wrap};
+        fn main() {
+            const values = (base, keep[int](9), (Wrap[int](11), base));
+            io::println(values.0);
+            io::println(values.1);
+            io::println((values.2).0.value);
+            if true {
+                const base = 3;
+                const local = (base, keep[int](4));
+                io::println(local.0);
+                io::println(local.1);
+            }
+        }
+        "#,
+    );
+    assert_eq!(f.run(), "7\n9\n11\n3\n4\n");
+
+    f.write(
+        "main.cog",
+        "use model; fn main() { const values = (model::hidden(), 1); }",
+    );
+    let error = f.compile().unwrap_err();
+    assert!(error.contains("private"), "{error}");
+    assert!(!error.contains("E0002"), "{error}");
+}
+
+#[test]
 fn comptime_packages_include_sources_and_select_duplicate_module_names() {
     let f = Fixture::new();
     f.write("package.kdl", "package \"app\" version=\"0.1.0\"\n");
+    f.dependency_alias("game", "src/game");
+    f.write("src/game/package.kdl", "package \"game\" version=\"1\"\n");
     f.write(
         "src/main.cog",
-        "include game; include std; use io; use random from game as game_random; use random from std as std_random; fn main() { io::println(game_random::answer()); }",
+        "@!include(\"game\") @!include(\"std\") use io; use random from game as game_random; use random from std as std_random; fn main() { io::println(game_random::answer()); }",
     );
     f.write("src/game/random.cog", "public fn answer() -> int { 42 }");
     assert_eq!(f.run(), "42\n");
@@ -388,7 +472,7 @@ fn comptime_packages_include_sources_and_select_duplicate_module_names() {
 
     f.write(
         "src/main.cog",
-        "include game; include std; use random; fn main() {}",
+        "@!include(\"game\") @!include(\"std\") use random; fn main() {}",
     );
     let error = f.compile().unwrap_err();
     assert!(error.contains("ambiguous module `random`"), "{error}");
@@ -396,16 +480,61 @@ fn comptime_packages_include_sources_and_select_duplicate_module_names() {
 }
 
 #[test]
+fn include_directives_resolve_only_builtin_or_declared_manifest_aliases() {
+    let f = Fixture::new();
+    f.dependency();
+    f.write_raw(
+        "src/main.cog",
+        "@!include(\"std\")\n@!include(\"dep\")\nuse io;\nuse dep;\nfn main() { io::println(dep::answer()); }\n",
+    );
+    assert_eq!(f.run(), "42\n");
+
+    let f = Fixture::new();
+    f.write("package.kdl", "package \"app\" version=\"0.1.0\"\n");
+    f.write_raw("src/main.cog", "@!include(\"missing\")\nfn main() {}\n");
+    let error = f.compile().unwrap_err();
+    assert!(
+        error
+            .contains("unknown package dependency alias `missing`; declare it in dependencies.kdl"),
+        "{error}"
+    );
+}
+
+#[test]
+fn comptime_const_attributes_evaluate_before_runtime_execution() {
+    let f = Fixture::new();
+    f.write_raw(
+        "main.cog",
+        r#"@!include("std")
+use io;
+
+@public @comptime fn double(value: int) -> int { value * 2 }
+@comptime const BASE: int = 21;
+
+fn main() {
+    @comptime const RESULT: int = double(BASE);
+    io::println(RESULT);
+}
+"#,
+    );
+    assert_eq!(f.run(), "42\n");
+}
+
+#[test]
 fn block_imports_preserve_package_selection_and_aliases() {
     let f = Fixture::new();
+    f.dependency_alias("game", "src/game");
+    f.dependency_alias("other", "src/other");
+    f.write("src/game/package.kdl", "package \"game\" version=\"1\"\n");
+    f.write("src/other/package.kdl", "package \"other\" version=\"1\"\n");
     f.write("src/game/dice.cog", "public fn answer() -> int { 1 }");
     f.write("src/other/dice.cog", "public fn answer() -> int { 2 }");
     f.write_raw(
         "src/main.cog",
         r#"
-        include std;
-        include game;
-        include other;
+        @!include("std")
+        @!include("game")
+        @!include("other")
         use io;
         fn main() {
             use dice from game as first;
@@ -425,23 +554,21 @@ fn block_imports_preserve_package_selection_and_aliases() {
 #[test]
 fn block_imports_reject_unknown_or_unconnected_packages() {
     let f = Fixture::new();
+    f.dependency_alias("game", "src/game");
+    f.write("src/game/package.kdl", "package \"game\" version=\"1\"\n");
     f.write("src/marker.cog", "public fn answer() -> int { 99 }");
-    f.write(
-        "src/game/bytes.cog",
-        "public fn new(size: int) -> int { 99 }",
-    );
     for (source, expected) in [
         (
             "fn main() { use marker from absent; marker::answer(); }",
             "unknown module `marker` in package `absent`",
         ),
         (
-            "fn main() { use bytes from game; bytes::new(1); }",
-            "unknown module `bytes` in package `game`",
+            "fn main() { use dice from game; dice::answer(); }",
+            "unknown module `dice` in package `game`",
         ),
         (
-            "include game; fn main() { use bytes from std; bytes::new(1); }",
-            "unknown module `bytes` in package `std`",
+            "@!include(\"game\") fn main() { use ascii from std; ascii::is_digit(49); }",
+            "unknown module `ascii` in package `std`",
         ),
     ] {
         f.write_raw("src/main.cog", source);
@@ -455,6 +582,8 @@ fn block_imports_reject_unknown_or_unconnected_packages() {
 #[test]
 fn nested_package_import_forms_resolve_a_unique_provider() {
     let f = Fixture::new();
+    f.dependency_alias("game", "src/game");
+    f.write("src/game/package.kdl", "package \"game\" version=\"1\"\n");
     f.write("src/game/util/dice.cog", "public fn answer() -> int { 42 }");
     for (import, call) in [
         ("use util::dice;", "dice::answer()"),
@@ -467,7 +596,7 @@ fn nested_package_import_forms_resolve_a_unique_provider() {
             f.write_raw(
                 "src/main.cog",
                 &format!(
-                    "include std; include game; use io; {global} fn main() {{ {local} io::println({call}); }}"
+                    "@!include(\"std\") @!include(\"game\") use io; {global} fn main() {{ {local} io::println({call}); }}"
                 ),
             );
             assert_eq!(f.run(), "42\n", "{import}, in_block={in_block}");
@@ -479,13 +608,17 @@ fn nested_package_import_forms_resolve_a_unique_provider() {
 fn nested_imports_reject_multiple_providers_including_local_modules() {
     for include_other in [false, true] {
         let f = Fixture::new();
+        f.dependency_alias("game", "src/game");
+        f.write("src/game/package.kdl", "package \"game\" version=\"1\"\n");
         f.write("src/game/util/dice.cog", "public fn answer() -> int { 1 }");
         let includes = if include_other {
+            f.dependency_alias("other", "src/other");
+            f.write("src/other/package.kdl", "package \"other\" version=\"1\"\n");
             f.write("src/other/util/dice.cog", "public fn answer() -> int { 2 }");
-            "include game; include other;"
+            "@!include(\"game\") @!include(\"other\")"
         } else {
             f.write("src/util/dice.cog", "public fn answer() -> int { 3 }");
-            "include game;"
+            "@!include(\"game\")"
         };
         for import in [
             "use util::dice;",
@@ -511,6 +644,10 @@ fn nested_imports_reject_multiple_providers_including_local_modules() {
 #[test]
 fn explicit_nested_import_paths_select_the_requested_provider() {
     let f = Fixture::new();
+    f.dependency_alias("game", "src/game");
+    f.dependency_alias("other", "src/other");
+    f.write("src/game/package.kdl", "package \"game\" version=\"1\"\n");
+    f.write("src/other/package.kdl", "package \"other\" version=\"1\"\n");
     f.write("src/game/util/dice.cog", "public fn answer() -> int { 1 }");
     f.write("src/other/util/dice.cog", "public fn answer() -> int { 2 }");
     f.write("src/util/dice.cog", "public fn answer() -> int { 3 }");
@@ -524,7 +661,7 @@ fn explicit_nested_import_paths_select_the_requested_provider() {
             f.write_raw(
                 "src/main.cog",
                 &format!(
-                    "include std; include game; include other; use io; {global} fn main() {{ {local} io::println(pick()); }}"
+                    "@!include(\"std\") @!include(\"game\") @!include(\"other\") use io; {global} fn main() {{ {local} io::println(pick()); }}"
                 ),
             );
             assert_eq!(f.run(), expected, "{import}, in_block={in_block}");
@@ -535,6 +672,8 @@ fn explicit_nested_import_paths_select_the_requested_provider() {
 #[test]
 fn nested_package_imports_preserve_member_visibility() {
     let f = Fixture::new();
+    f.dependency_alias("game", "src/game");
+    f.write("src/game/package.kdl", "package \"game\" version=\"1\"\n");
     f.write("src/game/util/dice.cog", "fn secret() -> int { 42 }");
     for (import, call, expected) in [
         ("use util::dice;", "dice::secret()", "`secret` is private"),
@@ -548,7 +687,7 @@ fn nested_package_imports_preserve_member_visibility() {
     ] {
         f.write_raw(
             "src/main.cog",
-            &format!("include game; {import} fn main() {{ {call}; }}"),
+            &format!("@!include(\"game\") {import} fn main() {{ {call}; }}"),
         );
         let error = f.compile().unwrap_err();
         assert!(error.contains("error[E1003]"), "{error}");
@@ -557,11 +696,11 @@ fn nested_package_imports_preserve_member_visibility() {
 }
 
 #[test]
-fn include_edges_participate_in_package_cycle_diagnostics() {
+fn manifest_dependencies_participate_in_package_cycle_diagnostics() {
     for transitive in [false, true] {
         let f = Fixture::new();
         f.write("package.kdl", "package \"app\" version=\"1\"\n");
-        f.write_raw("src/main.cog", "include game; fn main() {}");
+        f.dependency_alias("game", "src/game");
         f.write("src/game/package.kdl", "package \"game\" version=\"1\"\n");
         let expected = if transitive {
             f.write("src/game/dependencies.kdl", "leaf path=\"../leaf\"\n");
@@ -584,15 +723,13 @@ fn include_edges_participate_in_package_cycle_diagnostics() {
 }
 
 #[test]
-fn including_the_current_package_reports_a_located_cycle() {
+fn manifest_self_dependency_reports_a_located_cycle() {
     let f = Fixture::new();
     f.write("package.kdl", "package \"app\" version=\"1\"\n");
-    let path = relative_path(&std::env::current_dir().unwrap(), &f.0)
-        .to_string_lossy()
-        .replace('\\', "/");
+    f.dependency_alias("app", ".");
     f.write_raw(
         "src/main.cog",
-        &format!("include app from {path:?}; fn main() {{}}"),
+        &format!("@!include(\"app\") fn main() {{}}"),
     );
     let error = f.compile().unwrap_err();
     assert!(error.contains("error[E3001]"), "{error}");
@@ -600,7 +737,7 @@ fn including_the_current_package_reports_a_located_cycle() {
         error.contains("cyclic package dependency: app -> app"),
         "{error}"
     );
-    assert!(error.contains("main.cog:1:1"), "{error}");
+    assert!(error.contains("dependencies.kdl:1:1"), "{error}");
 }
 
 #[test]
@@ -614,6 +751,8 @@ fn included_packages_can_share_an_acyclic_dependency_and_a_stable_lockfile() {
         );
     }
     f.write("src/shared/lib.cog", "public fn answer() -> int { 7 }");
+    f.dependency_alias("first", "src/first");
+    f.dependency_alias("second", "src/second");
     for name in ["first", "second"] {
         f.write(
             &format!("src/{name}/dependencies.kdl"),
@@ -626,7 +765,7 @@ fn included_packages_can_share_an_acyclic_dependency_and_a_stable_lockfile() {
     }
     f.write_raw(
         "src/main.cog",
-        "include std; include first; include second; use io; use first; use second; fn main() { io::println(first::answer() + second::answer()); }",
+        "@!include(\"std\") @!include(\"first\") @!include(\"second\") use io; use first; use second; fn main() { io::println(first::answer() + second::answer()); }",
     );
     assert_eq!(f.run(), "14\n");
     success(&f.cli("build", &[]));
@@ -646,51 +785,61 @@ fn package_alias_conflicts_are_rejected_in_both_declaration_orders() {
         for reverse in [false, true] {
             let f = Fixture::new();
             f.write("package.kdl", "package \"app\" version=\"1\"\n");
-            f.write("packages/first/lib.cog", "");
-            f.write("packages/second/lib.cog", "");
-            let path = |name| {
-                relative_path(&std::env::current_dir().unwrap(), &f.0.join(name))
-                    .to_string_lossy()
-                    .replace('\\', "/")
-            };
-            let first = format!("include {alias} from {:?};", path("packages/first"));
-            let second = if alias == "std" {
-                "include std;".to_owned()
+            for name in ["first", "second"] {
+                f.write(
+                    &format!("packages/{name}/package.kdl"),
+                    &format!("package {name:?} version=\"1\"\n"),
+                );
+            }
+            let first = if alias == "std" {
+                "std path=\"packages/first\"\n".to_owned()
             } else {
-                format!("include {alias} from {:?};", path("packages/second"))
+                "game path=\"packages/first\"\n".to_owned()
+            };
+            let second = if alias == "std" {
+                String::new()
+            } else {
+                "game path=\"packages/second\"\n".to_owned()
             };
             let (first, second) = if reverse {
                 (second, first)
             } else {
                 (first, second)
             };
+            f.write_raw("dependencies.kdl", &(first + &second));
             f.write_raw(
                 "src/main.cog",
-                &format!("{first}\n{second}\nfn main() {{}}"),
+                &format!("@!include(\"{alias}\")\nfn main() {{}}"),
             );
             let output = f.cli("build", &[]);
             assert!(!output.status.success());
             let error = String::from_utf8(output.stderr).unwrap();
-            assert!(error.contains("error[E3001]"), "{error}");
-            assert!(
-                error.contains(&format!(
-                    "package alias `{alias}` selects more than one package"
-                )),
-                "{error}"
-            );
-            assert!(error.contains("main.cog:2:1"), "{error}");
+            if alias == "std" {
+                assert!(error.contains("error[E3001]"), "{error}");
+                assert!(
+                    error.contains("package alias `std` selects more than one package"),
+                    "{error}"
+                );
+                assert!(error.contains("main.cog:1:1"), "{error}");
+            } else {
+                assert!(error.contains("error[E3003]"), "{error}");
+                assert!(
+                    error.contains("invalid or duplicate dependency alias `game`"),
+                    "{error}"
+                );
+                assert!(error.contains("dependencies.kdl:"), "{error}");
+            }
             assert!(!f.0.join("cog.lock").exists());
             assert!(!f.0.join("target/app.cogb").exists());
         }
     }
 }
-
 #[test]
 fn standard_include_cannot_replace_a_manifest_dependency_alias() {
     let f = Fixture::new();
     f.dependency();
     f.write("dependencies.kdl", "std path=\"packages/dep\"\n");
-    f.write_raw("src/main.cog", "include std; fn main() {}");
+    f.write_raw("src/main.cog", "@!include(\"std\") fn main() {}");
     let output = f.cli("build", &[]);
     assert!(!output.status.success());
     let error = String::from_utf8(output.stderr).unwrap();
@@ -709,7 +858,7 @@ fn repeated_includes_of_the_same_package_preserve_manifest_resolution() {
     f.dependency();
     f.write_raw(
         "src/main.cog",
-        "include std; include dep; include std; include dep; use io; use dep; fn main() { io::println(dep::answer()); }",
+        "@!include(\"std\") @!include(\"dep\") @!include(\"std\") @!include(\"dep\") use io; use dep; fn main() { io::println(dep::answer()); }",
     );
     assert_eq!(f.run(), "42\n");
     success(&f.cli("build", &[]));
@@ -727,8 +876,9 @@ fn locked_builds_reject_existing_lockfiles_with_include_cycles() {
     let f = Fixture::new();
     f.write("package.kdl", "package \"app\" version=\"1\"\n");
     f.write("src/game/package.kdl", "package \"game\" version=\"1\"\n");
+    f.dependency_alias("game", "src/game");
     f.write("src/game/dependencies.kdl", "app path=\"../..\"\n");
-    f.write_raw("src/main.cog", "include game; fn main() {}");
+    f.write_raw("src/main.cog", "@!include(\"game\") fn main() {}");
     let text = "COGLOCK 1\nroot 0\npkg 0 \"app\" \"1\" path \".\"\npkg 1 \"game\" \"1\" path \"src/game\"\ndep 0 \"game\" 1\ndep 1 \"app\" 0\n";
     f.write_raw("cog.lock", text);
     let output = f.cli("build", &["--locked"]);
@@ -744,7 +894,7 @@ fn locked_builds_reject_existing_lockfiles_with_include_cycles() {
 }
 
 #[test]
-fn cli_rejects_include_directives_outside_the_project_entry_point() {
+fn cli_rejects_package_directives_outside_the_project_entry_point() {
     let f = Fixture::new();
     f.write("package.kdl", "package \"app\" version=\"1\"\n");
     f.write_raw(
@@ -752,9 +902,9 @@ fn cli_rejects_include_directives_outside_the_project_entry_point() {
         "use helper; fn main() { helper::answer(); }",
     );
     for include in [
-        "include missing;",
-        "include std;",
-        "include missing from \"./definitely_absent\";",
+        "@!include(\"missing\")",
+        "@!include(\"std\")",
+        "@!include(\"dep\")",
     ] {
         f.write_raw(
             "src/helper.cog",
@@ -780,11 +930,10 @@ fn cli_rejects_include_directives_outside_the_project_entry_point() {
 #[test]
 fn compile_source_rejects_source_package_includes_with_located_diagnostics() {
     for (include, package) in [
-        ("include missing;", "missing"),
-        ("include missing from \"./definitely_absent\";", "missing"),
-        ("include std from \"./definitely_absent\";", "std"),
+        ("@!include(\"missing\")", "missing"),
+        ("@!include(\"dep\")", "dep"),
     ] {
-        let source = format!("include std;\n{include}\nfn main() {{}}");
+        let source = format!("@!include(\"std\")\n{include}\nfn main() {{}}");
         let error = project::compile_source("unsupported-includes.cog", &source).unwrap_err();
         assert!(error.contains("error[E3001]"), "{error}");
         assert!(
@@ -803,12 +952,57 @@ fn compile_source_rejects_source_package_includes_with_located_diagnostics() {
 fn compile_source_preserves_embedded_standard_package_inclusion() {
     let program = project::compile_source(
         "embedded-standard.cog",
-        "include std; include std; use io; use bytes from std; fn main() { io::println(bytes::len(bytes::new(4))); }",
+        "@!include(\"std\") @!include(\"std\") use io; use bytes from std; fn main() { io::println(bytes::len(bytes::new(4))); }",
     ).unwrap();
     let program = bytecode::decode(&bytecode::encode(&program).unwrap()).unwrap();
     let mut output = Vec::new();
     interpreter::run_with(&program, &mut output).unwrap();
     assert_eq!(output, b"4\n");
+}
+
+#[test]
+fn entry_point_errors_preserve_independent_standard_and_source_package_inclusions() {
+    let f = Fixture::new();
+    f.write("package.kdl", "package \"app\" version=\"0.1.0\"\n");
+    f.dependency_alias("game", "src/game");
+    f.write("src/game/package.kdl", "package \"game\" version=\"1\"\n");
+    f.write("src/game/random.cog", "public fn answer() -> int { 42 }");
+    for bad in [r#""\q""#, "1 +", "1 io::println(2)"] {
+        f.write_raw(
+            "src/main.cog",
+            &format!(
+                "@!include(\"std\") @!include(\"game\") use io; use random from game as game_random;\nfn main() {{ io::println({bad}); io::println(game_random::answer()); const wrong: int = false; }}"
+            ),
+        );
+        for command in ["check", "build", "run"] {
+            let output = f.cli(command, &[]);
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+            let error = String::from_utf8(output.stderr).unwrap();
+            assert!(error.contains("main.cog:2:"), "{error}");
+            assert!(error.contains("type mismatch"), "{error}");
+            assert!(!error.contains("unknown import"), "{error}");
+            assert!(!error.contains("unknown module"), "{error}");
+            assert!(!error.contains("unresolved package inclusion"), "{error}");
+            assert!(!f.0.join("cog.lock").exists());
+            assert!(!f.0.join("target/app.cogb").exists());
+        }
+    }
+}
+
+#[test]
+fn cli_runs_hexadecimal_terminal_escapes_with_standard_package_inclusion() {
+    let f = Fixture::new();
+    f.write_raw(
+        "src/main.cog",
+        r#"@!include("std")
+use io;
+fn main() { io::println("\x1B[2J\x1B[H"); }"#,
+    );
+    success(&f.cli("check", &[]));
+    let output = f.cli("run", &[]);
+    success(&output);
+    assert_eq!(output.stdout, b"\x1B[2J\x1B[H\n");
 }
 
 #[test]
@@ -833,7 +1027,7 @@ fn root_standard_modules_require_include_in_cli_and_in_memory_compilation() {
         let diagnostic = project::compile_source("missing-std.cog", &source).unwrap_err();
         assert!(diagnostic.contains("error[E1003]"), "{diagnostic}");
 
-        let connected = format!("include std;\n{source}");
+        let connected = format!("@!include(\"std\")\n{source}");
         f.write_raw("main.cog", &connected);
         success(&f.cli("check", &[]));
         let compiled = project::compile_source("connected-std.cog", &connected).unwrap();
@@ -851,10 +1045,13 @@ fn root_standard_modules_require_include_in_cli_and_in_memory_compilation() {
 #[test]
 fn prepared_projects_reject_new_unresolved_include_declarations() {
     let f = Fixture::new();
-    f.write_raw("main.cog", "include std; fn main() {}");
+    f.write_raw("main.cog", "@!include(\"std\") fn main() {}");
     let prepared = project::prepare(&f.0, None, false)
         .unwrap_or_else(|errors| panic!("{}", frontend::render(&errors)));
-    f.write_raw("main.cog", "include std;\ninclude missing;\nfn main() {}");
+    f.write_raw(
+        "main.cog",
+        "@!include(\"std\")\n@!include(\"missing\")\nfn main() {}",
+    );
     let loaded = prepared.resolve();
     let error = project::compile(loaded.program, loaded.diagnostics, &loaded.names).unwrap_err();
     assert!(error.contains("error[E3001]"), "{error}");
@@ -886,7 +1083,7 @@ fn standard_library_is_connected_as_an_explicit_comptime_package() {
 
     f.write(
         "main.cog",
-        "include std; use io; use bytes from std; fn main() { io::println(bytes::len(bytes::new(1))); }",
+        "@!include(\"std\") use io; use bytes from std; fn main() { io::println(bytes::len(bytes::new(1))); }",
     );
     assert_eq!(f.run(), "1\n");
 }
@@ -895,38 +1092,32 @@ fn standard_library_is_connected_as_an_explicit_comptime_package() {
 fn comptime_package_import_without_collision_resolves_unique_module() {
     let f = Fixture::new();
     f.write("package.kdl", "package \"app\" version=\"0.1.0\"\n");
+    f.dependency_alias("game", "src/game");
+    f.write("src/game/package.kdl", "package \"game\" version=\"1\"\n");
     f.write(
         "src/main.cog",
-        "include game; include std; use io; use dice; fn main() { io::println(dice::answer()); }",
+        "@!include(\"game\") @!include(\"std\") use io; use dice; fn main() { io::println(dice::answer()); }",
     );
     f.write("src/game/dice.cog", "public fn answer() -> int { 7 }");
     assert_eq!(f.run(), "7\n");
 }
 
 #[test]
-fn comptime_package_paths_are_relative_to_the_invocation_directory() {
-    let invocation_dir = std::env::current_dir().unwrap();
-    let f = Fixture::new_in(&invocation_dir.join("target"));
+fn package_dependency_paths_are_relative_to_the_manifest_directory() {
+    let f = Fixture::new();
     f.write("package.kdl", "package \"app\" version=\"0.1.0\"\n");
-    let external = f.0.join("external/game");
+    f.dependency_alias("game", "external/game");
+    f.write(
+        "external/game/package.kdl",
+        "package \"game\" version=\"1\"\n",
+    );
     f.write(
         "external/game/src/random.cog",
         "public fn answer() -> int { 9 }",
     );
-    let relative = relative_path(&invocation_dir, &external);
-    assert!(
-        relative.is_relative(),
-        "expected a relative path, got {relative:?}"
-    );
-    let relative = relative.to_string_lossy().replace('\\', "/");
-    let relative = if relative.starts_with("./") || relative.starts_with("../") {
-        relative
-    } else {
-        format!("./{relative}")
-    };
     f.write(
         "src/main.cog",
-        &format!("include game from {relative}; use io; use random from game as game_random; fn main() {{ io::println(game_random::answer()); }}"),
+        "@!include(\"std\") @!include(\"game\") use io; use random from game as game_random; fn main() { io::println(game_random::answer()); }",
     );
     assert_eq!(f.run(), "9\n");
 }
@@ -945,18 +1136,18 @@ fn process_example_builds_and_runs_through_cli_and_cached_artifact() {
     for source in [
         include_str!("../examples/processes.cog").to_owned(),
         include_str!("../examples/processes.cog")
-            .replace("use process;", "use process::run;")
-            .replace("process::run(", "run("),
+            .replace("use process;", "use process::run_sync;")
+            .replace("process::run_sync(", "run("),
         include_str!("../examples/processes.cog")
             .replace("use process;", "use process::*;")
-            .replace("process::run(", "run("),
+            .replace("process::run_sync(", "run("),
     ] {
         f.write("main.cog", &source);
         success(&f.cli("check", &[]));
         success(&f.cli("build", &[]));
         let run = f.cli("run", &[]);
         success(&run);
-        assert_eq!(run.stdout, b"hello from child\n");
+        assert_eq!(run.stdout, b"hello from child\nexplicit blocking run\n");
         assert!(run.stderr.is_empty());
     }
 }
@@ -1019,6 +1210,250 @@ fn main_argument_parameter_receives_cli_arguments_after_double_dash() {
     let empty = f.cli("run", &["--"]);
     success(&empty);
     assert_eq!(empty.stdout, b"0\n");
+}
+
+fn argument_echo_bytecode() -> Vec<u8> {
+    let program = project::compile_source(
+        "arguments.cog",
+        "@!include(\"std\") use io; fn main(args: str[]) { io::println(args.len())!!; for argument in args { io::println(argument)!!; } }",
+    )
+    .unwrap();
+    bytecode::encode(&program).unwrap()
+}
+
+#[test]
+fn bytecode_headers_allow_arbitrary_input_names_in_any_directory() {
+    let f = Fixture::new();
+    let bytes = argument_echo_bytecode();
+    for name in [
+        "tool",
+        "other/nested/tool.data",
+        "bin/tool.cogb",
+        "tools/tool.cog",
+    ] {
+        let path = f.0.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        for action in [None, Some("run"), Some("check")] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_cog"));
+            if let Some(action) = action {
+                command.arg(action);
+            }
+            let output = command.arg(&path).output().unwrap();
+            success(&output);
+            if action == Some("check") {
+                assert!(output.stdout.is_empty());
+            } else {
+                assert_eq!(output.stdout, b"0\n");
+                assert!(output.stderr.is_empty());
+            }
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        if path.extension() != Some(std::ffi::OsStr::new("cogb")) {
+            assert!(!path.with_extension("cogb").exists());
+        }
+    }
+    assert!(!f.0.join("target").exists());
+}
+
+#[test]
+fn implicit_bytecode_execution_passes_all_remaining_arguments_verbatim() {
+    let f = Fixture::new();
+    let path = f.0.join("tool.cogb");
+    std::fs::write(&path, argument_echo_bytecode()).unwrap();
+    for arguments in [
+        vec![],
+        vec![
+            "--help",
+            "-V",
+            "--output",
+            "file",
+            "run",
+            "two words",
+            "é",
+            "",
+        ],
+        vec!["--", "--debug"],
+        vec!["--use", "--plugin", "--restricted", "--color", "invalid"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_cog"))
+            .arg(&path)
+            .args(&arguments)
+            .output()
+            .unwrap();
+        success(&output);
+        let mut expected = format!("{}\n", arguments.len());
+        for argument in arguments {
+            expected.push_str(argument);
+            expected.push('\n');
+        }
+        assert_eq!(output.stdout, expected.as_bytes());
+        assert!(output.stderr.is_empty());
+    }
+    // Explicit run retains Cog options and the program-argument separator.
+    let output = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .args(["run", "--debug"])
+        .arg(&path)
+        .args(["--", "--help"])
+        .output()
+        .unwrap();
+    success(&output);
+    assert!(output.stdout.starts_with(b"bytecode\n"));
+    assert!(output.stdout.ends_with(b"1\n--help\n"));
+
+    let renamed = f.0.join("tool");
+    std::fs::copy(&path, &renamed).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .arg(&renamed)
+        .arg("--help")
+        .output()
+        .unwrap();
+    success(&output);
+    assert_eq!(output.stdout, b"1\n--help\n");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .arg("--restricted")
+        .arg(&renamed)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("permission denied"));
+}
+
+#[test]
+fn extensionless_build_outputs_are_validated_and_cached() {
+    let f = Fixture::new();
+    f.write("main.cog", "use io; fn main() { io::println(42)!!; }");
+    std::fs::create_dir(f.0.join("bin")).unwrap();
+    for name in ["bin/tool", "bin/tool.data"] {
+        let output = f.0.join(name);
+        let first = f.cli("build", &["-o", output.to_str().unwrap()]);
+        success(&first);
+        assert!(first.stderr.starts_with(b"built "));
+        bytecode::decode(&std::fs::read(&output).unwrap()).unwrap();
+        let again = f.cli("build", &["-o", output.to_str().unwrap()]);
+        success(&again);
+        assert!(again.stderr.starts_with(b"finished "));
+        let ran = Command::new(env!("CARGO_BIN_EXE_cog"))
+            .arg(&output)
+            .output()
+            .unwrap();
+        success(&ran);
+        assert_eq!(ran.stdout, b"42\n");
+        assert!(ran.stderr.is_empty());
+    }
+}
+
+#[test]
+fn arbitrary_output_names_cannot_replace_project_sources_or_configuration() {
+    let f = Fixture::new();
+    f.dependency();
+    f.write("main.cog", "use dep; fn main() { dep::answer(); }");
+    f.write_raw("build.kdl", "target \"app\" entry=\"main.cog\"\n");
+    success(&f.cli("build", &[]));
+    for name in [
+        "main.cog",
+        "package.kdl",
+        "dependencies.kdl",
+        "build.kdl",
+        "packages/dep/src/lib.cog",
+        "cog.lock",
+    ] {
+        let path = f.0.join(name);
+        let before = std::fs::read(&path).unwrap();
+        let output = f.cli("build", &["-o", path.to_str().unwrap()]);
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("output would overwrite a project input"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+}
+
+#[test]
+fn new_output_paths_cannot_alias_missing_configuration_or_parent_traversal_inputs() {
+    for name in [
+        "not-created/../main.cog",
+        "cog.lock",
+        "build.kdl",
+        "dependencies.kdl",
+        "BUILD.KDL",
+        "DEPENDENCIES.KDL",
+        "COG.LOCK",
+    ] {
+        let f = Fixture::new();
+        if name.eq_ignore_ascii_case("cog.lock") {
+            f.dependency();
+        } else {
+            f.write("package.kdl", "package \"app\" version=\"1\"\n");
+        }
+        f.write("main.cog", "use io; fn main() { io::println(42)!!; }");
+        let source = std::fs::read(f.0.join("main.cog")).unwrap();
+        let path = f.0.join(name);
+        let output = f.cli("build", &["-o", path.to_str().unwrap()]);
+        assert!(!output.status.success(), "accepted output {name}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("output would overwrite a project input")
+        );
+        assert_eq!(std::fs::read(f.0.join("main.cog")).unwrap(), source);
+        assert!(!f.0.join("not-created").exists());
+        if name != "not-created/../main.cog" {
+            assert!(!path.exists());
+        }
+    }
+}
+
+#[test]
+fn malformed_renamed_bytecode_is_rejected_without_fallback_or_writes() {
+    let f = Fixture::new();
+    let mut unsupported = argument_echo_bytecode();
+    unsupported[4..6].copy_from_slice(&u16::MAX.to_le_bytes());
+    for bytes in [unsupported, b"COG\0".to_vec()] {
+        for name in ["tool", "tool.data", "tool.cog", "tool.cogb"] {
+            let path = f.0.join(name);
+            std::fs::write(&path, &bytes).unwrap();
+            for action in [None, Some("run"), Some("check")] {
+                let mut command = Command::new(env!("CARGO_BIN_EXE_cog"));
+                if let Some(action) = action {
+                    command.arg(action);
+                }
+                let output = command.arg(&path).output().unwrap();
+                assert!(!output.status.success());
+                assert!(output.stdout.is_empty());
+                assert!(String::from_utf8_lossy(&output.stderr).contains("bytecode"));
+            }
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+    }
+    assert!(!f.0.join("target").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn renamed_bytecode_accepts_non_utf8_paths_but_checks_program_argument_utf8_at_runtime() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    let f = Fixture::new();
+    let path = f.0.join(OsString::from_vec(b"tool-\xff".to_vec()));
+    std::fs::write(&path, argument_echo_bytecode()).unwrap();
+    for action in [None, Some("run"), Some("check")] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cog"));
+        if let Some(action) = action {
+            command.arg(action);
+        }
+        success(&command.arg(&path).output().unwrap());
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .arg(&path)
+        .arg(OsString::from_vec(vec![0xff]))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot parse OS argument as str"));
 }
 
 #[test]
@@ -1091,7 +1526,7 @@ fn restricted_cli_allows_output_and_denies_other_host_effects_for_source_and_art
     assert_eq!(output.stdout, b"allowed\n");
     for source in [
         "use io; fn main() { io::open(\"must-not-exist\", \"w\", 0)!!; }",
-        "use process; fn main() { const args: str[] = []; process::run(\"unused\", args)!!; }",
+        "use process; fn main() { const args: str[] = []; process::run_sync(\"unused\", args)!!; }",
         "use time; fn main() { time::now()!!; }",
         "use entropy; fn main() { entropy::bytes(1)!!; }",
     ] {
@@ -1490,7 +1925,6 @@ fn core_implementation_helpers_are_private_for_all_import_forms() {
         ("random", "initialized", "initialized"),
         ("random", "MODULUS", "MODULUS"),
         ("random", "ensure_seeded", "ensure_seeded()"),
-        ("random", "bytes_to_uint", "bytes_to_uint([1, 2])"),
         ("random", "range_bound", "range_bound(1)"),
         ("math", "number", "number(1, \"probe\")"),
         ("io", "output", "output(nil, nil)"),
@@ -1793,6 +2227,1105 @@ fn kdl_schemas_reject_duplicates_unknown_fields_and_wrong_types_together() {
     assert!(config::dependencies(&f.0.join("dependencies.kdl")).is_err());
     f.write("build.kdl", "target \"bad\" entry=\"../outside.cog\"\n");
     assert!(config::targets(&f.0.join("build.kdl")).is_err());
+}
+
+#[test]
+fn library_packages_are_checked_without_an_executable_entry_point() {
+    for library_entry in ["src/lib.cog", "lib.cog"] {
+        let f = Fixture::new();
+        f.write_raw(
+            "package.kdl",
+            "package \"sample-library\" version=\"0.1.0\" kind=\"library\"\n",
+        );
+        f.write(library_entry, "public fn answer() -> int { 42 }");
+
+        success(&f.cli("check", &[]));
+        assert!(!f.0.join("target").exists());
+
+        for command in ["build", "run"] {
+            let output = f.cli(command, &[]);
+            assert!(!output.status.success());
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(error.contains("library packages can be checked"), "{error}");
+            assert!(!f.0.join("target").exists());
+        }
+
+        f.write(library_entry, "public fn answer() -> int { \"wrong\" }");
+        let invalid = f.cli("check", &[]);
+        assert!(!invalid.status.success());
+        assert!(
+            String::from_utf8_lossy(&invalid.stderr).contains("type mismatch"),
+            "{}",
+            String::from_utf8_lossy(&invalid.stderr)
+        );
+    }
+
+    let f = Fixture::new();
+    f.write_raw(
+        "package.kdl",
+        "package \"sample-library\" version=\"0.1.0\" kind=\"library\"\n",
+    );
+    f.write_raw("src/other.cog", "public fn answer() -> int { 42 }");
+    f.write_raw("lib.cog", "public fn answer() -> int { 42 }");
+    let output = f.cli("check", &[]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("requires src/lib.cog when src/ exists"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn package_kind_defaults_to_application_and_rejects_unknown_values() {
+    let f = Fixture::new();
+    f.write_raw("package.kdl", "package \"app\" version=\"1\"\n");
+    assert_eq!(
+        config::package(&f.0.join("package.kdl")).unwrap().kind,
+        config::PackageKind::Application
+    );
+    f.write_raw(
+        "package.kdl",
+        "package \"app\" version=\"1\" kind=\"plugin\"\n",
+    );
+    let error = frontend::render(&config::package(&f.0.join("package.kdl")).unwrap_err());
+    assert!(
+        error.contains("package kind must be `application` or `library`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn library_kind_dependencies_remain_available_as_importable_packages() {
+    let f = Fixture::new();
+    f.write_raw("package.kdl", "package \"app\" version=\"0.1.0\"\n");
+    f.write_raw("dependencies.kdl", "regex path=\"packages/regex\"\n");
+    f.write_raw(
+        "packages/regex/package.kdl",
+        "package \"regex\" version=\"0.1.0\" kind=\"library\"\n",
+    );
+    f.write_raw(
+        "packages/regex/src/answer.cog",
+        "public fn value() -> int { 42 }",
+    );
+    f.write_raw(
+        "src/main.cog",
+        "@!include(\"std\") use io; use answer from regex; fn main() { io::println(answer::value()); }",
+    );
+
+    let output = f.cli("run", &[]);
+    success(&output);
+    assert_eq!(output.stdout, b"42\n");
+}
+
+#[test]
+fn prepared_projects_collect_root_and_dependency_package_plugins() {
+    let f = Fixture::new();
+    f.write_raw(
+        "package.kdl",
+        r#"package "app" version="0.1.0" {
+    asset "data/app.json"
+    plugin version=1 library="native/app.so" {
+        function "app_native::value" result="int"
+    }
+}
+"#,
+    );
+    f.write_raw("dependencies.kdl", "regex path=\"packages/regex\"\n");
+    f.write_raw(
+        "packages/regex/package.kdl",
+        r#"package "regex" version="0.1.0" kind="library" {
+    asset "data/regex.txt"
+    plugin version=1 library="native/regex.so" {
+        function "regex_native::count" result="int" { param "str"; }
+    }
+}
+"#,
+    );
+    f.write_raw(
+        "packages/regex/src/lib.cog",
+        "public fn available() -> int { 1 }",
+    );
+    f.write_raw("src/main.cog", "fn main() {}");
+
+    let prepared = project::prepare(&f.0, None, false).unwrap();
+    assert_eq!(prepared.plugins.len(), 2);
+    assert_eq!(prepared.plugins[0].0, f.0.canonicalize().unwrap());
+    assert_eq!(prepared.plugins[0].1.library, Path::new("native/app.so"));
+    assert_eq!(prepared.plugins[0].1.functions()[0].0, "app_native::value");
+    assert_eq!(
+        prepared.plugins[1].0,
+        f.0.join("packages/regex").canonicalize().unwrap()
+    );
+    assert_eq!(prepared.plugins[1].1.library, Path::new("native/regex.so"));
+    assert_eq!(
+        prepared.plugins[1].1.functions()[0].0,
+        "regex_native::count"
+    );
+}
+
+#[test]
+fn package_build_vendors_external_dependencies_and_round_trips_locked_metadata() {
+    let root = Fixture::new();
+    let external = Fixture::new();
+    let nested = Fixture::new();
+    let dependency_path = format!("../{}", external.0.file_name().unwrap().to_string_lossy());
+
+    root.write_raw(
+        "package.kdl",
+        r#"package "archive-app" version="0.1.0" {
+    asset "data/config.txt"
+    plugin version=1 {
+        library target="x86_64-unknown-linux-gnu" path="native/fixture.bin"
+        library target="x86_64-pc-windows-msvc" path="native/fixture.bin"
+        library target="aarch64-apple-darwin" path="native/fixture.bin"
+        function "host::fixture" result="int"
+    }
+}
+
+"#,
+    );
+    root.write_raw(
+        "dependencies.kdl",
+        &format!("dep path={dependency_path:?}\n"),
+    );
+    root.write_raw("data/config.txt", "root asset\n");
+    root.write_raw("native/fixture.bin", "native library fixture");
+    root.write_raw(
+        "src/main.cog",
+        &format!(
+            "@!include(\"dep\")\n@!include(\"std\")\nuse io;\nuse answer from dep;\nuse host;\nfn main() {{ io::println(answer::value())!!; io::println(host::fixture())!!; }}\n"
+        ),
+    );
+    external.write_raw(
+        "package.kdl",
+        "package \"archive-library\" version=\"0.2.0\" kind=\"library\" { asset \"data/list.txt\" }\n",
+    );
+    external.write_raw(
+        "dependencies.kdl",
+        &format!(
+            "coredep path=\"../{}\"\n",
+            nested.0.file_name().unwrap().to_string_lossy()
+        ),
+    );
+    external.write_raw("data/list.txt", "dependency asset\n");
+    external.write_raw(
+        "src/answer.cog",
+        "use base from coredep; public fn value() -> int { base::answer() }",
+    );
+    nested.write_raw(
+        "package.kdl",
+        "package \"archive-core\" version=\"0.1.0\" kind=\"library\"\n",
+    );
+    nested.write_raw("src/base.cog", "public fn answer() -> int { 42 }");
+
+    let archive_path = root.0.join("target/archive-app.cogpkg");
+    let built = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .arg("package")
+        .arg("build")
+        .arg(&root.0)
+        .arg("-o")
+        .arg(&archive_path)
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let archive_bytes = read_cogpkg_tar(&archive_path);
+    let mut archive = tar::Archive::new(archive_bytes.as_slice());
+    let mut files = std::collections::BTreeMap::new();
+    for item in archive.entries().unwrap() {
+        let mut item = item.unwrap();
+        let path = item.path().unwrap().to_string_lossy().into_owned();
+        let mut contents = Vec::new();
+        item.read_to_end(&mut contents).unwrap();
+        files.insert(path, contents);
+    }
+    assert_eq!(files["COGPKG"], b"COGPKG 3\n");
+    assert!(files[".cog/app.cogb"].starts_with(b"COG\0"));
+    assert_eq!(files["data/config.txt"], b"root asset\n");
+    assert_eq!(files["native/fixture.bin"], b"native library fixture");
+    assert_eq!(
+        files[".cog/packages/1/data/list.txt"],
+        b"dependency asset\n"
+    );
+    assert_eq!(
+        files[".cog/packages/1/src/answer.cog"],
+        b"use base from coredep; public fn value() -> int { base::answer() }"
+    );
+    assert_eq!(
+        files[".cog/packages/2/src/base.cog"],
+        b"public fn answer() -> int { 42 }"
+    );
+    let root_dependencies = String::from_utf8(files["dependencies.kdl"].clone()).unwrap();
+    assert!(root_dependencies.contains("dep path=\".cog/packages/1\""));
+    let dependency_dependencies =
+        String::from_utf8(files[".cog/packages/1/dependencies.kdl"].clone()).unwrap();
+    assert!(dependency_dependencies.contains("coredep path=\"../2\""));
+    let lock = String::from_utf8(files["cog.lock"].clone()).unwrap();
+    assert!(lock.contains("path \".cog/packages/1\""), "{lock}");
+    assert!(!lock.contains("../"), "{lock}");
+    let main = String::from_utf8(files["src/main.cog"].clone()).unwrap();
+    assert!(main.contains("@!include(\"dep\")"), "{main}");
+
+    let extracted = Fixture::new();
+    tar::Archive::new(read_cogpkg_tar(&archive_path).as_slice())
+        .unpack(&extracted.0)
+        .unwrap();
+    let checked = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .arg("check")
+        .arg(&extracted.0)
+        .arg("--locked")
+        .output()
+        .unwrap();
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    let repeated_path = root.0.join("target/archive-app-repeat.cogpkg");
+    let repeated = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .arg("package")
+        .arg("build")
+        .arg(&root.0)
+        .arg("-o")
+        .arg(&repeated_path)
+        .output()
+        .unwrap();
+    assert!(
+        repeated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repeated.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&archive_path).unwrap(),
+        std::fs::read(repeated_path).unwrap()
+    );
+}
+
+#[test]
+fn application_package_runs_after_move_with_forwarded_arguments() {
+    let project = Fixture::new();
+    project.write_raw(
+        "package.kdl",
+        "package \"portable-app\" version=\"0.1.0\"\n",
+    );
+    project.write_raw("dependencies.kdl", "dep path=\"packages/dep\"\n");
+    project.write_raw(
+        "packages/dep/package.kdl",
+        "package \"portable-dependency\" version=\"0.2.0\" kind=\"library\"\n",
+    );
+    project.write_raw("packages/dep/dependencies.kdl", "core path=\"../core\"\n");
+    project.write_raw(
+        "packages/dep/src/answer.cog",
+        "use base from core; public fn answer() -> int { base::answer() }\n",
+    );
+    project.write_raw(
+        "packages/core/package.kdl",
+        "package \"portable-core\" version=\"0.1.0\" kind=\"library\"\n",
+    );
+    project.write_raw(
+        "packages/core/src/base.cog",
+        "public fn answer() -> int { 42 }\n",
+    );
+    project.write_raw(
+        "src/main.cog",
+        r#"@!include("dep") @!include("std") use io; use process; use answer from dep;
+fn main() {
+    const args = process::args();
+    if args.len() != 2 || args[0]!! != "one two" || args[1]!! != "é" { crash("bad args"); }
+    io::println("portable-ok")!!;
+    io::println(answer::answer())!!;
+}
+"#,
+    );
+    let archive = project.0.join("target/portable.cogpkg");
+    let built = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .args(["package", "build"])
+        .arg(&project.0)
+        .arg("-o")
+        .arg(&archive)
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let tar_bytes = read_cogpkg_tar(&archive);
+    let mut files = std::collections::BTreeMap::new();
+    for item in tar::Archive::new(tar_bytes.as_slice()).entries().unwrap() {
+        let mut item = item.unwrap();
+        let path = item.path().unwrap().to_string_lossy().into_owned();
+        let mut content = Vec::new();
+        item.read_to_end(&mut content).unwrap();
+        files.insert(path, content);
+    }
+    assert_eq!(files["COGPKG"], b"COGPKG 3\n");
+    assert!(files[".cog/app.cogb"].starts_with(b"COG\0"));
+
+    let repeat = project.0.join("target/portable-repeat.cogpkg");
+    let repeated = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .args(["package", "build"])
+        .arg(&project.0)
+        .arg("-o")
+        .arg(&repeat)
+        .output()
+        .unwrap();
+    assert!(
+        repeated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repeated.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&archive).unwrap(),
+        std::fs::read(&repeat).unwrap()
+    );
+
+    let moved = Fixture::new();
+    let moved_archive = moved.0.join("renamed.cogpkg");
+    std::fs::copy(&archive, &moved_archive).unwrap();
+    let run = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .args(["run"])
+        .arg(&moved_archive)
+        .arg("--")
+        .args(["one two", "é"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, b"portable-ok\n42\n");
+}
+
+#[test]
+fn application_package_rejects_lockfile_identity_mismatches() {
+    let project = Fixture::new();
+    project.write_raw(
+        "package.kdl",
+        "package \"identity-app\" version=\"0.1.0\"\n",
+    );
+    project.write_raw("src/main.cog", "fn main() {}\n");
+    let archive = project.0.join("target/identity.cogpkg");
+    let built = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .args(["package", "build"])
+        .arg(&project.0)
+        .arg("-o")
+        .arg(&archive)
+        .output()
+        .unwrap();
+    success(&built);
+
+    let lock = tar::Archive::new(read_cogpkg_tar(&archive).as_slice())
+        .entries()
+        .unwrap()
+        .find_map(|item| {
+            let mut item = item.unwrap();
+            if item.path().unwrap() == Path::new("cog.lock") {
+                let mut contents = String::new();
+                item.read_to_string(&mut contents).unwrap();
+                Some(contents)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let lock = lock.replace("\"identity-app\"", "\"spoofed-app\"");
+    let corrupted = project.0.join("target/identity-mismatch.cogpkg");
+    rewrite_cogpkg_file(&archive, &corrupted, "cog.lock", lock.as_bytes());
+
+    let error = match cog::package::open_application(&corrupted) {
+        Ok(_) => panic!("application with a mismatched lock identity was accepted"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("identity does not match package manifest"),
+        "{error}"
+    );
+}
+
+#[test]
+fn application_package_rejects_lockfiles_over_the_configuration_limit() {
+    let project = Fixture::new();
+    project.write_raw(
+        "package.kdl",
+        "package \"large-lock-app\" version=\"0.1.0\"\n",
+    );
+    project.write_raw("src/main.cog", "fn main() {}\n");
+    let archive = project.0.join("target/large-lock.cogpkg");
+    let built = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .args(["package", "build"])
+        .arg(&project.0)
+        .arg("-o")
+        .arg(&archive)
+        .output()
+        .unwrap();
+    success(&built);
+
+    let tar_bytes = read_cogpkg_tar(&archive);
+    let lock = tar::Archive::new(tar_bytes.as_slice())
+        .entries()
+        .unwrap()
+        .find_map(|item| {
+            let mut item = item.unwrap();
+            if item.path().unwrap() == Path::new("cog.lock") {
+                let mut contents = Vec::new();
+                item.read_to_end(&mut contents).unwrap();
+                Some(contents)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let oversized_len = config::MAX_CONFIGURATION_BYTES + 1;
+    assert!(lock.len() < oversized_len);
+    let mut lock = lock;
+    lock.resize(oversized_len, b' ');
+    let corrupted = project.0.join("target/oversized-lock.cogpkg");
+    rewrite_cogpkg_file(&archive, &corrupted, "cog.lock", &lock);
+
+    let error = match cog::package::open_application(&corrupted) {
+        Ok(_) => panic!("oversized application lockfile was accepted"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("application lockfile exceeds the 256 KiB limit"),
+        "{error}"
+    );
+}
+
+#[test]
+fn application_package_rejects_dependency_manifest_lockfile_mismatches() {
+    let project = Fixture::new();
+    project.write_raw("package.kdl", "package \"graph-app\" version=\"0.1.0\"\n");
+    project.write_raw("dependencies.kdl", "dep path=\"packages/dep\"\n");
+    project.write_raw("src/main.cog", "@!include(\"dep\") fn main() {}\n");
+    project.write_raw(
+        "packages/dep/package.kdl",
+        "package \"graph-lib\" version=\"0.2.0\" kind=\"library\"\n",
+    );
+    project.write_raw(
+        "packages/dep/src/lib.cog",
+        "public fn answer() -> int { 42 }\n",
+    );
+    let archive = project.0.join("target/graph.cogpkg");
+    let built = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .args(["package", "build"])
+        .arg(&project.0)
+        .arg("-o")
+        .arg(&archive)
+        .output()
+        .unwrap();
+    success(&built);
+
+    let tar_bytes = read_cogpkg_tar(&archive);
+    let mut replacement = None;
+    for item in tar::Archive::new(tar_bytes.as_slice()).entries().unwrap() {
+        let mut item = item.unwrap();
+        if item.path().unwrap() == Path::new("cog.lock") {
+            let mut lock = String::new();
+            item.read_to_string(&mut lock).unwrap();
+            let mut changed = false;
+            let lock = lock
+                .lines()
+                .map(|line| {
+                    if line.starts_with("dep ") {
+                        changed = true;
+                        line.replacen("\"dep\"", "\"other\"", 1)
+                    } else {
+                        line.to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            assert!(changed, "built lockfile has no dependency edge: {lock}");
+            replacement = Some(lock);
+            break;
+        }
+    }
+    let corrupted = project.0.join("target/graph-mismatch.cogpkg");
+    rewrite_cogpkg_file(
+        &archive,
+        &corrupted,
+        "cog.lock",
+        replacement.unwrap().as_bytes(),
+    );
+
+    let error = match cog::package::open_application(&corrupted) {
+        Ok(_) => panic!("application with mismatched dependency metadata was accepted"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("dependency manifests do not match cog.lock"),
+        "{error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn application_cache_rejects_a_symlink_lockfile() {
+    let project = Fixture::new();
+    project.write_raw("package.kdl", "package \"cache-app\" version=\"0.1.0\"\n");
+    project.write_raw("src/main.cog", "fn main() {}\n");
+    let archive = project.0.join("cache.cogpkg");
+    let built = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .args(["package", "build"])
+        .arg(&project.0)
+        .arg("-o")
+        .arg(&archive)
+        .output()
+        .unwrap();
+    success(&built);
+
+    let digest = blake3::hash(&std::fs::read(&archive).unwrap()).to_hex();
+    let cache = project
+        .0
+        .join("target/.cog-application-cache")
+        .join(digest.as_str());
+    std::fs::create_dir_all(&cache).unwrap();
+    tar::Archive::new(read_cogpkg_tar(&archive).as_slice())
+        .unpack(&cache)
+        .unwrap();
+    let external_lock = project.0.join("external.lock");
+    std::fs::copy(cache.join("cog.lock"), &external_lock).unwrap();
+    std::fs::remove_file(cache.join("cog.lock")).unwrap();
+    std::os::unix::fs::symlink(&external_lock, cache.join("cog.lock")).unwrap();
+
+    let error = match cog::package::open_application(&archive) {
+        Ok(_) => panic!("application cache followed its cog.lock symlink"),
+        Err(error) => error,
+    };
+    assert!(error.contains("cog.lock is a symbolic link"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn application_cache_rejects_symlinked_vendored_package_directories() {
+    let project = Fixture::new();
+    project.write_raw(
+        "package.kdl",
+        "package \"cache-graph-app\" version=\"0.1.0\"\n",
+    );
+    project.write_raw("dependencies.kdl", "dep path=\"packages/dep\"\n");
+    project.write_raw(
+        "packages/dep/package.kdl",
+        "package \"cache-graph-lib\" version=\"0.2.0\" kind=\"library\"\n",
+    );
+    project.write_raw(
+        "packages/dep/src/answer.cog",
+        "public fn answer() -> int { 42 }\n",
+    );
+    project.write_raw(
+        "src/main.cog",
+        "@!include(\"dep\") use answer from dep; fn main() { answer::answer(); }\n",
+    );
+    let archive = project.0.join("cache-graph.cogpkg");
+    let built = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .args(["package", "build"])
+        .arg(&project.0)
+        .arg("-o")
+        .arg(&archive)
+        .output()
+        .unwrap();
+    success(&built);
+
+    let digest = blake3::hash(&std::fs::read(&archive).unwrap()).to_hex();
+    let cache = project
+        .0
+        .join("target/.cog-application-cache")
+        .join(digest.as_str());
+    std::fs::create_dir_all(&cache).unwrap();
+    tar::Archive::new(read_cogpkg_tar(&archive).as_slice())
+        .unpack(&cache)
+        .unwrap();
+    let outside_packages = project.0.join("outside-packages");
+    std::fs::rename(cache.join(".cog/packages"), &outside_packages).unwrap();
+    std::os::unix::fs::symlink(&outside_packages, cache.join(".cog/packages")).unwrap();
+
+    let error = match cog::package::open_application(&archive) {
+        Ok(_) => panic!("application cache followed a vendored-package directory symlink"),
+        Err(error) => error,
+    };
+    assert!(error.contains("symbolic link"), "{error}");
+}
+
+#[test]
+fn corrupt_packaged_bytecode_is_rejected_before_any_plugin_load() {
+    let project = Fixture::new();
+    project.write_raw(
+        "package.kdl",
+        r#"package "corrupt-app" version="0.1.0" {
+    plugin version=1 {
+        library target="x86_64-unknown-linux-gnu" path="native/plugin.bin"
+        library target="x86_64-pc-windows-msvc" path="native/plugin.bin"
+        library target="aarch64-apple-darwin" path="native/plugin.bin"
+        function "host::probe" result="int"
+    }
+}
+"#,
+    );
+    project.write_raw("native/plugin.bin", "not an actual shared library");
+    project.write_raw(
+        "src/main.cog",
+        "@!include(\"std\") use host; use io; fn main() { io::println(host::probe())!!; }\n",
+    );
+    let archive = project.0.join("target/corrupt.cogpkg");
+    let built = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .args(["package", "build"])
+        .arg(&project.0)
+        .arg("-o")
+        .arg(&archive)
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let tar_bytes = read_cogpkg_tar(&archive);
+    let mut replacement = tar::Builder::new(Vec::new());
+    for item in tar::Archive::new(tar_bytes.as_slice()).entries().unwrap() {
+        let mut item = item.unwrap();
+        let path = item.path().unwrap().to_path_buf();
+        let mut contents = Vec::new();
+        item.read_to_end(&mut contents).unwrap();
+        if path == Path::new(".cog/app.cogb") {
+            contents = b"corrupted bytecode".to_vec();
+        }
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        replacement
+            .append_data(&mut header, path, contents.as_slice())
+            .unwrap();
+    }
+    let corrupted = project.0.join("corrupted.cogpkg");
+    write_cogpkg_tar(&corrupted, &replacement.into_inner().unwrap());
+    let run = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .args(["run"])
+        .arg(&corrupted)
+        .output()
+        .unwrap();
+    assert!(!run.status.success());
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains("invalid packaged application bytecode"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("not an actual shared library"), "{stderr}");
+}
+
+#[test]
+fn package_build_refuses_to_replace_an_asset() {
+    let f = Fixture::new();
+    f.write_raw(
+        "package.kdl",
+        "package \"asset-owner\" version=\"0.1.0\" { asset \"data/value.txt\" }\n",
+    );
+    f.write_raw("data/value.txt", "keep this file\n");
+    f.write_raw("src/main.cog", "fn main() {}\n");
+    let destination = f.0.join("data/value.txt");
+    let result = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .arg("package")
+        .arg("build")
+        .arg(&f.0)
+        .arg("-o")
+        .arg(&destination)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("would overwrite a project input"));
+    assert_eq!(std::fs::read(destination).unwrap(), b"keep this file\n");
+}
+
+#[test]
+fn package_build_refuses_to_replace_the_entry_source() {
+    let f = Fixture::new();
+    f.dependency();
+    f.write("src/main.cog", "@!include(\"dep\") fn main() {}\n");
+    let destination = f.0.join("src/main.cog");
+    let original = std::fs::read(&destination).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .arg("package")
+        .arg("build")
+        .arg(&f.0)
+        .arg("-o")
+        .arg(&destination)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("would overwrite a project input"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(std::fs::read(destination).unwrap(), original);
+}
+
+#[test]
+fn package_build_reserves_the_lockfile_and_its_portable_case_alias() {
+    let f = Fixture::new();
+    f.write_raw("package.kdl", "package \"lock-owner\" version=\"0.1.0\"\n");
+    f.write_raw("src/main.cog", "fn main() {}\n");
+    let lock = lockfile::Lockfile {
+        packages: vec![lockfile::Package {
+            name: "lock-owner".into(),
+            version: "0.1.0".into(),
+            path: ".".into(),
+        }],
+        dependencies: Vec::new(),
+    }
+    .encode()
+    .unwrap();
+    f.write_raw("cog.lock", &lock);
+
+    for output_name in ["cog.lock", "COG.LOCK"] {
+        let before = std::fs::read(f.0.join("cog.lock")).unwrap();
+        let destination = f.0.join(output_name);
+        let result = Command::new(env!("CARGO_BIN_EXE_cog"))
+            .arg("package")
+            .arg("build")
+            .arg(&f.0)
+            .arg("-o")
+            .arg(&destination)
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("would overwrite a project input")
+        );
+        assert_eq!(std::fs::read(f.0.join("cog.lock")).unwrap(), before);
+        if output_name == "COG.LOCK" {
+            assert!(!destination.exists());
+        }
+    }
+}
+
+#[test]
+fn package_build_accepts_a_library_without_an_executable_main() {
+    let library = Fixture::new();
+    library.write_raw(
+        "package.kdl",
+        "package \"cog-greeting\" version=\"0.1.0\" kind=\"library\"\n",
+    );
+    library.write_raw("src/lib.cog", "public fn greeting() -> str { \"hello\" }\n");
+
+    let result = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .arg("package")
+        .arg("build")
+        .arg(&library.0)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let archive_path = library.0.join("target/package-cog-greeting.cogpkg");
+    assert!(archive_path.is_file());
+    let archive_bytes = read_cogpkg_tar(&archive_path);
+    let mut archive = tar::Archive::new(archive_bytes.as_slice());
+    let entries = archive
+        .entries()
+        .unwrap()
+        .map(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    assert!(entries.contains(&"src/lib.cog".to_owned()));
+    assert!(!entries.iter().any(|path| path.ends_with("main.cog")));
+    let mut marker_archive = tar::Archive::new(archive_bytes.as_slice());
+    let marker = marker_archive
+        .entries()
+        .unwrap()
+        .find_map(|item| {
+            let mut item = item.unwrap();
+            (item.path().unwrap() == Path::new("COGPKG")).then(|| {
+                let mut marker = Vec::new();
+                item.read_to_end(&mut marker).unwrap();
+                marker
+            })
+        })
+        .unwrap();
+    assert_eq!(marker, b"COGPKG 2\n");
+    assert!(!entries.iter().any(|path| path == ".cog/app.cogb"));
+}
+
+#[cfg(unix)]
+#[test]
+fn package_build_rejects_symlink_assets() {
+    use std::os::unix::fs::symlink;
+
+    let project = Fixture::new();
+    let outside = Fixture::new();
+    project.write_raw(
+        "package.kdl",
+        "package \"symlink-owner\" version=\"0.1.0\" { asset \"data/input.txt\" }\n",
+    );
+    project.write_raw("src/main.cog", "fn main() {}\n");
+    outside.write_raw("secret.txt", "not package input\n");
+    let link = project.0.join("data/input.txt");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    symlink(outside.0.join("secret.txt"), &link).unwrap();
+
+    let output = project.0.join("target/symlink-owner.cogpkg");
+    let result = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .arg("package")
+        .arg("build")
+        .arg(&project.0)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("symbolic link"));
+    assert!(!output.exists());
+}
+
+#[test]
+fn local_package_archive_dependencies_are_cached_locked_and_checked() {
+    let dependency = Fixture::new();
+    dependency.write_raw(
+        "package.kdl",
+        "package \"archive-library\" version=\"0.1.0\" kind=\"library\"\n",
+    );
+    dependency.write_raw("dependencies.kdl", "base path=\"packages/base\"\n");
+    dependency.write_raw(
+        "src/lib.cog",
+        "use base; public fn answer() -> int { base::answer() }\n",
+    );
+    dependency.write_raw(
+        "packages/base/package.kdl",
+        "package \"archive-base\" version=\"0.1.0\" kind=\"library\"\n",
+    );
+    dependency.write_raw(
+        "packages/base/src/lib.cog",
+        "public fn answer() -> int { 42 }\n",
+    );
+    let archive_path = dependency.0.join("target/archive-library.cogpkg");
+    let built = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .arg("package")
+        .arg("build")
+        .arg(&dependency.0)
+        .arg("-o")
+        .arg(&archive_path)
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let app = Fixture::new();
+    app.write_raw("package.kdl", "package \"archive-app\" version=\"0.1.0\"\n");
+    app.write_raw(
+        "dependencies.kdl",
+        "dep archive=\"vendor/archive-library.cogpkg\"\n",
+    );
+    app.write_raw(
+        "src/main.cog",
+        "@!include(\"std\") use io; use dep; fn main() -> nil { io::println(dep::answer())!!; }\n",
+    );
+    let app_archive = app.0.join("vendor/archive-library.cogpkg");
+    std::fs::create_dir_all(app_archive.parent().unwrap()).unwrap();
+    std::fs::copy(&archive_path, &app_archive).unwrap();
+
+    let built = app.cli("build", &[]);
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let lock = std::fs::read_to_string(app.0.join("cog.lock")).unwrap();
+    assert!(lock.contains("target/.cog-package-cache/"), "{lock}");
+    assert_eq!(app.run(), "42\n");
+    let checked = app.cli("check", &["--locked"]);
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    let original_archive = std::fs::read(&app_archive).unwrap();
+    let overwrite = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .arg("package")
+        .arg("build")
+        .arg(&app.0)
+        .arg("-o")
+        .arg(&app_archive)
+        .output()
+        .unwrap();
+    assert!(!overwrite.status.success());
+    assert!(
+        String::from_utf8_lossy(&overwrite.stderr).contains("would overwrite a project input"),
+        "{}",
+        String::from_utf8_lossy(&overwrite.stderr)
+    );
+    assert_eq!(std::fs::read(&app_archive).unwrap(), original_archive);
+
+    dependency.write_raw(
+        "src/lib.cog",
+        "use base; public fn answer() -> int { base::answer() + 1 }\n",
+    );
+    let rebuilt = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .arg("package")
+        .arg("build")
+        .arg(&dependency.0)
+        .arg("-o")
+        .arg(&archive_path)
+        .output()
+        .unwrap();
+    assert!(
+        rebuilt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rebuilt.stderr)
+    );
+    std::fs::copy(&archive_path, &app_archive).unwrap();
+    let locked = app.cli("check", &["--locked"]);
+    assert!(!locked.status.success());
+    assert!(
+        String::from_utf8_lossy(&locked.stderr).contains("cog.lock is stale"),
+        "{}",
+        String::from_utf8_lossy(&locked.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(app.0.join("cog.lock")).unwrap(),
+        lock
+    );
+}
+
+#[test]
+fn local_dependency_rejects_legacy_v2_application_archives() {
+    let app = Fixture::new();
+    app.write_raw("package.kdl", "package \"consumer\" version=\"1\"\n");
+    app.write_raw("dependencies.kdl", "old archive=\"vendor/old.cogpkg\"\n");
+    app.write_raw("src/main.cog", "fn main() {}\n");
+    let archive_path = app.0.join("vendor/old.cogpkg");
+    std::fs::create_dir_all(archive_path.parent().unwrap()).unwrap();
+    let mut tar = tar::Builder::new(Vec::new());
+    for (path, bytes) in [
+        ("COGPKG", &b"COGPKG 2\n"[..]),
+        ("package.kdl", &b"package \"old-app\" version=\"1\"\n"[..]),
+        ("dependencies.kdl", &b""[..]),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_cksum();
+        tar.append_data(&mut header, path, bytes).unwrap();
+    }
+    write_cogpkg_tar(&archive_path, &tar.into_inner().unwrap());
+    let error = app
+        .load(false)
+        .err()
+        .expect("a v2 application archive was accepted as a library dependency");
+    assert!(error.contains("COGPKG 2 library packages"), "{error}");
+}
+
+#[test]
+fn local_package_archive_rejects_traversal_without_writing_outside_cache() {
+    let app = Fixture::new();
+    app.write_raw("package.kdl", "package \"archive-app\" version=\"0.1.0\"\n");
+    app.write_raw("dependencies.kdl", "dep archive=\"bad.cogpkg\"\n");
+    app.write_raw("src/main.cog", "fn main() {}\n");
+    let archive_path = app.0.join("bad.cogpkg");
+    let mut archive = tar::Builder::new(Vec::new());
+    let mut safe_header = tar::Header::new_gnu();
+    safe_header.set_entry_type(tar::EntryType::Regular);
+    safe_header.set_path("safe.txt").unwrap();
+    safe_header.set_size(4);
+    safe_header.set_cksum();
+    archive.append(&safe_header, &b"safe"[..]).unwrap();
+
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_path("safe.txt").unwrap();
+    header.set_size(4);
+    let name = &mut header.as_mut_bytes()[..100];
+    name.fill(0);
+    name[..13].copy_from_slice(b"../escape.txt");
+    header.set_cksum();
+    archive.append(&header, &b"nope"[..]).unwrap();
+    let tar_bytes = archive.into_inner().unwrap();
+    write_cogpkg_tar(&archive_path, &tar_bytes);
+
+    let error = app.load(false).err().expect("unsafe archive was accepted");
+    assert!(error.contains("unsafe package archive path"), "{error}");
+    assert!(!app.0.parent().unwrap().join("escape.txt").exists());
+    let cache = app.0.join("target/.cog-package-cache");
+    assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 0);
+
+    app.write_raw("dependencies.kdl", "dep archive=\"bad-link.cogpkg\"\n");
+    let mut archive = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Symlink);
+    header.set_path("package.kdl").unwrap();
+    header.set_link_name("outside.kdl").unwrap();
+    header.set_size(0);
+    header.set_cksum();
+    archive.append(&header, &b""[..]).unwrap();
+    let tar_bytes = archive.into_inner().unwrap();
+    write_cogpkg_tar(&app.0.join("bad-link.cogpkg"), &tar_bytes);
+    let error = app.load(false).err().expect("archive symlink was accepted");
+    assert!(
+        error.contains("only regular files and directories"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 0);
+}
+
+#[test]
+fn local_package_archive_rejects_unknown_format_versions() {
+    let app = Fixture::new();
+    app.write_raw("package.kdl", "package \"archive-app\" version=\"0.1.0\"\n");
+    app.write_raw("dependencies.kdl", "dep archive=\"unknown.cogpkg\"\n");
+    app.write_raw("src/main.cog", "fn main() {}\n");
+    let mut archive = tar::Builder::new(Vec::new());
+    for (path, contents) in [
+        ("COGPKG", &b"COGPKG 99\n"[..]),
+        (
+            "package.kdl",
+            &b"package \"archive-lib\" version=\"0.1.0\" kind=\"library\"\n"[..],
+        ),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(contents.len() as u64);
+        header.set_cksum();
+        archive.append_data(&mut header, path, contents).unwrap();
+    }
+    let tar_bytes = archive.into_inner().unwrap();
+    write_cogpkg_tar(&app.0.join("unknown.cogpkg"), &tar_bytes);
+
+    let error = app
+        .load(false)
+        .err()
+        .expect("unknown package archive version was accepted");
+    assert!(
+        error.contains("unsupported or invalid .cogpkg format version"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_dir(app.0.join("target/.cog-package-cache"))
+            .unwrap()
+            .count(),
+        0
+    );
 }
 
 #[test]
@@ -2381,7 +3914,7 @@ fn missing_or_modified_artifacts_and_cache_records_trigger_rebuilds() {
     let artifact = f.0.join("target/app.cogb");
     let other = project::compile_source(
         "other.cog",
-        "include std; use io; fn main() { io::println(99); }",
+        "@!include(\"std\") use io; fn main() { io::println(99); }",
     )
     .unwrap();
     std::fs::write(&artifact, bytecode::encode(&other).unwrap()).unwrap();

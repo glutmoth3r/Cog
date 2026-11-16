@@ -16,6 +16,8 @@ fn number(value, operation: str) {
     value!!;
     match value {
         int => value,
+        uint => value,
+        bigint => value,
         float => value,
         _ => Error::TypeMismatch(operation),
     }
@@ -53,6 +55,8 @@ public fn max(a, b) {
 // Conversion truncates toward zero; negative fractions need an adjustment.
 public fn floor(x) {
     const value = number(x, "math::floor")!!;
+    when value is uint { return value; }
+    when value is bigint { return value; }
     const truncated = (value as int)!!;
     if truncated > value {
         return truncated - 1;
@@ -62,6 +66,8 @@ public fn floor(x) {
 
 public fn ceil(x) {
     const value = number(x, "math::ceil")!!;
+    when value is uint { return value; }
+    when value is bigint { return value; }
     const truncated = (value as int)!!;
     if truncated < value {
         return truncated + 1;
@@ -72,6 +78,8 @@ public fn ceil(x) {
 public fn round(x) {
     const value = number(x, "math::round")!!;
     when value is int { return value; }
+    when value is uint { return value; }
+    when value is bigint { return value; }
     const lower = floor(value)!!;
     if value - lower >= 0.5 { return lower + 1; }
     return lower;
@@ -85,6 +93,12 @@ public fn pow(base, exponent) {
     if exponent < 0 {
         return Error::InvalidArgument("math::pow");
     }
+    when value is uint {
+        return uint_power(value, exponent);
+    }
+    when value is bigint {
+        return bigint_power(value, exponent);
+    }
     var result = when value is float { 1.0 } else { 1 };
     var power = value;
     var remaining = exponent;
@@ -94,6 +108,30 @@ public fn pow(base, exponent) {
         if remaining > 0 { power = (power * power)!!; }
     }
     return result;
+}
+
+fn uint_power(base: uint, exponent: int) -> uint {
+    var result: uint = 1;
+    var power = base;
+    var remaining = exponent;
+    while remaining > 0 {
+        if remaining % 2 == 1 { result = (result * power)!!; }
+        remaining = remaining / 2;
+        if remaining > 0 { power = (power * power)!!; }
+    }
+    result
+}
+
+fn bigint_power(base: bigint, exponent: int) -> bigint {
+    var result: bigint = 1 as bigint;
+    var power = base;
+    var remaining = exponent;
+    while remaining > 0 {
+        if remaining % 2 == 1 { result = (result * power)!!; }
+        remaining = remaining / 2;
+        if remaining > 0 { power = (power * power)!!; }
+    }
+    result
 }
 
 // Scale by powers of four before Newton iteration to cover the binary64 range.

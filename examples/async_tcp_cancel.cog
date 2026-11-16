@@ -1,0 +1,36 @@
+@!include("std")
+use err::Error;
+use io;
+use async::net;
+use async::time;
+
+@async fn main() -> nil {
+    const listener = await net::listen("127.0.0.1", 18768)!!;
+
+    const waiting_accept = spawn(net::accept(listener, 5000, 5000));
+    await time::sleep(0.02);
+    io::println($"accept cancellation accepted: {cancel(waiting_accept)}");
+    when await waiting_accept is Error::Cancelled {
+        io::println("pending accept stopped");
+    } else {
+        crash("expected accept cancellation");
+    }
+
+    const accept_task = spawn(net::accept(listener, 5000, 5000));
+    const connect_task = spawn(net::connect("127.0.0.1", 18768, 5000));
+    const server = await accept_task!!;
+    const client = await connect_task!!;
+
+    const pending_read = spawn(net::read_all(server));
+    await time::sleep(0.02);
+    io::println($"read-all cancellation accepted: {cancel(pending_read)}");
+    when await pending_read is Error::Cancelled {
+        io::println("pending read-all stopped");
+    } else {
+        crash("expected read cancellation");
+    }
+
+    io::close(server)!!;
+    io::close(client)!!;
+    io::close(listener)!!;
+}

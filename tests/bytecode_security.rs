@@ -46,6 +46,15 @@ fn rejected(program: CompiledProgram, message: &str) {
     assert!(bytecode::encode(&program).is_err());
 }
 
+fn untrusted_instructions(instruction_count: usize, encoded: &[u8]) -> Vec<u8> {
+    let seed = CompiledProgram::new((0..instruction_count).map(|_| I::Halt).collect());
+    let mut bytes = bytecode::encode(&seed).expect("valid seed artifact should encode");
+    let instruction_start = 20; // Fixed header with empty import and callable tables.
+    let source_map_start = bytes.len() - 4;
+    bytes.splice(instruction_start..source_map_start, encoded.iter().copied());
+    bytes
+}
+
 #[test]
 fn typed_instruction_descriptors_reject_empty_identities_in_dead_code() {
     use cog::value::RuntimeType as T;
@@ -84,6 +93,193 @@ fn typed_instruction_descriptors_reject_empty_identities_in_dead_code() {
             let error = bytecode::decode(&bytes).unwrap_err();
             assert!(error.contains("identity"), "{error}");
             assert!(bytecode::read(std::io::Cursor::new(&bytes)).is_err());
+        }
+    }
+}
+
+#[test]
+fn typed_aggregate_metadata_is_bounded_canonical_and_versioned() {
+    use cog::value::RuntimeType as T;
+
+    let mismatched_tuple = CompiledProgram::new(vec![
+        I::Push(Value::Int(1)),
+        I::MakeTypedTuple(1, vec![T::Int, T::Str]),
+        I::Halt,
+    ]);
+    assert!(bytecode::encode(&mismatched_tuple).is_err());
+
+    for fields in [
+        vec![("z".into(), T::Int), ("a".into(), T::Str)],
+        vec![("a".into(), T::Int), ("a".into(), T::Str)],
+    ] {
+        let program = CompiledProgram::new(vec![I::Halt, I::ConstrainRecordFields(fields)]);
+        assert!(bytecode::encode(&program).is_err());
+    }
+
+    let mut legacy = bytecode::encode(&CompiledProgram::new(vec![I::Halt])).unwrap();
+    legacy[4..6].copy_from_slice(&10_u16.to_le_bytes());
+    assert!(
+        bytecode::decode(&legacy)
+            .unwrap_err()
+            .contains("unsupported bytecode version 10; expected 38")
+    );
+}
+
+#[test]
+fn conflicting_aliased_array_contracts_do_not_partially_mutate_values() {
+    use cog::value::RuntimeType as T;
+
+    fn require(instructions: &mut Vec<I>, message: &str) {
+        let target = instructions.len() + 3;
+        instructions.extend([
+            I::JumpIfTrue(target),
+            I::Push(Value::Nil),
+            I::Crash(Some(message.into())),
+        ]);
+    }
+
+    for operation in 0..8 {
+        for subsequent in [Value::Int(7), Value::Str("kept".into())] {
+            let expected = T::Tuple(vec![T::Array(Box::new(T::Int)), T::Array(Box::new(T::Str))]);
+            let mut instructions = vec![I::MakeArray(0), I::Dup, I::Store(0)];
+            if operation == 3 {
+                // Conflicting uses of the shared child occur in separate roots.
+                instructions.extend([
+                    I::MakeArray(0),
+                    I::MakeTuple(2),
+                    I::MakeArray(0),
+                    I::Load(0),
+                    I::MakeTuple(2),
+                    I::MakeTypedArray(2, expected),
+                ]);
+            } else {
+                instructions.extend([I::Dup, I::MakeTuple(2)]);
+                match operation {
+                    0 => instructions.push(I::MakeTypedArray(1, expected)),
+                    1 => instructions.extend([
+                        I::MakeTypedArray(0, T::Int),
+                        I::MakeTypedArray(0, T::Str),
+                        I::MakeTuple(2),
+                        I::ConstrainArrayFrom,
+                    ]),
+                    2 => {
+                        instructions.extend([I::MakeTypedArray(0, expected), I::Swap, I::ArrayPush])
+                    }
+                    4 => instructions.extend([
+                        I::MakeTypedArray(0, T::Int),
+                        I::MakeTypedArray(0, T::Str),
+                        I::MakeTuple(2),
+                        I::MakeTypedArray(1, expected),
+                        I::Swap,
+                        I::Push(Value::Int(0)),
+                        I::Swap,
+                        I::IndexSet,
+                    ]),
+                    5 => instructions.extend([I::MakeTypedArray(0, expected), I::ArrayPrepend]),
+                    6 | 7 => {
+                        if operation == 6 {
+                            instructions.extend([
+                                I::Push(Value::TypeTag("@struct::Holder".into())),
+                                I::Push(Value::Nil),
+                            ]);
+                        }
+                        instructions.extend([
+                            I::Push(Value::Str("items".into())),
+                            I::MakeTypedArray(0, T::Int),
+                            I::MakeTypedArray(0, T::Str),
+                            I::MakeTuple(2),
+                            I::MakeRecord(if operation == 6 { 2 } else { 1 }),
+                            I::Swap,
+                            I::Push(Value::Str("items".into())),
+                            I::Swap,
+                            I::IndexSet,
+                        ]);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            instructions.extend([
+                I::ErrorKind,
+                I::Push(Value::Str("TypeMismatch".into())),
+                I::Eq,
+            ]);
+            require(&mut instructions, "conflicting alias contracts must fail");
+            instructions.extend([
+                I::Load(0),
+                I::Push(subsequent.clone()),
+                I::ArrayPush,
+                I::Dup,
+                I::IsType(ValueType::Error),
+                I::Not,
+            ]);
+            require(&mut instructions, "failed constraint changed the alias");
+            instructions.extend([I::Push(Value::Int(0)), I::Index, I::Push(subsequent), I::Eq]);
+            require(&mut instructions, "subsequent insertion lost its value");
+            instructions.push(I::Halt);
+
+            let program = CompiledProgram::new(instructions);
+            let decoded = bytecode::decode(&bytecode::encode(&program).unwrap()).unwrap();
+            for artifact in [&program, &decoded] {
+                interpreter::run_with(artifact, &mut Vec::new())
+                    .unwrap_or_else(|error| panic!("array operation {operation} failed: {error}"));
+            }
+        }
+    }
+}
+
+#[test]
+fn nominal_record_tuple_fields_accept_compatible_replacements() {
+    let program = cog::project::compile_source(
+        "tuple_field.cog",
+        r#"
+        struct Pair { value: (int, str) }
+        fn main() {
+            var pair = Pair((1, "old"));
+            pair.value = (2, "new");
+            pair.value = pair.value;
+            if pair.value.0 != 2 { crash("tuple field was not replaced"); }
+            if pair.value.1 != "new" { crash("tuple field lost its value"); }
+        }
+        "#,
+    )
+    .unwrap();
+    let decoded = bytecode::decode(&bytecode::encode(&program).unwrap()).unwrap();
+    for artifact in [&program, &decoded] {
+        interpreter::run_with(artifact, &mut Vec::new()).unwrap();
+    }
+}
+
+#[test]
+fn nominal_record_tuple_fields_reject_incompatible_replacements() {
+    use cog::value::RuntimeType as T;
+    for replacement in [
+        vec![
+            I::Push(Value::Bool(false)),
+            I::Push(Value::Str("bad".into())),
+            I::MakeTuple(2),
+        ],
+        vec![I::Push(Value::Int(2)), I::MakeTuple(1)],
+        vec![I::MakeTypedArray(0, T::Int)],
+    ] {
+        let mut instructions = vec![
+            I::Push(Value::TypeTag("@struct::Pair".into())),
+            I::Push(Value::Nil),
+            I::Push(Value::Str("value".into())),
+            I::Push(Value::Int(1)),
+            I::Push(Value::Str("old".into())),
+            I::MakeTuple(2),
+            I::MakeRecord(2),
+            I::Push(Value::Str("value".into())),
+        ];
+        instructions.extend(replacement);
+        instructions.extend([I::IndexSet, I::Halt]);
+        let program = CompiledProgram::new(instructions);
+        let decoded = bytecode::decode(&bytecode::encode(&program).unwrap()).unwrap();
+        for artifact in [&program, &decoded] {
+            assert!(matches!(
+                interpreter::run_with(artifact, &mut Vec::new()),
+                Err(cog::error::RuntimeError::TypeMismatch { op: "indexset" })
+            ));
         }
     }
 }
@@ -137,6 +333,122 @@ fn verifier_preserves_scalar_and_error_results_of_array_templates() {
         let error = bytecode::decode(&bytes).unwrap_err();
         assert!(error.contains("not initialized"), "{error}");
         assert!(bytecode::read(std::io::Cursor::new(&bytes)).is_err());
+    }
+}
+
+#[test]
+fn verifier_preserves_constructor_errors_through_indexing_and_call_summaries() {
+    let nested_tuples = |levels| {
+        let mut instructions = vec![I::Push(Value::Int(1))];
+        instructions.extend((0..levels).map(|_| I::MakeTuple(1)));
+        instructions
+    };
+    for case in 0..5 {
+        for call_kind in 0..5 {
+            let (mut body, predicate) = match case {
+                0 => (nested_tuples(64), ValueType::Error),
+                1 => {
+                    let mut instructions = nested_tuples(63);
+                    instructions.extend([
+                        I::Push(Value::Bool(false)),
+                        I::MakeTuple(2),
+                        I::Push(Value::Int(1)),
+                        I::Index,
+                    ]);
+                    (instructions, ValueType::Error)
+                }
+                2 => {
+                    let mut instructions = nested_tuples(64);
+                    instructions.extend([I::Push(Value::Str("resource".into())), I::Index]);
+                    (instructions, ValueType::Str)
+                }
+                3 => (
+                    vec![
+                        I::Push(Value::Int(1)),
+                        I::Push(Value::Str("incompatible".into())),
+                        I::MakeArray(2),
+                        I::Push(Value::Str("op".into())),
+                        I::Index,
+                    ],
+                    ValueType::Str,
+                ),
+                _ => (
+                    vec![
+                        I::Push(Value::Int(1)),
+                        I::MakeTypedArray(1, cog::value::RuntimeType::Bool),
+                        I::Push(Value::Str("op".into())),
+                        I::Index,
+                    ],
+                    ValueType::Str,
+                ),
+            };
+            let mut program = CompiledProgram::new(match call_kind {
+                0 => std::mem::take(&mut body),
+                1 | 3 => vec![I::Call(0, 0)],
+                _ => vec![I::Push(Value::Function(0)), I::CallValue(0)],
+            });
+            let observe = program.instructions.len();
+            let sentinel = 0x1234_5678i64;
+            program.instructions.extend([
+                I::IsType(predicate),
+                I::JumpIfFalse(observe + 4),
+                I::Push(Value::Int(sentinel)),
+                I::Pop,
+                I::Halt,
+            ]);
+            if call_kind != 0 {
+                let entry = program.instructions.len();
+                program.instructions[0] = if matches!(call_kind, 1 | 3) {
+                    I::Call(entry, 0)
+                } else {
+                    I::Push(Value::Function(entry))
+                };
+                program.instructions.extend(body);
+                program.instructions.push(I::Return);
+                let mut signature = CallableSignature::dynamic(0, 0);
+                if call_kind >= 3 {
+                    signature.result_type = Some(if case < 2 {
+                        cog::value::RuntimeType::Bool
+                    } else {
+                        cog::value::RuntimeType::Str
+                    });
+                }
+                program.callables.insert(entry, signature);
+            }
+            let mut bytes = bytecode::encode(&program).unwrap();
+            let decoded = bytecode::decode(&bytes).unwrap();
+            interpreter::run_with(&decoded, &mut Vec::new()).unwrap();
+
+            program.instructions[observe + 2] = I::Load(99);
+            assert!(
+                matches!(
+                    interpreter::run_with(&program, &mut Vec::new()),
+                    Err(cog::error::RuntimeError::InvalidLocal(99))
+                ),
+                "constructor case {case}, call kind {call_kind} did not reach the observation"
+            );
+            let error = match bytecode::validate(&program) {
+                Err(error) => error,
+                Ok(()) => panic!(
+                    "constructor case {case}, call kind {call_kind} hid a reachable local load"
+                ),
+            };
+            assert!(error.contains("not initialized"), "{error}");
+            assert!(bytecode::encode(&program).is_err());
+
+            let mut pattern = vec![46, 0];
+            pattern.extend_from_slice(&sentinel.to_le_bytes());
+            let offset = bytes
+                .windows(pattern.len())
+                .position(|window| window == pattern)
+                .unwrap();
+            let mut invalid_load = vec![48];
+            invalid_load.extend_from_slice(&99u32.to_le_bytes());
+            bytes.splice(offset..offset + pattern.len(), invalid_load);
+            let error = bytecode::decode(&bytes).unwrap_err();
+            assert!(error.contains("not initialized"), "{error}");
+            assert!(bytecode::read(std::io::Cursor::new(&bytes)).is_err());
+        }
     }
 }
 
@@ -379,6 +691,72 @@ fn verifier_preserves_global_facts_across_native_and_known_indirect_calls() {
 }
 
 #[test]
+fn verifier_invalidates_global_facts_after_a_known_indirect_writer() {
+    let mut program = CompiledProgram::new(vec![
+        I::Push(Value::Bool(false)),
+        I::StoreGlobal(0),
+        I::Push(Value::Function(9)),
+        I::CallValue(0),
+        I::Pop,
+        I::LoadGlobal(0),
+        I::JumpIfFalse(8),
+        I::Load(99),
+        I::Halt,
+        I::Push(Value::Bool(true)),
+        I::StoreGlobal(0),
+        I::Push(Value::Nil),
+        I::Return,
+    ]);
+    program
+        .callables
+        .insert(9, CallableSignature::dynamic(0, 0));
+
+    assert!(matches!(
+        interpreter::run_with(&program, &mut Vec::new()),
+        Err(cog::error::RuntimeError::InvalidLocal(99))
+    ));
+    rejected(program, "not initialized");
+}
+
+#[test]
+fn verifier_discards_global_facts_after_an_unknown_indirect_call() {
+    let mut program = CompiledProgram::new(vec![
+        I::Push(Value::Bool(false)),
+        I::StoreGlobal(0),
+        I::Push(Value::Bool(true)),
+        I::JumpIfFalse(6),
+        I::Push(Value::Function(14)),
+        I::Jump(7),
+        I::Push(Value::Function(18)),
+        I::CallValue(0),
+        I::Pop,
+        I::LoadGlobal(0),
+        I::JumpIfFalse(12),
+        I::Load(99),
+        I::Halt,
+        I::Halt,
+        I::Push(Value::Bool(true)),
+        I::StoreGlobal(0),
+        I::Push(Value::Nil),
+        I::Return,
+        I::Push(Value::Nil),
+        I::Return,
+    ]);
+    program
+        .callables
+        .insert(14, CallableSignature::dynamic(0, 0));
+    program
+        .callables
+        .insert(18, CallableSignature::dynamic(0, 0));
+
+    assert!(matches!(
+        interpreter::run_with(&program, &mut Vec::new()),
+        Err(cog::error::RuntimeError::InvalidLocal(99))
+    ));
+    rejected(program, "not initialized");
+}
+
+#[test]
 fn verifier_does_not_guess_a_branching_callable_result() {
     rejected(
         callable(
@@ -402,6 +780,43 @@ fn verifier_does_not_guess_a_branching_callable_result() {
         ),
         "not initialized",
     );
+}
+
+#[test]
+fn verifier_keeps_oversized_callable_instruction_summary_unknown() {
+    let mut instructions = vec![
+        I::Call(5, 0),
+        I::JumpIfFalse(4),
+        I::Load(99),
+        I::Pop,
+        I::Halt,
+    ];
+    for _ in 0..65 {
+        instructions.extend([I::Push(Value::Nil), I::Pop]);
+    }
+    instructions.extend([I::Push(Value::Bool(false)), I::Return]);
+    let program = callable(instructions, 5, 0, 0);
+
+    interpreter::run_with(&program, &mut Vec::new()).unwrap();
+    rejected(program, "not initialized");
+}
+
+#[test]
+fn verifier_keeps_overstack_callable_summary_unknown() {
+    let mut instructions = vec![
+        I::Call(5, 0),
+        I::JumpIfFalse(4),
+        I::Load(99),
+        I::Pop,
+        I::Halt,
+    ];
+    instructions.extend((0..33).map(|_| I::Push(Value::Nil)));
+    instructions.extend((0..33).map(|_| I::Pop));
+    instructions.extend([I::Push(Value::Bool(false)), I::Return]);
+    let program = callable(instructions, 5, 0, 0);
+
+    interpreter::run_with(&program, &mut Vec::new()).unwrap();
+    rejected(program, "not initialized");
 }
 
 #[test]
@@ -532,6 +947,7 @@ fn verifier_prunes_branches_from_exact_type_predicates() {
             CallableSignature {
                 parameters: 0,
                 captures: 0,
+                asynchronous: false,
                 parameter_types: None,
                 result_type: Some(cog::value::RuntimeType::Error("Error".into())),
             },
@@ -628,6 +1044,7 @@ fn verifier_propagates_definite_nominal_call_mismatch_as_error() {
             CallableSignature {
                 parameters: 1,
                 captures: 0,
+                asynchronous: false,
                 parameter_types: Some(vec![Some(cog::value::RuntimeType::Nominal(
                     "demo::B".into(),
                 ))]),
@@ -671,6 +1088,7 @@ fn verifier_keeps_unknown_nominal_call_mismatches_on_the_error_path() {
             CallableSignature {
                 parameters: 1,
                 captures: 0,
+                asynchronous: false,
                 parameter_types: Some(vec![Some(expected)]),
                 result_type: None,
             },
@@ -738,6 +1156,7 @@ fn typed_calls_accept_nominal_enum_nullable_and_metadata_identities() {
             CallableSignature {
                 parameters: 1,
                 captures: 0,
+                asynchronous: false,
                 parameter_types: Some(vec![Some(expected)]),
                 result_type: Some(T::Bool),
             },
@@ -770,6 +1189,7 @@ fn error_arguments_can_enter_typed_cog_functions() {
             CallableSignature {
                 parameters: 1,
                 captures: 0,
+                asynchronous: false,
                 parameter_types: Some(vec![Some(expected)]),
                 result_type: Some(T::Bool),
             },
@@ -836,6 +1256,7 @@ fn native_any_can_handle_error_and_return_a_normal_value() {
         CallableSignature {
             parameters: 1,
             captures: 0,
+            asynchronous: false,
             parameter_types: Some(vec![Some(cog::value::RuntimeType::Bool)]),
             result_type: None,
         },
@@ -952,7 +1373,11 @@ fn verifier_tracks_known_record_fields_and_missing_field_errors() {
 
 #[test]
 fn verifier_tracks_fields_after_single_type_tags() {
-    for tag in ["@struct::Point", "Enum::Variant"] {
+    for tag in [
+        "@struct::Point",
+        "Enum::Variant",
+        "$core::err::Error::Custom",
+    ] {
         let program = CompiledProgram::new(vec![
             I::Push(Value::TypeTag(tag.into())),
             I::Push(Value::Nil),
@@ -1256,6 +1681,7 @@ fn verifier_keeps_type_predicates_dynamic_when_a_typed_call_may_return_error() {
         CallableSignature {
             parameters: 0,
             captures: 0,
+            asynchronous: false,
             parameter_types: None,
             result_type: Some(cog::value::RuntimeType::Int),
         },
@@ -1321,14 +1747,7 @@ fn verifier_rejects_stack_underflow_in_unreachable_instructions() {
 
     // Same shape as the rejected program, encoded directly to exercise the
     // untrusted file decoder rather than the validating encoder.
-    let mut bytes = b"COG\0\x0a\0\0\0".to_vec();
-    bytes.extend_from_slice(&0u32.to_le_bytes()); // imports
-    bytes.extend_from_slice(&0u32.to_le_bytes()); // callables
-    bytes.extend_from_slice(&3u32.to_le_bytes()); // instructions
-    bytes.extend_from_slice(&[52]); // Jump
-    bytes.extend_from_slice(&2u32.to_le_bytes());
-    bytes.extend_from_slice(&[36, 18]); // Pop; Halt
-    bytes.extend_from_slice(&0u32.to_le_bytes()); // source map
+    let bytes = untrusted_instructions(3, &[52, 2, 0, 0, 0, 36, 18]);
     for _ in 0..2 {
         assert!(
             bytecode::decode(&bytes)
@@ -1336,6 +1755,22 @@ fn verifier_rejects_stack_underflow_in_unreachable_instructions() {
                 .contains("operand stack underflow")
         );
     }
+}
+
+#[test]
+fn verifier_rejects_inconsistent_stack_heights_in_detached_unreachable_code() {
+    rejected(
+        CompiledProgram::new(vec![
+            I::Jump(6),
+            I::Push(Value::Bool(true)),
+            I::JumpIfFalse(5),
+            I::Push(Value::Nil),
+            I::Jump(5),
+            I::Halt,
+            I::Halt,
+        ]),
+        "inconsistent operand stack heights at merge",
+    );
 }
 
 #[test]
@@ -1402,6 +1837,7 @@ fn verifier_leaves_dynamic_and_error_branch_conditions_to_the_vm() {
         CallableSignature {
             parameters: 0,
             captures: 0,
+            asynchronous: false,
             parameter_types: None,
             result_type: Some(cog::value::RuntimeType::Error("error".to_owned())),
         },
@@ -1504,7 +1940,7 @@ fn calls_and_function_constants_require_declared_entries_and_matching_shapes() {
             0,
             1,
         ),
-        "capture signature",
+        "capture or async signature mismatch",
     );
     rejected(
         callable(
@@ -1728,6 +2164,146 @@ fn verifier_iterates_capture_facts_through_nested_closures() {
 }
 
 #[test]
+fn verifier_waits_for_capture_facts_before_rejecting_infeasible_local_reads() {
+    for (nested, guarded_outer) in [(false, false), (true, false), (true, true)] {
+        let mut instructions = vec![
+            I::Push(Value::Bool(false)),
+            I::MakeClosure(4, 1),
+            I::CallValue(0),
+            I::Halt,
+        ];
+        if nested {
+            if guarded_outer {
+                // This first sweep fails before discovering the inner closure.
+                instructions.extend([
+                    I::LoadCapture(0),
+                    I::JumpIfFalse(9),
+                    I::Load(99),
+                    I::Pop,
+                    I::Jump(9),
+                ]);
+            }
+            let inner_entry = instructions.len() + 4;
+            instructions.extend([
+                I::LoadCapture(0),
+                I::MakeClosure(inner_entry, 1),
+                I::CallValue(0),
+                I::Return,
+            ]);
+        }
+        let body = instructions.len();
+        instructions.extend([
+            I::LoadCapture(0),
+            I::JumpIfFalse(body + 5),
+            I::Load(99),
+            I::Pop,
+            I::Jump(body + 5),
+            I::Push(Value::Nil),
+            I::Return,
+        ]);
+        let mut program = CompiledProgram::new(instructions);
+        program
+            .callables
+            .insert(4, CallableSignature::dynamic(0, 1));
+        if nested {
+            program
+                .callables
+                .insert(body, CallableSignature::dynamic(0, 1));
+        }
+
+        // Execute the valid fixture before asking the serializer to verify it.
+        interpreter::run_with(&program, &mut Vec::new()).unwrap();
+        let mut bytes = bytecode::encode(&program).unwrap();
+        let decoded = bytecode::decode(&bytes).unwrap();
+        interpreter::run_with(&decoded, &mut Vec::new()).unwrap();
+
+        // Changing only the capture makes the same local read reachable.
+        program.instructions[0] = I::Push(Value::Bool(true));
+        assert!(matches!(
+            interpreter::run_with(&program, &mut Vec::new()),
+            Err(cog::error::RuntimeError::InvalidLocal(99))
+        ));
+        rejected(program, "not initialized");
+
+        let prefix = [46, 2, 0, 59, 4, 0, 0, 0, 1, 0, 0, 0];
+        let offsets: Vec<_> = bytes
+            .windows(prefix.len())
+            .enumerate()
+            .filter_map(|(offset, window)| (window == prefix).then_some(offset))
+            .collect();
+        assert_eq!(offsets.len(), 1);
+        bytes[offsets[0] + 2] = 1;
+        let error = bytecode::decode(&bytes).unwrap_err();
+        assert!(error.contains("not initialized"), "{error}");
+        let error = bytecode::read(std::io::Cursor::new(&bytes)).unwrap_err();
+        assert!(error.contains("not initialized"), "{error}");
+    }
+}
+
+#[test]
+fn verifier_checks_dead_capture_branches_after_bootstrap() {
+    for (instruction, message) in [
+        (I::Pop, "operand stack underflow"),
+        (I::Jump(0), "branch crosses a callable region"),
+        (
+            I::LoadCapture(1),
+            "capture index exceeds callable signature",
+        ),
+    ] {
+        let mut program = callable(
+            vec![
+                I::Push(Value::Bool(false)),
+                I::MakeClosure(4, 1),
+                I::CallValue(0),
+                I::Halt,
+                I::LoadCapture(0),
+                I::JumpIfFalse(9),
+                I::Load(99),
+                I::Pop,
+                I::Jump(9),
+                I::Push(Value::Nil),
+                I::Return,
+            ],
+            4,
+            0,
+            1,
+        );
+        program.instructions[6] = instruction;
+        interpreter::run_with(&program, &mut Vec::new()).unwrap();
+        rejected(program, message);
+    }
+}
+
+#[test]
+fn verifier_rejects_stable_capture_facts_when_a_region_still_fails() {
+    let program = callable(
+        vec![
+            I::Push(Value::Bool(true)),
+            I::MakeClosure(9, 1),
+            I::Pop,
+            I::Load(0),
+            I::Pop,
+            I::Push(Value::Bool(false)),
+            I::MakeClosure(9, 1),
+            I::Pop,
+            I::Halt,
+            I::LoadCapture(0),
+            I::JumpIfTrue(13),
+            I::Load(0),
+            I::Return,
+            I::Push(Value::Nil),
+            I::Return,
+        ],
+        9,
+        0,
+        1,
+    );
+    // The first constructor supplies a precise fact before the root fails.
+    // Stable partial output must never turn the root's error into success.
+    rejected(program, "not initialized");
+}
+
+#[test]
 fn verifier_keeps_error_only_captures_on_runtime_branch_paths() {
     let program = callable(
         vec![
@@ -1749,12 +2325,15 @@ fn verifier_keeps_error_only_captures_on_runtime_branch_paths() {
         1,
     );
     bytecode::validate(&program).unwrap();
-    assert_eq!(
-        interpreter::run_with(&program, &mut Vec::new())
-            .unwrap_err()
-            .kind(),
-        "TypeMismatch"
-    );
+    let decoded = bytecode::decode(&bytecode::encode(&program).unwrap()).unwrap();
+    for artifact in [&program, &decoded] {
+        assert_eq!(
+            interpreter::run_with(artifact, &mut Vec::new())
+                .unwrap_err()
+                .kind(),
+            "TypeMismatch"
+        );
+    }
 }
 
 #[test]
@@ -1808,12 +2387,7 @@ fn assembler_closures_round_trip_with_explicit_signatures() {
 #[test]
 fn decoder_verifies_stack_shape_and_callable_table_before_execution() {
     // No imports, no callables, two instructions: Pop; Halt.
-    let mut bytes = b"COG\0\x0a\0\0\0".to_vec();
-    bytes.extend_from_slice(&0u32.to_le_bytes());
-    bytes.extend_from_slice(&0u32.to_le_bytes());
-    bytes.extend_from_slice(&2u32.to_le_bytes());
-    bytes.extend_from_slice(&[36, 18]);
-    bytes.extend_from_slice(&0u32.to_le_bytes());
+    let mut bytes = untrusted_instructions(2, &[36, 18]);
     assert!(bytecode::decode(&bytes).unwrap_err().contains("underflow"));
     bytes[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(

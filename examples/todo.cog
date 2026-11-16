@@ -2,7 +2,7 @@
 // Commands: add, done, remove, list, stats, help, quit.
 // Each saved line starts with [ ] or [x], followed by the task name.
 // io::read_line() returns a line without the newline, or an Error on input failure.
-include std;
+@!include("std")
 use collections from std;
 use io;
 use bytes;
@@ -11,9 +11,9 @@ use fmt;
 use fs;
 use str::{trim, builder, build, split,};
 
-comptime PROMPT = "> ";
-comptime HELP = "commands: add, done, remove, list, stats, help, quit";
-comptime NOTES_PATH = "txt/todo.txt";
+@comptime const PROMPT = "> ";
+@comptime const HELP = "commands: add, done, remove, list, stats, help, quit";
+@comptime const NOTES_PATH = "txt/todo.txt";
 
 fn read_notes() -> str {
     // a+ creates the notes file on first run without truncating existing notes.
@@ -52,7 +52,7 @@ fn save_tasks(tasks: collections::Map[str, bool]) -> nil {
 
 fn load_tasks() -> collections::Map[str, bool] {
     const text = read_notes()!!;
-    var tasks = collections::map_new[str, bool]();
+    var tasks = collections::Map::new[str, bool]();
     if text == "" { return tasks; }
 
     const lines = split(text, "\n")!!;

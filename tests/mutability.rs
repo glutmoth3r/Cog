@@ -1,7 +1,7 @@
 use cog::{bytecode, interpreter, project};
 
 fn source(body: &str) -> String {
-    format!("include std; use io; use err::Error; {body}")
+    format!("@!include(\"std\") use io; use err::Error; {body}")
 }
 fn run(body: &str) -> String {
     let program =

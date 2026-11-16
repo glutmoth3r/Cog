@@ -1,0 +1,11 @@
+@!include("std")
+use host;
+use io;
+
+@async fn main() -> nil {
+    const first = spawn(host::delayed(250));
+    const second = spawn(host::delayed(250));
+    const first_result = await first;
+    const second_result = await second;
+    io::println($"results: {first_result}, {second_result}");
+}

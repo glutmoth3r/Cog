@@ -48,7 +48,6 @@ pub enum Item {
     /// before module resolution; it is never emitted into runtime code.
     ComptimeInclude {
         package: String,
-        path: Option<String>,
         span: Option<crate::diagnostic::SourceSpan>,
     },
     Extend(ExtendDecl),
@@ -78,7 +77,7 @@ pub struct ExtendDecl {
     pub trait_name: Option<String>,
     /// Type arguments supplied to the implemented trait.
     pub trait_arguments: Vec<TypeAnnotation>,
-    /// True for `comptime extend`. Extension declarations are resolved before
+    /// True for `@comptime extend`. Extension declarations are resolved before
     /// runtime lowering; this distinguishes their source role for diagnostics.
     pub comptime: bool,
     pub methods: Vec<ExtensionMethod>,
@@ -127,6 +126,7 @@ pub struct TraitMethod {
     pub name: String,
     pub params: Vec<Param>,
     pub mutating_receiver: bool,
+    pub asynchronous: bool,
     pub result_type: Option<TypeAnnotation>,
 }
 
@@ -147,8 +147,28 @@ pub struct EnumVariant {
 pub enum MatchPattern {
     Wildcard,
     StringLiteral(String),
+    CharacterLiteral(char),
     Type(String),
     Variant { name: String, bindings: Vec<String> },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BindingPattern {
+    Name(String),
+    Tuple(Vec<BindingPattern>),
+}
+
+impl BindingPattern {
+    pub fn visit_names(&self, visitor: &mut impl FnMut(&str)) {
+        match self {
+            Self::Name(name) => visitor(name),
+            Self::Tuple(items) => {
+                for item in items {
+                    item.visit_names(visitor);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -165,6 +185,17 @@ pub enum Visibility {
     Public,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InlineMode {
+    /// The compiler chooses whether this function is a good inline candidate.
+    #[default]
+    Auto,
+    /// Prefer inlining this function when it is safe and within the code-size budget.
+    Hint,
+    /// Keep this function out of the inliner.
+    Never,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FunctionDecl {
     pub name: String,
@@ -173,6 +204,10 @@ pub struct FunctionDecl {
     pub visibility: Visibility,
     /// Compile-time-only callable; it is evaluated by `comptime` and is not emitted at runtime.
     pub comptime: bool,
+    /// Runtime task-producing callable declared with `@async`.
+    pub asynchronous: bool,
+    /// Inlining preference supplied with `@inline` or `@inline("never")`.
+    pub inline: InlineMode,
     pub type_params: Vec<TypeParameter>,
     pub params: Vec<Param>,
     pub result_type: Option<TypeAnnotation>,
@@ -187,10 +222,27 @@ pub struct Block {
     pub tail: Option<Box<Expr>>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ForClause {
+    Range {
+        var: String,
+        start: Expr,
+        end: Expr,
+        step: Option<Expr>,
+    },
+    Each {
+        pattern: BindingPattern,
+        iterable: Expr,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VarType {
     Int,
+    UInt,
+    BigInt,
     Bool,
+    Char,
     Str,
     Float,
     Nil,
@@ -200,7 +252,10 @@ impl VarType {
     pub fn name(self) -> &'static str {
         match self {
             VarType::Int => "int",
+            VarType::UInt => "uint",
+            VarType::BigInt => "bigint",
             VarType::Bool => "bool",
+            VarType::Char => "char",
             VarType::Str => "str",
             VarType::Float => "float",
             VarType::Nil => "nil",
@@ -377,12 +432,12 @@ pub enum Stmt {
     // Binding types are inferred or annotated by the semantic pass,
     // independently of instruction emission and mutation capability.
     VarDecl {
-        name: String,
+        pattern: BindingPattern,
         ty: Option<TypeAnnotation>,
         value: Expr,
     },
     Const {
-        name: String,
+        pattern: BindingPattern,
         ty: Option<TypeAnnotation>,
         value: Expr,
     },
@@ -451,10 +506,16 @@ pub enum Stmt {
         body: Block,
     },
     /// Iterate array elements or Unicode scalar strings, evaluating the
-    /// collection expression once at loop entry.
+    /// collection expression once at loop entry. Tuple patterns bind positions
+    /// of tuple-valued elements recursively.
     ForEach {
-        var: String,
+        pattern: BindingPattern,
         iterable: Expr,
+        body: Block,
+    },
+    /// Iterate multiple ranges or collections in lockstep until one is exhausted.
+    ForZip {
+        clauses: Vec<ForClause>,
         body: Block,
     },
     Break,
@@ -470,14 +531,18 @@ pub enum Stmt {
 pub enum Expr {
     Located(crate::diagnostic::SourceSpan, Box<Expr>),
     Int(i64),
+    /// Positive integer magnitudes outside `int` but within `uint`.
+    UInt(u64),
+    BigInt(BigInt),
     Float(f64),
+    Char(char),
     Str(String),
     /// Immutable compiler snapshot, freshly allocated on runtime materialization.
     Bytes(Vec<u8>),
     Interpolated(Vec<StringPart>),
     Bool(bool),
     Nil,
-    /// A compiler-only type expression, accepted in a `comptime T: type` initializer.
+    /// A compiler-only type expression, accepted in a `@comptime const T: type` initializer.
     TypeLiteral(TypeAnnotation),
     Ident(String),
     Array(Vec<Expr>),
@@ -490,6 +555,14 @@ pub enum Expr {
     Apply(Box<Expr>, Vec<CallArgument>),
     /// Explicit compile-time type arguments, erased from the runtime call ABI.
     SpecializedCall(String, Vec<TypeAnnotation>, Vec<CallArgument>),
+    /// Type-associated call: `Type::method(args...)`. The target is a type,
+    /// while the method is resolved against `extend` declarations.
+    AssociatedCall {
+        target: TypeAnnotation,
+        method: String,
+        type_arguments: Vec<TypeAnnotation>,
+        args: Vec<CallArgument>,
+    },
     /// Method call: `receiver.method(args...)`. The receiver is part of the
     /// expression, not syntactic sugar for a wrapper function. Built-in
     /// methods lower to VM primitives or linked runtime calls.
@@ -596,4 +669,6 @@ pub enum BinOp {
 pub enum UnOp {
     Neg,
     Not,
+    Await,
 }
+use num_bigint::BigInt;

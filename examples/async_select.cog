@@ -1,0 +1,27 @@
+@!include("std")
+use io;
+use task;
+use async::time;
+
+@async fn delayed(value: str, seconds: float) -> str {
+    await time::sleep(seconds);
+    io::println($"{value} finished")!!;
+    return value;
+}
+
+@async fn main() -> nil {
+    const first = spawn(delayed("first", 0.005));
+    const second = spawn(delayed("second", 0.04));
+    const selected = await task::select2(first, second);
+
+    if selected == 0 {
+        const value = await first;
+        io::println($"selected {value}")!!;
+    } else {
+        const value = await second;
+        io::println($"selected {value}")!!;
+    }
+
+    const other = if selected == 0 { await second } else { await first };
+    io::println($"joined {other}")!!;
+}

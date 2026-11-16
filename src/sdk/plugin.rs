@@ -1,9 +1,12 @@
-use super::abi::{self, Bytes, Handle, HostV1, Status, ValueView};
-use super::{
-    Effects, Engine, Error, ErrorKind, NativeContext, Signature, Type, Value, entry_allowed,
-};
+use super::abi::{self, Bytes, Handle, HostV3, Status, ValueView};
+use super::entry_allowed;
+use super::{Effects, Engine, Error, ErrorKind, Permissions, Signature, Type};
+use super::{NativeContext, Value};
+use crate::error::RuntimeError;
+use crate::runtime::{AsyncWakeHandle, NativeAsyncFactory, NativeAsyncOperation, RuntimeContext};
 use crate::value::Value as VmValue;
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -32,6 +35,8 @@ impl Type {
             9 => Self::Float,
             10 => Self::Bool,
             11 => Self::StrBuf,
+            13 => Self::Char,
+            14 => Self::UInt,
             _ => return Err(failure("unknown native type tag")),
         })
     }
@@ -49,19 +54,127 @@ impl Type {
             "float" => Self::Float,
             "bool" => Self::Bool,
             "strbuf" => Self::StrBuf,
+            "char" => Self::Char,
             _ => return Err(failure("unknown native type name")),
         })
     }
 }
 
-/// Explicit CLI plugin metadata. Parsing/checking never loads native code.
-/// Library paths are resolved relative to the manifest file by the CLI.
+/// C ABI v3 native plugin metadata. Parsing and static checking never load
+/// native code; the CLI resolves the library relative to its package or manifest.
 #[derive(Clone, Debug)]
 pub struct PluginManifest {
+    /// Legacy single-library path used by external `--plugin` manifests and
+    /// older source package manifests.
     pub library: PathBuf,
+    /// Exact target selections for portable package plugins.
+    pub target_libraries: BTreeMap<String, PathBuf>,
     functions: Vec<(String, Signature)>,
 }
 impl PluginManifest {
+    /// Parse an embedded package plugin declaration with a normalized,
+    /// package-relative library path suitable for a future archive.
+    pub(crate) fn parse_package_node(node: &kdl::KdlNode) -> Result<Self, Error> {
+        let mut property_names = std::collections::BTreeSet::new();
+        if node.name().value() != "plugin"
+            || node.ty().is_some()
+            || node.entries().iter().any(|entry| entry.ty().is_some())
+            || node.entries().iter().any(|entry| {
+                entry
+                    .name()
+                    .is_none_or(|name| !matches!(name.value(), "version" | "library"))
+                    || !property_names.insert(entry.name().unwrap().value().to_owned())
+            })
+            || !matches!(node.entries().len(), 1 | 2)
+            || node.get("version").and_then(|value| value.as_integer()) != Some(1)
+        {
+            return Err(failure(
+                "package plugin requires plugin version=1 library=\"relative/path\"",
+            ));
+        }
+        let legacy_library = node
+            .get("library")
+            .and_then(|value| value.as_string())
+            .map(PathBuf::from);
+        if legacy_library
+            .as_ref()
+            .is_some_and(|path| !package_library_path(path))
+        {
+            return Err(failure(
+                "package plugin library path must be a normalized path inside the package",
+            ));
+        }
+        let children = node
+            .children()
+            .ok_or_else(|| failure("package plugin requires function declarations"))?;
+        let mut functions = Vec::new();
+        let mut target_libraries = BTreeMap::new();
+        for child in children.nodes() {
+            match child.name().value() {
+                "function" if functions.len() < 4096 => {
+                    let function = parse_function(child)?;
+                    if functions
+                        .iter()
+                        .any(|(existing, _)| existing == &function.0)
+                    {
+                        return Err(failure("duplicate native function"));
+                    }
+                    functions.push(function);
+                }
+                "library" => {
+                    let mut properties = std::collections::BTreeSet::new();
+                    let target = child
+                        .get("target")
+                        .and_then(|value| value.as_string())
+                        .ok_or_else(|| failure("target library requires target= and path="))?;
+                    let path = child
+                        .get("path")
+                        .and_then(|value| value.as_string())
+                        .filter(|path| !path.is_empty() && !path.contains('\0'))
+                        .map(PathBuf::from)
+                        .ok_or_else(|| failure("target library requires target= and path="))?;
+                    if child.ty().is_some()
+                        || child.children().is_some()
+                        || child.entries().len() != 2
+                        || child.entries().iter().any(|entry| {
+                            entry.ty().is_some()
+                                || entry.name().is_none_or(|name| {
+                                    !matches!(name.value(), "target" | "path")
+                                        || !properties.insert(name.value().to_owned())
+                                })
+                        })
+                        || !SUPPORTED_PLUGIN_TARGETS.contains(&target)
+                        || !package_library_path(&path)
+                    {
+                        return Err(failure("invalid target library declaration"));
+                    }
+                    if target_libraries.insert(target.to_owned(), path).is_some() {
+                        return Err(failure("duplicate plugin library target"));
+                    }
+                }
+                _ => return Err(failure("unknown or excessive package plugin metadata")),
+            }
+        }
+        if functions.is_empty() {
+            return Err(failure("package plugin requires at least one function"));
+        }
+        if !target_libraries.is_empty() && legacy_library.is_some() {
+            return Err(failure(
+                "package plugin cannot combine `library` and target library declarations",
+            ));
+        }
+        if legacy_library.is_none() && target_libraries.is_empty() {
+            return Err(failure(
+                "package plugin requires a library or target library declarations",
+            ));
+        }
+        Ok(Self {
+            library: legacy_library.unwrap_or_default(),
+            target_libraries,
+            functions,
+        })
+    }
+
     pub fn parse(text: &str) -> Result<Self, Error> {
         if text.len() > crate::config::MAX_CONFIGURATION_BYTES {
             return Err(failure("plugin manifest exceeds 256 KiB"));
@@ -96,81 +209,18 @@ impl PluginManifest {
                     library = Some(path);
                 }
                 "function" if functions.len() < 4096 => {
-                    if node.entries().len() != 2 || node.entries()[0].name().is_some() {
-                        return Err(failure(
-                            "function requires a positional name and result=\"type\"",
-                        ));
-                    }
-                    let name = node
-                        .get(0)
-                        .and_then(|v| v.as_string())
-                        .ok_or_else(|| failure("function requires a name"))?;
-                    let result = node
-                        .get("result")
-                        .and_then(|v| v.as_string())
-                        .ok_or_else(|| failure("function requires a result type"))?;
-                    let mut signature = Signature::new(Vec::new(), Type::from_name(result)?);
-                    if let Some(children) = node.children() {
-                        for child in children.nodes() {
-                            if child.ty().is_some()
-                                || child.children().is_some()
-                                || child.entries().len() != 1
-                                || child.entries()[0].name().is_some()
-                                || child.entries()[0].ty().is_some()
-                            {
-                                return Err(failure("invalid function metadata"));
-                            }
-                            match child.name().value() {
-                                "param" if signature.parameters.len() < MAX_PLUGIN_ARGUMENTS => {
-                                    signature.parameters.push(Type::from_name(
-                                        child
-                                            .get(0)
-                                            .and_then(|v| v.as_string())
-                                            .ok_or_else(|| failure("param requires a type"))?,
-                                    )?);
-                                }
-                                "effect" => {
-                                    let effect = match child.get(0).and_then(|v| v.as_string()) {
-                                        Some("output") => Effects::OUTPUT,
-                                        Some("input") => Effects::INPUT,
-                                        Some("fs_read") => Effects::FS_READ,
-                                        Some("fs_write") => Effects::FS_WRITE,
-                                        Some("process") => Effects::PROCESS,
-                                        Some("process_info") => Effects::PROCESS_INFO,
-                                        Some("clock") => Effects::CLOCK,
-                                        Some("sleep") => Effects::SLEEP,
-                                        Some("entropy") => Effects::ENTROPY,
-                                        _ => return Err(failure("unknown native effect")),
-                                    };
-                                    if signature.effects.contains(effect) {
-                                        return Err(failure("duplicate native effect"));
-                                    }
-                                    signature.effects = signature.effects | effect;
-                                }
-                                "mutates" => signature.mutating_parameters.push(
-                                    usize::try_from(
-                                        child
-                                            .get(0)
-                                            .and_then(|v| v.as_integer())
-                                            .ok_or_else(|| failure("mutates requires an index"))?,
-                                    )
-                                    .map_err(|_| failure("invalid mutation index"))?,
-                                ),
-                                _ => return Err(failure("unknown or excessive function metadata")),
-                            }
-                        }
-                    }
-                    signature.identity(name)?;
-                    if functions.iter().any(|(existing, _)| existing == name) {
+                    let (name, signature) = parse_function(node)?;
+                    if functions.iter().any(|(existing, _)| existing == &name) {
                         return Err(failure("duplicate native function"));
                     }
-                    functions.push((name.to_owned(), signature));
+                    functions.push((name, signature));
                 }
                 _ => return Err(failure("unknown or duplicate plugin manifest node")),
             }
         }
         Ok(Self {
             library: library.ok_or_else(|| failure("missing plugin node"))?,
+            target_libraries: BTreeMap::new(),
             functions,
         })
     }
@@ -184,6 +234,19 @@ impl PluginManifest {
     }
     pub fn functions(&self) -> &[(String, Signature)] {
         &self.functions
+    }
+    pub fn library_paths(&self) -> impl Iterator<Item = &Path> {
+        if self.target_libraries.is_empty() {
+            std::iter::once(self.library.as_path())
+                .collect::<Vec<_>>()
+                .into_iter()
+        } else {
+            self.target_libraries
+                .values()
+                .map(PathBuf::as_path)
+                .collect::<Vec<_>>()
+                .into_iter()
+        }
     }
     pub fn register_metadata(&self, engine: &mut Engine) -> Result<(), Error> {
         let mut next = engine.clone();
@@ -199,8 +262,8 @@ impl PluginManifest {
     ///
     /// # Safety
     /// This executes trusted native code with process authority. The library and
-    /// all transitive dependencies must obey C ABI v1, including pointer validity,
-    /// no unwind across C, synchronous calls and context/state ownership.
+    /// all transitive dependencies must obey C ABI v3, including pointer validity,
+    /// no unwind across C, thread ownership, async wakeups and operation cleanup.
     pub unsafe fn load(&self, engine: &mut Engine, manifest_directory: &Path) -> Result<(), Error> {
         if self.library.is_absolute() {
             return Err(failure(
@@ -215,12 +278,311 @@ impl PluginManifest {
             )
         }
     }
+
+    /// Load a package plugin for an exact compilation target. A target bundle
+    /// never falls back to another platform's library.
+    ///
+    /// # Safety
+    /// The selected library and its transitive dependencies must be trusted and
+    /// obey C ABI v3, including pointer validity, no unwind across C, thread
+    /// ownership, async wakeups and operation cleanup.
+    pub unsafe fn load_for_target(
+        &self,
+        engine: &mut Engine,
+        package_root: &Path,
+        target: &str,
+    ) -> Result<(), Error> {
+        let library = if self.target_libraries.is_empty() {
+            &self.library
+        } else {
+            self.target_libraries
+                .get(target)
+                .ok_or_else(|| failure(format!("plugin has no library for target `{target}`")))?
+        };
+        if !package_library_path(library) {
+            return Err(failure(
+                "plugin library path must be a normalized path inside the package",
+            ));
+        }
+        unsafe { load(engine, &package_root.join(library), Some(&self.functions)) }
+    }
+}
+
+pub(crate) const SUPPORTED_PLUGIN_TARGETS: [&str; 3] = [
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+];
+
+fn parse_function(node: &kdl::KdlNode) -> Result<(String, Signature), Error> {
+    if node.ty().is_some()
+        || node.entries().iter().any(|entry| entry.ty().is_some())
+        || node.entries().len() != 2
+        || node.entries()[0].name().is_some()
+    {
+        return Err(failure(
+            "function requires a positional name and result=\"type\"",
+        ));
+    }
+    let name = node
+        .get(0)
+        .and_then(|value| value.as_string())
+        .ok_or_else(|| failure("function requires a name"))?;
+    let result = node
+        .get("result")
+        .and_then(|value| value.as_string())
+        .ok_or_else(|| failure("function requires a result type"))?;
+    let mut signature = Signature::new(Vec::new(), Type::from_name(result)?);
+    if let Some(children) = node.children() {
+        for child in children.nodes() {
+            if child.name().value() == "async" {
+                if signature.asynchronous
+                    || child.ty().is_some()
+                    || child.children().is_some()
+                    || !child.entries().is_empty()
+                {
+                    return Err(failure("invalid or duplicate async function marker"));
+                }
+                signature = signature.with_async();
+                continue;
+            }
+            if child.ty().is_some()
+                || child.children().is_some()
+                || child.entries().len() != 1
+                || child.entries()[0].name().is_some()
+                || child.entries()[0].ty().is_some()
+            {
+                return Err(failure("invalid function metadata"));
+            }
+            match child.name().value() {
+                "param" if signature.parameters.len() < MAX_PLUGIN_ARGUMENTS => {
+                    signature.parameters.push(Type::from_name(
+                        child
+                            .get(0)
+                            .and_then(|value| value.as_string())
+                            .ok_or_else(|| failure("param requires a type"))?,
+                    )?);
+                }
+                "effect" => {
+                    let effect = match child.get(0).and_then(|value| value.as_string()) {
+                        Some("output") => Effects::OUTPUT,
+                        Some("input") => Effects::INPUT,
+                        Some("fs_read") => Effects::FS_READ,
+                        Some("fs_write") => Effects::FS_WRITE,
+                        Some("process") => Effects::PROCESS,
+                        Some("process_info") => Effects::PROCESS_INFO,
+                        Some("clock") => Effects::CLOCK,
+                        Some("sleep") => Effects::SLEEP,
+                        Some("entropy") => Effects::ENTROPY,
+                        Some("network") => Effects::NETWORK,
+                        _ => return Err(failure("unknown native effect")),
+                    };
+                    if signature.effects.contains(effect) {
+                        return Err(failure("duplicate native effect"));
+                    }
+                    signature.effects = signature.effects | effect;
+                }
+                "mutates" => signature.mutating_parameters.push(
+                    usize::try_from(
+                        child
+                            .get(0)
+                            .and_then(|value| value.as_integer())
+                            .ok_or_else(|| failure("mutates requires an index"))?,
+                    )
+                    .map_err(|_| failure("invalid mutation index"))?,
+                ),
+                _ => return Err(failure("unknown or excessive function metadata")),
+            }
+        }
+    }
+    signature.identity(name)?;
+    Ok((name.to_owned(), signature))
+}
+
+fn package_library_path(path: &Path) -> bool {
+    let Some(text) = path.to_str() else {
+        return false;
+    };
+    !text.is_empty()
+        && !text
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '\\' | ':'))
+        && !path.is_absolute()
+        && text
+            .split('/')
+            .all(|component| !matches!(component, "" | "." | ".."))
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 struct LibraryState {
     state: *mut c_void,
     destroy: Option<unsafe extern "C" fn(*mut c_void)>,
     _library: libloading::Library,
+}
+
+struct PluginAsyncFactory {
+    state: Rc<LibraryState>,
+    start: abi::AsyncStartV3,
+    poll: abi::AsyncPollV3,
+    cancel: abi::AsyncCancelV3,
+    destroy: abi::AsyncDestroyV3,
+    effects: Effects,
+}
+
+struct WakeRegistration {
+    wake: AsyncWakeHandle,
+    active: std::sync::atomic::AtomicBool,
+}
+
+struct PluginAsyncOperation {
+    state: Rc<LibraryState>,
+    operation: *mut c_void,
+    poll: abi::AsyncPollV3,
+    cancel: abi::AsyncCancelV3,
+    destroy: abi::AsyncDestroyV3,
+    wake: Box<WakeRegistration>,
+    cancelled: bool,
+}
+
+fn runtime_plugin_failure(error: Error) -> RuntimeError {
+    RuntimeError::NativeFailure {
+        message: error.message().to_owned(),
+    }
+}
+
+impl NativeAsyncFactory for PluginAsyncFactory {
+    fn start(
+        &self,
+        context: &mut RuntimeContext<'_>,
+        arguments: &[crate::value::Value],
+        wake: AsyncWakeHandle,
+    ) -> Result<Box<dyn NativeAsyncOperation>, RuntimeError> {
+        if !Permissions::from_runtime(context.capabilities)
+            .allowed
+            .contains(self.effects)
+        {
+            return Err(RuntimeError::PermissionDenied {
+                op: "native extension",
+            });
+        }
+        check_argument_count(arguments.len()).map_err(runtime_plugin_failure)?;
+        let id = next_call_id().map_err(runtime_plugin_failure)?;
+        let mut native_context = NativeContext { inner: context };
+        let remaining_bytes = native_context.inner.limits.buffer_limit();
+        let mut frame = Frame {
+            context: &mut native_context,
+            id,
+            values: Vec::new(),
+            error: None,
+            remaining_bytes,
+        };
+        let mut handles = [0; MAX_PLUGIN_ARGUMENTS];
+        for (index, value) in arguments.iter().enumerate() {
+            handles[index] =
+                frame
+                    .push(Value(value.clone()))
+                    .map_err(|_| RuntimeError::ResourceLimit {
+                        resource: "native handle budget",
+                    })?;
+        }
+        let wake = Box::new(WakeRegistration {
+            wake,
+            active: std::sync::atomic::AtomicBool::new(true),
+        });
+        let wake_pointer = (&*wake as *const WakeRegistration).cast_mut().cast();
+        let mut operation = std::ptr::null_mut();
+        let status = unsafe {
+            (self.start)(
+                self.state.state,
+                &HOST,
+                (&mut frame as *mut Frame<'_, '_, '_>).cast(),
+                wake_pointer,
+                handles.as_ptr(),
+                arguments.len(),
+                &mut operation,
+            )
+        };
+        if status != abi::OK || frame.error.is_some() {
+            return Err(runtime_plugin_failure(failure(frame.error.unwrap_or_else(
+                || format!("async plugin start failed ({status})"),
+            ))));
+        }
+        Ok(Box::new(PluginAsyncOperation {
+            state: self.state.clone(),
+            operation,
+            poll: self.poll,
+            cancel: self.cancel,
+            destroy: self.destroy,
+            wake,
+            cancelled: false,
+        }))
+    }
+}
+
+impl NativeAsyncOperation for PluginAsyncOperation {
+    fn poll(
+        &mut self,
+        context: &mut RuntimeContext<'_>,
+    ) -> Result<Option<crate::value::Value>, RuntimeError> {
+        let id = next_call_id().map_err(runtime_plugin_failure)?;
+        let mut native_context = NativeContext { inner: context };
+        let remaining_bytes = native_context.inner.limits.buffer_limit();
+        let mut frame = Frame {
+            context: &mut native_context,
+            id,
+            values: Vec::new(),
+            error: None,
+            remaining_bytes,
+        };
+        let mut result = 0;
+        let status = unsafe {
+            (self.poll)(
+                self.state.state,
+                self.operation,
+                &HOST,
+                (&mut frame as *mut Frame<'_, '_, '_>).cast(),
+                &mut result,
+            )
+        };
+        if status == abi::PENDING && frame.error.is_none() {
+            return Ok(None);
+        }
+        if status != abi::OK || frame.error.is_some() {
+            return Err(runtime_plugin_failure(failure(frame.error.unwrap_or_else(
+                || format!("async plugin poll failed ({status})"),
+            ))));
+        }
+        frame
+            .get(result)
+            .cloned()
+            .map(|value| Some(value.0))
+            .map_err(|_| {
+                runtime_plugin_failure(failure(
+                    "async plugin returned an invalid or expired value handle",
+                ))
+            })
+    }
+
+    fn cancel(&mut self) {
+        if !self.cancelled {
+            self.cancelled = true;
+            self.wake
+                .active
+                .store(false, std::sync::atomic::Ordering::Release);
+            unsafe { (self.cancel)(self.state.state, self.operation) };
+        }
+    }
+}
+
+impl Drop for PluginAsyncOperation {
+    fn drop(&mut self) {
+        self.wake
+            .active
+            .store(false, std::sync::atomic::Ordering::Release);
+        unsafe { (self.destroy)(self.state.state, self.operation) };
+    }
 }
 impl Drop for LibraryState {
     fn drop(&mut self) {
@@ -234,7 +596,7 @@ impl Drop for LibraryState {
 }
 
 impl Engine {
-    /// Load a trusted C ABI v1 plugin and register its descriptor's functions.
+    /// Load a trusted C ABI v3 plugin and register its descriptor's functions.
     /// Source check/build tools should use PluginManifest metadata instead.
     ///
     /// # Safety
@@ -243,6 +605,16 @@ impl Engine {
     pub unsafe fn load_plugin(&mut self, path: &Path) -> Result<(), Error> {
         unsafe { load(self, path, None) }
     }
+}
+
+enum PluginCallbacks {
+    Sync(abi::CallbackV3),
+    Async {
+        start: abi::AsyncStartV3,
+        poll: abi::AsyncPollV3,
+        cancel: abi::AsyncCancelV3,
+        destroy: abi::AsyncDestroyV3,
+    },
 }
 
 // The unsafe caller guarantees descriptor storage for the lifetime of library.
@@ -269,11 +641,11 @@ unsafe fn load(
         .canonicalize()
         .map_err(|error| failure(format!("cannot resolve plugin {}: {error}", path.display())))?;
     let library = unsafe { libloading::Library::new(&path) }.map_err(|e| failure(e.to_string()))?;
-    let entry: libloading::Symbol<'_, unsafe extern "C" fn() -> *const abi::PluginV1> =
-        unsafe { library.get(b"cog_plugin_v1\0") }.map_err(|e| failure(e.to_string()))?;
+    let entry: libloading::Symbol<'_, unsafe extern "C" fn() -> *const abi::PluginV3> =
+        unsafe { library.get(b"cog_plugin_v3\0") }.map_err(|e| failure(e.to_string()))?;
     let descriptor = unsafe { entry() };
     if descriptor.is_null()
-        || unsafe { descriptor.cast::<u32>().read() } != size_of::<abi::PluginV1>() as u32
+        || unsafe { descriptor.cast::<u32>().read() } != size_of::<abi::PluginV3>() as u32
     {
         return Err(failure("invalid plugin descriptor size"));
     }
@@ -289,7 +661,7 @@ unsafe fn load(
     let mut metadata_bytes = 0usize;
     for index in 0..descriptor.function_count {
         let pointer = unsafe { descriptor.functions.add(index) };
-        if unsafe { pointer.cast::<u32>().read() } != size_of::<abi::FunctionV1>() as u32 {
+        if unsafe { pointer.cast::<u32>().read() } != size_of::<abi::FunctionV3>() as u32 {
             return Err(failure("invalid plugin function descriptor size"));
         }
         let function = unsafe { &*pointer };
@@ -305,7 +677,14 @@ unsafe fn load(
             .iter()
             .map(|tag| Type::from_tag(*tag))
             .collect::<Result<Vec<_>, _>>()?;
-        let signature = Signature::new(parameters, Type::from_tag(function.result)?)
+        if function.asynchronous > 1 {
+            return Err(failure("invalid async function marker"));
+        }
+        let mut signature = Signature::new(parameters, Type::from_tag(function.result)?);
+        if function.asynchronous == 1 {
+            signature = signature.with_async();
+        }
+        let signature = signature
             .with_effects(Effects::from_bits(function.effects)?)
             .with_mutating_parameters(
                 (0..MAX_PLUGIN_ARGUMENTS)
@@ -313,13 +692,42 @@ unsafe fn load(
                     .collect(),
             );
         signature.identity(&name)?;
-        let invoke = function
-            .invoke
-            .ok_or_else(|| failure("missing native callback"))?;
+        let callbacks = if function.asynchronous == 0 {
+            if function.start.is_some()
+                || function.poll.is_some()
+                || function.cancel.is_some()
+                || function.destroy_operation.is_some()
+            {
+                return Err(failure("sync function has async callbacks"));
+            }
+            PluginCallbacks::Sync(
+                function
+                    .invoke
+                    .ok_or_else(|| failure("missing native callback"))?,
+            )
+        } else {
+            if function.invoke.is_some() {
+                return Err(failure("async function has a sync callback"));
+            }
+            PluginCallbacks::Async {
+                start: function
+                    .start
+                    .ok_or_else(|| failure("missing async start callback"))?,
+                poll: function
+                    .poll
+                    .ok_or_else(|| failure("missing async poll callback"))?,
+                cancel: function
+                    .cancel
+                    .ok_or_else(|| failure("missing async cancel callback"))?,
+                destroy: function
+                    .destroy_operation
+                    .ok_or_else(|| failure("missing async destroy callback"))?,
+            }
+        };
         if functions.iter().any(|(existing, _, _)| existing == &name) {
             return Err(failure("duplicate plugin function"));
         }
-        functions.push((name, signature, invoke));
+        functions.push((name, signature, callbacks));
     }
     if let Some(expected) = expected
         && (expected.len() != functions.len()
@@ -350,11 +758,31 @@ unsafe fn load(
         }
     }
     let mut next = engine.clone();
-    for (name, signature, invoke) in functions {
-        let state = state.clone();
-        next.register(&name, signature, move |context, arguments| {
-            call(&state, invoke, context, arguments)
-        })?;
+    for (name, signature, callbacks) in functions {
+        match callbacks {
+            PluginCallbacks::Sync(invoke) => {
+                let state = state.clone();
+                next.register(&name, signature, move |context, arguments| {
+                    call(&state, invoke, context, arguments)
+                })?;
+            }
+            PluginCallbacks::Async {
+                start,
+                poll,
+                cancel,
+                destroy,
+            } => {
+                let factory = Rc::new(PluginAsyncFactory {
+                    state: state.clone(),
+                    start,
+                    poll,
+                    cancel,
+                    destroy,
+                    effects: signature.effects,
+                });
+                next.register_async_plugin(&name, signature, factory)?;
+            }
+        }
     }
     *engine = next;
     Ok(())
@@ -409,7 +837,7 @@ impl Frame<'_, '_, '_> {
 
 fn call(
     state: &LibraryState,
-    invoke: abi::Callback,
+    invoke: abi::CallbackV3,
     context: &mut NativeContext<'_, '_>,
     arguments: &[Value],
 ) -> Result<Value, Error> {
@@ -477,16 +905,30 @@ unsafe extern "C" fn inspect(
         let mut view = ValueView::default();
         view.kind = match &value.0 {
             VmValue::Int(v) => {
-                view.integer = *v;
+                view.integer = *v as u64;
                 Type::Int as u32
+            }
+            VmValue::UInt(v) => {
+                view.integer = *v;
+                Type::UInt as u32
             }
             VmValue::Float(v) => {
                 view.number = *v;
                 Type::Float as u32
             }
             VmValue::Bool(v) => {
-                view.integer = i64::from(*v);
+                view.integer = u64::from(*v);
                 Type::Bool as u32
+            }
+            VmValue::Char(v) => {
+                view.integer = *v as u32 as u64;
+                Type::Char as u32
+            }
+            VmValue::Bytes(v) => {
+                let bytes = v.try_borrow().map_err(|_| abi::INVALID)?;
+                // The frame roots this value until the synchronous native callback returns.
+                view.bytes = Bytes::new(bytes.as_slice());
+                Type::Bytes as u32
             }
             VmValue::Str(v) => {
                 view.bytes = Bytes::new(v.as_bytes());
@@ -518,9 +960,15 @@ unsafe extern "C" fn make(
         let frame = unsafe { frame(context) };
         let input = unsafe { &*input };
         let value = match input.kind {
-            1 => Value::int(input.integer),
+            1 => Value::int(input.integer as i64),
+            14 => Value::uint(input.integer),
             9 => Value::float(input.number),
             10 if input.integer == 0 || input.integer == 1 => Value::boolean(input.integer != 0),
+            13 => {
+                let scalar = u32::try_from(input.integer).map_err(|_| abi::INVALID)?;
+                let character = char::from_u32(scalar).ok_or(abi::INVALID)?;
+                Value::character(character)
+            }
             5 => Value::nil(),
             2 => {
                 frame.charge(input.bytes.len)?;
@@ -627,8 +1075,27 @@ unsafe extern "C" fn set_error(context: *mut c_void, bytes: Bytes) -> Status {
         Ok(())
     })
 }
-static HOST: HostV1 = HostV1 {
-    size: size_of::<HostV1>() as u32,
+unsafe extern "C" fn wake(context: *mut c_void) -> Status {
+    guarded(|| {
+        if context.is_null() {
+            return Err(abi::INVALID);
+        }
+        let registration = unsafe { &*context.cast::<WakeRegistration>() };
+        if !registration
+            .active
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(abi::INVALID);
+        }
+        registration.wake.wake().map_err(|error| match error {
+            RuntimeError::ResourceLimit { .. } => abi::LIMIT,
+            _ => abi::INVALID,
+        })
+    })
+}
+
+static HOST: HostV3 = HostV3 {
+    size: size_of::<HostV3>() as u32,
     version: abi::VERSION,
     inspect,
     make,
@@ -636,6 +1103,7 @@ static HOST: HostV1 = HostV1 {
     array_set,
     write_output,
     set_error,
+    wake,
 };
 
 #[cfg(test)]

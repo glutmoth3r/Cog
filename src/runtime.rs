@@ -8,19 +8,39 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, OnceLock};
 
+pub(crate) mod async_io;
 mod fs;
 mod host;
 mod json;
 mod path;
 pub(crate) mod text;
 
+pub(crate) fn async_sleep_duration(
+    context: &RuntimeContext<'_>,
+    arguments: &[Value],
+) -> Result<std::time::Duration, RuntimeError> {
+    host::sleep_duration(context, arguments, "async::time::sleep")
+}
+
+pub(crate) fn async_timeout_duration(
+    context: &RuntimeContext<'_>,
+    arguments: &[Value],
+) -> Result<std::time::Duration, RuntimeError> {
+    host::sleep_duration(context, arguments, "async::time::timeout")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeType {
     Any,
     Int,
+    UInt,
     Str,
     Bytes,
     Handle,
@@ -30,6 +50,7 @@ pub enum NativeType {
     Record,
     Float,
     Bool,
+    Char,
     StrBuf,
 }
 
@@ -50,15 +71,20 @@ impl NativeType {
             (self, value),
             (Self::Any, _)
                 | (Self::Int, Value::Int(_))
+                | (Self::UInt, Value::UInt(_))
                 | (Self::Str, Value::Str(_))
                 | (Self::Bytes, Value::Bytes(_))
                 | (Self::Handle, Value::Handle(_))
                 | (Self::Nil, Value::Nil)
-                | (Self::Number, Value::Int(_) | Value::Float(_))
+                | (
+                    Self::Number,
+                    Value::Int(_) | Value::UInt(_) | Value::Float(_)
+                )
                 | (Self::Array, Value::Array(_))
                 | (Self::Record, Value::Record(_))
                 | (Self::Float, Value::Float(_))
                 | (Self::Bool, Value::Bool(_))
+                | (Self::Char, Value::Char(_))
                 | (Self::StrBuf, Value::StrBuf(_))
         )
     }
@@ -76,6 +102,69 @@ pub(crate) struct NativeFunction {
 pub(crate) type NativeCallback =
     dyn Fn(&mut RuntimeContext<'_>, &[Value]) -> Result<Value, RuntimeError>;
 
+pub(crate) trait NativeAsyncOperation {
+    /// `None` means the operation is still pending; `Some(value)` completes it.
+    fn poll(&mut self, context: &mut RuntimeContext<'_>) -> Result<Option<Value>, RuntimeError>;
+    fn cancel(&mut self);
+}
+
+pub(crate) trait NativeAsyncFactory {
+    fn start(
+        &self,
+        context: &mut RuntimeContext<'_>,
+        arguments: &[Value],
+        wake: AsyncWakeHandle,
+    ) -> Result<Box<dyn NativeAsyncOperation>, RuntimeError>;
+}
+
+/// Thread-safe, coalescing notification token. A plugin may call `wake` from
+/// its worker threads; the scheduler consumes the notification on the VM thread.
+#[derive(Clone)]
+pub(crate) struct AsyncWakeHandle {
+    task: usize,
+    sender: SyncSender<usize>,
+    signalled: Arc<AtomicBool>,
+}
+
+impl AsyncWakeHandle {
+    pub(crate) fn new(task: usize, sender: SyncSender<usize>) -> Self {
+        Self {
+            task,
+            sender,
+            signalled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn wake(&self) -> Result<(), RuntimeError> {
+        if self
+            .signalled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+        match self.sender.try_send(self.task) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                self.signalled.store(false, Ordering::Release);
+                Err(RuntimeError::ResourceLimit {
+                    resource: "async plugin wake queue",
+                })
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.signalled.store(false, Ordering::Release);
+                Err(RuntimeError::InvalidArgument {
+                    op: "async plugin wakeup",
+                })
+            }
+        }
+    }
+
+    pub(crate) fn reset(&self) {
+        self.signalled.store(false, Ordering::Release);
+    }
+}
+
 pub(crate) struct RegisteredNative {
     pub source_name: String,
     pub identity: String,
@@ -83,7 +172,9 @@ pub(crate) struct RegisteredNative {
     pub parameters: Vec<NativeType>,
     pub result: NativeType,
     pub mutating_parameters: Vec<usize>,
+    pub asynchronous: bool,
     pub invoke: Option<Rc<NativeCallback>>,
+    pub async_factory: Option<Rc<dyn NativeAsyncFactory>>,
 }
 
 #[derive(Clone, Default)]
@@ -155,11 +246,22 @@ impl NativeImport {
         parameters: &[NativeType],
         result: NativeType,
     ) -> Result<Self, String> {
+        Self::resolve_with_async(name, version, parameters, result, false)
+    }
+
+    pub fn resolve_with_async(
+        name: &str,
+        version: u16,
+        parameters: &[NativeType],
+        result: NativeType,
+        asynchronous: bool,
+    ) -> Result<Self, String> {
         let import = Self::named(name)?;
         if name != import.name()
             || version != import.version()
             || parameters != import.parameters()
             || result != import.result()
+            || asynchronous != import.is_async()
         {
             return Err(format!(
                 "runtime import signature/ABI mismatch for `{}`",
@@ -167,6 +269,53 @@ impl NativeImport {
             ));
         }
         Ok(import)
+    }
+
+    pub(crate) fn is_async(&self) -> bool {
+        matches!(&self.0, NativeCode::Registered(function) if function.asynchronous)
+    }
+
+    pub(crate) fn validate_arguments(&self, arguments: &[Value]) -> Result<(), RuntimeError> {
+        if arguments.len() != self.parameters().len() {
+            return Err(RuntimeError::InvalidNativeCall);
+        }
+        for (ty, value) in self.parameters().iter().zip(arguments) {
+            if *ty != NativeType::Any && matches!(value, Value::Error(_)) {
+                continue;
+            }
+            if !ty.accepts(value) {
+                return Err(RuntimeError::TypeMismatch {
+                    op: self.operation(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn start_async(
+        &self,
+        context: &mut RuntimeContext<'_>,
+        arguments: &[Value],
+        wake: AsyncWakeHandle,
+    ) -> Result<Box<dyn NativeAsyncOperation>, RuntimeError> {
+        if !self.is_async() {
+            return Err(RuntimeError::InvalidNativeCall);
+        }
+        self.validate_arguments(arguments)?;
+        let NativeCode::Registered(function) = &self.0 else {
+            return Err(RuntimeError::InvalidNativeCall);
+        };
+        let factory =
+            function
+                .async_factory
+                .as_ref()
+                .ok_or_else(|| RuntimeError::NativeFailure {
+                    message: format!(
+                        "async native function `{}` is not linked",
+                        function.source_name
+                    ),
+                })?;
+        factory.start(context, arguments, wake)
     }
 
     pub fn name(&self) -> &str {
@@ -196,7 +345,13 @@ impl NativeImport {
     pub(crate) fn is_linked(&self) -> bool {
         match &self.0 {
             NativeCode::Builtin(_) => true,
-            NativeCode::Registered(function) => function.invoke.is_some(),
+            NativeCode::Registered(function) => {
+                if function.asynchronous {
+                    function.async_factory.is_some()
+                } else {
+                    function.invoke.is_some()
+                }
+            }
         }
     }
     fn operation(&self) -> &'static str {
@@ -238,19 +393,53 @@ impl NativeImport {
         context: &mut RuntimeContext<'_>,
         arguments: &[Value],
     ) -> Result<Value, RuntimeError> {
-        if arguments.len() != self.parameters().len() {
+        self.call_inner(context, arguments, true)
+    }
+
+    /// Interpreter calls already derive this slice from the import's declared
+    /// arity and the checked operand stack, so the public boundary check would
+    /// repeat work here.
+    pub(crate) fn call_from_vm(
+        &self,
+        context: &mut RuntimeContext<'_>,
+        arguments: &[Value],
+    ) -> Result<Value, RuntimeError> {
+        self.call_inner(context, arguments, false)
+    }
+
+    fn call_inner(
+        &self,
+        context: &mut RuntimeContext<'_>,
+        arguments: &[Value],
+        check_arity: bool,
+    ) -> Result<Value, RuntimeError> {
+        let (parameters, result_type, operation, asynchronous) = match &self.0 {
+            NativeCode::Builtin(function) => {
+                (function.parameters, function.result, function.name, false)
+            }
+            NativeCode::Registered(function) => (
+                function.parameters.as_slice(),
+                function.result,
+                "native extension",
+                function.asynchronous,
+            ),
+        };
+        if asynchronous {
             return Err(RuntimeError::InvalidNativeCall);
         }
-        for (ty, value) in self.parameters().iter().zip(arguments) {
+        if check_arity && arguments.len() != parameters.len() {
+            return Err(RuntimeError::InvalidNativeCall);
+        }
+        for (ty, value) in parameters.iter().zip(arguments) {
             if *ty != NativeType::Any && matches!(value, Value::Error(_)) {
                 return Ok(value.clone());
             }
             if !ty.accepts(value) {
-                return Err(RuntimeError::TypeMismatch {
-                    op: self.operation(),
-                });
+                return Err(RuntimeError::TypeMismatch { op: operation });
             }
         }
+        let _heap_object_limit =
+            crate::heap::limit_object_allocations(context.limits.max_heap_objects);
         let value = match &self.0 {
             NativeCode::Builtin(function) => (function.invoke)(context, arguments)?,
             NativeCode::Registered(function) => {
@@ -267,7 +456,7 @@ impl NativeImport {
                 invoke(context, arguments)?
             }
         };
-        if !matches!(value, Value::Error(_)) && !self.result().accepts(&value) {
+        if !matches!(value, Value::Error(_)) && !result_type.accepts(&value) {
             return Err(match &self.0 {
                 NativeCode::Builtin(_) => RuntimeError::InvalidNativeCall,
                 NativeCode::Registered(function) => RuntimeError::NativeFailure {
@@ -326,7 +515,7 @@ pub(crate) fn builtin_module(name: &str) -> bool {
     }) || crate::core_modules::SOURCES
         .iter()
         .any(|(module, _)| *module == name)
-        || matches!(name, "err" | "build")
+        || matches!(name, "err" | "build" | "async")
 }
 
 pub(crate) fn fingerprint_natives(hasher: &mut blake3::Hasher) {
@@ -344,7 +533,9 @@ pub(crate) fn fingerprint_natives(hasher: &mut blake3::Hasher) {
     });
 }
 
-use NativeType::{Any, Array, Bool, Bytes, Float, Handle, Int, Nil, Number, Record, Str, StrBuf};
+use NativeType::{
+    Any, Array, Bool, Bytes, Char, Float, Handle, Int, Nil, Number, Record, Str, StrBuf, UInt,
+};
 
 static HASH_STATE: OnceLock<std::collections::hash_map::RandomState> = OnceLock::new();
 
@@ -354,7 +545,10 @@ fn hash_value(_: &mut RuntimeContext<'_>, args: &[Value]) -> Result<Value, Runti
         .build_hasher();
     match &args[0] {
         Value::Int(value) => value.hash(&mut hasher),
+        Value::UInt(value) => value.hash(&mut hasher),
+        Value::BigInt(value) => value.hash(&mut hasher),
         Value::Bool(value) => value.hash(&mut hasher),
+        Value::Char(value) => value.hash(&mut hasher),
         Value::Str(value) => value.hash(&mut hasher),
         _ => return Err(RuntimeError::TypeMismatch { op: "hash::of" }),
     }
@@ -564,8 +758,10 @@ fn clone_value(
             result
         }
         Value::Int(_)
+        | Value::UInt(_)
         | Value::Float(_)
         | Value::Bool(_)
+        | Value::Char(_)
         | Value::Nil
         | Value::Str(_)
         | Value::Error(_) => Ok(value.clone()),
@@ -611,6 +807,18 @@ static FUNCTIONS: &[NativeFunction] = &[
         invoke: text::to_int,
     },
     NativeFunction {
+        name: "str::to_uint",
+        parameters: &[Any],
+        result: UInt,
+        invoke: text::to_uint,
+    },
+    NativeFunction {
+        name: "str::to_bigint",
+        parameters: &[Any],
+        result: Any,
+        invoke: text::to_bigint,
+    },
+    NativeFunction {
         name: "str::to_float",
         parameters: &[Any],
         result: Float,
@@ -621,6 +829,12 @@ static FUNCTIONS: &[NativeFunction] = &[
         parameters: &[Any],
         result: Bool,
         invoke: text::to_bool,
+    },
+    NativeFunction {
+        name: "str::to_char",
+        parameters: &[Any],
+        result: Char,
+        invoke: text::to_char,
     },
     NativeFunction {
         name: "str::to_str",
@@ -683,10 +897,10 @@ static FUNCTIONS: &[NativeFunction] = &[
         invoke: host::entropy,
     },
     NativeFunction {
-        name: "process::run",
+        name: "process::run_sync",
         parameters: &[Str, Array],
         result: Record,
-        invoke: host::run,
+        invoke: host::run_sync,
     },
     NativeFunction {
         name: "process::shell",
@@ -924,6 +1138,7 @@ pub struct VmCapabilities {
     pub allow_process_info: bool,
     pub allow_fs_read: bool,
     pub allow_fs_write: bool,
+    pub allow_network: bool,
 }
 
 impl Default for VmCapabilities {
@@ -944,6 +1159,7 @@ impl VmCapabilities {
             allow_process_info: true,
             allow_fs_read: true,
             allow_fs_write: true,
+            allow_network: true,
         }
     }
     pub const fn restricted() -> Self {
@@ -958,6 +1174,7 @@ impl VmCapabilities {
             allow_process_info: false,
             allow_fs_read: false,
             allow_fs_write: false,
+            allow_network: false,
         }
     }
 }
@@ -977,6 +1194,8 @@ pub struct RuntimeLimits {
     pub max_slots: Option<usize>,
     /// Optional limit on live managed Cog objects. None leaves growth to the OS.
     pub max_heap_objects: Option<usize>,
+    /// Optional limit for arbitrary-precision integer decimal digits.
+    pub max_numeric_digits: Option<usize>,
 }
 impl RuntimeLimits {
     /// Return the active buffer cap, or `usize::MAX` when no VM cap is set.
@@ -984,6 +1203,17 @@ impl RuntimeLimits {
     /// this does not promise protection from process-wide memory exhaustion.
     pub(crate) fn buffer_limit(&self) -> usize {
         self.max_buffer_bytes.unwrap_or(usize::MAX)
+    }
+
+    pub(crate) fn any_active(&self) -> bool {
+        self.max_buffer_bytes.is_some()
+            || self.max_resources.is_some()
+            || self.max_steps.is_some()
+            || self.max_operand_values.is_some()
+            || self.max_call_frames.is_some()
+            || self.max_slots.is_some()
+            || self.max_heap_objects.is_some()
+            || self.max_numeric_digits.is_some()
     }
 }
 
@@ -1006,14 +1236,135 @@ impl Eq for ResourceHandle {}
 enum Stream {
     Stdout,
     Stdin,
-    File(FileStream),
+    File(SharedFileStream),
+    Tcp(TcpSocket),
+    TcpListener(Arc<Mutex<TcpListener>>),
 }
-enum FileStream {
+struct TcpSocket {
+    reader: Arc<Mutex<TcpStream>>,
+    writer: Arc<Mutex<TcpStream>>,
+    timeout: std::time::Duration,
+}
+pub(crate) type SharedFileStream = Arc<Mutex<FileStream>>;
+pub(crate) type SharedInputStream<'a> = Arc<Mutex<BufReader<Box<dyn Read + Send + 'a>>>>;
+pub(crate) type SharedOutputStream<'a> = Arc<Mutex<&'a mut (dyn Write + Send)>>;
+
+pub(crate) enum AsyncIoReadStream {
+    File(SharedFileStream),
+    Stdin,
+}
+
+pub(crate) enum AsyncIoWriteStream {
+    File(SharedFileStream),
+    Stdout,
+}
+
+pub(crate) enum FileStream {
     Direct(std::fs::File),
     Buffered(BufferedFile),
 }
 
-struct BufferedFile {
+#[derive(Clone, Copy)]
+pub(crate) struct FileOpenMode {
+    pub(crate) readable: bool,
+    pub(crate) writable: bool,
+    create: bool,
+    truncate: bool,
+    append: bool,
+}
+
+impl FileOpenMode {
+    pub(crate) fn parse(mode: &str) -> Option<Self> {
+        Some(match mode {
+            "r" => Self {
+                readable: true,
+                writable: false,
+                create: false,
+                truncate: false,
+                append: false,
+            },
+            "r+" => Self {
+                readable: true,
+                writable: true,
+                create: false,
+                truncate: false,
+                append: false,
+            },
+            "w" => Self {
+                readable: false,
+                writable: true,
+                create: true,
+                truncate: true,
+                append: false,
+            },
+            "w+" => Self {
+                readable: true,
+                writable: true,
+                create: true,
+                truncate: true,
+                append: false,
+            },
+            "a" => Self {
+                readable: false,
+                writable: true,
+                create: true,
+                truncate: false,
+                append: true,
+            },
+            "a+" => Self {
+                readable: true,
+                writable: true,
+                create: true,
+                truncate: false,
+                append: true,
+            },
+            _ => return None,
+        })
+    }
+}
+
+pub(crate) struct FileWriteBuffer {
+    bytes: Vec<u8>,
+    capacity: usize,
+}
+
+pub(crate) fn file_write_buffer(
+    mode: FileOpenMode,
+    capacity: usize,
+) -> Result<Option<FileWriteBuffer>, RuntimeError> {
+    if !mode.writable || capacity == 0 {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| RuntimeError::ResourceLimit { resource: "bytes" })?;
+    Ok(Some(FileWriteBuffer { bytes, capacity }))
+}
+
+pub(crate) fn open_file_stream(
+    path: &str,
+    mode: FileOpenMode,
+    buffer: Option<FileWriteBuffer>,
+) -> io::Result<FileStream> {
+    let file = std::fs::OpenOptions::new()
+        .read(mode.readable)
+        .write(mode.writable)
+        .create(mode.create)
+        .truncate(mode.truncate)
+        .append(mode.append)
+        .open(path)?;
+    Ok(match buffer {
+        Some(buffer) => FileStream::Buffered(BufferedFile {
+            file,
+            buffer: buffer.bytes,
+            capacity: buffer.capacity,
+        }),
+        None => FileStream::Direct(file),
+    })
+}
+
+pub(crate) struct BufferedFile {
     file: std::fs::File,
     buffer: Vec<u8>,
     capacity: usize,
@@ -1076,6 +1427,40 @@ impl Seek for BufferedFile {
         self.file.seek(position)
     }
 }
+
+impl Read for FileStream {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Direct(file) => file.read(bytes),
+            Self::Buffered(file) => file.file.read(bytes),
+        }
+    }
+}
+
+impl Write for FileStream {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Direct(file) => file.write(bytes),
+            Self::Buffered(file) => file.write(bytes),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Direct(file) => file.flush(),
+            Self::Buffered(file) => file.flush(),
+        }
+    }
+}
+
+impl Seek for FileStream {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        match self {
+            Self::Direct(file) => file.seek(position),
+            Self::Buffered(file) => file.seek(position),
+        }
+    }
+}
 struct Resource {
     stream: Stream,
     readable: bool,
@@ -1085,6 +1470,12 @@ struct Resource {
 struct Slot {
     generation: u64,
     resource: Option<Resource>,
+    reserved: bool,
+}
+
+fn lock_file_stream(file: &SharedFileStream) -> std::sync::MutexGuard<'_, FileStream> {
+    file.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// One execution's host state. Explicit finish reports flush failures and closes
@@ -1092,12 +1483,14 @@ struct Slot {
 pub struct RuntimeContext<'a> {
     pub capabilities: VmCapabilities,
     pub limits: RuntimeLimits,
-    output: &'a mut dyn Write,
-    input: Option<Box<dyn Read + 'a>>,
-    buffered_input: Option<BufReader<Box<dyn Read + 'a>>>,
+    output: SharedOutputStream<'a>,
+    input: SharedInputStream<'a>,
     identity: Rc<()>,
     process_arguments: Option<Vec<OsString>>,
     last_source_location: Option<crate::diagnostic::SourceLocation>,
+    pub(crate) jit_enabled: bool,
+    pub(crate) jit_debug: bool,
+    pub(crate) jit_profile_path: Option<PathBuf>,
     slots: Vec<Slot>,
     free: Vec<usize>,
 }
@@ -1116,30 +1509,36 @@ impl<'a> RuntimeContext<'a> {
         {
             return Err(RuntimeError::ResourceLimit { resource: "bytes" });
         }
-        self.output
+        let mut output = self
+            .output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        output
             .write_all(text.as_bytes())
-            .and_then(|()| self.output.flush())
+            .and_then(|()| output.flush())
             .map_err(|error| RuntimeError::IoWriteFailed {
                 message: error.to_string(),
             })
     }
-    pub fn new(output: &'a mut dyn Write, capabilities: VmCapabilities) -> Self {
+    pub fn new(output: &'a mut (dyn Write + Send), capabilities: VmCapabilities) -> Self {
         Self::with_input(output, Box::new(io::stdin()), capabilities)
     }
     pub fn with_input(
-        output: &'a mut dyn Write,
-        input: Box<dyn Read + 'a>,
+        output: &'a mut (dyn Write + Send),
+        input: Box<dyn Read + Send + 'a>,
         capabilities: VmCapabilities,
     ) -> Self {
         Self {
             capabilities,
             limits: RuntimeLimits::default(),
-            output,
-            input: Some(input),
-            buffered_input: None,
+            output: Arc::new(Mutex::new(output)),
+            input: Arc::new(Mutex::new(BufReader::new(input))),
             identity: Rc::new(()),
             process_arguments: None,
             last_source_location: None,
+            jit_enabled: false,
+            jit_debug: false,
+            jit_profile_path: None,
             free: Vec::new(),
             slots: vec![
                 Slot {
@@ -1150,6 +1549,7 @@ impl<'a> RuntimeContext<'a> {
                         writable: true,
                         dirty: false,
                     }),
+                    reserved: false,
                 },
                 Slot {
                     generation: 0,
@@ -1159,15 +1559,26 @@ impl<'a> RuntimeContext<'a> {
                         writable: false,
                         dirty: false,
                     }),
+                    reserved: false,
                 },
             ],
         }
     }
 
     /// Supply arguments for `process::args`. When omitted, the native module
-    /// reads the host process arguments excluding argv[0].
+    /// reads the host process arguments excluding `argv[0]`.
     pub fn set_process_arguments(&mut self, arguments: Vec<OsString>) {
         self.process_arguments = Some(arguments);
+    }
+
+    /// Enable the experimental adaptive Cranelift JIT. Runtime limits force
+    /// interpretation so JIT execution cannot bypass VM metering.
+    pub fn configure_jit(&mut self, enabled: bool, profile_path: Option<&Path>, debug: bool) {
+        self.jit_enabled = enabled;
+        self.jit_debug = enabled && debug;
+        self.jit_profile_path = enabled
+            .then(|| profile_path.map(Path::to_path_buf))
+            .flatten();
     }
 
     /// Source coordinate for the last terminal VM error, when the artifact has
@@ -1199,7 +1610,11 @@ impl<'a> RuntimeContext<'a> {
             return Err(RuntimeError::InvalidResource);
         }
         match self.slots.get(handle.slot) {
-            Some(slot) if slot.generation == handle.generation && slot.resource.is_some() => {
+            Some(slot)
+                if slot.generation == handle.generation
+                    && slot.resource.is_some()
+                    && !slot.reserved =>
+            {
                 Ok(handle.slot)
             }
             _ => Err(RuntimeError::InvalidResource),
@@ -1228,23 +1643,239 @@ impl<'a> RuntimeContext<'a> {
         self.reserve_resource_slot()?;
         let slot = if let Some(slot) = self.free.pop() {
             self.slots[slot].resource = Some(resource);
+            self.slots[slot].reserved = false;
             slot
         } else {
             self.slots.push(Slot {
                 generation: 0,
                 resource: Some(resource),
+                reserved: false,
             });
             self.slots.len() - 1
         };
         Ok(Value::Handle(self.handle(slot)))
     }
+
+    pub(crate) fn reserve_file_slot(&mut self) -> Result<usize, RuntimeError> {
+        if let Some(slot) = self.free.pop() {
+            let Some(entry) = self.slots.get_mut(slot) else {
+                return Err(RuntimeError::InvalidNativeCall);
+            };
+            if entry.resource.is_some() || entry.reserved {
+                self.free.push(slot);
+                return Err(RuntimeError::InvalidNativeCall);
+            }
+            entry.reserved = true;
+            return Ok(slot);
+        }
+        if self
+            .limits
+            .max_resources
+            .is_some_and(|limit| self.slots.len() >= limit)
+        {
+            return Err(RuntimeError::ResourceLimit {
+                resource: "handles",
+            });
+        }
+        self.slots
+            .try_reserve(1)
+            .map_err(|_| RuntimeError::ResourceLimit { resource: "bytes" })?;
+        self.free
+            .try_reserve(1)
+            .map_err(|_| RuntimeError::ResourceLimit { resource: "bytes" })?;
+        let slot = self.slots.len();
+        self.slots.push(Slot {
+            generation: 0,
+            resource: None,
+            reserved: true,
+        });
+        Ok(slot)
+    }
+
+    pub(crate) fn release_file_slot(&mut self, slot: usize) -> Result<(), RuntimeError> {
+        let Some(entry) = self.slots.get_mut(slot) else {
+            return Err(RuntimeError::InvalidNativeCall);
+        };
+        if !entry.reserved || entry.resource.is_some() || slot < 2 {
+            return Err(RuntimeError::InvalidNativeCall);
+        }
+        entry.reserved = false;
+        self.free.push(slot);
+        Ok(())
+    }
+
+    pub(crate) fn insert_reserved_file(
+        &mut self,
+        slot: usize,
+        stream: SharedFileStream,
+        mode: FileOpenMode,
+    ) -> Result<Value, RuntimeError> {
+        let Some(entry) = self.slots.get_mut(slot) else {
+            return Err(RuntimeError::InvalidNativeCall);
+        };
+        if !entry.reserved || entry.resource.is_some() || slot < 2 {
+            return Err(RuntimeError::InvalidNativeCall);
+        }
+        entry.resource = Some(Resource {
+            stream: Stream::File(stream),
+            readable: mode.readable,
+            writable: mode.writable,
+            dirty: false,
+        });
+        entry.reserved = false;
+        Ok(Value::Handle(self.handle(slot)))
+    }
+
+    pub(crate) fn insert_tcp_stream(
+        &mut self,
+        stream: TcpStream,
+        timeout: std::time::Duration,
+    ) -> Result<Value, RuntimeError> {
+        const OP: &str = "async::net::connect";
+        if !self.capabilities.allow_network {
+            return Err(RuntimeError::PermissionDenied { op: OP });
+        }
+        self.reserve_resource_slot()?;
+        let reader = stream.try_clone().map_err(|error| io_error(OP, error))?;
+        let writer = stream.try_clone().map_err(|error| io_error(OP, error))?;
+        self.insert(Resource {
+            stream: Stream::Tcp(TcpSocket {
+                reader: Arc::new(Mutex::new(reader)),
+                writer: Arc::new(Mutex::new(writer)),
+                timeout,
+            }),
+            readable: true,
+            writable: true,
+            dirty: false,
+        })
+    }
+
+    pub(crate) fn insert_tcp_listener(
+        &mut self,
+        listener: TcpListener,
+    ) -> Result<Value, RuntimeError> {
+        const OP: &str = "async::net::listen";
+        if !self.capabilities.allow_network {
+            return Err(RuntimeError::PermissionDenied { op: OP });
+        }
+        self.insert(Resource {
+            stream: Stream::TcpListener(Arc::new(Mutex::new(listener))),
+            readable: false,
+            writable: false,
+            dirty: false,
+        })
+    }
+
+    pub(crate) fn tcp_stream(
+        &self,
+        value: &Value,
+        writing: bool,
+        op: &'static str,
+    ) -> Result<(Arc<Mutex<TcpStream>>, std::time::Duration), RuntimeError> {
+        let Value::Handle(handle) = value else {
+            return Err(RuntimeError::TypeMismatch { op });
+        };
+        let slot = self.slot(handle)?;
+        self.permission(slot, writing, op)?;
+        match &self.slots[slot].resource.as_ref().unwrap().stream {
+            Stream::Tcp(socket) => Ok((
+                if writing {
+                    Arc::clone(&socket.writer)
+                } else {
+                    Arc::clone(&socket.reader)
+                },
+                socket.timeout,
+            )),
+            _ => Err(RuntimeError::InvalidArgument { op }),
+        }
+    }
+
+    pub(crate) fn async_io_read_stream(
+        &self,
+        value: &Value,
+        op: &'static str,
+    ) -> Result<AsyncIoReadStream, RuntimeError> {
+        let Value::Handle(handle) = value else {
+            return Err(RuntimeError::TypeMismatch { op });
+        };
+        let slot = self.slot(handle)?;
+        self.permission(slot, false, op)?;
+        match &self.slots[slot].resource.as_ref().unwrap().stream {
+            Stream::File(file) => Ok(AsyncIoReadStream::File(Arc::clone(file))),
+            Stream::Stdin => Ok(AsyncIoReadStream::Stdin),
+            _ => Err(RuntimeError::InvalidArgument { op }),
+        }
+    }
+
+    pub(crate) fn shared_input_stream(&self) -> SharedInputStream<'a> {
+        Arc::clone(&self.input)
+    }
+
+    pub(crate) fn shared_output_stream(&self) -> SharedOutputStream<'a> {
+        Arc::clone(&self.output)
+    }
+
+    pub(crate) fn async_io_write_stream(
+        &self,
+        value: &Value,
+        op: &'static str,
+    ) -> Result<AsyncIoWriteStream, RuntimeError> {
+        let Value::Handle(handle) = value else {
+            return Err(RuntimeError::TypeMismatch { op });
+        };
+        let slot = self.slot(handle)?;
+        self.permission(slot, true, op)?;
+        match &self.slots[slot].resource.as_ref().unwrap().stream {
+            Stream::File(file) => Ok(AsyncIoWriteStream::File(Arc::clone(file))),
+            Stream::Stdout => Ok(AsyncIoWriteStream::Stdout),
+            _ => Err(RuntimeError::InvalidArgument { op }),
+        }
+    }
+
+    pub(crate) fn file_stream_for_seek(
+        &self,
+        value: &Value,
+        op: &'static str,
+    ) -> Result<SharedFileStream, RuntimeError> {
+        let Value::Handle(handle) = value else {
+            return Err(RuntimeError::TypeMismatch { op });
+        };
+        let slot = self.slot(handle)?;
+        let resource = self.slots[slot].resource.as_ref().unwrap();
+        self.permission(slot, !resource.readable, op)?;
+        match &resource.stream {
+            Stream::File(file) => Ok(Arc::clone(file)),
+            _ => Err(RuntimeError::InvalidArgument { op }),
+        }
+    }
+
+    pub(crate) fn tcp_listener(
+        &self,
+        value: &Value,
+        op: &'static str,
+    ) -> Result<Arc<Mutex<TcpListener>>, RuntimeError> {
+        let Value::Handle(handle) = value else {
+            return Err(RuntimeError::TypeMismatch { op });
+        };
+        if !self.capabilities.allow_network {
+            return Err(RuntimeError::PermissionDenied { op });
+        }
+        let slot = self.slot(handle)?;
+        match &self.slots[slot].resource.as_ref().unwrap().stream {
+            Stream::TcpListener(listener) => Ok(Arc::clone(listener)),
+            _ => Err(RuntimeError::InvalidArgument { op }),
+        }
+    }
+
     fn permission(&self, slot: usize, writing: bool, op: &'static str) -> Result<(), RuntimeError> {
         let resource = self.slots[slot].resource.as_ref().unwrap();
-        let allowed = match resource.stream {
+        let allowed = match &resource.stream {
             Stream::Stdout => self.capabilities.allow_print,
             Stream::Stdin => self.capabilities.allow_read,
             Stream::File(_) if writing => self.capabilities.allow_fs_write,
             Stream::File(_) => self.capabilities.allow_fs_read,
+            Stream::Tcp(_) => self.capabilities.allow_network,
+            Stream::TcpListener(_) => self.capabilities.allow_network,
         };
         if !allowed {
             return Err(RuntimeError::PermissionDenied { op });
@@ -1259,11 +1890,16 @@ impl<'a> RuntimeContext<'a> {
     }
     fn flush_slot(&mut self, slot: usize) -> Result<(), RuntimeError> {
         self.permission(slot, true, "io::flush")?;
+        let output = Arc::clone(&self.output);
         let resource = self.slots[slot].resource.as_mut().unwrap();
         let result = match &mut resource.stream {
-            Stream::Stdout => self.output.flush(),
-            Stream::File(FileStream::Direct(file)) => file.flush(),
-            Stream::File(FileStream::Buffered(file)) => file.flush(),
+            Stream::Stdout => output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .flush(),
+            Stream::File(file) => lock_file_stream(file).flush(),
+            Stream::Tcp(_) => Ok(()),
+            Stream::TcpListener(_) => unreachable!(),
             Stream::Stdin => unreachable!(),
         };
         resource.dirty = false;
@@ -1273,11 +1909,14 @@ impl<'a> RuntimeContext<'a> {
     fn pending_output(&self, slot: usize) -> bool {
         let resource = self.slots[slot].resource.as_ref().unwrap();
         resource.dirty
-            || matches!(&resource.stream, Stream::File(FileStream::Buffered(file)) if file.has_pending_output())
+            || matches!(&resource.stream, Stream::File(file) if matches!(&*lock_file_stream(file), FileStream::Buffered(buffered) if buffered.has_pending_output()))
     }
     fn close_slot(&mut self, slot: usize, explicit: bool) -> Result<(), RuntimeError> {
         let resource = self.slots[slot].resource.as_ref().unwrap();
-        let result = if resource.writable && (explicit || resource.dirty) {
+        let result = if resource.writable
+            && (explicit || resource.dirty)
+            && !matches!(resource.stream, Stream::Tcp(_))
+        {
             self.flush_slot(slot)
         } else {
             Ok(())
@@ -1313,9 +1952,7 @@ impl<'a> RuntimeContext<'a> {
 }
 
 fn discard(resource: Resource) {
-    if let Stream::File(FileStream::Buffered(file)) = resource.stream {
-        drop(file);
-    }
+    drop(resource);
 }
 impl Drop for RuntimeContext<'_> {
     fn drop(&mut self) {
@@ -1394,7 +2031,7 @@ fn range(start: &Value, count: &Value, len: usize) -> Result<std::ops::Range<usi
         .ok_or_else(|| invalid("bytes range"))?;
     Ok(offset..end)
 }
-fn checked_size(context: &RuntimeContext<'_>, n: i64) -> Result<usize, RuntimeError> {
+pub(crate) fn checked_size(context: &RuntimeContext<'_>, n: i64) -> Result<usize, RuntimeError> {
     usize::try_from(n)
         .ok()
         .filter(|n| *n <= context.limits.buffer_limit())
@@ -1493,9 +2130,10 @@ fn stdin(context: &mut RuntimeContext<'_>, _: &[Value]) -> Result<Value, Runtime
 fn read_line(context: &mut RuntimeContext<'_>, _: &[Value]) -> Result<Value, RuntimeError> {
     let slot = context.slot(&context.handle(1))?;
     context.permission(slot, false, "io::read_line")?;
-    let input = context
-        .buffered_input
-        .get_or_insert_with(|| BufReader::new(context.input.take().unwrap()));
+    let input = Arc::clone(&context.input);
+    let mut input = input
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // UTF-8 sequences can straddle reads; keep unread bytes in the reader.
     let mut bytes = Vec::new();
     loop {
@@ -1537,17 +2175,11 @@ fn read_line(context: &mut RuntimeContext<'_>, _: &[Value]) -> Result<Value, Run
     Ok(Value::Str(line.into()))
 }
 fn open(context: &mut RuntimeContext<'_>, args: &[Value]) -> Result<Value, RuntimeError> {
-    let (read, write, create, truncate, append) = match string(&args[1]) {
-        "r" => (true, false, false, false, false),
-        "r+" => (true, true, false, false, false),
-        "w" => (false, true, true, true, false),
-        "w+" => (true, true, true, true, false),
-        "a" => (false, true, true, false, true),
-        "a+" => (true, true, true, false, true),
-        _ => return Err(invalid("io::open")),
+    let Some(mode) = FileOpenMode::parse(string(&args[1])) else {
+        return Err(invalid("io::open"));
     };
-    if (read && !context.capabilities.allow_fs_read)
-        || (write && !context.capabilities.allow_fs_write)
+    if (mode.readable && !context.capabilities.allow_fs_read)
+        || (mode.writable && !context.capabilities.allow_fs_write)
     {
         return Err(RuntimeError::PermissionDenied { op: "io::open" });
     }
@@ -1555,41 +2187,20 @@ fn open(context: &mut RuntimeContext<'_>, args: &[Value]) -> Result<Value, Runti
     // Reserve the slot and its future free-list entry before opening a path.
     // A fallible table growth must not happen after a truncating open.
     context.reserve_resource_slot()?;
-    let buffer = if write && capacity > 0 {
-        let mut buffer = Vec::new();
-        buffer
-            .try_reserve_exact(capacity)
-            .map_err(|_| RuntimeError::ResourceLimit { resource: "bytes" })?;
-        Some(buffer)
-    } else {
-        None
-    };
-    let file = std::fs::OpenOptions::new()
-        .read(read)
-        .write(write)
-        .create(create)
-        .truncate(truncate)
-        .append(append)
-        .open(string(&args[0]))
+    let buffer = file_write_buffer(mode, capacity)?;
+    let stream = open_file_stream(string(&args[0]), mode, buffer)
         .map_err(|error| io_error("io::open", error))?;
-    let stream = match buffer {
-        Some(buffer) => FileStream::Buffered(BufferedFile {
-            file,
-            buffer,
-            capacity,
-        }),
-        None => FileStream::Direct(file),
-    };
     context.insert(Resource {
-        stream: Stream::File(stream),
-        readable: read,
-        writable: write,
+        stream: Stream::File(Arc::new(Mutex::new(stream))),
+        readable: mode.readable,
+        writable: mode.writable,
         dirty: false,
     })
 }
 fn read_into(context: &mut RuntimeContext<'_>, args: &[Value]) -> Result<Value, RuntimeError> {
     let slot = context.slot(handle(&args[0]))?;
     context.permission(slot, false, "io::read_into")?;
+    let input = Arc::clone(&context.input);
     let mut bytes = bytes_borrow_mut(&args[1], "io::read_into")?;
     let span = range(&args[2], &args[3], bytes.len())?;
     if span.is_empty() {
@@ -1598,20 +2209,32 @@ fn read_into(context: &mut RuntimeContext<'_>, args: &[Value]) -> Result<Value, 
     if context.pending_output(slot) {
         context.flush_slot(slot)?;
     }
-    let resource = context.slots[slot].resource.as_mut().unwrap();
+    let file = match &context.slots[slot].resource.as_ref().unwrap().stream {
+        Stream::File(file) => Some(Arc::clone(file)),
+        _ => None,
+    };
     let result = loop {
-        let result = match &mut resource.stream {
-            Stream::Stdin => match &mut context.buffered_input {
-                Some(input) => input.read(&mut bytes[span.clone()]),
-                None => context
-                    .input
-                    .as_mut()
-                    .unwrap()
+        let result = if let Some(file) = &file {
+            lock_file_stream(file).read(&mut bytes[span.clone()])
+        } else {
+            let resource = context.slots[slot].resource.as_mut().unwrap();
+            match &mut resource.stream {
+                Stream::Stdin => input
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .read(&mut bytes[span.clone()]),
-            },
-            Stream::File(FileStream::Direct(file)) => file.read(&mut bytes[span.clone()]),
-            Stream::File(FileStream::Buffered(file)) => file.file.read(&mut bytes[span.clone()]),
-            Stream::Stdout => unreachable!(),
+                Stream::Tcp(socket) => socket
+                    .reader
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .read(&mut bytes[span.clone()]),
+                Stream::TcpListener(_) => Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "TCP listener does not support reading",
+                )),
+                Stream::File(_) => unreachable!(),
+                Stream::Stdout => unreachable!(),
+            }
         };
         if !matches!(&result, Err(error) if error.kind() == io::ErrorKind::Interrupted) {
             break result;
@@ -1628,15 +2251,41 @@ fn write_bytes(
     all: bool,
 ) -> Result<usize, RuntimeError> {
     context.permission(slot, true, "io::write")?;
+    let output = Arc::clone(&context.output);
     let resource = context.slots[slot].resource.as_mut().unwrap();
-    let output: &mut dyn Write = match &mut resource.stream {
-        Stream::Stdout => context.output,
-        Stream::File(FileStream::Direct(file)) => file,
-        Stream::File(FileStream::Buffered(file)) => file,
+    let result = match &mut resource.stream {
+        Stream::Stdout => {
+            let mut output = output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            write_stream(&mut **output, bytes, all)
+        }
+        Stream::File(file) => write_stream(&mut *lock_file_stream(file), bytes, all),
+        Stream::Tcp(socket) => {
+            let mut writer = socket
+                .writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            write_stream(&mut *writer, bytes, all)
+        }
+        Stream::TcpListener(_) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "TCP listener does not support writing",
+        )),
         Stream::Stdin => unreachable!(),
     };
     let was_dirty = resource.dirty;
-    let result = if all {
+    // The caller has received this failure. Automatic cleanup must not retry
+    // the write or report it again; explicit flush/close can retry deliberately.
+    resource.dirty = match result {
+        Ok(count) => was_dirty || count > 0,
+        Err(_) => false,
+    };
+    result.map_err(write_error)
+}
+
+fn write_stream(output: &mut dyn Write, bytes: &[u8], all: bool) -> io::Result<usize> {
+    if all {
         output.write_all(bytes).map(|()| bytes.len())
     } else {
         loop {
@@ -1645,14 +2294,7 @@ fn write_bytes(
                 result => break result,
             }
         }
-    };
-    // The caller has received this failure. Automatic cleanup must not retry
-    // the write or report it again; explicit flush/close can retry deliberately.
-    resource.dirty = match result {
-        Ok(count) => was_dirty || count > 0,
-        Err(_) => false,
-    };
-    result.map_err(write_error)
+    }
 }
 fn write_common(
     context: &mut RuntimeContext<'_>,
@@ -1701,8 +2343,7 @@ fn seek(context: &mut RuntimeContext<'_>, args: &[Value]) -> Result<Value, Runti
     }
     let resource = context.slots[slot].resource.as_mut().unwrap();
     let position = match &mut resource.stream {
-        Stream::File(FileStream::Direct(file)) => file.seek(position),
-        Stream::File(FileStream::Buffered(file)) => file.seek(position),
+        Stream::File(file) => lock_file_stream(file).seek(position),
         _ => {
             return Err(io_error(
                 "io::seek",

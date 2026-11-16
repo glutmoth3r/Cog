@@ -1,7 +1,7 @@
 use cog::{bytecode, frontend, interpreter, project};
 
 fn compile(body: &str) -> cog::backend::CompiledProgram {
-    let source = format!("include std; use io; use err::Error; {body}");
+    let source = format!("@!include(\"std\") use io; use err::Error; {body}");
     let program = project::compile_source("strings.cog", &source).unwrap_or_else(|e| panic!("{e}"));
     bytecode::decode(&bytecode::encode(&program).unwrap()).unwrap()
 }
@@ -55,6 +55,47 @@ fn both_string_forms_decode_escapes_once_and_preserve_unicode_and_dollar() {
         run(r#"fn main() { io::println("\\n\"\t\r\0🦀$"); io::println($"\\n\"\t\r\0🦀${7}"); }"#),
         "\\n\"\t\r\0🦀$\n\\n\"\t\r\0🦀$7\n"
     );
+}
+
+#[test]
+fn hexadecimal_ascii_escapes_decode_once_in_plain_and_interpolated_strings() {
+    assert_eq!(
+        run(r#"fn main() {
+            io::println("\x1B[2J\x1b[H");
+            io::println("\x00\x7f\x41\x0A\x22\x5Cn\\x41\x7Bname\x7D");
+            io::println($"\x1B[H\x7Bmissing\x7D=\x22{7}\x22\x5Cn\\x41");
+            io::println($"nested={"\x41"}");
+        }"#),
+        "\x1B[2J\x1B[H\n\x00\x7fA\n\"\\n\\x41{name}\n\x1B[H{missing}=\"7\"\\n\\x41\nnested=A\n"
+    );
+}
+
+#[test]
+fn invalid_hexadecimal_escapes_report_the_cause_and_recover_following_statements() {
+    for (escape, message) in [
+        (r"\x", "two hexadecimal digits"),
+        (r"\x1", "two hexadecimal digits"),
+        (r"\xGG", "two hexadecimal digits"),
+        (r"\x0G", "two hexadecimal digits"),
+        (r"\xé0", "two hexadecimal digits"),
+        (r"\x🦀", "two hexadecimal digits"),
+        (r"\x80", "ASCII range"),
+        (r"\xff", "ASCII range"),
+        (r"\q", "unknown escape"),
+    ] {
+        for prefix in ["", "$"] {
+            let source = format!(
+                "@!include(\"std\") use io; fn main() {{ io::println({prefix}\"{escape}\"); const wrong: int = false; }}"
+            );
+            let error = project::compile_source("escapes.cog", &source).unwrap_err();
+            assert_eq!(error.matches("error[E0001]").count(), 1, "{error}");
+            assert!(error.contains(message), "{escape}: {error}");
+            assert!(error.contains("type mismatch"), "{error}");
+            assert!(!error.contains("error[E0002]"), "{error}");
+            assert!(!error.contains("unknown import"), "{error}");
+            assert!(!error.contains("unresolved package inclusion"), "{error}");
+        }
+    }
 }
 
 #[test]

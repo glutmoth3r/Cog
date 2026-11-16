@@ -13,6 +13,7 @@ pub enum RuntimeError {
     Overflow,
     InvalidLocal(usize),
     NegativeSleep(f64),
+    Timeout,
     MissingHalt,
     InvalidJump(usize),
     InvalidCall(usize),
@@ -36,6 +37,7 @@ pub enum RuntimeError {
     InvalidArgument {
         op: &'static str,
     },
+    Cancelled,
     ResourceLimit {
         resource: &'static str,
     },
@@ -118,6 +120,7 @@ impl RuntimeError {
                 | RuntimeError::Overflow
                 | RuntimeError::TypeMismatch { .. }
                 | RuntimeError::NegativeSleep(_)
+                | RuntimeError::Timeout
                 | RuntimeError::ParseFailure { .. }
                 | RuntimeError::IndexOutOfBounds { .. }
                 | RuntimeError::MissingField { .. }
@@ -127,6 +130,7 @@ impl RuntimeError {
                 | RuntimeError::IoFailure { .. }
                 | RuntimeError::InvalidResource
                 | RuntimeError::InvalidArgument { .. }
+                | RuntimeError::Cancelled
                 | RuntimeError::NativeFailure { .. }
                 | RuntimeError::ResourceLimit { .. }
                 | RuntimeError::EntropyUnavailable
@@ -146,6 +150,7 @@ impl RuntimeError {
             Self::Overflow => "Overflow",
             Self::InvalidLocal(_) => "InvalidLocal",
             Self::NegativeSleep(_) => "NegativeSleep",
+            Self::Timeout => "Timeout",
             Self::MissingHalt => "MissingHalt",
             Self::InvalidJump(_) => "InvalidJump",
             Self::InvalidCall(_) => "InvalidCall",
@@ -157,6 +162,7 @@ impl RuntimeError {
             Self::NativeFailure { .. } => "NativeFailure",
             Self::InvalidResource => "InvalidResource",
             Self::InvalidArgument { .. } => "InvalidArgument",
+            Self::Cancelled => "Cancelled",
             Self::ResourceLimit { .. } => "ResourceLimit",
             Self::IoFailure { .. } => "IoFailure",
             Self::PermissionDenied { .. } => "PermissionDenied",
@@ -222,6 +228,7 @@ impl std::fmt::Display for RuntimeError {
             RuntimeError::Overflow => write!(f, "integer arithmetic overflow"),
             RuntimeError::InvalidLocal(i) => write!(f, "invalid local `{i}`"),
             RuntimeError::NegativeSleep(s) => write!(f, "negative sleep duration `{s}`"),
+            RuntimeError::Timeout => write!(f, "async task timed out"),
             RuntimeError::MissingHalt => write!(f, "missing halt"),
             RuntimeError::InvalidJump(i) => write!(f, "invalid jump target `{i}`"),
             RuntimeError::InvalidCall(i) => write!(f, "invalid callable target or signature `{i}`"),
@@ -239,6 +246,7 @@ impl std::fmt::Display for RuntimeError {
             }
             RuntimeError::InvalidResource => write!(f, "closed, stale or foreign resource handle"),
             RuntimeError::InvalidArgument { op } => write!(f, "invalid argument in `{op}`"),
+            RuntimeError::Cancelled => write!(f, "async task was cancelled"),
             RuntimeError::ResourceLimit { resource } => {
                 write!(f, "runtime resource limit: {resource}")
             }

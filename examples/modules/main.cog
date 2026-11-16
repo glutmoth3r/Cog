@@ -1,4 +1,4 @@
-include std;
+@!include("std")
 use io;
 use greeting;
 

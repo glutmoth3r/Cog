@@ -13,7 +13,7 @@ enum Target {
     Block(Label),
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct CompiledProgram {
     pub instructions: Vec<Instruction>,
     pub imports: Vec<crate::runtime::NativeImport>,
@@ -36,6 +36,7 @@ pub struct SourceMapEntry {
 pub struct CallableSignature {
     pub parameters: usize,
     pub captures: usize,
+    pub asynchronous: bool,
     /// Sparse metadata allocation: `None` means every parameter is dynamic.
     /// `Some` is positional and has the same length as `parameters`.
     pub parameter_types: Option<Vec<Option<crate::value::RuntimeType>>>,
@@ -48,6 +49,7 @@ impl CallableSignature {
         Self {
             parameters,
             captures,
+            asynchronous: false,
             parameter_types: None,
             result_type: None,
         }
@@ -116,7 +118,11 @@ impl Emitter {
         }
         if matches!(
             instruction,
-            Instruction::Jump(_) | Instruction::Return | Instruction::Crash(_) | Instruction::Halt
+            Instruction::Jump(_)
+                | Instruction::Return
+                | Instruction::ReturnPropagate
+                | Instruction::Crash(_)
+                | Instruction::Halt
         ) {
             self.unreachable = true;
         }
@@ -171,6 +177,16 @@ impl Emitter {
         parameter_types: Vec<Option<crate::value::RuntimeType>>,
         result_type: Option<crate::value::RuntimeType>,
     ) {
+        self.function_with_async_types(name, parameter_types, result_type, false);
+    }
+
+    pub fn function_with_async_types(
+        &mut self,
+        name: &str,
+        parameter_types: Vec<Option<crate::value::RuntimeType>>,
+        result_type: Option<crate::value::RuntimeType>,
+        asynchronous: bool,
+    ) {
         let parameters = parameter_types.len();
         let parameter_types = parameter_types
             .iter()
@@ -191,6 +207,7 @@ impl Emitter {
             CallableSignature {
                 parameters,
                 captures: 0,
+                asynchronous,
                 parameter_types,
                 result_type,
             },
@@ -217,6 +234,15 @@ impl Emitter {
         self.patches
             .push((self.instructions.len(), Target::Function(name.to_owned())));
         self.emit(Instruction::Call(0, arity));
+    }
+
+    pub fn call_async(&mut self, name: &str, arity: usize) {
+        if self.unreachable {
+            return;
+        }
+        self.patches
+            .push((self.instructions.len(), Target::Function(name.to_owned())));
+        self.emit(Instruction::CallAsync(0, arity));
     }
 
     pub fn call_native(&mut self, import: crate::runtime::NativeImport) {
@@ -258,9 +284,11 @@ impl Emitter {
                 })?;
             match &mut self.instructions[index] {
                 Instruction::Call(target, _)
+                | Instruction::CallAsync(target, _)
                 | Instruction::Jump(target)
                 | Instruction::JumpIfFalse(target)
-                | Instruction::JumpIfTrue(target) => *target = address,
+                | Instruction::JumpIfTrue(target)
+                | Instruction::JumpIfNoPropagation(target) => *target = address,
                 _ => return Err("internal error: invalid bytecode fixup".into()),
             }
         }
@@ -271,8 +299,16 @@ impl Emitter {
             callables: self.callables,
             source_map: self.source_map,
         };
-        crate::bytecode::validate(&program)?;
-        Ok(program)
+        let optimized = crate::optimizer::optimize(&program);
+        match crate::bytecode::validate(&optimized) {
+            Ok(()) => Ok(optimized),
+            Err(_) => {
+                // An optimizer invariant failure must preserve executable
+                // compiler output when the pre-optimization program is valid.
+                crate::bytecode::validate(&program)?;
+                Ok(program)
+            }
+        }
     }
 }
 
@@ -349,11 +385,68 @@ impl CompiledProgram {
                         .map(str::to_owned)
                         .unwrap_or_else(|| target.to_string())
                 ),
+                Instruction::CallAsync(target, arity) => format!(
+                    "call_async {} {arity}",
+                    self.functions
+                        .get(target)
+                        .map(String::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| target.to_string())
+                ),
+                Instruction::Await => "await".into(),
+                Instruction::Spawn => "spawn".into(),
+                Instruction::YieldNow => "yield_now".into(),
+                Instruction::TimeoutAsync => "timeout".into(),
+                Instruction::Select2 => "select2".into(),
+                Instruction::Select => "select".into(),
+                Instruction::SleepAsync => "sleep".into(),
+                Instruction::ReadBytesAsync => "read_bytes".into(),
+                Instruction::ProcessRunAsync => "run".into(),
+                Instruction::ProcessRunTimeoutAsync => "run_timeout".into(),
+                Instruction::ProcessRunInputAsync => "run_input".into(),
+                Instruction::ProcessRunInputTimeoutAsync => "run_input_timeout".into(),
+                Instruction::ProcessRunInputTimeoutOutputLimitAsync => {
+                    "run_input_timeout_output_limit".into()
+                }
+                Instruction::NetworkExchangeAsync => "tcp_exchange".into(),
+                Instruction::TcpListenAsync => "tcp_listen".into(),
+                Instruction::TcpAcceptAsync => "tcp_accept".into(),
+                Instruction::TcpConnectAsync => "tcp_connect".into(),
+                Instruction::TcpReadAsync => "tcp_read".into(),
+                Instruction::TcpReadExactAsync => "tcp_read_exact".into(),
+                Instruction::TcpReadAllAsync => "tcp_read_all".into(),
+                Instruction::TcpWriteAsync => "tcp_write".into(),
+                Instruction::TcpWriteAllAsync => "tcp_write_all".into(),
+                Instruction::TcpShutdownWriteAsync => "tcp_shutdown_write".into(),
+                Instruction::AsyncIoOpen => "io_open".into(),
+                Instruction::AsyncIoRead => "io_read".into(),
+                Instruction::AsyncIoReadExact => "io_read_exact".into(),
+                Instruction::AsyncIoReadAll => "io_read_all".into(),
+                Instruction::AsyncIoWrite => "io_write".into(),
+                Instruction::AsyncIoWriteAll => "io_write_all".into(),
+                Instruction::AsyncIoFlush => "io_flush".into(),
+                Instruction::AsyncIoSeek => "io_seek".into(),
+                Instruction::FsMetadataAsync => "metadata".into(),
+                Instruction::FsReadDirAsync => "read_dir".into(),
+                Instruction::FsWriteBytesAsync => "write_bytes".into(),
+                Instruction::FsCreateDirAsync => "create_dir".into(),
+                Instruction::FsCreateDirAllAsync => "create_dir_all".into(),
+                Instruction::FsRemoveFileAsync => "remove_file".into(),
+                Instruction::FsRemoveDirAsync => "remove_dir".into(),
+                Instruction::FsReadTextAsync => "read_text".into(),
+                Instruction::FsWriteTextAsync => "write_text".into(),
+                Instruction::FsReadLinesAsync => "read_lines".into(),
+                Instruction::FsAppendBytesAsync => "append_bytes".into(),
+                Instruction::FsAppendTextAsync => "append_text".into(),
+                Instruction::FsCopyAsync => "copy".into(),
+                Instruction::FsRenameAsync => "rename".into(),
                 Instruction::Return => "ret".into(),
+                Instruction::ReturnPropagate => "retprop".into(),
                 Instruction::CallNative(index) => format!("call_native {index}"),
                 Instruction::Jump(n) => format!("jmp {n}"),
                 Instruction::JumpIfFalse(n) => format!("jz {n}"),
                 Instruction::JumpIfTrue(n) => format!("jnz {n}"),
+                Instruction::JumpIfNoPropagation(n) => format!("jnp {n}"),
                 Instruction::MakeRecord(n) => format!("record {n}"),
                 Instruction::MakeArray(n) => format!("array {n}"),
                 Instruction::MakeTuple(n) => format!("tuple {n}"),

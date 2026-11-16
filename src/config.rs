@@ -11,12 +11,25 @@ pub const MAX_CONFIGURATION_BYTES: usize = 256 * 1024;
 pub struct Package {
     pub name: String,
     pub version: String,
+    pub kind: PackageKind,
+    pub plugins: Vec<crate::sdk::PluginManifest>,
+    pub assets: Vec<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PackageKind {
+    #[default]
+    Application,
+    Library,
 }
 
 #[derive(Clone, Debug)]
 pub struct Dependency {
     pub alias: String,
     pub path: PathBuf,
+    pub archive: bool,
+    /// Exact package identity resolved from the user-local Cog store.
+    pub installed: Option<(String, String)>,
     pub span: SourceSpan,
 }
 
@@ -50,7 +63,7 @@ fn configuration_size_error() -> Vec<Diagnostic> {
     )]
 }
 
-fn read_configuration(path: &Path) -> Result<String, Vec<Diagnostic>> {
+pub(crate) fn read_configuration(path: &Path) -> Result<String, Vec<Diagnostic>> {
     let read =
         || crate::limits::read_at_most(std::fs::File::open(path)?, MAX_CONFIGURATION_BYTES + 1);
     let read_error = |e| {
@@ -121,12 +134,26 @@ fn fields(
     source: &Rc<SourceFile>,
     errors: &mut Vec<Diagnostic>,
 ) -> (Vec<String>, BTreeMap<String, String>) {
-    if node.ty().is_some() || node.children().is_some() {
+    fields_with_children(node, allowed, source, errors, false)
+}
+
+fn fields_with_children(
+    node: &KdlNode,
+    allowed: &[&str],
+    source: &Rc<SourceFile>,
+    errors: &mut Vec<Diagnostic>,
+    allow_children: bool,
+) -> (Vec<String>, BTreeMap<String, String>) {
+    if node.ty().is_some() || (!allow_children && node.children().is_some()) {
         error(
             errors,
             source,
             node,
-            "type annotations and child blocks are not allowed here",
+            if allow_children {
+                "type annotations are not allowed here"
+            } else {
+                "type annotations and child blocks are not allowed here"
+            },
         );
     }
     let mut args = Vec::new();
@@ -204,7 +231,8 @@ pub fn package_from_source(path: &Path, text: &str) -> Result<Package, Vec<Diagn
             );
             continue;
         }
-        let (args, props) = fields(node, &["version"], &source, &mut errors);
+        let (args, props) =
+            fields_with_children(node, &["version", "kind"], &source, &mut errors, true);
         if result.is_some() {
             error(&mut errors, &source, node, "duplicate package declaration");
         }
@@ -226,9 +254,59 @@ pub fn package_from_source(path: &Path, text: &str) -> Result<Package, Vec<Diagn
                 "package name must be a filename component without separators or control characters",
             );
         } else {
+            let kind = match props.get("kind").map(String::as_str) {
+                None | Some("application") => PackageKind::Application,
+                Some("library") => PackageKind::Library,
+                Some(_) => {
+                    error(
+                        &mut errors,
+                        &source,
+                        node,
+                        "package kind must be `application` or `library`",
+                    );
+                    continue;
+                }
+            };
+            let mut plugins = Vec::new();
+            let mut assets = Vec::new();
+            let mut seen_assets = BTreeSet::new();
+            if let Some(children) = node.children() {
+                for child in children.nodes() {
+                    match child.name().value() {
+                        "plugin" => match crate::sdk::PluginManifest::parse_package_node(child) {
+                            Ok(plugin) => plugins.push(plugin),
+                            Err(plugin_error) => error(
+                                &mut errors,
+                                &source,
+                                child,
+                                format!("invalid package plugin declaration: {plugin_error}"),
+                            ),
+                        },
+                        "asset" => match package_asset(child) {
+                            Ok(asset) if seen_assets.insert(asset.clone()) => assets.push(asset),
+                            Ok(_) => error(
+                                &mut errors,
+                                &source,
+                                child,
+                                "duplicate package asset declaration",
+                            ),
+                            Err(message) => error(&mut errors, &source, child, message),
+                        },
+                        name => error(
+                            &mut errors,
+                            &source,
+                            child,
+                            format!("unknown package child `{name}`; expected plugin or asset"),
+                        ),
+                    }
+                }
+            }
             result = Some(Package {
                 name: args[0].clone(),
                 version: props["version"].clone(),
+                kind,
+                plugins,
+                assets,
             });
         }
     }
@@ -244,6 +322,37 @@ pub fn package_from_source(path: &Path, text: &str) -> Result<Package, Vec<Diagn
     } else {
         Err(errors)
     }
+}
+
+fn package_asset(node: &KdlNode) -> Result<PathBuf, String> {
+    if node.ty().is_some() || node.children().is_some() || node.entries().len() != 1 {
+        return Err("asset requires one relative package path and no properties".into());
+    }
+    let entry = &node.entries()[0];
+    if entry.name().is_some() || entry.ty().is_some() {
+        return Err("expected: asset \"relative/path\"".into());
+    }
+    let value = entry
+        .value()
+        .as_string()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "asset requires a nonempty string path".to_owned())?;
+    if value
+        .chars()
+        .any(|character| character.is_control() || matches!(character, '\\' | ':'))
+    {
+        return Err("asset path contains an unsupported character".into());
+    }
+    let path = PathBuf::from(value);
+    if path.is_absolute()
+        || value.split('/').any(|part| matches!(part, "" | "." | ".."))
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err("asset path must be normalized and remain inside the package".into());
+    }
+    Ok(path)
 }
 
 pub fn dependencies(path: &Path) -> Result<Vec<Dependency>, Vec<Diagnostic>> {
@@ -264,7 +373,12 @@ pub fn dependencies_from_source(
     let mut seen = BTreeSet::new();
     for node in doc.nodes() {
         let alias = node.name().value();
-        let (args, props) = fields(node, &["path"], &source, &mut errors);
+        let (args, props) = fields(
+            node,
+            &["path", "archive", "package", "version"],
+            &source,
+            &mut errors,
+        );
         if !identifier(alias) || !seen.insert(alias.to_owned()) {
             error(
                 &mut errors,
@@ -273,18 +387,35 @@ pub fn dependencies_from_source(
                 format!("invalid or duplicate dependency alias `{alias}`"),
             );
         }
-        if !args.is_empty() || props.get("path").is_none_or(|p| p.is_empty()) {
+        let directory = props.get("path");
+        let archive = props.get("archive");
+        let package = props.get("package");
+        let version = props.get("version");
+        let dependency_path = directory.or(archive);
+        let local_source = (directory.is_some() ^ archive.is_some())
+            && package.is_none()
+            && version.is_none()
+            && dependency_path.is_some_and(|path| !path.is_empty());
+        let installed_source = directory.is_none()
+            && archive.is_none()
+            && package.is_some_and(|name| valid_package_name(name))
+            && version.is_some_and(|value| !value.is_empty());
+        if !args.is_empty() || !(local_source || installed_source) {
             error(
                 &mut errors,
                 &source,
                 node,
-                "expected: alias path=\"directory\"",
+                "expected alias path=\"directory\", alias archive=\"file.cogpkg\", or alias package=\"name\" version=\"version\"",
             );
         } else {
             let s = node.span();
             result.push(Dependency {
                 alias: alias.into(),
-                path: props["path"].clone().into(),
+                path: dependency_path.map(PathBuf::from).unwrap_or_default(),
+                archive: archive.is_some(),
+                installed: package
+                    .zip(version)
+                    .map(|(name, version)| (name.to_owned(), version.to_owned())),
                 span: source.span(s.offset()..s.offset() + s.len()),
             });
         }

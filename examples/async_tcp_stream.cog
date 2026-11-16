@@ -1,0 +1,19 @@
+@!include("std")
+use bytes;
+use io;
+use async::net;
+
+@async fn main() -> nil {
+    const socket = await net::connect("127.0.0.1", 18766, 5000)!!;
+    const greeting_task = spawn(net::read(socket, 64));
+    const write_task = spawn(net::write_all(socket, bytes::from_str("ping")!!));
+
+    await write_task!!;
+    const greeting = await greeting_task!!;
+    io::println(bytes::to_str(greeting, 0, bytes::len(greeting)!!)!!);
+
+    await net::shutdown_write(socket)!!;
+    const response = await net::read(socket, 64)!!;
+    io::println(bytes::to_str(response, 0, bytes::len(response)!!)!!);
+    io::close(socket)!!;
+}

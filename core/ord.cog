@@ -14,11 +14,35 @@ extend int with Ord {
     }
 }
 
+extend uint with Ord {
+    fn compare(self, other: uint) -> int {
+        if self < other { return -1; }
+        if self > other { return 1; }
+        0
+    }
+}
+
+extend bigint with Ord {
+    fn compare(self, other: bigint) -> int {
+        if self < other { return -1; }
+        if self > other { return 1; }
+        0
+    }
+}
+
 extend bool with Ord {
     fn compare(self, other: bool) -> int {
         if self == other { return 0; }
         if !self { return -1; }
         1
+    }
+}
+
+extend char with Ord {
+    fn compare(self, other: char) -> int {
+        if self < other { return -1; }
+        if self > other { return 1; }
+        0
     }
 }
 

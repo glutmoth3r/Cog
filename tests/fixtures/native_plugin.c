@@ -25,10 +25,10 @@ static FILE *open_marker(const char *path) { return fopen(path, "wb"); }
 #define TEST_PLUGIN_VERSION COG_ABI_VERSION
 #endif
 #ifndef TEST_PLUGIN_SIZE
-#define TEST_PLUGIN_SIZE sizeof(CogPluginV1)
+#define TEST_PLUGIN_SIZE sizeof(CogPluginV3)
 #endif
 #ifndef TEST_FUNCTION_SIZE
-#define TEST_FUNCTION_SIZE sizeof(CogFunctionV1)
+#define TEST_FUNCTION_SIZE sizeof(CogFunctionV3)
 #endif
 
 typedef struct { int64_t count; CogHandle saved; char *marker; } State;
@@ -59,25 +59,25 @@ static void destroy(void *pointer) {
     }
     free(state);
 }
-static CogStatus invoke(void *pointer, const CogHostV1 *host, void *context,
+static CogStatus invoke(void *pointer, const CogHostV3 *host, void *context,
                         const CogHandle *arguments, size_t count, CogHandle *output) {
     State *state = (State *)pointer;
     CogValueView value = {0};
-    if (host->size != sizeof(CogHostV1) || host->version != COG_ABI_VERSION || count != 1) return COG_INVALID;
+    if (host->size != sizeof(CogHostV3) || host->version != COG_ABI_VERSION || count != 1) return COG_INVALID;
     if (host->inspect(context, arguments[0], &value) != COG_OK) return COG_INVALID;
     if (value.kind == COG_INT) {
-        if (value.integer == 0) { *output = 0; return COG_OK; }
-        if (value.integer == -1) { *output = state->saved; return COG_OK; }
-        if (value.integer == -4) {
+        if ((int64_t)value.integer == 0) { *output = 0; return COG_OK; }
+        if ((int64_t)value.integer == -1) { *output = state->saved; return COG_OK; }
+        if ((int64_t)value.integer == -4) {
             CogValueView invalid = {0};
             if (host->inspect(context, 0, &invalid) != COG_INVALID) return COG_FAILURE;
             *output = arguments[0];
             return COG_OK;
         }
-        if (value.integer == -2) {
+        if ((int64_t)value.integer == -2) {
             /* Expired handles must be rejected by host operations as well. */
             if (host->inspect(context, state->saved, &value) != COG_INVALID) return COG_FAILURE;
-        } else if (value.integer == -3) {
+        } else if ((int64_t)value.integer == -3) {
             value.kind = COG_STR;
             value.bytes.data = (const uint8_t *)"x";
             value.bytes.len = (size_t)-1;
@@ -99,12 +99,12 @@ static CogStatus invoke(void *pointer, const CogHostV1 *host, void *context,
     return COG_OK;
 }
 static const uint8_t parameters[] = {COG_ANY};
-static const CogFunctionV1 functions[] = {{
+static const CogFunctionV3 functions[] = {{
     TEST_FUNCTION_SIZE,
     {(const uint8_t *)"host::probe", 11}, {parameters, 1},
-    COG_ANY, COG_FS_WRITE, 0, invoke
+    COG_ANY, 0, COG_FS_WRITE, 0, invoke, NULL, NULL, NULL, NULL
 }};
-static const CogPluginV1 plugin = {
+static const CogPluginV3 plugin = {
     TEST_PLUGIN_SIZE, TEST_PLUGIN_VERSION, 1, functions, create, destroy
 };
-COG_EXPORT const CogPluginV1 *cog_plugin_v1(void) { return &plugin; }
+COG_EXPORT const CogPluginV3 *cog_plugin_v3(void) { return &plugin; }

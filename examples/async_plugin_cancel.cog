@@ -1,0 +1,21 @@
+@!include("std")
+use err::Error;
+use host;
+use io;
+use async::time;
+
+@async fn cancel_after(task: Task[int]) -> bool {
+    await time::sleep(0.02);
+    return cancel(task);
+}
+
+@async fn main() -> nil {
+    const work = spawn(host::delayed(5000));
+    const stopper = spawn(cancel_after(work));
+    io::println($"cancel accepted: {await stopper}");
+    when await work is Error::Cancelled {
+        io::println("plugin worker stopped and joined");
+    } else {
+        crash("expected async plugin cancellation");
+    }
+}

@@ -1,0 +1,18 @@
+@!include("std")
+use bytes;
+use async::fs;
+use io;
+
+@async fn main() -> nil {
+    const path = ".cog-async-lines-demo.txt";
+    await fs::write_text(path, "first\r\n");
+    await fs::append_text(path, "second\n");
+    await fs::append_bytes(path, bytes::from_str("third\n")!!);
+
+    const lines: str[] = await fs::read_lines(path);
+    for line in lines {
+        io::println(line);
+    }
+
+    await fs::remove_file(path);
+}

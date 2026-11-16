@@ -1,12 +1,12 @@
-include std;
+@!include("std")
 use io;
 
-comptime fn factorial(value: int) -> int {
+@comptime fn factorial(value: int) -> int {
     if value <= 1 { return 1; }
     return value * factorial(value - 1);
 }
 
-comptime FACTORIAL: int = factorial(5);
+@comptime const FACTORIAL: int = factorial(5);
 
 fn main() -> nil {
     io::println($"5! = {FACTORIAL}")!!;

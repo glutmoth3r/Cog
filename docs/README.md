@@ -14,10 +14,12 @@ Start with the [repository README](../README.md), the
 | [Standard library](STANDARD_LIBRARY.md) | Generic array search and sorting, cloning, text, ASCII, hex, Base64, bytes, streams, time, and processes |
 | [Projects and configuration](PROJECT_FORMATS.md) | Modules, KDL manifests, dependencies, lockfiles, targets, and caching |
 | [Runtime and bytecode](RUNTIME.md) | Compilation pipeline, artifacts, native ABI, and embedding boundaries |
-| [Rust SDK and plugins](SDK.md) | Owned embedding API, native registration, C ABI v1 and plugin lifecycle |
+| [Numeric types](NUMERIC_TYPES.md) | Implemented `int`, `uint`, and `bigint` behavior; proposed decimal contract |
+| [Rust SDK and plugins](SDK.md) | Owned embedding API, native registration, C ABI v3 and plugin lifecycle |
 | [Semantic contracts](SEMANTIC_CONTRACTS.md) | Implemented invariants, accepted future specifications, and open decisions |
+| [Async design](ASYNC_DESIGN.md) | Task scheduling, async host/plugin APIs, limits, cancellation, and open ownership contracts |
 | [Contributing](CONTRIBUTING.md) | Source layout, validation, diagnostics, and performance tools |
 
 The [roadmap](../ROADMAP.md) separates completed work, near-term priorities, and
-longer-term goals. A design example or ignored specification test does not imply
-that its syntax is implemented.
+longer-term goals. Design sections identify which parts are implemented and which
+remain proposed.

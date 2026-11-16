@@ -1,11 +1,11 @@
 //! Build as a separate cdylib with the command in docs/SDK.md.
-use cog::sdk::abi::{self, FunctionV1, Handle, HostV1, PluginV1};
+use cog::sdk::abi::{self, FunctionV3, Handle, HostV3, PluginV3};
 use cog::sdk::{Effects, Type};
 use std::ffi::c_void;
 
 unsafe extern "C" fn double(
     _state: *mut c_void,
-    host: *const HostV1,
+    host: *const HostV3,
     context: *mut c_void,
     arguments: *const Handle,
     count: usize,
@@ -24,7 +24,7 @@ unsafe extern "C" fn double(
 
 unsafe extern "C" fn fail(
     _state: *mut c_void,
-    host: *const HostV1,
+    host: *const HostV3,
     context: *mut c_void,
     arguments: *const Handle,
     count: usize,
@@ -37,8 +37,8 @@ unsafe extern "C" fn fail(
     }
 }
 
-static FUNCTIONS: [FunctionV1; 2] = [
-    FunctionV1::new(
+static FUNCTIONS: [FunctionV3; 2] = [
+    FunctionV3::new(
         "host::double",
         &[Type::Int],
         Type::Int,
@@ -46,12 +46,12 @@ static FUNCTIONS: [FunctionV1; 2] = [
         0,
         double,
     ),
-    FunctionV1::new("host::fail", &[], Type::Nil, Effects::PURE, 0, fail),
+    FunctionV3::new("host::fail", &[], Type::Nil, Effects::PURE, 0, fail),
 ];
-static PLUGIN: PluginV1 = PluginV1::new(&FUNCTIONS);
+static PLUGIN: PluginV3 = PluginV3::new(&FUNCTIONS);
 
 #[unsafe(no_mangle)]
-pub extern "C" fn cog_plugin_v1() -> *const PluginV1 {
+pub extern "C" fn cog_plugin_v3() -> *const PluginV3 {
     &PLUGIN
 }
 

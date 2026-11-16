@@ -47,7 +47,9 @@ fn public_markdown_cog_examples_compile_and_round_trip() {
                         let location = format!("{name}:{start}");
                         let includes_external_package = source.lines().any(|line| {
                             let line = line.trim();
-                            line.starts_with("include ") && line != "include std;"
+                            line.starts_with("@!include(\"")
+                                && line != "@!include(\"std\")"
+                                && line != "@!include(\"std\");"
                         });
                         if includes_external_package {
                             // These are package-level fragments; project tests

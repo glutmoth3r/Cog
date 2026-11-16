@@ -3,7 +3,7 @@
 use crate::ast::*;
 use crate::builtins::Builtin;
 use crate::diagnostic::{Diagnostic, SourceSpan};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 const CLONE_TRAIT: &str = "$core::clone::Clone";
 
@@ -14,6 +14,7 @@ enum Type {
     Never,
     EmptyArray,
     Array(Box<Type>),
+    Task(Box<Type>),
     Tuple(Vec<Type>),
     Bytes,
     StrBuf,
@@ -53,10 +54,43 @@ fn type_compatible(expected: &Type, actual: &Type) -> bool {
         (Type::Enum(expected, _), Type::Enum(actual, _)) => expected == actual,
         (Type::Array(_), Type::EmptyArray) => true,
         (Type::Array(expected), Type::Array(actual)) => array_element_compatible(expected, actual),
+        (Type::Task(expected), Type::Task(actual)) => type_compatible(expected, actual),
         (Type::Tuple(a), Type::Tuple(b)) => {
             a.len() == b.len() && a.iter().zip(b).all(|(x, y)| type_compatible(x, y))
         }
         (a, b) => a == b,
+    }
+}
+
+fn integer_literal_expression(expr: &Expr) -> bool {
+    match expr.node() {
+        Expr::Int(value) => *value >= 0,
+        Expr::UInt(_) => true,
+        Expr::Binary(op, left, right)
+            if matches!(
+                op,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+            ) =>
+        {
+            integer_literal_expression(left) && integer_literal_expression(right)
+        }
+        _ => false,
+    }
+}
+
+fn bigint_literal_expression(expr: &Expr) -> bool {
+    match expr.node() {
+        Expr::Int(_) | Expr::UInt(_) | Expr::BigInt(_) => true,
+        Expr::Unary(UnOp::Neg, value) => bigint_literal_expression(value),
+        Expr::Binary(op, left, right)
+            if matches!(
+                op,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+            ) =>
+        {
+            bigint_literal_expression(left) && bigint_literal_expression(right)
+        }
+        _ => false,
     }
 }
 
@@ -92,6 +126,16 @@ fn generic_extension_matches(extension: &ExtendDecl, receiver: &Type) -> bool {
         .type_params
         .iter()
         .all(|parameter| substitutions.contains_key(&parameter.name))
+}
+
+fn associated_type_name(ty: &TypeAnnotation) -> Option<&str> {
+    match &ty.kind {
+        TypeKind::Named(name) => Some(name),
+        TypeKind::ResolvedName { symbol, .. } => Some(symbol),
+        TypeKind::Applied { source, .. } => Some(source),
+        TypeKind::ResolvedApplied { symbol, .. } => Some(symbol),
+        _ => None,
+    }
 }
 
 fn extension_target_uses_parameter(ty: &TypeAnnotation, name: &str) -> bool {
@@ -135,16 +179,42 @@ fn match_extension_type(
                 }
             }
         }
-        TypeKind::Applied { source, arguments }
-        | TypeKind::ResolvedApplied {
-            symbol: source,
-            arguments,
-            ..
-        } => {
+        TypeKind::Applied { source, arguments } => {
+            if source == "Task" {
+                let Type::Task(actual) = actual else {
+                    return false;
+                };
+                return arguments.len() == 1
+                    && match_extension_type(&arguments[0], actual, parameters, substitutions);
+            }
             let Type::Struct(_, actual_name, actual_arguments) = actual else {
                 return false;
             };
             (source == actual_name || actual_name.ends_with(&format!("::{source}")))
+                && arguments.len() == actual_arguments.len()
+                && arguments
+                    .iter()
+                    .zip(actual_arguments)
+                    .all(|(pattern, actual)| {
+                        match_extension_type(pattern, actual, parameters, substitutions)
+                    })
+        }
+        TypeKind::ResolvedApplied {
+            source,
+            symbol,
+            arguments,
+        } => {
+            if source == "Task" || symbol == "Task" {
+                let Type::Task(actual) = actual else {
+                    return false;
+                };
+                return arguments.len() == 1
+                    && match_extension_type(&arguments[0], actual, parameters, substitutions);
+            }
+            let Type::Struct(_, actual_name, actual_arguments) = actual else {
+                return false;
+            };
+            (symbol == actual_name || actual_name.ends_with(&format!("::{source}")))
                 && arguments.len() == actual_arguments.len()
                 && arguments
                     .iter()
@@ -178,7 +248,10 @@ fn match_extension_type(
             Type::Primitive(base, nullable) => {
                 let named = match symbol.as_str() {
                     "int" => VarType::Int,
+                    "uint" => VarType::UInt,
+                    "bigint" => VarType::BigInt,
                     "bool" => VarType::Bool,
+                    "char" => VarType::Char,
                     "str" => VarType::Str,
                     "float" => VarType::Float,
                     _ => return false,
@@ -283,6 +356,7 @@ impl Type {
             Self::Never => "<no normal exit>".into(),
             Self::EmptyArray => "empty array".into(),
             Self::Array(element) => format!("{}[]", element.display()),
+            Self::Task(result) => format!("Task[{}]", result.display()),
             Self::Tuple(items) => format!(
                 "({})",
                 items
@@ -329,6 +403,7 @@ impl Type {
                 Self::Array(element)
             }
             (Self::Array(a), Self::Array(b)) if a == b => Self::Array(a),
+            (Self::Task(a), Self::Task(b)) => Self::Task(Box::new((*a).join(*b))),
             (Self::Array(a), Self::Array(b)) => {
                 let element = (*a).join(*b);
                 if element == Self::Dynamic {
@@ -408,6 +483,7 @@ fn equivalent_expression(left: &Expr, right: &Expr) -> bool {
     match (left.node(), right.node()) {
         (Expr::Int(left), Expr::Int(right)) => left == right,
         (Expr::Float(left), Expr::Float(right)) => left.to_bits() == right.to_bits(),
+        (Expr::Char(left), Expr::Char(right)) => left == right,
         (Expr::Str(left), Expr::Str(right)) => left == right,
         (Expr::Bytes(left), Expr::Bytes(right)) => left == right,
         (Expr::Bool(left), Expr::Bool(right)) => left == right,
@@ -444,6 +520,25 @@ fn equivalent_expression(left: &Expr, right: &Expr) -> bool {
             Expr::SpecializedCall(right_name, right_types, right_args),
         ) => {
             left_name == right_name
+                && left_types == right_types
+                && equivalent_arguments(left_args, right_args)
+        }
+        (
+            Expr::AssociatedCall {
+                target: left_target,
+                method: left_method,
+                type_arguments: left_types,
+                args: left_args,
+            },
+            Expr::AssociatedCall {
+                target: right_target,
+                method: right_method,
+                type_arguments: right_types,
+                args: right_args,
+            },
+        ) => {
+            left_target == right_target
+                && left_method == right_method
                 && left_types == right_types
                 && equivalent_arguments(left_args, right_args)
         }
@@ -564,6 +659,7 @@ struct Checker<'a> {
     flow_facts: FlowFacts,
     in_cleanup: bool,
     in_function: bool,
+    in_async: bool,
     in_comptime: bool,
     in_comptime_initializer: bool,
     result_type: Option<TypeAnnotation>,
@@ -576,6 +672,7 @@ struct Checker<'a> {
     extension_methods: HashMap<(Type, String), &'a ExtensionMethod>,
     extension_method_traits: HashMap<(Type, String), Option<&'a str>>,
     generic_extension_methods: Vec<(&'a ExtendDecl, &'a ExtensionMethod)>,
+    associated_extension_methods: Vec<(&'a ExtendDecl, &'a ExtensionMethod)>,
     trait_implementations: std::collections::HashSet<(Type, String, Vec<Type>)>,
     generic_trait_implementations: Vec<&'a ExtendDecl>,
     current_function: Option<String>,
@@ -583,6 +680,9 @@ struct Checker<'a> {
     call_specializations: HashMap<CallSite, String>,
     struct_call_specializations: HashMap<CallSite, String>,
     specializations: Vec<Specialization>,
+    uint_literals: HashSet<usize>,
+    uint_expressions: HashSet<usize>,
+    bigint_literals: HashSet<usize>,
     specialization_names: HashMap<(String, Vec<Type>), String>,
     struct_specializations: Vec<StructSpecialization>,
     struct_specialization_names: HashMap<(String, Vec<Type>), String>,
@@ -611,6 +711,9 @@ pub(crate) struct CheckResult {
     pub struct_call_specializations: HashMap<CallSite, String>,
     pub specializations: Vec<Specialization>,
     pub struct_specializations: Vec<StructSpecialization>,
+    pub uint_literals: HashSet<usize>,
+    pub uint_expressions: HashSet<usize>,
+    pub bigint_literals: HashSet<usize>,
 }
 
 pub(crate) fn expression_site(function: Option<&str>, expr: &Expr) -> CallSite {
@@ -624,6 +727,14 @@ pub fn check(program: &Program, function_modules: &HashMap<String, String>) -> V
 pub(crate) fn check_with_methods(
     program: &Program,
     function_modules: &HashMap<String, String>,
+) -> CheckResult {
+    check_with_methods_and_names(program, function_modules, &BTreeMap::new())
+}
+
+pub(crate) fn check_with_methods_and_names(
+    program: &Program,
+    function_modules: &HashMap<String, String>,
+    names: &BTreeMap<String, String>,
 ) -> CheckResult {
     let mut c = Checker {
         functions: HashMap::new(),
@@ -645,6 +756,7 @@ pub(crate) fn check_with_methods(
         flow_facts: FlowFacts::default(),
         in_cleanup: false,
         in_function: false,
+        in_async: false,
         in_comptime: false,
         in_comptime_initializer: false,
         result_type: None,
@@ -657,6 +769,7 @@ pub(crate) fn check_with_methods(
         extension_methods: HashMap::new(),
         extension_method_traits: HashMap::new(),
         generic_extension_methods: Vec::new(),
+        associated_extension_methods: Vec::new(),
         trait_implementations: Default::default(),
         generic_trait_implementations: Vec::new(),
         current_function: None,
@@ -664,10 +777,17 @@ pub(crate) fn check_with_methods(
         call_specializations: HashMap::new(),
         struct_call_specializations: HashMap::new(),
         specializations: Vec::new(),
+        uint_literals: HashSet::new(),
+        uint_expressions: HashSet::new(),
+        bigint_literals: HashSet::new(),
         specialization_names: HashMap::new(),
         struct_specializations: Vec::new(),
         struct_specialization_names: HashMap::new(),
     };
+    c.access_facts.symbol_names = names
+        .iter()
+        .map(|(symbol, name)| (symbol.clone(), name.clone()))
+        .collect();
     for item in &program.items {
         match item {
             Item::Invalid {
@@ -801,7 +921,7 @@ pub(crate) fn check_with_methods(
             c.error(
                 "E2001",
                 format!(
-                    "`extend` requires a named struct, enum, or generic array type; use `comptime extend` for `{}`",
+                    "`extend` requires a named struct, enum, or generic array type; use `@comptime extend` for `{}`",
                     extension.target.display()
                 ),
                 extension
@@ -815,7 +935,7 @@ pub(crate) fn check_with_methods(
         }
         for method in &extension.methods {
             let function = &method.function;
-            if let Some(receiver) = function.params.first()
+            if let Some(receiver) = function.params.first().filter(|p| p.name == "self")
                 && let Some(receiver_type) = &receiver.ty
                 && !type_compatible(&target, &c.annotation_type(receiver_type))
             {
@@ -835,7 +955,8 @@ pub(crate) fn check_with_methods(
                         .or_else(|| function.body.tail.as_deref().and_then(Expr::span)),
                 );
             }
-            let duplicate = if extension.type_params.is_empty() {
+            let has_receiver = function.params.first().is_some_and(|p| p.name == "self");
+            let duplicate = if extension.type_params.is_empty() && has_receiver {
                 let key = (target.clone(), method.name.clone());
                 let previous = c.extension_methods.get(&key).copied();
                 let previous_trait = c.extension_method_traits.get(&key).copied().flatten();
@@ -857,7 +978,7 @@ pub(crate) fn check_with_methods(
                 } else {
                     !equivalent
                 }
-            } else {
+            } else if !extension.type_params.is_empty() && has_receiver {
                 let duplicate = c
                     .generic_extension_methods
                     .iter()
@@ -867,6 +988,18 @@ pub(crate) fn check_with_methods(
                     });
                 if !duplicate {
                     c.generic_extension_methods.push((extension, method));
+                }
+                duplicate
+            } else {
+                let duplicate =
+                    c.associated_extension_methods
+                        .iter()
+                        .any(|(existing, previous)| {
+                            previous.name == method.name
+                                && existing.target.canonical() == extension.target.canonical()
+                        });
+                if !duplicate {
+                    c.associated_extension_methods.push((extension, method));
                 }
                 duplicate
             };
@@ -901,7 +1034,8 @@ pub(crate) fn check_with_methods(
         } = item
         {
             c.module = name.rsplit_once("::").map(|(m, _)| m.to_owned());
-            let actual = c.expr(value);
+            let expected_type = ty.as_ref().map(|annotation| c.annotation_type(annotation));
+            let actual = c.expr_with_expected_type(value, expected_type.as_ref());
             if ty.is_none() && contains_unresolved_empty_array(&actual) {
                 c.error(
                     "E2001",
@@ -952,6 +1086,9 @@ pub(crate) fn check_with_methods(
         struct_call_specializations: c.struct_call_specializations,
         specializations: c.specializations,
         struct_specializations: c.struct_specializations,
+        uint_literals: c.uint_literals,
+        uint_expressions: c.uint_expressions,
+        bigint_literals: c.bigint_literals,
     }
 }
 
@@ -1059,6 +1196,16 @@ impl<'a> Checker<'a> {
                     .map(|element| self.concrete_annotation(element, substitutions, self_type))
                     .collect::<Option<Vec<_>>>()?,
             ),
+            TypeKind::Applied { source, arguments } if source == "Task" => {
+                if arguments.len() != 1 {
+                    return None;
+                }
+                Type::Task(Box::new(self.concrete_annotation(
+                    &arguments[0],
+                    substitutions,
+                    self_type,
+                )?))
+            }
             TypeKind::Applied { source, arguments } => {
                 let name = self
                     .constructors
@@ -1075,6 +1222,20 @@ impl<'a> Checker<'a> {
                         })
                         .collect::<Option<Vec<_>>>()?,
                 )
+            }
+            TypeKind::ResolvedApplied {
+                source,
+                symbol,
+                arguments,
+            } if source == "Task" || symbol == "Task" => {
+                if arguments.len() != 1 {
+                    return None;
+                }
+                Type::Task(Box::new(self.concrete_annotation(
+                    &arguments[0],
+                    substitutions,
+                    self_type,
+                )?))
             }
             TypeKind::ResolvedApplied {
                 source,
@@ -1108,8 +1269,11 @@ impl<'a> Checker<'a> {
                 } else {
                     match name.as_str() {
                         "int" => Type::concrete(VarType::Int),
+                        "uint" => Type::concrete(VarType::UInt),
+                        "bigint" => Type::concrete(VarType::BigInt),
                         "float" => Type::concrete(VarType::Float),
                         "bool" => Type::concrete(VarType::Bool),
+                        "char" => Type::concrete(VarType::Char),
                         "str" => Type::concrete(VarType::Str),
                         _ => Type::Named(name.clone()),
                     }
@@ -1124,6 +1288,11 @@ impl<'a> Checker<'a> {
             Type::Primitive(base, _) => TypeKind::Primitive(*base),
             Type::Nil => TypeKind::Primitive(VarType::Nil),
             Type::Array(element) => TypeKind::Array(Box::new(self.type_annotation_for(element)?)),
+            Type::Task(result) => TypeKind::ResolvedApplied {
+                source: "Task".to_owned(),
+                symbol: "Task".to_owned(),
+                arguments: vec![self.type_annotation_for(result)?],
+            },
             Type::Tuple(items) => TypeKind::Tuple(
                 items
                     .iter()
@@ -1339,6 +1508,17 @@ impl<'a> Checker<'a> {
                 );
                 valid = false;
             }
+            if function.asynchronous != required.asynchronous {
+                self.error(
+                    "E2001",
+                    format!(
+                        "async status of method `{}()` does not match trait `{trait_name}`",
+                        required.name
+                    ),
+                    function.result_span.as_ref(),
+                );
+                valid = false;
+            }
             for (index, (expected, actual)) in
                 required.params.iter().zip(&function.params).enumerate()
             {
@@ -1448,9 +1628,17 @@ impl<'a> Checker<'a> {
         parameters: &[TypeParameter],
         expr: &Expr,
     ) -> HashMap<String, Type> {
-        let Expr::SpecializedCall(_, arguments, _) = expr.node() else {
-            return HashMap::new();
+        let arguments = match expr.node() {
+            Expr::SpecializedCall(_, arguments, _) => arguments.as_slice(),
+            Expr::AssociatedCall { type_arguments, .. } if !type_arguments.is_empty() => {
+                type_arguments.as_slice()
+            }
+            Expr::AssociatedCall { .. } => return HashMap::new(),
+            _ => return HashMap::new(),
         };
+        if arguments.is_empty() && parameters.is_empty() {
+            return HashMap::new();
+        }
         if arguments.len() != parameters.len() {
             self.error("E2001", format!("expected {} explicit generic arguments, got {}; partial arguments are not supported", parameters.len(), arguments.len()), expr.span());
             return HashMap::new();
@@ -1469,6 +1657,18 @@ impl<'a> Checker<'a> {
         args: &[CallArgument],
         actual: Vec<Type>,
         expr: &Expr,
+    ) -> Type {
+        self.generic_call_with_result_context(name, function, args, actual, expr, None)
+    }
+
+    fn generic_call_with_result_context(
+        &mut self,
+        name: &str,
+        function: &FunctionDecl,
+        args: &[CallArgument],
+        actual: Vec<Type>,
+        expr: &Expr,
+        expected_result: Option<&Type>,
     ) -> Type {
         let bindings = crate::arguments::bind(name, &function.params, args);
         for error in bindings.errors {
@@ -1501,6 +1701,15 @@ impl<'a> Checker<'a> {
                 &type_parameters,
                 &mut substitutions,
                 args[argument_index].value.span(),
+            );
+        }
+        if let (Some(expected), Some(result)) = (expected_result, function.result_type.as_ref()) {
+            self.infer_generic_type(
+                result,
+                expected,
+                &type_parameters,
+                &mut substitutions,
+                expr.span(),
             );
         }
 
@@ -1616,12 +1825,17 @@ impl<'a> Checker<'a> {
             .specializations
             .insert(crate::mutability::expr_id(expr), instance);
 
-        function
+        let result = function
             .result_type
             .as_ref()
             .map_or(Type::Dynamic, |result| {
                 self.substituted_type(result, &substitutions)
-            })
+            });
+        if function.asynchronous {
+            Type::Task(Box::new(result))
+        } else {
+            result
+        }
     }
 
     fn generic_struct_call(
@@ -1836,6 +2050,26 @@ impl<'a> Checker<'a> {
                 source, arguments, ..
             }
             | TypeKind::ResolvedApplied {
+                source,
+                symbol: _,
+                arguments,
+            } if source == "Task" => {
+                if let Type::Task(actual) = actual
+                    && arguments.len() == 1
+                {
+                    self.infer_generic_type(
+                        &arguments[0],
+                        actual,
+                        parameters,
+                        substitutions,
+                        span,
+                    );
+                }
+            }
+            TypeKind::Applied {
+                source, arguments, ..
+            }
+            | TypeKind::ResolvedApplied {
                 symbol: source,
                 arguments,
                 ..
@@ -1879,9 +2113,31 @@ impl<'a> Checker<'a> {
                     .map(|element| self.substituted_type(element, substitutions))
                     .collect(),
             ),
+            TypeKind::Applied { source, arguments } if source == "Task" => {
+                if arguments.len() != 1 {
+                    Type::Poison
+                } else {
+                    Type::Task(Box::new(
+                        self.substituted_type(&arguments[0], substitutions),
+                    ))
+                }
+            }
             TypeKind::Applied { source, arguments } => {
                 let symbol = self.resolve(source, None).unwrap_or_else(|| source.clone());
                 self.substituted_applied_type(&symbol, arguments, substitutions)
+            }
+            TypeKind::ResolvedApplied {
+                source,
+                symbol,
+                arguments,
+            } if source == "Task" || symbol == "Task" => {
+                if arguments.len() != 1 {
+                    Type::Poison
+                } else {
+                    Type::Task(Box::new(
+                        self.substituted_type(&arguments[0], substitutions),
+                    ))
+                }
             }
             TypeKind::ResolvedApplied {
                 symbol, arguments, ..
@@ -1916,6 +2172,7 @@ impl<'a> Checker<'a> {
         let previous_flow_facts = std::mem::take(&mut self.flow_facts);
         let previous_function = self.current_function.replace(f.name.clone());
         let previous_owner = std::mem::replace(&mut self.owner, f.owner.clone());
+        let previous_async = std::mem::replace(&mut self.in_async, f.asynchronous);
         self.module = function_modules
             .get(&f.name)
             .cloned()
@@ -1976,6 +2233,7 @@ impl<'a> Checker<'a> {
             }
             self.in_function = false;
             self.in_comptime = false;
+            self.in_async = false;
             self.result_type = None;
             self.location = None;
             self.scopes.pop();
@@ -1987,6 +2245,7 @@ impl<'a> Checker<'a> {
         self.flow_facts = previous_flow_facts;
         self.current_function = previous_function;
         self.owner = previous_owner;
+        self.in_async = previous_async;
     }
 
     fn annotation_type(&mut self, ty: &TypeAnnotation) -> Type {
@@ -1994,6 +2253,10 @@ impl<'a> Checker<'a> {
             TypeKind::Primitive(base) if *base == VarType::Nil && !ty.nilable => Type::Nil,
             TypeKind::Primitive(base) => Type::Primitive(*base, ty.nilable),
             TypeKind::Named(name) => {
+                if name == "Task" {
+                    self.error("E2001", "`Task` requires one result type argument", None);
+                    return Type::Poison;
+                }
                 let resolved = self.resolve(name, None).unwrap_or_else(|| name.clone());
                 if let Some((id, _)) = self.constructors.get(&resolved) {
                     if self
@@ -2015,6 +2278,10 @@ impl<'a> Checker<'a> {
                 } else {
                     Type::Named(resolved)
                 }
+            }
+            TypeKind::ResolvedName { source, symbol } if source == "Task" || symbol == "Task" => {
+                self.error("E2001", "`Task` requires one result type argument", None);
+                Type::Poison
             }
             TypeKind::ResolvedName { source, symbol } => {
                 if let Some((id, _)) = self.constructors.get(symbol) {
@@ -2043,8 +2310,27 @@ impl<'a> Checker<'a> {
                 }
             }
             TypeKind::Applied { source, arguments } => {
+                if source == "Task" {
+                    if arguments.len() != 1 {
+                        self.error("E2001", "`Task` expects one result type argument", None);
+                        return Type::Poison;
+                    }
+                    return Type::Task(Box::new(self.annotation_type(&arguments[0])));
+                }
                 let symbol = self.resolve(source, None).unwrap_or_else(|| source.clone());
                 self.applied_struct_type(source, &symbol, arguments)
+            }
+            TypeKind::ResolvedApplied {
+                source,
+                symbol,
+                arguments,
+            } if source == "Task" || symbol == "Task" => {
+                if arguments.len() != 1 {
+                    self.error("E2001", "`Task` expects one result type argument", None);
+                    Type::Poison
+                } else {
+                    Type::Task(Box::new(self.annotation_type(&arguments[0])))
+                }
             }
             TypeKind::ResolvedApplied {
                 source,
@@ -2269,6 +2555,67 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn collect_binding_types(
+        &mut self,
+        pattern: &BindingPattern,
+        ty: Type,
+        span: Option<&SourceSpan>,
+        bindings: &mut Vec<(String, Type, Option<SourceSpan>)>,
+    ) {
+        match pattern {
+            BindingPattern::Name(name) => bindings.push((name.clone(), ty, span.cloned())),
+            BindingPattern::Tuple(patterns) => match ty {
+                Type::Tuple(types) if types.len() == patterns.len() => {
+                    for (pattern, ty) in patterns.iter().zip(types) {
+                        self.collect_binding_types(pattern, ty, span, bindings);
+                    }
+                }
+                Type::Tuple(types) => {
+                    self.error(
+                        "E2001",
+                        format!(
+                            "tuple binding pattern has {} elements but the value has {}",
+                            patterns.len(),
+                            types.len()
+                        ),
+                        span,
+                    );
+                    for pattern in patterns {
+                        self.collect_binding_types(pattern, Type::Poison, span, bindings);
+                    }
+                }
+                Type::Dynamic => {
+                    for pattern in patterns {
+                        self.collect_binding_types(pattern, Type::Dynamic, span, bindings);
+                    }
+                }
+                Type::Poison => {
+                    for pattern in patterns {
+                        self.collect_binding_types(pattern, Type::Poison, span, bindings);
+                    }
+                }
+                Type::ErrorValue | Type::Never => {
+                    for pattern in patterns {
+                        self.collect_binding_types(pattern, Type::Never, span, bindings);
+                    }
+                }
+                actual => {
+                    self.error(
+                        "E2001",
+                        format!(
+                            "tuple binding pattern requires a tuple, got {}",
+                            actual.display()
+                        ),
+                        span,
+                    );
+                    for pattern in patterns {
+                        self.collect_binding_types(pattern, Type::Poison, span, bindings);
+                    }
+                }
+            },
+        }
+    }
+
     fn local(&self, name: &str) -> Option<Binding> {
         self.scopes
             .iter()
@@ -2319,8 +2666,11 @@ impl<'a> Checker<'a> {
         } else if let Some(primitive) = crate::instruction::ValueType::primitive(name) {
             match primitive {
                 crate::instruction::ValueType::Int => Some(Type::concrete(VarType::Int)),
+                crate::instruction::ValueType::UInt => Some(Type::concrete(VarType::UInt)),
+                crate::instruction::ValueType::BigInt => Some(Type::concrete(VarType::BigInt)),
                 crate::instruction::ValueType::Float => Some(Type::concrete(VarType::Float)),
                 crate::instruction::ValueType::Bool => Some(Type::concrete(VarType::Bool)),
+                crate::instruction::ValueType::Char => Some(Type::concrete(VarType::Char)),
                 crate::instruction::ValueType::Str => Some(Type::concrete(VarType::Str)),
                 crate::instruction::ValueType::Nil | crate::instruction::ValueType::Error => None,
                 crate::instruction::ValueType::Enum(_)
@@ -2572,10 +2922,15 @@ impl<'a> Checker<'a> {
             reaches_tail &= result != Type::Never;
         }
         self.normal_reachable = previous_reachability && reaches_tail;
-        let tail = block
+        let expected_result = block
             .tail
-            .as_ref()
-            .map_or(Type::Nil, |tail| self.expr(tail));
+            .as_deref()
+            .filter(|_| self.in_function && self.scopes.len() == 3)
+            .and_then(|_| self.result_type.clone())
+            .map(|annotation| self.annotation_type(&annotation));
+        let tail = block.tail.as_ref().map_or(Type::Nil, |tail| {
+            self.expr_with_expected_result(tail, expected_result.as_ref())
+        });
         self.normal_reachable = previous_reachability;
         self.scopes.pop();
         if reaches_tail { tail } else { Type::Never }
@@ -2609,18 +2964,95 @@ impl<'a> Checker<'a> {
                     );
                 }
             }
-            Stmt::VarDecl { name, ty, value }
-            | Stmt::Const { name, ty, value }
-            | Stmt::Comptime { name, ty, value } => {
+            Stmt::VarDecl { pattern, ty, value } | Stmt::Const { pattern, ty, value } => {
+                let binding_label = match pattern {
+                    BindingPattern::Name(name) => format!("`{name}`"),
+                    BindingPattern::Tuple(_) => "tuple binding".to_owned(),
+                };
+                let expected_result = ty
+                    .as_ref()
+                    .map(|annotation| self.annotation_type(annotation));
+                let actual = self.expr_with_expected_result(value, expected_result.as_ref());
+                let valid = ty.clone().is_none_or(|annotation| {
+                    self.assignable(annotation, actual.clone(), value.span(), &binding_label)
+                });
+                let mutable = matches!(stmt.node(), Stmt::VarDecl { .. });
+                let access_id = stmt.node() as *const Stmt as usize;
+                if !valid || actual == Type::Poison {
+                    self.access_facts.invalid_bindings.insert(access_id);
+                } else {
+                    self.access_facts.invalid_bindings.remove(&access_id);
+                }
+
+                let pattern_type = if !valid || actual == Type::Poison {
+                    Type::Poison
+                } else if let Some(annotation) = ty {
+                    self.annotation_type(annotation)
+                } else {
+                    actual.clone()
+                };
+                let mut binding_types = Vec::new();
+                self.collect_binding_types(pattern, pattern_type, value.span(), &mut binding_types);
+                let mut pattern_name_ids = Vec::new();
+                pattern.visit_names(&mut |name| pattern_name_ids.push(name.as_ptr() as usize));
+
+                for ((name, projected_type, span), binding_id) in
+                    binding_types.into_iter().zip(pattern_name_ids)
+                {
+                    let inferred = mutable && ty.is_none() && projected_type != Type::Poison;
+                    if ty.is_none()
+                        && contains_unresolved_empty_array(&projected_type)
+                        && let Some(span) = value.span().cloned()
+                    {
+                        self.unresolved_empty_arrays
+                            .insert(binding_id, (name.clone(), span));
+                    }
+                    let binding_type = if !valid || actual == Type::Poison {
+                        Type::Poison
+                    } else if inferred
+                        && (projected_type == Type::ErrorValue
+                            || self.dynamic_bindings.contains(&binding_id))
+                    {
+                        Type::Dynamic
+                    } else {
+                        projected_type.clone()
+                    };
+                    self.define(
+                        &name,
+                        Binding {
+                            id: 0,
+                            error_only: false,
+                            ty: binding_type,
+                            mutable,
+                            inferred: inferred.then_some((
+                                binding_id,
+                                if projected_type == Type::ErrorValue {
+                                    Type::Dynamic
+                                } else {
+                                    projected_type
+                                },
+                            )),
+                        },
+                        span.as_ref(),
+                    );
+                }
+                if actual == Type::Never {
+                    return Type::Never;
+                }
+            }
+            Stmt::Comptime { name, ty, value } => {
                 let is_comptime_initializer = matches!(stmt.node(), Stmt::Comptime { .. });
                 let previous_comptime_initializer = self.in_comptime_initializer;
                 self.in_comptime_initializer |= is_comptime_initializer;
-                let actual = self.expr(value);
+                let expected_result = ty
+                    .as_ref()
+                    .map(|annotation| self.annotation_type(annotation));
+                let actual = self.expr_with_expected_result(value, expected_result.as_ref());
                 self.in_comptime_initializer = previous_comptime_initializer;
                 let valid = ty.clone().is_none_or(|t| {
                     self.assignable(t, actual.clone(), value.span(), &format!("`{name}`"))
                 });
-                let mutable = matches!(stmt.node(), Stmt::VarDecl { .. });
+                let mutable = false;
                 let access_id = stmt.node() as *const Stmt as usize;
                 if !valid || actual == Type::Poison {
                     self.access_facts.invalid_bindings.insert(access_id);
@@ -2677,9 +3109,12 @@ impl<'a> Checker<'a> {
                     );
                 }
                 let left = self.expr(target);
+                if left == Type::concrete(VarType::UInt) {
+                    self.contextualize_integer_literals(value, &left);
+                }
                 let right = self.expr(value);
                 let actual = self.binary_types(*op, left, right, value.span());
-                return self.assignment(target, actual, value.span());
+                return self.assignment(target, value, actual, value.span());
             }
             Stmt::Assign { target, value } => {
                 let actual = if matches!(value.node(), Expr::Array(items) if items.is_empty()) {
@@ -2692,7 +3127,7 @@ impl<'a> Checker<'a> {
                 } else {
                     self.expr(value)
                 };
-                return self.assignment(target, actual, value.span());
+                return self.assignment(target, value, actual, value.span());
             }
             Stmt::Use {
                 module,
@@ -2721,7 +3156,13 @@ impl<'a> Checker<'a> {
                 if self.in_cleanup {
                     self.error("E1004", "`return` cannot leave a defer block", stmt.span());
                 }
-                let actual = value.as_ref().map_or(Type::Nil, |expr| self.expr(expr));
+                let expected_result = value
+                    .as_ref()
+                    .and_then(|_| self.result_type.clone())
+                    .map(|annotation| self.annotation_type(&annotation));
+                let actual = value.as_ref().map_or(Type::Nil, |expr| {
+                    self.expr_with_expected_result(expr, expected_result.as_ref())
+                });
                 if let Some(expected) = self.result_type.clone() {
                     self.assignable(expected, actual, stmt.span(), "return value");
                 } else if contains_unresolved_empty_array(&actual) {
@@ -2870,9 +3311,7 @@ impl<'a> Checker<'a> {
                 step,
                 body,
             } => {
-                let a = self.expr(start);
-                let b = self.expr(end);
-                let step_type = step.as_ref().map(|step| self.expr(step));
+                let (range_type, step_type) = self.range_types(start, end, step.as_ref());
                 self.scopes.push(Scope::default());
                 self.define(
                     var,
@@ -2880,7 +3319,7 @@ impl<'a> Checker<'a> {
                         id: 0,
                         error_only: false,
                         inferred: None,
-                        ty: a.clone().join(b.clone()),
+                        ty: range_type.clone(),
                         mutable: true,
                     },
                     start.span(),
@@ -2894,12 +3333,12 @@ impl<'a> Checker<'a> {
                 self.loop_breaks.pop();
                 self.loops -= 1;
                 self.scopes.pop();
-                if a == Type::Never || b == Type::Never || step_type == Some(Type::Never) {
+                if range_type == Type::Never || step_type == Some(Type::Never) {
                     return Type::Never;
                 }
             }
             Stmt::ForEach {
-                var,
+                pattern,
                 iterable,
                 body,
             } => {
@@ -2914,7 +3353,7 @@ impl<'a> Checker<'a> {
                 let element = match &collection {
                     Type::Array(element) => (**element).clone(),
                     Type::EmptyArray | Type::Dynamic => Type::Dynamic,
-                    Type::Primitive(VarType::Str, _) => Type::concrete(VarType::Str),
+                    Type::Primitive(VarType::Str, _) => Type::concrete(VarType::Char),
                     Type::ErrorValue | Type::Never => Type::Never,
                     Type::Poison => Type::Poison,
                     _ => {
@@ -2929,18 +3368,22 @@ impl<'a> Checker<'a> {
                         Type::Poison
                     }
                 };
+                let mut bindings = Vec::new();
+                self.collect_binding_types(pattern, element, iterable.span(), &mut bindings);
                 self.scopes.push(Scope::default());
-                self.define(
-                    var,
-                    Binding {
-                        id: 0,
-                        error_only: false,
-                        inferred: None,
-                        ty: element,
-                        mutable: true,
-                    },
-                    iterable.span(),
-                );
+                for (name, ty, span) in bindings {
+                    self.define(
+                        &name,
+                        Binding {
+                            id: 0,
+                            error_only: false,
+                            inferred: None,
+                            ty,
+                            mutable: true,
+                        },
+                        span.as_ref(),
+                    );
+                }
                 let loop_flow = self.flow_facts.clone();
                 self.loops += 1;
                 self.loop_breaks.push(false);
@@ -2951,6 +3394,86 @@ impl<'a> Checker<'a> {
                 self.loops -= 1;
                 self.scopes.pop();
                 if collection == Type::Never || collection == Type::ErrorValue {
+                    return Type::Never;
+                }
+            }
+            Stmt::ForZip { clauses, body } => {
+                let mut bindings = Vec::with_capacity(clauses.len());
+                let mut never = false;
+                for clause in clauses {
+                    match clause {
+                        ForClause::Range {
+                            var,
+                            start,
+                            end,
+                            step,
+                        } => {
+                            let (range_type, step_type) =
+                                self.range_types(start, end, step.as_ref());
+                            never |= range_type == Type::Never || step_type == Some(Type::Never);
+                            bindings.push((var.clone(), range_type, start.span().cloned()));
+                        }
+                        ForClause::Each { pattern, iterable } => {
+                            let collection = self.expr(iterable);
+                            if self.in_comptime {
+                                self.error(
+                                    "E4002",
+                                    "collection iteration is available only in runtime functions",
+                                    stmt.span(),
+                                );
+                            }
+                            let element = match &collection {
+                                Type::Array(element) => (**element).clone(),
+                                Type::EmptyArray | Type::Dynamic => Type::Dynamic,
+                                Type::Primitive(VarType::Str, _) => Type::concrete(VarType::Char),
+                                Type::ErrorValue | Type::Never => Type::Never,
+                                Type::Poison => Type::Poison,
+                                _ => {
+                                    self.error(
+                                        "E2001",
+                                        format!(
+                                            "for-in requires an array or str, got {}",
+                                            collection.display()
+                                        ),
+                                        iterable.span(),
+                                    );
+                                    Type::Poison
+                                }
+                            };
+                            never |= collection == Type::Never || collection == Type::ErrorValue;
+                            self.collect_binding_types(
+                                pattern,
+                                element,
+                                iterable.span(),
+                                &mut bindings,
+                            );
+                        }
+                    }
+                }
+                self.scopes.push(Scope::default());
+                for (name, ty, span) in bindings {
+                    self.define(
+                        &name,
+                        Binding {
+                            id: 0,
+                            error_only: false,
+                            inferred: None,
+                            ty,
+                            mutable: true,
+                        },
+                        span.as_ref(),
+                    );
+                }
+                let loop_flow = self.flow_facts.clone();
+                self.loops += 1;
+                self.loop_breaks.push(false);
+                self.block(body);
+                self.flow_facts = loop_flow;
+                self.invalidate_mutable_flow_facts();
+                self.loop_breaks.pop();
+                self.loops -= 1;
+                self.scopes.pop();
+                if never {
                     return Type::Never;
                 }
             }
@@ -3028,26 +3551,57 @@ impl<'a> Checker<'a> {
                 Type::Primitive(VarType::Bool, false),
             ) => Type::concrete(VarType::Bool),
             (
-                BinOp::Add
-                | BinOp::Sub
-                | BinOp::Mul
-                | BinOp::Div
-                | BinOp::Mod
-                | BinOp::Lt
-                | BinOp::LtEq
-                | BinOp::Gt
-                | BinOp::GtEq,
-                Type::Primitive(x @ (VarType::Int | VarType::Float), false),
-                Type::Primitive(y @ (VarType::Int | VarType::Float), false),
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod,
+                Type::Primitive(
+                    x @ (VarType::Int | VarType::UInt | VarType::BigInt | VarType::Float),
+                    false,
+                ),
+                Type::Primitive(
+                    y @ (VarType::Int | VarType::UInt | VarType::BigInt | VarType::Float),
+                    false,
+                ),
             ) => {
-                if matches!(op, BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq) {
-                    Type::concrete(VarType::Bool)
-                } else if x == VarType::Float || y == VarType::Float {
+                if x == y {
+                    Type::concrete(x)
+                } else if x != VarType::BigInt
+                    && y != VarType::BigInt
+                    && (x == VarType::Float || y == VarType::Float)
+                {
                     Type::concrete(VarType::Float)
                 } else {
-                    Type::concrete(VarType::Int)
+                    self.error(
+                        "E2002",
+                        "mixed integer arithmetic requires an explicit conversion",
+                        span,
+                    );
+                    Type::Poison
                 }
             }
+            (
+                BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq,
+                Type::Primitive(
+                    x @ (VarType::Int | VarType::UInt | VarType::BigInt | VarType::Float),
+                    false,
+                ),
+                Type::Primitive(
+                    y @ (VarType::Int | VarType::UInt | VarType::BigInt | VarType::Float),
+                    false,
+                ),
+            ) if x == y
+                || x == VarType::UInt
+                || y == VarType::UInt
+                || x == VarType::BigInt
+                || y == VarType::BigInt
+                || x == VarType::Float
+                || y == VarType::Float =>
+            {
+                Type::concrete(VarType::Bool)
+            }
+            (
+                BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq,
+                Type::Primitive(VarType::Char, false),
+                Type::Primitive(VarType::Char, false),
+            ) => Type::concrete(VarType::Bool),
             _ => {
                 self.error(
                     "E2002",
@@ -3063,7 +3617,13 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn assignment(&mut self, target: &Expr, actual: Type, span: Option<&SourceSpan>) -> Type {
+    fn assignment(
+        &mut self,
+        target: &Expr,
+        value: &Expr,
+        mut actual: Type,
+        span: Option<&SourceSpan>,
+    ) -> Type {
         match target.node() {
             Expr::Ident(name) => {
                 let binding = self.local(name).or_else(|| {
@@ -3075,6 +3635,13 @@ impl<'a> Checker<'a> {
                     })
                 });
                 if let Some(binding) = binding {
+                    let expected = binding
+                        .inferred
+                        .as_ref()
+                        .map(|(_, initial)| initial)
+                        .unwrap_or(&binding.ty)
+                        .clone();
+                    actual = self.contextualized_literal_type(value, actual, &expected);
                     // Writes invalidate pattern knowledge, including
                     // overlays in enclosing arms. Do not infer new facts
                     // from conditional writes without a CFG join.
@@ -3195,16 +3762,400 @@ impl<'a> Checker<'a> {
         success.join(failure)
     }
 
+    fn expr_with_expected_result(&mut self, expr: &Expr, expected: Option<&Type>) -> Type {
+        if let Some(expected) = expected {
+            self.contextualize_integer_literals(expr, expected);
+        }
+        let Expr::AssociatedCall {
+            target,
+            method,
+            type_arguments,
+            args,
+        } = expr.node()
+        else {
+            return self.expr(expr);
+        };
+        let previous = self.location.clone();
+        if let Some(span) = expr.span() {
+            self.location = Some(span.clone());
+        }
+        let result = self.associated_call(target, method, type_arguments, args, expr, expected);
+        c_record_kind(
+            &mut self.access_facts,
+            crate::mutability::expr_id(expr),
+            result.clone(),
+        );
+        self.location = previous;
+        result
+    }
+
+    fn associated_call(
+        &mut self,
+        target: &TypeAnnotation,
+        method: &str,
+        type_arguments: &[TypeAnnotation],
+        args: &[CallArgument],
+        expr: &Expr,
+        expected_result: Option<&Type>,
+    ) -> Type {
+        let diagnostics_start = self.diagnostics.len();
+        let result =
+            self.associated_call_inner(target, method, type_arguments, args, expr, expected_result);
+        if self.diagnostics.len() > diagnostics_start {
+            Type::Poison
+        } else {
+            result
+        }
+    }
+
+    fn associated_call_inner(
+        &mut self,
+        target: &TypeAnnotation,
+        method: &str,
+        type_arguments: &[TypeAnnotation],
+        args: &[CallArgument],
+        expr: &Expr,
+        expected_result: Option<&Type>,
+    ) -> Type {
+        let Some(target_name) = associated_type_name(target) else {
+            self.error(
+                "E2001",
+                "associated call target must be a nominal type",
+                expr.span(),
+            );
+            return Type::Poison;
+        };
+        if !self.constructors.contains_key(target_name) && !self.enums.contains_key(target_name) {
+            self.error(
+                "E2001",
+                format!("type `{target_name}` cannot define associated functions"),
+                expr.span(),
+            );
+            return Type::Poison;
+        }
+        let candidates: Vec<_> = self
+            .associated_extension_methods
+            .iter()
+            .filter_map(|(extension, candidate)| {
+                (candidate.name == method
+                    && associated_type_name(&extension.target) == Some(target_name))
+                .then_some(*candidate)
+            })
+            .collect();
+        let Some(extension_method) = candidates.first().copied() else {
+            self.error(
+                "E1002",
+                format!("type `{target_name}` has no associated function `{method}()`"),
+                expr.span(),
+            );
+            return Type::Poison;
+        };
+        if candidates.len() > 1 {
+            self.error(
+                "E2001",
+                format!("associated function `{target_name}::{method}()` is ambiguous"),
+                expr.span(),
+            );
+            return Type::Poison;
+        }
+
+        let function = extension_method.function.clone();
+        if function.type_params.is_empty() {
+            let argument_bindings = crate::arguments::bind(method, &function.params, args);
+            for (argument_index, argument) in args.iter().enumerate() {
+                if let Some(parameter_index) = argument_bindings.by_argument[argument_index]
+                    && let Some(expected) = function.params[parameter_index].ty.as_ref()
+                {
+                    let expected_type = self.annotation_type(expected);
+                    self.contextualize_integer_literals(&argument.value, &expected_type);
+                }
+            }
+        }
+        let mut actual = Vec::with_capacity(args.len());
+        for argument in args {
+            actual.push(self.expr(&argument.value));
+        }
+        self.invalidate_mutable_flow_facts();
+        self.access_facts
+            .calls
+            .insert(crate::mutability::expr_id(expr), function.name.clone());
+        if function.comptime != self.in_comptime {
+            let (caller_phase, callee_phase) = if self.in_comptime {
+                ("comptime", "runtime")
+            } else {
+                ("runtime", "comptime")
+            };
+            self.error(
+                "E4002",
+                format!(
+                    "{caller_phase} code cannot call {callee_phase}-only associated function `{method}()`"
+                ),
+                expr.span(),
+            );
+            return Type::Poison;
+        }
+        if actual.contains(&Type::Poison) {
+            return Type::Poison;
+        }
+        if actual.contains(&Type::Never) {
+            return Type::Never;
+        }
+        let associated_name = format!("{target_name}::{method}");
+
+        if !function.type_params.is_empty() {
+            return self.generic_call_with_result_context(
+                &associated_name,
+                &function,
+                args,
+                actual,
+                expr,
+                expected_result,
+            );
+        }
+        if !type_arguments.is_empty() {
+            self.error(
+                "E2001",
+                format!("associated function `{method}()` does not accept generic arguments"),
+                expr.span(),
+            );
+            return Type::Poison;
+        }
+
+        let bindings = crate::arguments::bind(&associated_name, &function.params, args);
+        for error in bindings.errors {
+            self.error(
+                "E1005",
+                error.message,
+                error
+                    .argument
+                    .and_then(|index| args[index].value.span())
+                    .or(expr.span()),
+            );
+        }
+        for (argument_index, actual_type) in actual.iter().enumerate() {
+            let Some(parameter_index) = bindings.by_argument[argument_index] else {
+                continue;
+            };
+            if let Some(expected) = &function.params[parameter_index].ty {
+                self.assignable(
+                    expected.clone(),
+                    actual_type.clone(),
+                    args[argument_index].value.span(),
+                    &format!(
+                        "argument `{}` of `{method}()`",
+                        function.params[parameter_index].name
+                    ),
+                );
+            }
+        }
+        self.method_calls.insert(
+            expression_site(self.current_function.as_deref(), expr),
+            function.name.clone(),
+        );
+        let result = function
+            .result_type
+            .as_ref()
+            .map_or(Type::Dynamic, |ty| self.annotation_type(ty));
+        if function.asynchronous {
+            Type::Task(Box::new(result))
+        } else {
+            result
+        }
+    }
+
     fn expr(&mut self, expr: &Expr) -> Type {
         let previous = self.location.clone();
         if let Some(span) = expr.span() {
             self.location = Some(span.clone());
         }
         let result = self.expr_inner(expr);
+        if result == Type::concrete(VarType::UInt) {
+            self.uint_expressions
+                .insert(crate::mutability::expr_id(expr));
+        }
         use crate::mutability::expr_id;
         c_record_kind(&mut self.access_facts, expr_id(expr), result.clone());
         self.location = previous;
         result
+    }
+
+    fn range_types(
+        &mut self,
+        start: &Expr,
+        end: &Expr,
+        step: Option<&Expr>,
+    ) -> (Type, Option<Type>) {
+        let uint = Type::concrete(VarType::UInt);
+        let mut start_type = self.expr(start);
+        let mut end_type = self.expr(end);
+
+        if end_type == uint {
+            start_type = self.contextualized_literal_type(start, start_type, &uint);
+        }
+        if start_type == uint {
+            end_type = self.contextualized_literal_type(end, end_type, &uint);
+        }
+
+        let range_type = match (&start_type, &end_type) {
+            (Type::Primitive(VarType::Int, false), Type::Primitive(VarType::Int, false))
+            | (Type::Primitive(VarType::UInt, false), Type::Primitive(VarType::UInt, false)) => {
+                start_type.clone()
+            }
+            (Type::Dynamic, _) | (_, Type::Dynamic) => Type::Dynamic,
+            (Type::Poison, _) | (_, Type::Poison) => Type::Poison,
+            (Type::Never, _) | (_, Type::Never) => Type::Never,
+            (Type::ErrorValue, _) | (_, Type::ErrorValue) => Type::ErrorValue,
+            _ => {
+                self.error(
+                    "E2002",
+                    format!(
+                        "range bounds must both be `int` or both be `uint`, got {} and {}",
+                        start_type.display(),
+                        end_type.display()
+                    ),
+                    end.span(),
+                );
+                Type::Poison
+            }
+        };
+
+        let step_type = step.map(|step| {
+            let mut actual = self.expr(step);
+            if range_type == uint {
+                actual = self.contextualized_literal_type(step, actual, &uint);
+            }
+            if matches!(
+                range_type,
+                Type::Primitive(VarType::Int | VarType::UInt, false)
+            ) && actual != range_type
+                && !matches!(
+                    actual,
+                    Type::Dynamic | Type::Poison | Type::Never | Type::ErrorValue
+                )
+            {
+                self.error(
+                    "E2002",
+                    format!(
+                        "range step must be `{}`, got {}",
+                        range_type.display(),
+                        actual.display()
+                    ),
+                    step.span(),
+                );
+                actual = Type::Poison;
+            }
+            actual
+        });
+
+        (range_type, step_type)
+    }
+
+    fn contextualize_integer_literals(&mut self, expr: &Expr, expected: &Type) {
+        match (expected, expr.node()) {
+            (Type::Primitive(VarType::UInt, _), Expr::Int(value)) if *value >= 0 => {
+                self.uint_literals.insert(crate::mutability::expr_id(expr));
+            }
+            (Type::Primitive(VarType::UInt, _), Expr::Binary(op, left, right))
+                if matches!(
+                    op,
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+                ) =>
+            {
+                self.contextualize_integer_literals(left, expected);
+                self.contextualize_integer_literals(right, expected);
+            }
+            (Type::Primitive(VarType::BigInt, _), Expr::Int(_) | Expr::UInt(_)) => {
+                self.bigint_literals
+                    .insert(crate::mutability::expr_id(expr));
+            }
+            (Type::Primitive(VarType::BigInt, _), Expr::Unary(UnOp::Neg, value)) => {
+                self.contextualize_integer_literals(value, expected);
+            }
+            (Type::Primitive(VarType::BigInt, _), Expr::Binary(op, left, right))
+                if matches!(
+                    op,
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+                ) =>
+            {
+                self.contextualize_integer_literals(left, expected);
+                self.contextualize_integer_literals(right, expected);
+            }
+            (Type::Array(element), Expr::Array(items)) => {
+                for item in items {
+                    self.contextualize_integer_literals(item, element);
+                }
+            }
+            (Type::Tuple(expected_items), Expr::Tuple(items))
+                if expected_items.len() == items.len() =>
+            {
+                for (item, expected) in items.iter().zip(expected_items) {
+                    self.contextualize_integer_literals(item, expected);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn contextualized_literal_type(&mut self, expr: &Expr, actual: Type, expected: &Type) -> Type {
+        match (expected, expr.node(), actual) {
+            (Type::Primitive(VarType::BigInt, _), expression, actual)
+                if bigint_literal_expression(expression)
+                    && matches!(
+                        actual,
+                        Type::Primitive(VarType::Int | VarType::UInt | VarType::BigInt, false)
+                    ) =>
+            {
+                self.contextualize_integer_literals(expr, expected);
+                Type::concrete(VarType::BigInt)
+            }
+            (
+                Type::Primitive(VarType::UInt, _),
+                Expr::Int(value),
+                Type::Primitive(VarType::Int, false),
+            ) if *value >= 0 => {
+                self.uint_literals.insert(crate::mutability::expr_id(expr));
+                self.uint_expressions
+                    .insert(crate::mutability::expr_id(expr));
+                Type::concrete(VarType::UInt)
+            }
+            (Type::Primitive(VarType::UInt, _), Expr::Binary(op, left, right), actual)
+                if actual == Type::concrete(VarType::Int)
+                    && matches!(
+                        op,
+                        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+                    )
+                    && integer_literal_expression(left)
+                    && integer_literal_expression(right) =>
+            {
+                self.contextualize_integer_literals(expr, expected);
+                self.uint_expressions
+                    .insert(crate::mutability::expr_id(expr));
+                Type::concrete(VarType::UInt)
+            }
+            (Type::Array(expected_element), Expr::Array(items), Type::Array(actual_element))
+                if items.iter().all(integer_literal_expression)
+                    && *actual_element == Type::concrete(VarType::Int)
+                    && **expected_element == Type::concrete(VarType::UInt) =>
+            {
+                self.contextualize_integer_literals(expr, expected);
+                Type::Array(expected_element.clone())
+            }
+            (Type::Array(expected_element), Expr::Array(items), Type::Array(_))
+                if **expected_element == Type::concrete(VarType::BigInt)
+                    && items.iter().all(bigint_literal_expression) =>
+            {
+                self.contextualize_integer_literals(expr, expected);
+                Type::Array(expected_element.clone())
+            }
+            (_, _, actual) => actual,
+        }
+    }
+
+    fn expr_with_expected_type(&mut self, expr: &Expr, expected: Option<&Type>) -> Type {
+        if let Some(expected) = expected {
+            self.contextualize_integer_literals(expr, expected);
+        }
+        self.expr(expr)
     }
 
     fn expr_inner(&mut self, expr: &Expr) -> Type {
@@ -3218,8 +4169,18 @@ impl<'a> Checker<'a> {
                 Type::Poison
             }
             Expr::Located(_, _) => unreachable!("node removes locations"),
+            Expr::Int(_)
+                if self
+                    .uint_literals
+                    .contains(&crate::mutability::expr_id(expr)) =>
+            {
+                Type::concrete(VarType::UInt)
+            }
             Expr::Int(_) => Type::concrete(VarType::Int),
+            Expr::UInt(_) => Type::concrete(VarType::UInt),
+            Expr::BigInt(_) => Type::concrete(VarType::BigInt),
             Expr::Float(_) => Type::concrete(VarType::Float),
+            Expr::Char(_) => Type::concrete(VarType::Char),
             Expr::Bool(_) => Type::concrete(VarType::Bool),
             Expr::Str(_) => Type::concrete(VarType::Str),
             Expr::Bytes(_) => Type::Bytes,
@@ -3349,13 +4310,46 @@ impl<'a> Checker<'a> {
             },
             Expr::Unary(op, inner) => {
                 let ty = self.expr(inner);
+                if *op == UnOp::Await {
+                    if !self.in_async {
+                        self.error(
+                            "E2002",
+                            "`await` is only valid inside an `@async fn`",
+                            expr.span(),
+                        );
+                        return Type::Poison;
+                    }
+                    if self.in_cleanup {
+                        self.error(
+                            "E2002",
+                            "`await` is not allowed in a `defer` block",
+                            expr.span(),
+                        );
+                        return Type::Poison;
+                    }
+                    return match ty {
+                        Type::Task(result) => *result,
+                        Type::Poison => Type::Poison,
+                        Type::Never => Type::Never,
+                        Type::ErrorValue => Type::ErrorValue,
+                        other => {
+                            self.error(
+                                "E2002",
+                                format!("`await` expects Task[T], got {}", other.display()),
+                                expr.span(),
+                            );
+                            Type::Poison
+                        }
+                    };
+                }
                 match (op, ty.clone()) {
                     (_, Type::Poison | Type::ErrorValue | Type::Dynamic | Type::Never) => {
                         ty.clone()
                     }
-                    (UnOp::Neg, Type::Primitive(VarType::Int | VarType::Float, false)) => {
-                        ty.clone()
-                    }
+                    (
+                        UnOp::Neg,
+                        Type::Primitive(VarType::Int | VarType::BigInt | VarType::Float, false),
+                    ) => ty.clone(),
                     (UnOp::Not, Type::Primitive(VarType::Bool, false)) => ty.clone(),
                     _ => {
                         self.error(
@@ -3386,8 +4380,32 @@ impl<'a> Checker<'a> {
                 fallback,
             } => self.fallback(*kind, value, fallback, expr.span()),
             Expr::Binary(op, a, b) => {
-                let left = self.expr(a);
-                let right = self.expr(b);
+                let mut left = self.expr(a);
+                let mut right = self.expr(b);
+                if matches!(
+                    op,
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+                ) {
+                    if left == Type::concrete(VarType::BigInt) && bigint_literal_expression(b) {
+                        self.contextualize_integer_literals(b, &left);
+                        right = Type::concrete(VarType::BigInt);
+                    } else if right == Type::concrete(VarType::BigInt)
+                        && bigint_literal_expression(a)
+                    {
+                        self.contextualize_integer_literals(a, &right);
+                        left = Type::concrete(VarType::BigInt);
+                    } else if left == Type::concrete(VarType::UInt)
+                        && matches!(b.node(), Expr::Int(value) if *value >= 0)
+                    {
+                        self.contextualize_integer_literals(b, &left);
+                        right = Type::concrete(VarType::UInt);
+                    } else if right == Type::concrete(VarType::UInt)
+                        && matches!(a.node(), Expr::Int(value) if *value >= 0)
+                    {
+                        self.contextualize_integer_literals(a, &right);
+                        left = Type::concrete(VarType::UInt);
+                    }
+                }
                 if matches!(op, BinOp::Append) {
                     self.refine_empty_array(a, &right);
                 }
@@ -3467,8 +4485,26 @@ impl<'a> Checker<'a> {
             Expr::Call(name, args) | Expr::SpecializedCall(name, _, args) => {
                 self.call(name, args, expr)
             }
+            Expr::AssociatedCall {
+                target,
+                method,
+                type_arguments,
+                args,
+            } => self.associated_call(target, method, type_arguments, args, expr, None),
             Expr::MethodCall(receiver_expr, method, args) => {
                 let receiver = self.expr(receiver_expr);
+                if let Some(function) = self
+                    .extension_methods
+                    .get(&(receiver.clone(), method.clone()))
+                    .map(|extension| extension.function.clone())
+                {
+                    for (argument, parameter) in args.iter().zip(function.params.iter().skip(1)) {
+                        if let Some(expected) = parameter.ty.as_ref() {
+                            let expected_type = self.annotation_type(expected);
+                            self.contextualize_integer_literals(argument, &expected_type);
+                        }
+                    }
+                }
                 let mut poisoned = receiver == Type::Poison;
                 let mut never = receiver == Type::Never;
                 let mut argument_types = Vec::with_capacity(args.len());
@@ -3594,10 +4630,15 @@ impl<'a> Checker<'a> {
                         expression_site(self.current_function.as_deref(), expr),
                         function.name.clone(),
                     );
-                    return function
+                    let result = function
                         .result_type
                         .as_ref()
                         .map_or(Type::Dynamic, |ty| self.annotation_type(ty));
+                    return if function.asynchronous {
+                        Type::Task(Box::new(result))
+                    } else {
+                        result
+                    };
                 }
                 if method == "clone"
                     && matches!(receiver, Type::Array(_) | Type::Tuple(_))
@@ -3628,8 +4669,8 @@ impl<'a> Checker<'a> {
                 }
                 let expected = match method.as_str() {
                     "expect" | "append" | "prepend" => 1,
-                    "len" | "to_int" | "to_float" | "to_bool" | "to_str" | "error_kind"
-                    | "unwrap" | "empty_like" => 0,
+                    "len" | "to_int" | "to_uint" | "to_float" | "to_bool" | "to_char"
+                    | "to_str" | "error_kind" | "unwrap" | "empty_like" => 0,
                     _ => {
                         self.error("E1002", format!("unknown method `{method}()`"), expr.span());
                         return Type::Poison;
@@ -3701,6 +4742,7 @@ impl<'a> Checker<'a> {
                     "to_int" | "len" => Type::concrete(VarType::Int),
                     "to_float" => Type::concrete(VarType::Float),
                     "to_bool" | "exclusive" => Type::concrete(VarType::Bool),
+                    "to_char" => Type::concrete(VarType::Char),
                     "to_str" | "error_kind" => Type::concrete(VarType::Str),
                     "unwrap" | "expect" => receiver,
                     _ => Type::Dynamic,
@@ -3732,7 +4774,7 @@ impl<'a> Checker<'a> {
                     let mut tested_type = None;
                     match &arm.pattern {
                         MatchPattern::Wildcard => wildcard |= arm.guard.is_none(),
-                        MatchPattern::StringLiteral(_) => {}
+                        MatchPattern::StringLiteral(_) | MatchPattern::CharacterLiteral(_) => {}
                         MatchPattern::Type(name) => {
                             let tested = self.type_test(name, expr.span());
                             tested_type.clone_from(&tested);
@@ -3864,7 +4906,7 @@ impl<'a> Checker<'a> {
                     } else {
                         match &arm.pattern {
                             MatchPattern::Wildcard => unmatched_flow = None,
-                            MatchPattern::StringLiteral(_) => {}
+                            MatchPattern::StringLiteral(_) | MatchPattern::CharacterLiteral(_) => {}
                             MatchPattern::Type(_) => {
                                 let mut next = arm_flow;
                                 if let Some(name) = tested_type.as_deref() {
@@ -3990,7 +5032,12 @@ impl<'a> Checker<'a> {
                 lhs != Type::Never
                     && !matches!(
                         value.node(),
-                        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Nil
+                        Expr::Int(_)
+                            | Expr::Float(_)
+                            | Expr::Char(_)
+                            | Expr::Bool(_)
+                            | Expr::Str(_)
+                            | Expr::Nil
                     )
             }
         };
@@ -4055,6 +5102,58 @@ impl<'a> Checker<'a> {
         let Some(resolved) = self.resolve(name, span) else {
             return Type::Poison;
         };
+        if matches!(Builtin::from_name(&resolved), Some(Builtin::Spawn)) {
+            if !self.in_async {
+                self.error("E2002", "`spawn` is only valid inside an `@async fn`", span);
+                return Type::Poison;
+            }
+            if args.len() != 1 {
+                self.error(
+                    "E1005",
+                    format!("`spawn` expects 1 argument, got {}", args.len()),
+                    span,
+                );
+                return Type::Poison;
+            }
+            return match actual.first() {
+                Some(Type::Task(_)) => actual[0].clone(),
+                Some(Type::Poison) => Type::Poison,
+                Some(other) => {
+                    self.error(
+                        "E2002",
+                        format!("`spawn` expects Task[T], got {}", other.display()),
+                        args[0].value.span(),
+                    );
+                    Type::Poison
+                }
+                None => Type::Poison,
+            };
+        }
+        if matches!(Builtin::from_name(&resolved), Some(Builtin::Cancel)) {
+            if args.len() != 1 {
+                self.error(
+                    "E1005",
+                    format!("`cancel` expects 1 argument, got {}", args.len()),
+                    span,
+                );
+                return Type::Poison;
+            }
+            return match actual.first() {
+                Some(Type::Task(_) | Type::Dynamic | Type::ErrorValue) => {
+                    Type::concrete(VarType::Bool)
+                }
+                Some(Type::Poison) => Type::Poison,
+                Some(other) => {
+                    self.error(
+                        "E2002",
+                        format!("`cancel` expects Task[T], got {}", other.display()),
+                        args[0].value.span(),
+                    );
+                    Type::Poison
+                }
+                None => Type::Poison,
+            };
+        }
         if let Some((id, fields)) = self.constructors.get(&resolved).copied()
             && fields
                 .iter()
@@ -4128,21 +5227,28 @@ impl<'a> Checker<'a> {
                     error.argument.and_then(|i| args[i].value.span()).or(span),
                 );
             }
-            for (i, actual) in actual.into_iter().enumerate() {
+            let mut actual = actual;
+            for i in 0..actual.len() {
                 if let Some(index) = bindings.by_argument[i] {
                     if let Some(ty) = fields[index].ty.clone() {
-                        if actual == Type::EmptyArray
+                        let expected_type = self.annotation_type(&ty);
+                        actual[i] = self.contextualized_literal_type(
+                            &args[i].value,
+                            actual[i].clone(),
+                            &expected_type,
+                        );
+                        if actual[i] == Type::EmptyArray
                             && let Type::Array(element) = self.annotation_type(&ty)
                         {
                             self.refine_empty_array(&args[i].value, &element);
                         }
                         self.assignable(
                             ty,
-                            actual,
+                            actual[i].clone(),
                             args[i].value.span(),
                             &format!("parameter `{}` of `{name}`", fields[index].name),
                         );
-                    } else if contains_unresolved_empty_array(&actual) {
+                    } else if contains_unresolved_empty_array(&actual[i]) {
                         self.error(
                             "E2001",
                             "cannot infer array element type for an empty argument to a dynamic parameter; declare a typed array first",
@@ -4160,10 +5266,20 @@ impl<'a> Checker<'a> {
                     Type::Enum(*id, resolved.clone())
                 }
             } else {
-                self.functions
+                let result = self
+                    .functions
                     .get(&resolved)
                     .and_then(|function| function.result_type.as_ref())
-                    .map_or(Type::Dynamic, |t| self.annotation_type(t))
+                    .map_or(Type::Dynamic, |t| self.annotation_type(t));
+                if self
+                    .functions
+                    .get(&resolved)
+                    .is_some_and(|function| function.asynchronous)
+                {
+                    Type::Task(Box::new(result))
+                } else {
+                    result
+                }
             };
         }
         if let Some(builtin) = Builtin::from_name(&resolved) {
@@ -4193,7 +5309,51 @@ impl<'a> Checker<'a> {
                     Type::Bytes
                 };
             }
-            if self.in_comptime && matches!(builtin, Builtin::Native(_)) {
+            if self.in_comptime
+                && matches!(
+                    builtin,
+                    Builtin::Native(_)
+                        | Builtin::YieldNow
+                        | Builtin::TimeoutAsync
+                        | Builtin::Select
+                        | Builtin::Select2
+                        | Builtin::SleepAsync
+                        | Builtin::ReadBytesAsync
+                        | Builtin::ProcessRunAsync
+                        | Builtin::NetworkExchangeAsync
+                        | Builtin::TcpListenAsync
+                        | Builtin::TcpAcceptAsync
+                        | Builtin::TcpConnectAsync
+                        | Builtin::TcpReadAsync
+                        | Builtin::TcpReadExactAsync
+                        | Builtin::TcpReadAllAsync
+                        | Builtin::TcpWriteAsync
+                        | Builtin::TcpWriteAllAsync
+                        | Builtin::TcpShutdownWriteAsync
+                        | Builtin::FsMetadataAsync
+                        | Builtin::FsReadDirAsync
+                        | Builtin::FsWriteBytesAsync
+                        | Builtin::FsCreateDirAsync
+                        | Builtin::FsCreateDirAllAsync
+                        | Builtin::FsRemoveFileAsync
+                        | Builtin::FsRemoveDirAsync
+                        | Builtin::FsReadTextAsync
+                        | Builtin::FsWriteTextAsync
+                        | Builtin::FsReadLinesAsync
+                        | Builtin::FsAppendBytesAsync
+                        | Builtin::FsAppendTextAsync
+                        | Builtin::FsCopyAsync
+                        | Builtin::FsRenameAsync
+                        | Builtin::AsyncIoRead
+                        | Builtin::AsyncIoReadExact
+                        | Builtin::AsyncIoReadAll
+                        | Builtin::AsyncIoOpen
+                        | Builtin::AsyncIoWrite
+                        | Builtin::AsyncIoWriteAll
+                        | Builtin::AsyncIoFlush
+                        | Builtin::AsyncIoSeek
+                )
+            {
                 self.error(
                     "E4002",
                     format!("runtime-only function `{resolved}` cannot execute at comptime"),
@@ -4208,12 +5368,16 @@ impl<'a> Checker<'a> {
                     args.get(index).and_then(|arg| arg.value.span()),
                 );
             }
-            if builtin.arity() != args.len() {
+            if !builtin.accepts_arity(args.len()) {
+                let expected = if matches!(builtin, Builtin::ProcessRunAsync) {
+                    "2, 3, 4, or 5".to_owned()
+                } else {
+                    builtin.arity().to_string()
+                };
                 self.error(
                     "E1005",
                     format!(
-                        "`{name}` expects {} argument(s), got {}",
-                        builtin.arity(),
+                        "`{name}` expects {expected} argument(s), got {}",
                         args.len()
                     ),
                     span,
@@ -4227,6 +5391,234 @@ impl<'a> Checker<'a> {
                 };
                 self.error("E1005", message, span);
             }
+            for (index, (actual, argument)) in actual.iter().zip(args).enumerate() {
+                let (expected, valid) = match (&builtin, index) {
+                    (Builtin::TimeoutAsync, 0) => (
+                        "Task[T]",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || matches!(actual, Type::Task(_)),
+                    ),
+                    (Builtin::TimeoutAsync, 1) => (
+                        "int, uint, or float",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || [VarType::Int, VarType::UInt, VarType::Float]
+                                .into_iter()
+                                .any(|kind| *actual == Type::concrete(kind)),
+                    ),
+                    (Builtin::Select2, _) => (
+                        "Task[T]",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || matches!(actual, Type::Task(_)),
+                    ),
+                    (Builtin::Select, 0) => (
+                        "Task[T][]",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || matches!(actual, Type::Array(element) if matches!(element.as_ref(), Type::Task(_) | Type::Dynamic)),
+                    ),
+                    (Builtin::SleepAsync, 0) => (
+                        "int, uint, or float",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || [VarType::Int, VarType::UInt, VarType::Float]
+                                .into_iter()
+                                .any(|kind| *actual == Type::concrete(kind)),
+                    ),
+                    (Builtin::NetworkExchangeAsync, 0) => (
+                        "str",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || type_compatible(&Type::concrete(VarType::Str), actual),
+                    ),
+                    (Builtin::NetworkExchangeAsync, 1 | 3) => (
+                        "int or uint",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || *actual == Type::concrete(VarType::Int)
+                            || *actual == Type::concrete(VarType::UInt),
+                    ),
+                    (Builtin::NetworkExchangeAsync, 2) => (
+                        "bytes",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || type_compatible(&Type::Bytes, actual),
+                    ),
+                    (Builtin::TcpConnectAsync | Builtin::TcpListenAsync, 0) => (
+                        "str",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || type_compatible(&Type::concrete(VarType::Str), actual),
+                    ),
+                    (Builtin::TcpConnectAsync, 1 | 2)
+                    | (Builtin::TcpListenAsync, 1)
+                    | (Builtin::TcpReadAsync, 1)
+                    | (Builtin::TcpReadExactAsync, 1)
+                    | (Builtin::TcpAcceptAsync, 1 | 2) => (
+                        "int or uint",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || *actual == Type::concrete(VarType::Int)
+                            || *actual == Type::concrete(VarType::UInt),
+                    ),
+                    (Builtin::AsyncIoReadExact, 1) => (
+                        "int or uint",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || *actual == Type::concrete(VarType::Int)
+                            || *actual == Type::concrete(VarType::UInt),
+                    ),
+                    (
+                        Builtin::TcpReadAsync
+                        | Builtin::TcpReadExactAsync
+                        | Builtin::TcpReadAllAsync
+                        | Builtin::TcpAcceptAsync
+                        | Builtin::TcpWriteAsync
+                        | Builtin::TcpWriteAllAsync
+                        | Builtin::TcpShutdownWriteAsync,
+                        0,
+                    ) => (
+                        "handle",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || *actual == Type::Handle,
+                    ),
+                    (Builtin::TcpWriteAsync | Builtin::TcpWriteAllAsync, 1) => (
+                        "bytes",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || type_compatible(&Type::Bytes, actual),
+                    ),
+                    (
+                        Builtin::AsyncIoRead
+                        | Builtin::AsyncIoReadExact
+                        | Builtin::AsyncIoReadAll
+                        | Builtin::AsyncIoWrite
+                        | Builtin::AsyncIoWriteAll
+                        | Builtin::AsyncIoFlush
+                        | Builtin::AsyncIoSeek,
+                        0,
+                    ) => (
+                        "handle",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || *actual == Type::Handle,
+                    ),
+                    (Builtin::AsyncIoOpen, 0 | 1) => (
+                        "str",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || type_compatible(&Type::concrete(VarType::Str), actual),
+                    ),
+                    (Builtin::AsyncIoOpen, 2) => (
+                        "int",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || *actual == Type::concrete(VarType::Int),
+                    ),
+                    (Builtin::AsyncIoRead, 1) => (
+                        "int or uint",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || *actual == Type::concrete(VarType::Int)
+                            || *actual == Type::concrete(VarType::UInt),
+                    ),
+                    (Builtin::AsyncIoWrite | Builtin::AsyncIoWriteAll, 1) => (
+                        "bytes",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || type_compatible(&Type::Bytes, actual),
+                    ),
+                    (Builtin::AsyncIoSeek, 1) => (
+                        "int",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || *actual == Type::concrete(VarType::Int),
+                    ),
+                    (Builtin::AsyncIoSeek, 2) => (
+                        "str",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || type_compatible(&Type::concrete(VarType::Str), actual),
+                    ),
+                    (Builtin::ReadBytesAsync, 0)
+                    | (Builtin::ProcessRunAsync, 0)
+                    | (Builtin::FsMetadataAsync, 0)
+                    | (Builtin::FsReadDirAsync, 0)
+                    | (Builtin::FsWriteBytesAsync, 0)
+                    | (Builtin::FsCreateDirAsync, 0)
+                    | (Builtin::FsCreateDirAllAsync, 0)
+                    | (Builtin::FsRemoveFileAsync, 0)
+                    | (Builtin::FsRemoveDirAsync, 0)
+                    | (Builtin::FsReadTextAsync, 0)
+                    | (Builtin::FsReadLinesAsync, 0)
+                    | (Builtin::FsWriteTextAsync, 0)
+                    | (Builtin::FsAppendBytesAsync, 0)
+                    | (Builtin::FsAppendTextAsync, 0)
+                    | (Builtin::FsCopyAsync, 0)
+                    | (Builtin::FsRenameAsync, 0) => (
+                        "str",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || type_compatible(&Type::concrete(VarType::Str), actual),
+                    ),
+                    (Builtin::ProcessRunAsync, 1) => (
+                        "array",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || type_compatible(&Type::dynamic_array(), actual),
+                    ),
+                    (Builtin::ProcessRunAsync, 2) if args.len() == 5 => (
+                        "bytes",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || type_compatible(&Type::Bytes, actual),
+                    ),
+                    (Builtin::ProcessRunAsync, 2) if args.len() == 4 => (
+                        "bytes, int, uint, or nil",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || type_compatible(&Type::Bytes, actual)
+                            || *actual == Type::concrete(VarType::Int)
+                            || *actual == Type::concrete(VarType::UInt)
+                            || *actual == Type::Nil,
+                    ),
+                    (Builtin::ProcessRunAsync, 2) => (
+                        "bytes, int, or uint",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || type_compatible(&Type::Bytes, actual)
+                            || *actual == Type::concrete(VarType::Int)
+                            || *actual == Type::concrete(VarType::UInt),
+                    ),
+                    (Builtin::ProcessRunAsync, 3) => (
+                        "int, uint, or nil",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || *actual == Type::concrete(VarType::Int)
+                            || *actual == Type::concrete(VarType::UInt)
+                            || *actual == Type::Nil,
+                    ),
+                    (Builtin::ProcessRunAsync, 4) => (
+                        "int or uint",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || *actual == Type::concrete(VarType::Int)
+                            || *actual == Type::concrete(VarType::UInt),
+                    ),
+                    (Builtin::FsWriteBytesAsync, 1) => (
+                        "bytes",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || type_compatible(&Type::Bytes, actual),
+                    ),
+                    (Builtin::FsWriteTextAsync, 1) => (
+                        "str",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || type_compatible(&Type::concrete(VarType::Str), actual),
+                    ),
+                    (Builtin::FsAppendBytesAsync, 1) => (
+                        "bytes",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || type_compatible(&Type::Bytes, actual),
+                    ),
+                    (Builtin::FsAppendTextAsync, 1) => (
+                        "str",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || type_compatible(&Type::concrete(VarType::Str), actual),
+                    ),
+                    (Builtin::FsCopyAsync | Builtin::FsRenameAsync, 1) => (
+                        "str",
+                        matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
+                            || type_compatible(&Type::concrete(VarType::Str), actual),
+                    ),
+                    _ => continue,
+                };
+                if !valid {
+                    self.error(
+                        "E2001",
+                        format!(
+                            "type mismatch: `{name}` expects {expected}, got {}",
+                            actual.display()
+                        ),
+                        argument.value.span(),
+                    );
+                }
+            }
             if let Builtin::Native(ref import) = builtin {
                 for ((parameter, actual), argument) in
                     import.parameters().iter().zip(&actual).zip(args)
@@ -4236,12 +5628,13 @@ impl<'a> Checker<'a> {
                     if *parameter == N::Number {
                         if !matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
                             && *actual != Type::concrete(VarType::Int)
+                            && *actual != Type::concrete(VarType::UInt)
                             && *actual != Type::concrete(VarType::Float)
                         {
                             self.error(
                                 "E2001",
                                 format!(
-                                    "type mismatch: `{name}` expects int or float, got {}",
+                                    "type mismatch: `{name}` expects int, uint, or float, got {}",
                                     actual.display()
                                 ),
                                 value.span(),
@@ -4253,8 +5646,10 @@ impl<'a> Checker<'a> {
                         N::Any => continue,
                         N::Number => unreachable!(),
                         N::Int => Type::concrete(VarType::Int),
+                        N::UInt => Type::concrete(VarType::UInt),
                         N::Float => Type::concrete(VarType::Float),
                         N::Bool => Type::concrete(VarType::Bool),
+                        N::Char => Type::concrete(VarType::Char),
                         N::StrBuf => Type::StrBuf,
                         N::Str => Type::concrete(VarType::Str),
                         N::Bytes => Type::Bytes,
@@ -4283,26 +5678,87 @@ impl<'a> Checker<'a> {
                 Builtin::ErrorKind => Type::concrete(VarType::Str),
                 Builtin::Exclusive => Type::concrete(VarType::Bool),
                 Builtin::BuildInput => Type::Poison,
-                Builtin::Native(import) => match import.result() {
-                    crate::runtime::NativeType::Int => Type::concrete(VarType::Int),
-                    crate::runtime::NativeType::Float => Type::concrete(VarType::Float),
-                    crate::runtime::NativeType::Bool => Type::concrete(VarType::Bool),
-                    crate::runtime::NativeType::StrBuf => Type::StrBuf,
-                    crate::runtime::NativeType::Str => Type::concrete(VarType::Str),
-                    crate::runtime::NativeType::Nil => Type::Nil,
-                    crate::runtime::NativeType::Bytes => Type::Bytes,
-                    crate::runtime::NativeType::Handle => Type::Handle,
-                    crate::runtime::NativeType::Array => Type::dynamic_array(),
-                    crate::runtime::NativeType::Record => Type::Record,
-                    _ => Type::Dynamic,
+                Builtin::Spawn => actual.first().cloned().unwrap_or(Type::Poison),
+                Builtin::Cancel => Type::concrete(VarType::Bool),
+                Builtin::YieldNow => Type::Task(Box::new(Type::Nil)),
+                Builtin::TimeoutAsync => match actual.first() {
+                    Some(Type::Task(result)) => Type::Task(result.clone()),
+                    _ => Type::Task(Box::new(Type::Dynamic)),
                 },
+                Builtin::Select => Type::Task(Box::new(Type::concrete(VarType::Int))),
+                Builtin::Select2 => Type::Task(Box::new(Type::concrete(VarType::Int))),
+                Builtin::SleepAsync => Type::Task(Box::new(Type::Nil)),
+                Builtin::ReadBytesAsync => Type::Task(Box::new(Type::Bytes)),
+                Builtin::AsyncIoRead => Type::Task(Box::new(Type::Bytes)),
+                Builtin::AsyncIoReadExact => Type::Task(Box::new(Type::Bytes)),
+                Builtin::AsyncIoReadAll => Type::Task(Box::new(Type::Bytes)),
+                Builtin::AsyncIoOpen => Type::Task(Box::new(Type::Handle)),
+                Builtin::AsyncIoSeek => Type::Task(Box::new(Type::concrete(VarType::Int))),
+                Builtin::AsyncIoWrite | Builtin::TcpWriteAsync => {
+                    Type::Task(Box::new(Type::concrete(VarType::UInt)))
+                }
+                Builtin::AsyncIoWriteAll | Builtin::AsyncIoFlush => Type::Task(Box::new(Type::Nil)),
+                Builtin::ProcessRunAsync => Type::Task(Box::new(Type::Record)),
+                Builtin::NetworkExchangeAsync => Type::Task(Box::new(Type::Bytes)),
+                Builtin::TcpListenAsync | Builtin::TcpAcceptAsync | Builtin::TcpConnectAsync => {
+                    Type::Task(Box::new(Type::Handle))
+                }
+                Builtin::TcpReadAsync | Builtin::TcpReadExactAsync | Builtin::TcpReadAllAsync => {
+                    Type::Task(Box::new(Type::Bytes))
+                }
+                Builtin::TcpWriteAllAsync | Builtin::TcpShutdownWriteAsync => {
+                    Type::Task(Box::new(Type::Nil))
+                }
+                Builtin::FsMetadataAsync => Type::Task(Box::new(Type::Record)),
+                Builtin::FsReadDirAsync => Type::Task(Box::new(Type::Array(Box::new(
+                    Type::concrete(VarType::Str),
+                )))),
+                Builtin::FsReadLinesAsync => Type::Task(Box::new(Type::Array(Box::new(
+                    Type::concrete(VarType::Str),
+                )))),
+                Builtin::FsReadTextAsync => Type::Task(Box::new(Type::concrete(VarType::Str))),
+                Builtin::FsCopyAsync => Type::Task(Box::new(Type::concrete(VarType::UInt))),
+                Builtin::FsWriteBytesAsync
+                | Builtin::FsWriteTextAsync
+                | Builtin::FsAppendBytesAsync
+                | Builtin::FsAppendTextAsync
+                | Builtin::FsRenameAsync
+                | Builtin::FsCreateDirAsync
+                | Builtin::FsCreateDirAllAsync
+                | Builtin::FsRemoveFileAsync
+                | Builtin::FsRemoveDirAsync => Type::Task(Box::new(Type::Nil)),
+                Builtin::Native(import) => {
+                    let result = match import.result() {
+                        crate::runtime::NativeType::Any if import.name() == "str::to_bigint" => {
+                            Type::concrete(VarType::BigInt)
+                        }
+                        crate::runtime::NativeType::Int => Type::concrete(VarType::Int),
+                        crate::runtime::NativeType::UInt => Type::concrete(VarType::UInt),
+                        crate::runtime::NativeType::Float => Type::concrete(VarType::Float),
+                        crate::runtime::NativeType::Bool => Type::concrete(VarType::Bool),
+                        crate::runtime::NativeType::Char => Type::concrete(VarType::Char),
+                        crate::runtime::NativeType::StrBuf => Type::StrBuf,
+                        crate::runtime::NativeType::Str => Type::concrete(VarType::Str),
+                        crate::runtime::NativeType::Nil => Type::Nil,
+                        crate::runtime::NativeType::Bytes => Type::Bytes,
+                        crate::runtime::NativeType::Handle => Type::Handle,
+                        crate::runtime::NativeType::Array => Type::dynamic_array(),
+                        crate::runtime::NativeType::Record => Type::Record,
+                        _ => Type::Dynamic,
+                    };
+                    if import.is_async() {
+                        Type::Task(Box::new(result))
+                    } else {
+                        result
+                    }
+                }
             };
         }
         // Wildcard native imports have no source declarations to enumerate.
         for scope in self.scopes.iter().rev() {
             for module in scope.modules.values() {
                 if let Some(builtin) = Builtin::from_name(&format!("{module}::{name}"))
-                    && builtin.arity() == args.len()
+                    && builtin.accepts_arity(args.len())
                 {
                     if let Builtin::Native(ref import) = builtin {
                         self.access_facts

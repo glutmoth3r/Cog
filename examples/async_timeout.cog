@@ -1,0 +1,19 @@
+@!include("std")
+use io;
+use async::time;
+use err::Error;
+
+@async fn slow_load() -> int {
+    await time::sleep(0.05);
+    return 42;
+}
+
+@async fn main() -> nil {
+    const work = spawn(slow_load());
+    when await time::timeout(work, 0.005) is Error::Timeout {
+        io::println("timed out; work continues")!!;
+    } else {
+        crash("expected timeout");
+    }
+    io::println(await work)!!;
+}

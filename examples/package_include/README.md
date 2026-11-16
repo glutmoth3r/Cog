@@ -6,8 +6,9 @@ Run from the repository root:
 cog run examples/package_include
 ```
 
-The entry point includes the `game` source package and the embedded standard
-library. Both packages provide a `random` module, so the imports select their
+The entry point uses `@!include("game")` for the declared source dependency and
+`@!include("std")` for the embedded standard library. Both packages provide a
+`random` module, so the imports select their
 providers with `from`. The `game::numbers` module also defines a compile-time
 type alias and registers an integer extension method.
 

@@ -1,4 +1,4 @@
-include std;
+@!include("std")
 use io;
 
 struct Point {
@@ -6,7 +6,7 @@ struct Point {
     y: int,
 }
 
-comptime Scalar: type = int;
+@comptime const Scalar: type = int;
 
 extend Point {
     fn shifted(self, amount: int) -> Point {
@@ -18,7 +18,7 @@ extend Point {
     }
 }
 
-comptime extend Scalar {
+@comptime extend Scalar {
     fn describe(self) -> str {
         $"integer {self}"
     }

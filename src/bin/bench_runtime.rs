@@ -25,7 +25,8 @@ fn measure(name: &str, operations: usize, mut work: impl FnMut()) {
 }
 
 fn compiled(source: &str) -> CompiledProgram {
-    let program = project::compile_source("benchmark.cog", source).unwrap();
+    let source = format!("@!include(\"std\")\n{source}");
+    let program = project::compile_source("benchmark.cog", &source).unwrap();
     bytecode::decode(&bytecode::encode(&program).unwrap()).unwrap()
 }
 
@@ -137,11 +138,31 @@ fn main() {
     let arithmetic = compiled(&format!(
         "fn main() {{ var sum: int = 0; for i in 0..{iterations} {{ sum += i; }} return sum; }}"
     ));
+    let helpers = (0..128)
+        .map(|index| format!("fn helper_{index}(value: int) -> int {{ return value + 1; }}\n"))
+        .collect::<String>();
+    let function_calls = compiled(&format!(
+        "{helpers} fn main() {{ var sum: int = 0; for i in 0..{iterations} {{ sum += helper_127(i); }} if sum != {} {{ crash(sum); }} }}",
+        iterations * (iterations + 1) / 2
+    ));
     let indexing = compiled(&format!(
         "fn main() {{ const a = [1, 2, 3]; var sum: int = 0; for i in 0..{iterations} {{ sum += a[1] as int; }} return sum; }}"
     ));
+    let wide_loop_iterations = 10_000usize;
+    let wide_loop_body = "sum += i;\n".repeat(140);
+    let wide_loop_expected = 140 * wide_loop_iterations * (wide_loop_iterations - 1) / 2;
+    let wide_loop = compiled(&format!(
+        "fn main() {{ var sum: int = 0; for i in 0..{wide_loop_iterations} {{ {wide_loop_body} }} if sum != {wide_loop_expected} {{ crash(sum); }} }}"
+    ));
+    assert!(wide_loop.instructions.len() > 512);
     measure("arithmetic/VM", iterations, || {
         interpreter::run_with(black_box(&arithmetic), &mut Vec::new()).unwrap();
+    });
+    measure("arithmetic/wide-loop/VM", wide_loop_iterations, || {
+        interpreter::run_with(black_box(&wide_loop), &mut Vec::new()).unwrap();
+    });
+    measure("call-dispatch/VM", iterations, || {
+        interpreter::run_with(black_box(&function_calls), &mut Vec::new()).unwrap();
     });
     measure("array-index/VM", iterations, || {
         interpreter::run_with(black_box(&indexing), &mut Vec::new()).unwrap();
@@ -185,6 +206,67 @@ fn main() {
     measure("empty len/VM native", iterations, || {
         interpreter::run_with(black_box(&native), &mut Vec::new()).unwrap();
     });
+    let empty_program = CompiledProgram::new(vec![I::Halt]);
+    let invocations = 2_000;
+    measure("startup/empty VM invocation", invocations, || {
+        let mut output = Vec::new();
+        for _ in 0..invocations {
+            interpreter::run_with(black_box(&empty_program), &mut output).unwrap();
+        }
+    });
+    let repeated_source = "fn main() { var sum: int = 0; for i in 0..100 { sum += i; } if sum != 4950 { crash(sum); } }";
+    let repeated_program = compiled(repeated_source);
+    let engine = cog::sdk::Engine::new();
+    let sdk_program = engine.compile("benchmark.cog", repeated_source).unwrap();
+    let repeated_invocations = 1_000;
+    measure(
+        "startup/reused bytecode (100-step body)",
+        repeated_invocations,
+        || {
+            let mut output = Vec::new();
+            for _ in 0..repeated_invocations {
+                interpreter::run_with(black_box(&repeated_program), &mut output).unwrap();
+            }
+        },
+    );
+    measure(
+        "startup/reused SDK Program (100-step body)",
+        repeated_invocations,
+        || {
+            let mut output = Vec::new();
+            for _ in 0..repeated_invocations {
+                sdk_program.run(&mut output).unwrap();
+            }
+        },
+    );
+    let repeated_call_source = format!(
+        "{helpers} fn main() {{ var sum: int = 0; for i in 0..100 {{ sum += helper_127(i); }} if sum != 5050 {{ crash(sum); }} }}"
+    );
+    let repeated_call_bytecode = compiled(&repeated_call_source);
+    let repeated_call_sdk = engine
+        .compile("benchmark-calls.cog", &repeated_call_source)
+        .unwrap();
+    let call_invocations = 500;
+    measure(
+        "startup/reused bytecode (128 callables x 100 calls)",
+        call_invocations,
+        || {
+            let mut output = Vec::new();
+            for _ in 0..call_invocations {
+                interpreter::run_with(black_box(&repeated_call_bytecode), &mut output).unwrap();
+            }
+        },
+    );
+    measure(
+        "startup/reused SDK Program (128 callables x 100 calls)",
+        call_invocations,
+        || {
+            let mut output = Vec::new();
+            for _ in 0..call_invocations {
+                repeated_call_sdk.run(&mut output).unwrap();
+            }
+        },
+    );
     measure_host(iterations);
     measure_text(iterations);
 }
@@ -298,7 +380,7 @@ fn measure_text(iterations: usize) {
         assert_eq!(sink, expected.as_bytes());
     });
     let builder = compiled(&format!(
-        "use str; use fmt; use io; fn main() {{ const b = str::builder(); for i in 0..{iterations} {{ fmt::write(b, \"{{{{}}}}\", i); }} io::print(str::build(b)); }}"
+        "use str; use fmt; use io; fn main() {{ var b = str::builder(); for i in 0..{iterations} {{ fmt::write(b, \"{{}}\", i); }} io::print(str::build(b)); }}"
     ));
     measure("builder/VM loop", iterations, || {
         let mut output = Vec::new();
@@ -381,7 +463,7 @@ fn measure_host(iterations: usize) {
                 assert!(output.stderr.is_empty());
             }
         });
-        let run = NativeImport::named("process::run").unwrap();
+        let run = NativeImport::named("process::run_sync").unwrap();
         let args = [
             Value::Str("/bin/sh".into()),
             Value::Array(cog::heap::HeapRef::new(
@@ -400,13 +482,15 @@ fn measure_host(iterations: usize) {
                 else {
                     panic!("wrong process result");
                 };
-                let fields = fields.borrow();
-                assert!(matches!(&fields["exit_code"], Value::Int(0)));
-                let Value::Bytes(stdout) = &fields["stdout"] else {
+                assert!(matches!(
+                    fields.try_get_field("exit_code").unwrap(),
+                    Some(Value::Int(0))
+                ));
+                let Some(Value::Bytes(stdout)) = fields.try_get_field("stdout").unwrap() else {
                     panic!("wrong stdout type");
                 };
                 assert_eq!(*stdout.borrow(), b"benchmark");
-                let Value::Bytes(stderr) = &fields["stderr"] else {
+                let Some(Value::Bytes(stderr)) = fields.try_get_field("stderr").unwrap() else {
                     panic!("wrong stderr type");
                 };
                 assert!(stderr.borrow().is_empty());
@@ -419,7 +503,7 @@ fn measure_host(iterations: usize) {
             fn main() {{
                 const args = ["-c", "printf benchmark"];
                 for i in 0..{operations} {{
-                    const child = process::run("/bin/sh", args);
+                    const child = process::run_sync("/bin/sh", args);
                     if child.exit_code != 0 || bytes::to_str(child.stdout, 0, 9) != "benchmark" || bytes::len(child.stderr) != 0 {{ crash(0); }}
                 }}
             }}

@@ -1,5 +1,6 @@
 pub use crate::string_literals::{InterpolationToken, InterpolationTokenPart};
 use logos::Logos;
+use num_bigint::BigInt;
 
 #[derive(Debug, Clone)]
 pub struct LexContext {
@@ -41,6 +42,7 @@ pub enum LexError {
     InvalidInt(String),
     InvalidFloat(String),
     InvalidString(String),
+    InvalidChar(String),
     InvalidInterpolation(String),
 }
 
@@ -51,7 +53,8 @@ impl std::fmt::Display for LexError {
             LexError::Other => write!(f, "invalid token"),
             LexError::InvalidInt(s) => write!(f, "invalid integer literal `{s}`"),
             LexError::InvalidFloat(s) => write!(f, "invalid float literal `{s}`"),
-            LexError::InvalidString(s) => write!(f, "invalid string literal `{s}`"),
+            LexError::InvalidString(message) => write!(f, "invalid string literal: {message}"),
+            LexError::InvalidChar(message) => write!(f, "invalid character literal: {message}"),
             LexError::InvalidInterpolation(message) => {
                 write!(f, "invalid interpolation: {message}")
             }
@@ -69,27 +72,64 @@ fn unescape_string(lex: &mut logos::Lexer<Token>) -> Result<String, LexError> {
             out.push(c);
             continue;
         }
-        let escaped = chars
-            .next()
-            .and_then(crate::string_literals::escape)
-            .ok_or_else(|| LexError::InvalidString(raw.to_string()))?;
+        let escaped = crate::string_literals::escape(&mut chars, '"')?;
         out.push(escaped);
     }
     Ok(out)
 }
 
-fn parse_int(lex: &mut logos::Lexer<Token>) -> Result<i64, LexError> {
+fn parse_char(lex: &mut logos::Lexer<Token>) -> Result<char, LexError> {
     let raw = lex.slice();
+    let inner = &raw[1..raw.len() - 1];
+    let mut chars = inner.chars();
+    let Some(first) = chars.next() else {
+        return Err(LexError::InvalidChar(
+            "expected exactly one Unicode scalar value".into(),
+        ));
+    };
+    let value = if first == '\\' {
+        crate::string_literals::escape(&mut chars, '\'')?
+    } else {
+        first
+    };
+    if chars.next().is_some() {
+        return Err(LexError::InvalidChar(
+            "expected exactly one Unicode scalar value".into(),
+        ));
+    }
+    Ok(value)
+}
+
+fn parse_int(lex: &mut logos::Lexer<Token>) -> Result<u64, LexError> {
+    integer_value(lex.slice())
+}
+
+fn integer_value(raw: &str) -> Result<u64, LexError> {
     let normalized = raw.replace('_', "");
     let parsed = if let Some(hex) = normalized
         .strip_prefix("0x")
         .or_else(|| normalized.strip_prefix("0X"))
     {
-        i64::from_str_radix(hex, 16)
+        u64::from_str_radix(hex, 16)
     } else {
-        normalized.parse::<i64>()
+        normalized.parse::<u64>()
     };
     parsed.map_err(|_| LexError::InvalidInt(raw.to_owned()))
+}
+
+fn parse_bigint(lex: &mut logos::Lexer<Token>) -> Result<BigInt, LexError> {
+    let raw = lex.slice();
+    let normalized = raw.replace('_', "");
+    let (digits, radix) = if let Some(hex) = normalized
+        .strip_prefix("0x")
+        .or_else(|| normalized.strip_prefix("0X"))
+    {
+        (hex, 16)
+    } else {
+        (normalized.as_str(), 10)
+    };
+    BigInt::parse_bytes(digits.as_bytes(), radix)
+        .ok_or_else(|| LexError::InvalidInt(raw.to_owned()))
 }
 
 fn parse_float(lex: &mut logos::Lexer<Token>) -> Result<f64, LexError> {
@@ -113,10 +153,17 @@ pub enum Token {
 
     #[regex(r"0[xX][0-9A-Fa-f](?:_?[0-9A-Fa-f])*", parse_int)]
     #[regex(r"[0-9](?:_?[0-9])*", parse_int)]
-    Int(i64),
+    Int(u64),
+
+    #[regex(r"0[xX][0-9A-Fa-f](?:_?[0-9A-Fa-f]){16,}", parse_bigint)]
+    #[regex(r"[0-9](?:_?[0-9]){19,}", parse_bigint)]
+    BigInt(BigInt),
 
     #[regex(r#""([^"\\]|\\.)*""#, unescape_string)]
     Str(String),
+
+    #[regex(r#"'([^'\\]|\\.)*'"#, parse_char)]
+    Char(char),
 
     #[token("$\"", crate::string_literals::lex_interpolation)]
     Interpolated(InterpolationToken),
@@ -152,9 +199,6 @@ pub enum Token {
 
     #[token("const")]
     Const,
-
-    #[token("comptime")]
-    Comptime,
 
     #[token("if")]
     If,
@@ -241,6 +285,9 @@ pub enum Token {
 
     #[token("!")]
     Bang,
+
+    #[token("@")]
+    At,
 
     #[token("??")]
     NilFallback,
@@ -343,6 +390,65 @@ pub struct LexOutput {
     pub errors: Vec<(LexError, std::ops::Range<usize>, usize)>,
 }
 
+/// Resolve adjacent numeric fields before parsing, including embedded code.
+/// Logos maximally munches `pair.0.1` as Ident, Dot, Float; after a field dot
+/// the decimal components must instead retain their individual integer spans.
+pub(crate) struct TokenCursor<'source> {
+    lexer: logos::Lexer<'source, Token>,
+    pending: Option<std::ops::Range<usize>>,
+    after_dot: bool,
+}
+
+impl<'source> TokenCursor<'source> {
+    pub(crate) fn new(lexer: logos::Lexer<'source, Token>) -> Self {
+        Self {
+            lexer,
+            pending: None,
+            after_dot: false,
+        }
+    }
+
+    pub(crate) fn charge(&self) -> bool {
+        self.lexer.extras.charge()
+    }
+}
+
+impl Iterator for TokenCursor<'_> {
+    type Item = (Result<Token, LexError>, std::ops::Range<usize>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (result, span) = if let Some(span) = self.pending.take() {
+            if self.lexer.source().as_bytes()[span.start] == b'.' {
+                self.pending = Some(span.start + 1..span.end);
+                (Ok(Token::Dot), span.start..span.start + 1)
+            } else {
+                (
+                    integer_value(&self.lexer.source()[span.clone()]).map(Token::Int),
+                    span,
+                )
+            }
+        } else {
+            let result = self.lexer.next()?;
+            let mut span = self.lexer.span();
+            let raw = self.lexer.slice();
+            let result = if self.after_dot
+                && matches!(result, Ok(Token::Float(_)) | Err(LexError::InvalidFloat(_)))
+                && !raw.contains(['e', 'E'])
+                && let Some(dot) = raw.find('.')
+            {
+                self.pending = Some(span.start + dot..span.end);
+                span.end = span.start + dot;
+                integer_value(&raw[..dot]).map(Token::Int)
+            } else {
+                result
+            };
+            (result, span)
+        };
+        self.after_dot = matches!(result, Ok(Token::Dot));
+        Some((result, span))
+    }
+}
+
 pub fn tokenize_recovering(source: &str) -> LexOutput {
     tokenize_with_limits(source, crate::limits::CompilerLimits::default())
 }
@@ -361,13 +467,13 @@ pub fn tokenize_with_limits(source: &str, limits: crate::limits::CompilerLimits)
     if source.starts_with("#!") {
         lex.bump(source.find('\n').unwrap_or(source.len()));
     }
+    let mut lex = TokenCursor::new(lex);
     let mut tokens = Vec::new();
     let mut errors = Vec::new();
     let mut scanned = 0;
     let mut line = 1;
-    while let Some(result) = lex.next() {
-        let span = lex.span();
-        if !lex.extras.charge() {
+    while let Some((result, span)) = lex.next() {
+        if !lex.charge() {
             errors.push((LexError::ResourceLimit("token"), span, line));
             break;
         }
@@ -464,11 +570,146 @@ mod tests {
     }
 
     #[test]
-    fn hexadecimal_integer_overflow_is_reported_as_a_lex_error() {
-        assert!(matches!(
-            tokenize("0x8000000000000000"),
-            Err((LexError::InvalidInt(_), 1))
-        ));
+    fn numeric_tuple_fields_keep_individual_tokens_and_source_spans() {
+        let source = "// header\npair.01.0_2.3.4 1.0 7E-2 0..2 1.0..2.0 pair.9007199254740993.9223372036854775807";
+        let tokens = tokenize(source).unwrap();
+        let expected = [
+            (Token::Ident("pair".into()), "pair"),
+            (Token::Dot, "."),
+            (Token::Int(1), "01"),
+            (Token::Dot, "."),
+            (Token::Int(2), "0_2"),
+            (Token::Dot, "."),
+            (Token::Int(3), "3"),
+            (Token::Dot, "."),
+            (Token::Int(4), "4"),
+            (Token::Float(1.0), "1.0"),
+            (Token::Float(0.07), "7E-2"),
+            (Token::Int(0), "0"),
+            (Token::DotDot, ".."),
+            (Token::Int(2), "2"),
+            (Token::Float(1.0), "1.0"),
+            (Token::DotDot, ".."),
+            (Token::Float(2.0), "2.0"),
+            (Token::Ident("pair".into()), "pair"),
+            (Token::Dot, "."),
+            (Token::Int(9007199254740993), "9007199254740993"),
+            (Token::Dot, "."),
+            (Token::Int(i64::MAX as u64), "9223372036854775807"),
+        ];
+        assert_eq!(tokens.len(), expected.len());
+        for (token, (kind, raw)) in tokens.iter().zip(expected) {
+            assert_eq!(token.token, kind);
+            assert_eq!(&source[token.span.clone()], raw);
+            assert_eq!(token.line, 2);
+        }
+        let tokens = tokenize("pair. /* field */\n 0.1").unwrap();
+        assert_eq!(tokens[2].token, Token::Int(0));
+        assert_eq!(tokens[2].line, 2);
+        assert_eq!(tokens[4].token, Token::Int(1));
+        assert_eq!(tokens[4].line, 2);
+    }
+
+    #[test]
+    fn numeric_tuple_fields_preserve_interpolation_offsets() {
+        let source = "// header\n$\"{pair.0.1}\"";
+        let outer = tokenize(source).unwrap().remove(0);
+        let Token::Interpolated(literal) = outer.token else {
+            panic!("expected an interpolated string");
+        };
+        let InterpolationTokenPart::Expression { tokens, errors, .. } = &literal.parts[0] else {
+            panic!("expected an interpolation expression");
+        };
+        assert!(errors.is_empty());
+        let expected = [
+            (Token::Ident("pair".into()), "pair"),
+            (Token::Dot, "."),
+            (Token::Int(0), "0"),
+            (Token::Dot, "."),
+            (Token::Int(1), "1"),
+        ];
+        assert_eq!(tokens.len(), expected.len());
+        for (token, (kind, raw)) in tokens.iter().zip(expected) {
+            assert_eq!(token.token, kind);
+            let span = outer.span.start + token.span.start..outer.span.start + token.span.end;
+            assert_eq!(&source[span], raw);
+            assert_eq!(outer.line + token.line - 1, 2);
+        }
+    }
+
+    #[test]
+    fn numeric_tuple_fields_charge_each_token_including_interpolation() {
+        for (source, count) in [
+            ("pair.0.1", 5),
+            ("$\"{pair.0.1}\"", 7),
+            ("$\"{$\"{pair.0.1}\"}\"", 9),
+        ] {
+            for budget in 0..=count {
+                let output = tokenize_with_limits(
+                    source,
+                    crate::limits::CompilerLimits {
+                        max_tokens: budget,
+                        ..crate::limits::CompilerLimits::default()
+                    },
+                );
+                if budget == count {
+                    assert!(output.errors.is_empty(), "{source}: {:?}", output.errors);
+                } else {
+                    assert!(
+                        output.errors.iter().any(|(error, _, _)| {
+                            matches!(error, LexError::ResourceLimit("token"))
+                        }),
+                        "{source} with budget {budget}: {:?}",
+                        output.errors
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_tuple_field_above_signed_range_preserves_uint_and_span() {
+        let field = 9_223_372_036_854_775_808u64;
+        for source in [
+            "// header\npair.9223372036854775808.0; after",
+            "// header\npair.0.9223372036854775808; after",
+            "// header\n$\"{pair.0.9223372036854775808}\"; after",
+        ] {
+            let output = tokenize_recovering(source);
+            assert!(output.errors.is_empty(), "{:?}", output.errors);
+            let start = source.find("9223372036854775808").unwrap();
+            let end = start + "9223372036854775808".len();
+            let direct = output.tokens.iter().any(|token| {
+                token.token == Token::Int(field) && token.span == (start..end) && token.line == 2
+            });
+            let interpolated = output.tokens.iter().any(|outer| {
+                let Token::Interpolated(literal) = &outer.token else {
+                    return false;
+                };
+                literal.parts.iter().any(|part| {
+                    let InterpolationTokenPart::Expression { tokens, .. } = part else {
+                        return false;
+                    };
+                    tokens.iter().any(|token| {
+                        let span =
+                            outer.span.start + token.span.start..outer.span.start + token.span.end;
+                        token.token == Token::Int(field) && span == (start..end)
+                    })
+                })
+            });
+            assert!(direct || interpolated, "{source}: {:?}", output.tokens);
+            assert_eq!(
+                output.tokens.last().unwrap().token,
+                Token::Ident("after".into())
+            );
+        }
+    }
+
+    #[test]
+    fn hexadecimal_integer_above_signed_range_is_a_uint_token() {
+        let tokens = tokenize("0x8000000000000000").unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].token, Token::Int(1u64 << 63));
     }
 
     #[test]

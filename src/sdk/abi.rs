@@ -1,4 +1,4 @@
-//! Version 1 C plugin interface. See `include/cog_plugin.h` and `docs/SDK.md`.
+//! Version 3 C plugin interface. See `include/cog_plugin.h` and `docs/SDK.md`.
 //! Only C layouts, opaque call handles and borrowed views cross this boundary.
 use super::{Error, Type};
 use std::ffi::c_void;
@@ -11,7 +11,8 @@ pub const INVALID: Status = 2;
 pub const TYPE_MISMATCH: Status = 3;
 pub const LIMIT: Status = 4;
 pub const PANIC: Status = 5;
-pub const VERSION: u32 = 1;
+pub const PENDING: Status = 6;
+pub const VERSION: u32 = 3;
 pub const ERROR_VALUE: u32 = 12;
 pub const OPAQUE_VALUE: u32 = 255;
 
@@ -39,7 +40,7 @@ unsafe impl Sync for Bytes {}
 #[derive(Clone, Copy)]
 pub struct ValueView {
     pub kind: u32,
-    pub integer: i64,
+    pub integer: u64,
     pub number: f64,
     pub bytes: Bytes,
     pub items: *const Handle,
@@ -59,7 +60,7 @@ impl Default for ValueView {
 }
 
 #[repr(C)]
-pub struct HostV1 {
+pub struct HostV3 {
     pub size: u32,
     pub version: u32,
     pub inspect: unsafe extern "C" fn(*mut c_void, Handle, *mut ValueView) -> Status,
@@ -68,35 +69,60 @@ pub struct HostV1 {
     pub array_set: unsafe extern "C" fn(*mut c_void, Handle, usize, Handle) -> Status,
     pub write_output: unsafe extern "C" fn(*mut c_void, Bytes) -> Status,
     pub set_error: unsafe extern "C" fn(*mut c_void, Bytes) -> Status,
+    pub wake: unsafe extern "C" fn(*mut c_void) -> Status,
 }
 
-pub type Callback = unsafe extern "C" fn(
+pub type CallbackV3 = unsafe extern "C" fn(
     *mut c_void,
-    *const HostV1,
+    *const HostV3,
     *mut c_void,
     *const Handle,
     usize,
     *mut Handle,
 ) -> Status;
 
+pub type AsyncStartV3 = unsafe extern "C" fn(
+    *mut c_void,
+    *const HostV3,
+    *mut c_void,
+    *mut c_void,
+    *const Handle,
+    usize,
+    *mut *mut c_void,
+) -> Status;
+pub type AsyncPollV3 = unsafe extern "C" fn(
+    *mut c_void,
+    *mut c_void,
+    *const HostV3,
+    *mut c_void,
+    *mut Handle,
+) -> Status;
+pub type AsyncCancelV3 = unsafe extern "C" fn(*mut c_void, *mut c_void);
+pub type AsyncDestroyV3 = unsafe extern "C" fn(*mut c_void, *mut c_void);
+
 #[repr(C)]
-pub struct FunctionV1 {
+pub struct FunctionV3 {
     pub size: u32,
     pub name: Bytes,
     pub parameters: Bytes,
     pub result: u8,
+    pub asynchronous: u8,
     pub effects: u16,
     pub mutations: u64,
-    pub invoke: Option<Callback>,
+    pub invoke: Option<CallbackV3>,
+    pub start: Option<AsyncStartV3>,
+    pub poll: Option<AsyncPollV3>,
+    pub cancel: Option<AsyncCancelV3>,
+    pub destroy_operation: Option<AsyncDestroyV3>,
 }
-impl FunctionV1 {
+impl FunctionV3 {
     pub const fn new(
         name: &'static str,
         parameters: &'static [Type],
         result: Type,
         effects: super::Effects,
         mutations: u64,
-        invoke: Callback,
+        invoke: CallbackV3,
     ) -> Self {
         Self {
             size: size_of::<Self>() as u32,
@@ -106,26 +132,61 @@ impl FunctionV1 {
                 len: parameters.len(),
             },
             result: result as u8,
+            asynchronous: 0,
             effects: effects.bits(),
             mutations,
             invoke: Some(invoke),
+            start: None,
+            poll: None,
+            cancel: None,
+            destroy_operation: None,
+        }
+    }
+
+    pub const fn new_async(
+        name: &'static str,
+        parameters: &'static [Type],
+        result: Type,
+        effects: super::Effects,
+        mutations: u64,
+        start: AsyncStartV3,
+        poll: AsyncPollV3,
+        cancel: AsyncCancelV3,
+        destroy_operation: AsyncDestroyV3,
+    ) -> Self {
+        Self {
+            size: size_of::<Self>() as u32,
+            name: Bytes::new(name.as_bytes()),
+            parameters: Bytes {
+                data: parameters.as_ptr().cast(),
+                len: parameters.len(),
+            },
+            result: result as u8,
+            asynchronous: 1,
+            effects: effects.bits(),
+            mutations,
+            invoke: None,
+            start: Some(start),
+            poll: Some(poll),
+            cancel: Some(cancel),
+            destroy_operation: Some(destroy_operation),
         }
     }
 }
 
 #[repr(C)]
-pub struct PluginV1 {
+pub struct PluginV3 {
     pub size: u32,
     pub version: u32,
     pub function_count: usize,
-    pub functions: *const FunctionV1,
+    pub functions: *const FunctionV3,
     pub create: Option<unsafe extern "C" fn(*mut *mut c_void) -> Status>,
     pub destroy: Option<unsafe extern "C" fn(*mut c_void)>,
 }
 // Plugin descriptors remain immutable and valid until the library unloads.
-unsafe impl Sync for PluginV1 {}
-impl PluginV1 {
-    pub const fn new(functions: &'static [FunctionV1]) -> Self {
+unsafe impl Sync for PluginV3 {}
+impl PluginV3 {
+    pub const fn new(functions: &'static [FunctionV3]) -> Self {
         Self {
             size: size_of::<Self>() as u32,
             version: VERSION,
@@ -140,10 +201,84 @@ impl PluginV1 {
 /// A borrowed call into the host. Handles and inspected views expire when the
 /// callback returns. This wrapper never permits VM reentry or retaining a view.
 pub struct PluginCall<'a> {
-    host: &'a HostV1,
+    host: &'a HostV3,
     context: *mut c_void,
     arguments: &'a [Handle],
 }
+/// A value view borrowed from one plugin callback. Its raw ABI pointers stay
+/// private; byte and string slices borrow this wrapper and cannot escape it.
+///
+/// ```compile_fail
+/// use cog::sdk::abi::{Handle, InspectedValue, PluginCall};
+///
+/// fn retain_view(call: &PluginCall<'_>, handle: Handle) -> InspectedValue<'static> {
+///     call.inspect(handle).unwrap()
+/// }
+/// ```
+pub struct InspectedValue<'call> {
+    view: ValueView,
+    _call: std::marker::PhantomData<&'call PluginCall<'call>>,
+}
+
+impl InspectedValue<'_> {
+    pub fn kind(&self) -> u32 {
+        self.view.kind
+    }
+
+    pub fn integer(&self) -> i64 {
+        self.view.integer as i64
+    }
+    pub fn unsigned_integer(&self) -> u64 {
+        self.view.integer
+    }
+
+    pub fn character(&self) -> Result<char, Error> {
+        if self.view.kind != Type::Char as u32 {
+            return Err(Error::new("expected char"));
+        }
+        let scalar = u32::try_from(self.view.integer).map_err(|_| Error::new("invalid char"))?;
+        char::from_u32(scalar).ok_or_else(|| Error::new("invalid char"))
+    }
+
+    pub fn number(&self) -> f64 {
+        self.view.number
+    }
+
+    pub fn len(&self) -> usize {
+        if self.view.kind == Type::Str as u32 || self.view.kind == Type::Bytes as u32 {
+            self.view.bytes.len
+        } else {
+            self.view.len
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn bytes(&self) -> Result<&[u8], Error> {
+        if self.view.kind != Type::Str as u32 && self.view.kind != Type::Bytes as u32 {
+            return Err(Error::new("expected string or bytes"));
+        }
+        if self.view.bytes.len == 0 {
+            return Ok(&[]);
+        }
+        if self.view.bytes.data.is_null() || self.view.bytes.len > isize::MAX as usize {
+            return Err(Error::new("invalid byte view"));
+        }
+        // The host roots inspected values until the callback returns. This
+        // wrapper's borrow is limited by the same callback-scoped lifetime.
+        Ok(unsafe { std::slice::from_raw_parts(self.view.bytes.data, self.view.bytes.len) })
+    }
+
+    pub fn string(&self) -> Result<&str, Error> {
+        if self.view.kind != Type::Str as u32 {
+            return Err(Error::new("expected str"));
+        }
+        std::str::from_utf8(self.bytes()?).map_err(|_| Error::new("host returned invalid UTF-8"))
+    }
+}
+
 impl PluginCall<'_> {
     pub fn argument(&self, index: usize) -> Result<Handle, Error> {
         self.arguments
@@ -158,37 +293,51 @@ impl PluginCall<'_> {
             Err(Error::new(format!("host operation failed ({status})")))
         }
     }
-    pub fn inspect(&self, value: Handle) -> Result<ValueView, Error> {
+    fn inspect_raw(&self, value: Handle) -> Result<ValueView, Error> {
         let mut result = ValueView::default();
         Self::status(unsafe { (self.host.inspect)(self.context, value, &mut result) })?;
         Ok(result)
     }
+
+    pub fn inspect(&self, value: Handle) -> Result<InspectedValue<'_>, Error> {
+        Ok(InspectedValue {
+            view: self.inspect_raw(value)?,
+            _call: std::marker::PhantomData,
+        })
+    }
+
     pub fn int(&self, value: Handle) -> Result<i64, Error> {
         let view = self.inspect(value)?;
-        if view.kind == Type::Int as u32 {
-            Ok(view.integer)
+        if view.kind() == Type::Int as u32 {
+            Ok(view.integer())
         } else {
             Err(Error::new("expected int"))
         }
     }
-    pub fn string(&self, value: Handle) -> Result<&str, Error> {
+    pub fn uint(&self, value: Handle) -> Result<u64, Error> {
         let view = self.inspect(value)?;
+        if view.kind() == Type::UInt as u32 {
+            Ok(view.unsigned_integer())
+        } else {
+            Err(Error::new("expected uint"))
+        }
+    }
+    pub fn character(&self, value: Handle) -> Result<char, Error> {
+        self.inspect(value)?.character()
+    }
+    pub fn string(&self, value: Handle) -> Result<&str, Error> {
+        let view = self.inspect_raw(value)?;
         if view.kind != Type::Str as u32 {
             return Err(Error::new("expected str"));
         }
-        // ABI v1 permits null pointers for empty views. Rust slices require a
-        // non-null pointer even when their length is zero.
         if view.bytes.len == 0 {
             return Ok("");
         }
-        // Host roots inspected strings throughout this call; this reference
-        // cannot outlive PluginCall. The ABI contract guarantees valid UTF-8.
-        Ok(unsafe {
-            std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                view.bytes.data,
-                view.bytes.len,
-            ))
-        })
+        if view.bytes.data.is_null() || view.bytes.len > isize::MAX as usize {
+            return Err(Error::new("invalid byte view"));
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(view.bytes.data, view.bytes.len) };
+        std::str::from_utf8(bytes).map_err(|_| Error::new("host returned invalid UTF-8"))
     }
     fn make(&self, value: ValueView) -> Result<Handle, Error> {
         let mut result = 0;
@@ -198,7 +347,14 @@ impl PluginCall<'_> {
     pub fn make_int(&self, value: i64) -> Result<Handle, Error> {
         self.make(ValueView {
             kind: Type::Int as u32,
-            integer: value,
+            integer: value as u64,
+            ..ValueView::default()
+        })
+    }
+    pub fn make_character(&self, value: char) -> Result<Handle, Error> {
+        self.make(ValueView {
+            kind: Type::Char as u32,
+            integer: value as u32 as u64,
             ..ValueView::default()
         })
     }
@@ -239,10 +395,10 @@ impl PluginCall<'_> {
 /// boundary. The host's normal panic hook may still run.
 ///
 /// # Safety
-/// The host table, context, argument array and output pointer must obey ABI v1
+/// The host table, context, argument array and output pointer must obey ABI v3
 /// and remain valid for this synchronous call. This does not catch aborts/OOM.
 pub unsafe fn dispatch(
-    host: *const HostV1,
+    host: *const HostV3,
     context: *mut c_void,
     arguments: *const Handle,
     count: usize,
@@ -259,7 +415,7 @@ pub unsafe fn dispatch(
     }
     // Read only the common header until the complete table has been checked.
     let size = unsafe { std::ptr::read(host.cast::<u32>()) };
-    if size != size_of::<HostV1>() as u32 {
+    if size != size_of::<HostV3>() as u32 {
         return INVALID;
     }
     let host = unsafe { &*host };
@@ -327,7 +483,7 @@ pub unsafe fn create_state<T: Default>(output: *mut *mut c_void) -> Status {
 /// Destroy plugin state while containing unwinding Drop panics.
 ///
 /// # Safety
-/// State must be null or a live pointer returned by create_state::<T> in this
+/// State must be null or a live pointer returned by `create_state::<T>` in this
 /// library. It must be destroyed once, after all calls have finished.
 pub unsafe fn destroy_state<T>(state: *mut c_void) {
     if !state.is_null() {
@@ -377,8 +533,11 @@ mod tests {
         unsafe extern "C" fn bytes(_: *mut c_void, _: Bytes) -> Status {
             INVALID
         }
-        let host = HostV1 {
-            size: size_of::<HostV1>() as u32,
+        unsafe extern "C" fn wake(_: *mut c_void) -> Status {
+            INVALID
+        }
+        let host = HostV3 {
+            size: size_of::<HostV3>() as u32,
             version: VERSION,
             inspect,
             make,
@@ -386,6 +545,7 @@ mod tests {
             array_set: set,
             write_output: bytes,
             set_error: bytes,
+            wake,
         };
         let mut context = 0u8;
         let call = PluginCall {
@@ -393,7 +553,14 @@ mod tests {
             context: (&mut context as *mut u8).cast(),
             arguments: &[],
         };
-        assert_eq!(call.string(0).unwrap(), "");
+        let empty = call.inspect(0).unwrap();
+        assert_eq!(empty.string().unwrap(), "");
+        assert!(empty.is_empty());
+        let text = call.inspect(1).unwrap();
+        assert_eq!(text.kind(), Type::Str as u32);
+        assert_eq!(text.len(), "Cog λ".len());
+        assert_eq!(text.bytes().unwrap(), "Cog λ".as_bytes());
+        assert_eq!(text.string().unwrap(), "Cog λ");
         assert_eq!(call.string(1).unwrap(), "Cog λ");
     }
 

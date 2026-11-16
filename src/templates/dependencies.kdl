@@ -3,5 +3,8 @@
 // Create the dependency directory before uncommenting a declaration:
 // geometry path="./packages/geometry"
 
+// Optional package installed in the user-local store:
+// arithmetic package="integer-math" version="0.1.0"
+
 // The alias selects a package for source imports: use module from geometry;
 // A successful cog build/run writes cog.lock; cog check does not write it.

@@ -4,7 +4,7 @@ use std::io::Cursor;
 
 fn compile(body: &str) -> cog::backend::CompiledProgram {
     let source = format!(
-        r#"include std; use err::Error;
+        r#"@!include("std") use err::Error;
         fn require(ok: bool) -> nil {{ if !ok {{ crash("assertion failed"); }} }}
         {body}"#
     );
@@ -162,7 +162,7 @@ fn trim_preserves_errors_and_surrounding_recovery() {
         fn fail() -> str { (1 / 0) as str }
         fn main() -> nil {
             const poisoned = fail();
-            const result = str::trim(poisoned);
+            const result = try { str::trim(poisoned) } catch(error) { error };
             when result is Error::DivisionByZero {} else { crash("lost original error"); }
             require((str::trim_start(fail()) ?! "fallback") == "fallback");
             try {
@@ -238,7 +238,7 @@ fn read_line_prompt_is_output_and_trim_only_removes_input_whitespace() {
 fn trim_validates_argument_types_and_keeps_helpers_private() {
     let error = project::compile_source(
         "bad_trim.cog",
-        "include std; use str; fn main() { str::trim(12); str::trim_start(nil); str::trim_end(false); str::replace(1, \"a\", \"b\"); }",
+        "@!include(\"std\") use str; fn main() { str::trim(12); str::trim_start(nil); str::trim_end(false); str::replace(1, \"a\", \"b\"); }",
     )
     .unwrap_err()
     .to_string();
@@ -246,7 +246,7 @@ fn trim_validates_argument_types_and_keeps_helpers_private() {
 
     let error = project::compile_source(
         "private_trim.cog",
-        "include std; use str; fn main() { str::trim_impl(\" x \", true, true); }",
+        "@!include(\"std\") use str; fn main() { str::trim_impl(\" x \", true, true); }",
     )
     .unwrap_err()
     .to_string();

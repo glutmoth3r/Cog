@@ -1,13 +1,22 @@
-include std;
+@!include("std")
 use io;
 use bytes;
-use process;
+use process::{run, run_sync};
 
-fn main() -> nil {
-    const child = process::run("echo", ["hello from child"])!!;
+@async fn main() -> nil {
+    const child = await run("echo", ["hello from child"])!!;
     if !child.success {
         crash("Child exited unsuccessfully");
     }
     const text = bytes::to_str(child.stdout, 0, bytes::len(child.stdout))!!;
     io::print(text)!!;
+
+    const synchronous = run_sync("echo", ["explicit blocking run"])!!;
+    if !synchronous.success {
+        crash("Blocking process capture failed");
+    }
+    const sync_text = bytes::to_str(
+        synchronous.stdout, 0, bytes::len(synchronous.stdout)
+    )!!;
+    io::print(sync_text)!!;
 }

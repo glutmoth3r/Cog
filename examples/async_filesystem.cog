@@ -1,0 +1,29 @@
+@!include("std")
+use async::fs;
+use io;
+
+@async fn main() -> nil {
+    const root = ".cog-async-filesystem-demo";
+    await fs::create_dir(root);
+
+    const source = root + "/source.txt";
+    const parallel = root + "/parallel.txt";
+    const copied = root + "/copied.txt";
+    const renamed = root + "/renamed.txt";
+
+    const source_write = spawn(fs::write_text(source, "written concurrently\n"));
+    const parallel_write = spawn(fs::write_text(parallel, "another worker job\n"));
+    await source_write;
+    await parallel_write;
+
+    const bytes: uint = await fs::copy(source, copied);
+    await fs::rename(copied, renamed);
+    const text: str = await fs::read_text(renamed);
+    io::println($"copied {bytes} bytes");
+    io::println(text);
+
+    await fs::remove_file(source);
+    await fs::remove_file(parallel);
+    await fs::remove_file(renamed);
+    await fs::remove_dir(root);
+}

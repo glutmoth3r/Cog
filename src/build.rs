@@ -67,38 +67,61 @@ fn fingerprint(prepared: &mut Prepared, compiler: Hash) -> Result<Hash, String> 
             Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
         }
     }
-    let mut source_bytes = 0usize;
+    snapshot_sources(prepared)?;
     for ((package, module), source) in &mut prepared.sources {
         field(&mut hasher, b"module");
         field(&mut hasher, &(*package as u64).to_le_bytes());
         field(&mut hasher, module.as_bytes());
         match source {
-            Source::File(path) => {
-                let path = path.clone();
-                let bytes = crate::limits::read_source(&path)
-                    .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-                source_bytes = charge_source_bytes(source_bytes, bytes.len())?;
-                field(&mut hasher, b"file");
-                field(&mut hasher, path.as_os_str().as_encoded_bytes());
-                field(&mut hasher, &bytes);
-                *source = Source::Snapshot(path, bytes);
-            }
             Source::Snapshot(path, bytes) => {
-                source_bytes = charge_source_bytes(source_bytes, bytes.len())?;
                 field(&mut hasher, b"file");
                 field(&mut hasher, path.as_os_str().as_encoded_bytes());
                 field(&mut hasher, bytes);
             }
             Source::Embedded(name, text) => {
-                source_bytes = charge_source_bytes(source_bytes, text.len())?;
                 field(&mut hasher, b"embedded");
                 field(&mut hasher, name.as_bytes());
                 field(&mut hasher, text.as_bytes());
+            }
+            Source::File(_) => {
+                return Err("internal error: build source was not snapshotted".into());
             }
             Source::Empty => field(&mut hasher, b"namespace"),
         }
     }
     Ok(hasher.finalize())
+}
+
+/// Freeze discovered source files before compilation or packaging. Consumers
+/// then validate and emit the exact bytes captured here, even if files change
+/// while the build is in progress.
+pub(crate) fn snapshot_sources(prepared: &mut Prepared) -> Result<(), String> {
+    snapshot_source_values(prepared.sources.values_mut())
+}
+
+fn snapshot_source_values<'a>(
+    sources: impl IntoIterator<Item = &'a mut Source>,
+) -> Result<(), String> {
+    let mut source_bytes = 0usize;
+    for source in sources {
+        match source {
+            Source::File(path) => {
+                let path = path.clone();
+                let bytes = crate::limits::read_source(&path)
+                    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+                source_bytes = charge_source_bytes(source_bytes, bytes.len())?;
+                *source = Source::Snapshot(path, bytes);
+            }
+            Source::Snapshot(_, bytes) => {
+                source_bytes = charge_source_bytes(source_bytes, bytes.len())?;
+            }
+            Source::Embedded(_, text) => {
+                source_bytes = charge_source_bytes(source_bytes, text.len())?;
+            }
+            Source::Empty => {}
+        }
+    }
+    Ok(())
 }
 
 fn charge_source_bytes(current: usize, additional: usize) -> Result<usize, String> {
@@ -160,6 +183,10 @@ pub fn project_with_warnings(
     mut prepared: Prepared,
     artifact: &Path,
 ) -> Result<(Built, Vec<crate::diagnostic::Diagnostic>), String> {
+    if prepared.kind == crate::config::PackageKind::Library {
+        return Err("cannot build a library package as an executable".into());
+    }
+    protect_project_inputs(&prepared, artifact)?;
     let cache = cache_path(&prepared, artifact)?;
     let inputs = fingerprint(&mut prepared, compiler_hash()?)?;
     let dependency_path = cache.with_extension("deps");
@@ -206,6 +233,103 @@ pub fn project_with_warnings(
     ))
 }
 
+fn protect_project_inputs(prepared: &Prepared, artifact: &Path) -> Result<(), String> {
+    let output = resolve_build_path(artifact)?;
+    let sources = prepared
+        .sources
+        .values()
+        .filter_map(|source| match source {
+            Source::File(path) | Source::Snapshot(path, _) => Some(path.clone()),
+            _ => None,
+        })
+        .chain(prepared.assets.iter().map(|(root, path)| root.join(path)))
+        .chain(
+            prepared
+                .plugins
+                .iter()
+                .map(|(root, plugin)| root.join(&plugin.library)),
+        );
+    let lock = prepared.root.join("cog.lock");
+    for input in sources {
+        let input = resolve_build_path(&input)?;
+        if same_build_path(&input, &output) {
+            return Err(format!(
+                "output would overwrite a project input: {}",
+                artifact.display()
+            ));
+        }
+    }
+    for input in prepared.manifests.iter().chain(std::iter::once(&lock)) {
+        let input = resolve_build_path(input)?;
+        // Reserve configuration names even before the file exists, including
+        // ASCII case variants that would alias it on common target filesystems.
+        let configuration_alias =
+            input
+                .file_name()
+                .zip(output.file_name())
+                .is_some_and(|(left, right)| {
+                    left.as_encoded_bytes()
+                        .eq_ignore_ascii_case(right.as_encoded_bytes())
+                })
+                && input
+                    .parent()
+                    .zip(output.parent())
+                    .is_some_and(|(left, right)| same_build_path(left, right));
+        if configuration_alias || same_build_path(&input, &output) {
+            return Err(format!(
+                "output would overwrite a project input: {}",
+                artifact.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn resolve_build_path(path: &Path) -> Result<PathBuf, String> {
+    let absolute = std::path::absolute(path)
+        .map_err(|error| format!("cannot resolve build path {}: {error}", path.display()))?;
+    for ancestor in absolute.ancestors() {
+        if let Ok(mut resolved) = ancestor.canonicalize() {
+            // Resolve existing symlinks first, then normalize the suffix that
+            // atomic_write may create. This also protects missing manifests and
+            // inputs reached via a not-yet-created `directory/../source` path.
+            for component in absolute.strip_prefix(ancestor).unwrap().components() {
+                match component {
+                    std::path::Component::ParentDir => {
+                        resolved.pop();
+                    }
+                    std::path::Component::CurDir => {}
+                    component => resolved.push(component.as_os_str()),
+                }
+            }
+            return Ok(resolved.canonicalize().unwrap_or(resolved));
+        }
+    }
+    Err(format!("cannot resolve build path {}", path.display()))
+}
+
+pub(crate) fn same_build_path(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    #[cfg(windows)]
+    if left
+        .as_os_str()
+        .as_encoded_bytes()
+        .eq_ignore_ascii_case(right.as_os_str().as_encoded_bytes())
+    {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(left), Ok(right)) = (left.metadata(), right.metadata()) {
+            return left.dev() == right.dev() && left.ino() == right.ino();
+        }
+    }
+    false
+}
+
 fn with_dependencies(inputs: Hash, dependencies: &[u8]) -> Hash {
     let mut hash = Hasher::new();
     field(&mut hash, b"cog-build-inputs-v2");
@@ -244,4 +368,35 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
         return Err(format!("cannot write {}: {e}", path.display()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::snapshot_source_values;
+    use crate::resolver::Source;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn source_snapshot_keeps_the_bytes_that_were_read() {
+        let path = std::env::temp_dir().join(format!(
+            "cog-source-snapshot-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, b"checked source").unwrap();
+        let mut sources = [Source::File(path.clone())];
+        snapshot_source_values(sources.iter_mut()).unwrap();
+
+        std::fs::write(&path, b"changed source").unwrap();
+        match &sources[0] {
+            Source::Snapshot(snapshot_path, bytes) => {
+                assert_eq!(snapshot_path, &path);
+                assert_eq!(bytes, b"checked source");
+            }
+            _ => panic!("source file was not frozen"),
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 }

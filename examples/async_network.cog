@@ -1,0 +1,18 @@
+@!include("std")
+use bytes;
+use io;
+use async::net;
+
+@async fn exchange(payload: str) -> str {
+    const sent = bytes::from_str(payload)!!;
+    const response = await net::exchange("127.0.0.1", 18765, sent, 5000);
+    return bytes::to_str(response, 0, bytes::len(response)!!)!!;
+}
+
+@async fn main() -> nil {
+    const first = spawn(exchange("first"));
+    const second = spawn(exchange("second"));
+
+    io::println(await first)!!;
+    io::println(await second)!!;
+}

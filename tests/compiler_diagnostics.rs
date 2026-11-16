@@ -17,28 +17,23 @@ fn parser_diagnostics_describe_source_tokens_without_debug_names() {
     assert!(message.contains("expected `;`, found `}`"), "{message}");
     assert!(!message.contains("RBrace"), "{message}");
 
-    let invalid_path = frontend::parse("invalid-path.cog", "include game from target;");
-    let message = &invalid_path.diagnostics[0].message;
+    let legacy_include = frontend::parse("legacy-include.cog", "include game from target;");
+    let message = &legacy_include.diagnostics[0].message;
     assert!(
-        message.contains("expected a relative path after `from`, found identifier `target`"),
+        message.contains("legacy package inclusion was removed"),
         "{message}"
     );
     assert!(!message.contains("Ident("), "{message}");
 }
 
 #[test]
-fn comptime_prefix_before_include_is_rejected_with_a_directive_diagnostic() {
-    let errors = diagnostics("comptime include std; fn main() {}");
-    assert_eq!(errors.len(), 1, "{errors:?}");
-    assert!(
-        errors[0]
-            .message
-            .contains("`comptime` cannot precede `include`")
-    );
+fn legacy_comptime_function_syntax_is_rejected() {
+    let parsed = frontend::parse("legacy-comptime.cog", "comptime fn main() {}");
+    assert!(!parsed.diagnostics.is_empty());
 }
 
 fn run(source: &str) -> String {
-    let source = format!("include std; use io::println; use err::Error;\n{source}");
+    let source = format!("@!include(\"std\") use io::println; use err::Error;\n{source}");
     let instructions =
         cog::project::compile_source("test.cog", &source).unwrap_or_else(|e| panic!("{e}"));
     let mut output = Vec::new();
@@ -229,7 +224,7 @@ fn parser_recovers_multiple_declarations_and_poisons_failed_bindings() {
 fn lexer_reports_independent_errors_without_duplicate_parser_messages() {
     let errors = diagnostics("fn main() { const a = @; const b = ~; const c: int = false; }");
     assert_eq!(errors.len(), 3, "{errors:?}");
-    assert_eq!(errors.iter().filter(|d| d.code == "E0001").count(), 2);
+    assert_eq!(errors.iter().filter(|d| d.code == "E0001").count(), 1);
 }
 
 #[test]
@@ -258,7 +253,7 @@ fn diagnostic_source_excerpts_do_not_repeat_an_entire_long_line() {
         "source excerpt expanded to {} bytes",
         rendered.len()
     );
-    assert!(rendered.contains("long-line.cog:1:262145"));
+    assert!(rendered.contains("long-line.cog:1:262146"), "{rendered}");
     assert!(rendered.contains("..."));
 }
 

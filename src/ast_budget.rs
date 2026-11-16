@@ -2,6 +2,64 @@
 use crate::ast::*;
 
 pub(crate) const MAX_COST: usize = 64 * 1024 * 1024;
+const NODE_COST: usize = 256;
+const MAX_PENDING_NODES: usize = MAX_COST / NODE_COST;
+
+struct Pending<'a> {
+    nodes: Vec<Node<'a>>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl<'a> Pending<'a> {
+    fn new(limit: usize) -> Self {
+        Self {
+            nodes: Vec::new(),
+            limit,
+            exceeded: false,
+        }
+    }
+
+    fn reserve(&mut self, additional: usize) -> bool {
+        if self.exceeded {
+            return false;
+        }
+        if additional > self.limit.saturating_sub(self.nodes.len())
+            || self.nodes.try_reserve(additional).is_err()
+        {
+            self.exceeded = true;
+            return false;
+        }
+        true
+    }
+
+    fn push(&mut self, node: Node<'a>) {
+        if self.reserve(1) {
+            self.nodes.push(node);
+        }
+    }
+
+    fn extend(&mut self, nodes: impl IntoIterator<Item = Node<'a>>) {
+        let nodes = nodes.into_iter();
+        let (lower, upper) = nodes.size_hint();
+        if let Some(count) = upper.filter(|upper| *upper == lower) {
+            if self.reserve(count) {
+                self.nodes.extend(nodes);
+            }
+            return;
+        }
+        for node in nodes {
+            self.push(node);
+            if self.exceeded {
+                break;
+            }
+        }
+    }
+
+    fn pop(&mut self) -> Option<Node<'a>> {
+        self.nodes.pop()
+    }
+}
 
 enum Node<'a> {
     Item(&'a Item),
@@ -10,30 +68,43 @@ enum Node<'a> {
     Block(&'a Block),
     Stmt(&'a Stmt),
     Expr(&'a Expr),
+    BindingPattern(&'a BindingPattern),
     Type(&'a TypeAnnotation, usize),
 }
 
 pub(crate) fn program(program: &Program) -> Result<usize, String> {
-    measure(program.items.iter().map(Node::Item).collect())
+    measure(program.items.iter().map(Node::Item))
 }
 
 pub(crate) fn item(item: &Item) -> Result<usize, String> {
-    measure(vec![Node::Item(item)])
+    measure(std::iter::once(Node::Item(item)))
 }
 pub(crate) fn function(function: &FunctionDecl) -> Result<usize, String> {
-    measure(vec![Node::Function(function)])
+    measure(std::iter::once(Node::Function(function)))
 }
 pub(crate) fn fields(fields: &[StructField]) -> Result<usize, String> {
-    measure(fields.iter().map(Node::Field).collect())
+    measure(fields.iter().map(Node::Field))
 }
 pub(crate) fn annotation(ty: &TypeAnnotation) -> Result<usize, String> {
-    measure(vec![Node::Type(ty, 0)])
+    measure(std::iter::once(Node::Type(ty, 0)))
 }
 
-fn measure(mut pending: Vec<Node<'_>>) -> Result<usize, String> {
+fn measure<'a>(nodes: impl IntoIterator<Item = Node<'a>>) -> Result<usize, String> {
+    measure_with_pending_limit(nodes, MAX_PENDING_NODES)
+}
+
+fn measure_with_pending_limit<'a>(
+    nodes: impl IntoIterator<Item = Node<'a>>,
+    pending_limit: usize,
+) -> Result<usize, String> {
+    let mut pending = Pending::new(pending_limit);
+    pending.extend(nodes);
+    if pending.exceeded {
+        return Err("compiler syntax accounting queue budget exceeded".into());
+    }
     let mut cost = 0usize;
     while let Some(node) = pending.pop() {
-        cost = cost.saturating_add(256);
+        cost = cost.saturating_add(NODE_COST);
         match node {
             Node::Item(item) => match item {
                 Item::Function(function) => pending.push(Node::Function(function)),
@@ -116,9 +187,14 @@ fn measure(mut pending: Vec<Node<'_>>) -> Result<usize, String> {
             }
             Node::Stmt(stmt) => match stmt {
                 Stmt::Located(_, inner) => pending.push(Node::Stmt(inner)),
-                Stmt::VarDecl { name, ty, value }
-                | Stmt::Const { name, ty, value }
-                | Stmt::Comptime { name, ty, value } => {
+                Stmt::VarDecl { pattern, ty, value } | Stmt::Const { pattern, ty, value } => {
+                    pending.push(Node::BindingPattern(pattern));
+                    if let Some(ty) = ty {
+                        pending.push(Node::Type(ty, 0));
+                    }
+                    pending.push(Node::Expr(value));
+                }
+                Stmt::Comptime { name, ty, value } => {
                     cost = cost.saturating_add(name.len());
                     if let Some(ty) = ty {
                         pending.push(Node::Type(ty, 0));
@@ -176,15 +252,45 @@ fn measure(mut pending: Vec<Node<'_>>) -> Result<usize, String> {
                     }
                 }
                 Stmt::ForEach {
-                    var,
+                    pattern,
                     iterable,
                     body,
                 } => {
-                    cost = cost.saturating_add(var.len());
+                    pending.push(Node::BindingPattern(pattern));
                     pending.push(Node::Expr(iterable));
                     pending.push(Node::Block(body));
                 }
+                Stmt::ForZip { clauses, body } => {
+                    pending.push(Node::Block(body));
+                    for clause in clauses {
+                        match clause {
+                            ForClause::Range {
+                                var,
+                                start,
+                                end,
+                                step,
+                            } => {
+                                cost = cost.saturating_add(var.len());
+                                pending.push(Node::Expr(start));
+                                pending.push(Node::Expr(end));
+                                if let Some(step) = step {
+                                    pending.push(Node::Expr(step));
+                                }
+                            }
+                            ForClause::Each { pattern, iterable } => {
+                                pending.push(Node::BindingPattern(pattern));
+                                pending.push(Node::Expr(iterable));
+                            }
+                        }
+                    }
+                }
                 _ => {}
+            },
+            Node::BindingPattern(pattern) => match pattern {
+                BindingPattern::Name(name) => cost = cost.saturating_add(name.len()),
+                BindingPattern::Tuple(items) => {
+                    pending.extend(items.iter().map(Node::BindingPattern));
+                }
             },
             Node::Expr(expr) => match expr {
                 Expr::Str(text) | Expr::Ident(text) => cost = cost.saturating_add(text.len()),
@@ -219,6 +325,17 @@ fn measure(mut pending: Vec<Node<'_>>) -> Result<usize, String> {
                     if let Expr::SpecializedCall(_, types, _) = expr {
                         pending.extend(types.iter().map(|ty| Node::Type(ty, 0)));
                     }
+                }
+                Expr::AssociatedCall {
+                    target,
+                    method,
+                    type_arguments,
+                    args,
+                } => {
+                    cost = cost.saturating_add(method.len());
+                    pending.push(Node::Type(target, 0));
+                    pending.extend(type_arguments.iter().map(|ty| Node::Type(ty, 0)));
+                    pending.extend(args.iter().map(|argument| Node::Expr(&argument.value)));
                 }
                 Expr::BracketApply(receiver, args) | Expr::MethodCall(receiver, _, args) => {
                     pending.push(Node::Expr(receiver));
@@ -299,9 +416,26 @@ fn measure(mut pending: Vec<Node<'_>>) -> Result<usize, String> {
                 }
             }
         }
+        if pending.exceeded {
+            return Err("compiler syntax accounting queue budget exceeded".into());
+        }
         if cost > MAX_COST {
             return Err("compiler syntax allocation budget (64 MiB) exceeded".into());
         }
     }
     Ok(cost)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Node, measure_with_pending_limit};
+    use crate::ast::Expr;
+
+    #[test]
+    fn wide_ast_is_rejected_before_its_work_queue_exceeds_the_budget() {
+        let expression = Expr::Array(vec![Expr::Bool(false); 3]);
+        let error =
+            measure_with_pending_limit(std::iter::once(Node::Expr(&expression)), 2).unwrap_err();
+        assert_eq!(error, "compiler syntax accounting queue budget exceeded");
+    }
 }

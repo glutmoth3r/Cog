@@ -1,17 +1,22 @@
-//! Owned embedding API and synchronous native registration for SDK ABI v1.
+//! Owned embedding API, synchronous Rust registration and C ABI v3 plugins.
 //! Engines, programs and values are thread confined. Native code is trusted.
 use crate::runtime::{NativeRegistry, RegisteredNative, RuntimeContext, VmCapabilities};
 use crate::value::Value as VmValue;
 use std::cell::Cell;
 use std::fmt;
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 pub mod abi;
 mod plugin;
 pub use plugin::PluginManifest;
 
-pub const ABI_VERSION: u16 = 1;
+pub const ABI_VERSION: u16 = 3;
+
+pub(crate) fn supports_plugin_target(target: &str) -> bool {
+    plugin::SUPPORTED_PLUGIN_TARGETS.contains(&target)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorKind {
@@ -60,6 +65,7 @@ impl std::error::Error for Error {}
 pub enum Type {
     Any = 0,
     Int = 1,
+    UInt = 14,
     Str = 2,
     Bytes = 3,
     Handle = 4,
@@ -70,6 +76,7 @@ pub enum Type {
     Float = 9,
     Bool = 10,
     StrBuf = 11,
+    Char = 13,
 }
 impl Type {
     fn runtime(self) -> crate::runtime::NativeType {
@@ -77,6 +84,7 @@ impl Type {
         match self {
             Self::Any => N::Any,
             Self::Int => N::Int,
+            Self::UInt => N::UInt,
             Self::Str => N::Str,
             Self::Bytes => N::Bytes,
             Self::Handle => N::Handle,
@@ -86,6 +94,7 @@ impl Type {
             Self::Record => N::Record,
             Self::Float => N::Float,
             Self::Bool => N::Bool,
+            Self::Char => N::Char,
             Self::StrBuf => N::StrBuf,
         }
     }
@@ -106,7 +115,8 @@ impl Effects {
     pub const CLOCK: Self = Self(1 << 6);
     pub const SLEEP: Self = Self(1 << 7);
     pub const ENTROPY: Self = Self(1 << 8);
-    pub const ALL: Self = Self((1 << 9) - 1);
+    pub const NETWORK: Self = Self(1 << 9);
+    pub const ALL: Self = Self((1 << 10) - 1);
     pub const fn bits(self) -> u16 {
         self.0
     }
@@ -153,6 +163,7 @@ impl Permissions {
             allow_read: has(Effects::INPUT),
             allow_fs_read: has(Effects::FS_READ),
             allow_fs_write: has(Effects::FS_WRITE),
+            allow_network: has(Effects::NETWORK),
             allow_exec: has(Effects::PROCESS),
             allow_process_info: has(Effects::PROCESS_INFO),
             allow_time: has(Effects::CLOCK),
@@ -173,6 +184,7 @@ impl Permissions {
             (capabilities.allow_time, Effects::CLOCK),
             (capabilities.allow_sleep, Effects::SLEEP),
             (capabilities.allow_random, Effects::ENTROPY),
+            (capabilities.allow_network, Effects::NETWORK),
         ] {
             if enabled {
                 allowed = allowed | effect;
@@ -191,6 +203,7 @@ impl Default for Permissions {
 pub struct Signature {
     pub parameters: Vec<Type>,
     pub result: Type,
+    pub asynchronous: bool,
     pub effects: Effects,
     pub mutating_parameters: Vec<usize>,
 }
@@ -199,9 +212,14 @@ impl Signature {
         Self {
             parameters,
             result,
+            asynchronous: false,
             effects: Effects::PURE,
             mutating_parameters: Vec::new(),
         }
+    }
+    pub fn with_async(mut self) -> Self {
+        self.asynchronous = true;
+        self
     }
     pub fn with_effects(mut self, effects: Effects) -> Self {
         self.effects = effects;
@@ -240,6 +258,7 @@ impl Signature {
             hasher.update(&[*parameter as u8]);
         }
         hasher.update(&[self.result as u8]);
+        hasher.update(&[u8::from(self.asynchronous)]);
         hasher.update(&self.effects.bits().to_le_bytes());
         let mutations = self
             .mutating_parameters
@@ -252,6 +271,8 @@ impl Signature {
 
 /// An owned Cog value. Cloning retains a graph root and preserves shared aliases.
 /// Resource handles retain their context/generation checks; no host pointer is exposed.
+/// Callable values can only be invoked by the exact [`Program`] that produced
+/// them, including when retained across that program's runs.
 #[derive(Clone)]
 pub struct Value(pub(crate) VmValue);
 impl fmt::Debug for Value {
@@ -266,11 +287,17 @@ impl Value {
     pub fn int(value: i64) -> Self {
         Self(VmValue::Int(value))
     }
+    pub fn uint(value: u64) -> Self {
+        Self(VmValue::UInt(value))
+    }
     pub fn float(value: f64) -> Self {
         Self(VmValue::Float(value))
     }
     pub fn boolean(value: bool) -> Self {
         Self(VmValue::Bool(value))
+    }
+    pub fn character(value: char) -> Self {
+        Self(VmValue::Char(value))
     }
     pub fn string(value: impl AsRef<str>) -> Self {
         Self(VmValue::Str(Rc::from(value.as_ref())))
@@ -280,6 +307,13 @@ impl Value {
             Ok(value)
         } else {
             Err(Error::new("expected int"))
+        }
+    }
+    pub fn as_uint(&self) -> Result<u64, Error> {
+        if let VmValue::UInt(value) = self.0 {
+            Ok(value)
+        } else {
+            Err(Error::new("expected uint"))
         }
     }
     pub fn as_float(&self) -> Result<f64, Error> {
@@ -294,6 +328,13 @@ impl Value {
             Ok(value)
         } else {
             Err(Error::new("expected bool"))
+        }
+    }
+    pub fn as_char(&self) -> Result<char, Error> {
+        if let VmValue::Char(value) = self.0 {
+            Ok(value)
+        } else {
+            Err(Error::new("expected char"))
         }
     }
     pub fn as_str(&self) -> Result<&str, Error> {
@@ -346,6 +387,8 @@ pub struct Limits {
     pub max_buffer_bytes: Option<usize>,
     /// Optional live host resource-slot cap, including standard streams.
     pub max_resources: Option<usize>,
+    /// Optional arbitrary-precision integer digit cap.
+    pub max_numeric_digits: Option<usize>,
     pub max_steps: Option<u64>,
     pub max_operand_values: Option<usize>,
     pub max_call_frames: Option<usize>,
@@ -358,6 +401,7 @@ impl Default for Limits {
         Self {
             max_buffer_bytes: limits.max_buffer_bytes,
             max_resources: limits.max_resources,
+            max_numeric_digits: limits.max_numeric_digits,
             max_steps: None,
             max_operand_values: None,
             max_call_frames: None,
@@ -371,6 +415,7 @@ impl Limits {
         crate::runtime::RuntimeLimits {
             max_buffer_bytes: self.max_buffer_bytes,
             max_resources: self.max_resources,
+            max_numeric_digits: self.max_numeric_digits,
             max_steps: self.max_steps,
             max_operand_values: self.max_operand_values,
             max_call_frames: self.max_call_frames,
@@ -386,12 +431,12 @@ pub struct RunContext<'a> {
     inner: RuntimeContext<'a>,
 }
 impl<'a> RunContext<'a> {
-    pub fn new(output: &'a mut dyn Write) -> Self {
+    pub fn new(output: &'a mut (dyn Write + Send)) -> Self {
         Self {
             inner: RuntimeContext::new(output, VmCapabilities::default()),
         }
     }
-    pub fn with_input(output: &'a mut dyn Write, input: impl Read + 'a) -> Self {
+    pub fn with_input(output: &'a mut (dyn Write + Send), input: impl Read + Send + 'a) -> Self {
         Self {
             inner: RuntimeContext::with_input(output, Box::new(input), VmCapabilities::default()),
         }
@@ -402,6 +447,24 @@ impl<'a> RunContext<'a> {
     }
     pub fn with_limits(mut self, limits: Limits) -> Self {
         self.inner.limits = limits.runtime();
+        self
+    }
+    /// Enable Cog's experimental adaptive Cranelift JIT for eligible loops.
+    /// Any configured runtime limit keeps execution in the interpreter.
+    pub fn with_jit(mut self, enabled: bool) -> Self {
+        self.inner.configure_jit(enabled, None, false);
+        self
+    }
+    /// Store advisory APE measurements at `path` when JIT is enabled.
+    pub fn with_jit_profile_path(mut self, path: impl AsRef<Path>) -> Self {
+        if self.inner.jit_enabled {
+            self.inner.jit_profile_path = Some(PathBuf::from(path.as_ref()));
+        }
+        self
+    }
+    /// Print JIT selection, calibration, and fallback diagnostics to stderr.
+    pub fn with_jit_debug(mut self, enabled: bool) -> Self {
+        self.inner.jit_debug = self.inner.jit_enabled && enabled;
         self
     }
     /// Set the arguments available to `process::args` and `fn main(args: str[])`.
@@ -458,6 +521,12 @@ impl Engine {
         signature: Signature,
         callback: impl Fn(&mut NativeContext<'_, '_>, &[Value]) -> Result<Value, Error> + 'static,
     ) -> Result<(), Error> {
+        if signature.asynchronous {
+            return Err(Error::at(
+                ErrorKind::Registration,
+                "async native functions require a plugin async callback",
+            ));
+        }
         let label = name.to_owned();
         let effects = signature.effects;
         let invoke: Rc<crate::runtime::NativeCallback> = Rc::new(move |context, arguments| {
@@ -515,6 +584,31 @@ impl Engine {
         signature: Signature,
         invoke: Option<Rc<crate::runtime::NativeCallback>>,
     ) -> Result<(), Error> {
+        self.insert_with_async_factory(name, signature, invoke, None)
+    }
+
+    pub(super) fn register_async_plugin(
+        &mut self,
+        name: &str,
+        signature: Signature,
+        factory: Rc<dyn crate::runtime::NativeAsyncFactory>,
+    ) -> Result<(), Error> {
+        if !signature.asynchronous {
+            return Err(Error::at(
+                ErrorKind::Registration,
+                "async plugin callback requires an async signature",
+            ));
+        }
+        self.insert_with_async_factory(name, signature, None, Some(factory))
+    }
+
+    fn insert_with_async_factory(
+        &mut self,
+        name: &str,
+        signature: Signature,
+        invoke: Option<Rc<crate::runtime::NativeCallback>>,
+        async_factory: Option<Rc<dyn crate::runtime::NativeAsyncFactory>>,
+    ) -> Result<(), Error> {
         entry_allowed()?;
         let identity = signature.identity(name)?;
         if crate::runtime::builtin_module(name.split_once("::").unwrap().0)
@@ -537,7 +631,9 @@ impl Engine {
                 .collect(),
             result: signature.result.runtime(),
             mutating_parameters: signature.mutating_parameters,
+            asynchronous: signature.asynchronous,
             invoke,
+            async_factory,
         });
         let registry = Rc::make_mut(&mut self.registry);
         registry.names.insert(name.to_owned(), function.clone());
@@ -549,7 +645,7 @@ impl Engine {
         crate::runtime::with_registry(self.registry.clone(), || {
             crate::project::compile_source(name, source)
         })
-        .map(|inner| Program { inner })
+        .map(Program::new)
         .map_err(|error| Error::at(ErrorKind::Compilation, error))
     }
     pub fn compile_project(
@@ -564,21 +660,103 @@ impl Engine {
                 .map_err(|errors| crate::frontend::render(&errors))?;
             loaded.compile()
         })
-        .map(|inner| Program { inner })
+        .map(Program::new)
+        .map_err(|error| Error::at(ErrorKind::Compilation, error))
+    }
+    /// Compile a project already prepared by the project resolver, using this
+    /// engine's registered native metadata.
+    pub fn compile_prepared(&self, prepared: crate::project::Prepared) -> Result<Program, Error> {
+        self.compile_prepared_with_warnings(prepared)
+            .map(|(program, _)| program)
+    }
+    pub(crate) fn compile_prepared_with_warnings(
+        &self,
+        prepared: crate::project::Prepared,
+    ) -> Result<(Program, Vec<crate::diagnostic::Diagnostic>), Error> {
+        entry_allowed()?;
+        crate::runtime::with_registry(self.registry.clone(), || {
+            let loaded = prepared.resolve();
+            crate::project::compile_with_inputs_and_warnings(
+                loaded.program,
+                loaded.diagnostics,
+                &loaded.names,
+                &loaded.build_inputs,
+            )
+        })
+        .map(|(program, warnings)| (Program::new(program), warnings))
+        .map_err(|error| Error::at(ErrorKind::Compilation, error))
+    }
+    /// Check a library package with this engine's registered native metadata.
+    /// It validates source/code generation without requiring an executable
+    /// entry point or writing bytecode, and returns compiler warnings.
+    pub fn check_library_project(
+        &self,
+        path: &std::path::Path,
+        locked: bool,
+    ) -> Result<Vec<crate::diagnostic::Diagnostic>, Error> {
+        entry_allowed()?;
+        crate::runtime::with_registry(self.registry.clone(), || {
+            let prepared = crate::project::prepare(path, None, locked)
+                .map_err(|errors| crate::frontend::render(&errors))?;
+            if prepared.kind != crate::config::PackageKind::Library {
+                return Err("check_library_project requires a library package".to_owned());
+            }
+            let loaded = prepared.resolve();
+            crate::project::check_with_inputs_and_warnings(
+                loaded.program,
+                loaded.diagnostics,
+                &loaded.names,
+                &loaded.build_inputs,
+            )
+        })
+        .map_err(|error| Error::at(ErrorKind::Compilation, error))
+    }
+    /// Check a prepared library package with this engine's registered native
+    /// metadata, without generating bytecode or requiring `main`.
+    pub fn check_library_prepared(
+        &self,
+        prepared: crate::project::Prepared,
+    ) -> Result<Vec<crate::diagnostic::Diagnostic>, Error> {
+        entry_allowed()?;
+        crate::runtime::with_registry(self.registry.clone(), || {
+            if prepared.kind != crate::config::PackageKind::Library {
+                return Err("check_library_prepared requires a library package".to_owned());
+            }
+            let loaded = prepared.resolve();
+            crate::project::check_with_inputs_and_warnings(
+                loaded.program,
+                loaded.diagnostics,
+                &loaded.names,
+                &loaded.build_inputs,
+            )
+        })
         .map_err(|error| Error::at(ErrorKind::Compilation, error))
     }
     pub fn decode(&self, bytes: &[u8]) -> Result<Program, Error> {
         entry_allowed()?;
         crate::runtime::with_registry(self.registry.clone(), || crate::bytecode::decode(bytes))
-            .map(|inner| Program { inner })
+            .map(Program::new)
             .map_err(|error| Error::at(ErrorKind::Bytecode, error))
     }
 }
 
+/// An immutable executable instance. Retained callable values remain valid
+/// across runs of this instance, but not in independently decoded instances.
 pub struct Program {
     inner: crate::backend::CompiledProgram,
+    callable_owner: Rc<()>,
+    execution_plan: Rc<crate::interpreter::VmExecutionPlan>,
 }
 impl Program {
+    fn new(inner: crate::backend::CompiledProgram) -> Self {
+        let execution_plan = crate::interpreter::prepare_execution_plan(&inner);
+        Self {
+            inner,
+            callable_owner: Rc::new(()),
+            execution_plan,
+        }
+    }
+
     pub fn disassemble(&self) -> String {
         self.inner.disassemble()
     }
@@ -589,7 +767,7 @@ impl Program {
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
         crate::bytecode::encode(&self.inner).map_err(|error| Error::at(ErrorKind::Bytecode, error))
     }
-    pub fn run(&self, output: &mut dyn Write) -> Result<(), Error> {
+    pub fn run(&self, output: &mut (dyn Write + Send)) -> Result<(), Error> {
         self.run_in(&mut RunContext::new(output))
     }
     pub fn run_in(&self, context: &mut RunContext<'_>) -> Result<(), Error> {
@@ -600,8 +778,13 @@ impl Program {
                 format!("native import `{}` is not linked", import.name()),
             ));
         }
-        crate::interpreter::run_with_context(&self.inner, &mut context.inner)
-            .map_err(|error| Error::at(ErrorKind::Runtime, error.to_string()))
+        crate::interpreter::run_with_callable_owner_and_plan(
+            &self.inner,
+            &mut context.inner,
+            &self.callable_owner,
+            &self.execution_plan,
+        )
+        .map_err(|error| Error::at(ErrorKind::Runtime, error.to_string()))
     }
 }
 
@@ -613,7 +796,7 @@ impl Engine {
     pub fn read(&self, input: impl Read) -> Result<Program, Error> {
         entry_allowed()?;
         crate::runtime::with_registry(self.registry.clone(), || crate::bytecode::read(input))
-            .map(|inner| Program { inner })
+            .map(Program::new)
             .map_err(|error| Error::at(ErrorKind::Bytecode, error))
     }
     /// Build/cache a source project with this engine's registered metadata.
@@ -632,9 +815,23 @@ impl Engine {
             crate::build::project(prepared, destination)
         })
         .map(|built| Build {
-            program: Program {
-                inner: built.program,
-            },
+            program: Program::new(built.program),
+            reused: built.reused,
+        })
+        .map_err(|error| Error::at(ErrorKind::Compilation, error))
+    }
+    /// Build a project already prepared by the project resolver.
+    pub fn build_prepared(
+        &self,
+        prepared: crate::project::Prepared,
+        destination: &std::path::Path,
+    ) -> Result<Build, Error> {
+        entry_allowed()?;
+        crate::runtime::with_registry(self.registry.clone(), || {
+            crate::build::project(prepared, destination)
+        })
+        .map(|built| Build {
+            program: Program::new(built.program),
             reused: built.reused,
         })
         .map_err(|error| Error::at(ErrorKind::Compilation, error))
@@ -644,6 +841,35 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_return_cannot_bind_an_unowned_function_to_the_receiving_program() {
+        use crate::backend::{CallableSignature, CompiledProgram};
+        use crate::instruction::Instruction as I;
+        let mut engine = Engine::new();
+        engine
+            .register("host::raw", Signature::new(vec![], Type::Any), |_, _| {
+                Ok(Value(VmValue::Function(3)))
+            })
+            .unwrap();
+        let bytes = crate::runtime::with_registry(engine.registry.clone(), || {
+            let mut artifact = CompiledProgram::new(vec![
+                I::CallNative(0),
+                I::CallValue(0),
+                I::Halt,
+                I::Push(VmValue::Nil),
+                I::Return,
+            ]);
+            artifact.imports = vec![crate::runtime::NativeImport::named("host::raw").unwrap()];
+            artifact
+                .callables
+                .insert(3, CallableSignature::dynamic(0, 0));
+            crate::bytecode::encode(&artifact).unwrap()
+        });
+        let program = engine.decode(&bytes).unwrap();
+        let error = program.run(&mut Vec::new()).unwrap_err();
+        assert!(error.message().contains("foreign callable"), "{error}");
+    }
 
     #[test]
     fn compiler_registry_restores_previous_scope_after_unwind() {
