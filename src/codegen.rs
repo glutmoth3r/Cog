@@ -25,6 +25,7 @@ enum DeclaredCall {
 #[derive(Clone)]
 struct InlineFunction {
     parameters: Vec<Param>,
+    bindings: Vec<Stmt>,
     body: Expr,
     nodes: usize,
     mode: InlineMode,
@@ -60,30 +61,59 @@ fn collect_inline_functions(program: &Program) -> HashMap<String, InlineFunction
                 continue;
             }
 
-            let body = match (
-                function.body.stmts.as_slice(),
-                function.body.tail.as_deref(),
-            ) {
-                ([], Some(expression)) => expression,
-                ([statement], None) => match statement.node() {
-                    Stmt::Return(Some(expression)) => expression,
-                    _ => continue,
-                },
-                _ => continue,
+            let (statements, body) = if let Some(expression) = function.body.tail.as_deref() {
+                (&function.body.stmts[..], expression)
+            } else {
+                let Some((statement, preceding)) = function.body.stmts.split_last() else {
+                    continue;
+                };
+                let Stmt::Return(Some(expression)) = statement.node() else {
+                    continue;
+                };
+                (preceding, expression)
             };
             let mut nodes = 0;
-            let parameter_names = function
+            let mut available_names = function
                 .params
                 .iter()
                 .map(|parameter| parameter.name.clone())
                 .collect::<Vec<_>>();
-            if !is_inlineable_body(body, &parameter_names, &mut nodes) {
+            let mut bindings = Vec::with_capacity(statements.len());
+            let mut supported = true;
+            for statement in statements {
+                let Stmt::Const {
+                    pattern: BindingPattern::Name(name),
+                    ty,
+                    value,
+                } = statement.node()
+                else {
+                    supported = false;
+                    break;
+                };
+                if available_names.iter().any(|available| available == name)
+                    || ty
+                        .as_ref()
+                        .is_some_and(|ty| !is_inline_scalar_type(ty) && !is_nil_type(ty))
+                {
+                    supported = false;
+                    break;
+                }
+                nodes += 1;
+                if !is_inlineable_body(value, &available_names, &mut nodes) {
+                    supported = false;
+                    break;
+                }
+                available_names.push(name.clone());
+                bindings.push(statement.clone());
+            }
+            if !supported || !is_inlineable_body(body, &available_names, &mut nodes) {
                 continue;
             }
             functions.insert(
                 function.name.clone(),
                 InlineFunction {
                     parameters: function.params.clone(),
+                    bindings,
                     body: body.clone(),
                     nodes,
                     mode: function.inline,
@@ -2776,7 +2806,13 @@ impl<'a> Codegen<'a> {
         for (parameter, slot) in function.parameters.iter().zip(slots) {
             scopes.bind_slot(&parameter.name, slot);
         }
-        let result = self.compile_expr(&function.body, scopes);
+        let result = (|| {
+            let mut deferred = self.active_defers.clone();
+            for binding in &function.bindings {
+                self.compile_stmt(binding, scopes, &mut deferred)?;
+            }
+            self.compile_expr(&function.body, scopes)
+        })();
         scopes.pop();
         result?;
         Ok(true)
