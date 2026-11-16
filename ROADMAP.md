@@ -149,8 +149,9 @@ thread-safe scheduler wakeups. Detach and async closures remain future work.
    bounded CFG-based scalar propagation, branch pruning, unreachable-block
    removal, and redundant local-store elimination before final verification.
    Runtime lowering folds bounded BigInt constants and eligible constant calls;
-   simple statically typed BigInt helpers can be inlined to expose their loops
-   to existing JIT arithmetic lowering.
+   small statically typed helpers with pure expressions and local `const`
+   bindings can be inlined to expose more work to constant propagation and JIT
+   lowering.
 5. Implement Windows process-tree termination to match Unix process-group
    cancellation. Buffered TCP framing helpers and detached tasks need separate memory,
    ownership, cancellation, and shutdown contracts.
