@@ -38,6 +38,35 @@ public fn contains(items, value) -> bool {
     index_of(items, value)!! != nil
 }
 
+// Higher-order operations call a synchronous function once per selected item.
+public fn map[T: type, U: type](items: T[], transform: fn(T) -> U) -> U[] {
+    var result: U[] = [];
+    for item in items {
+        result << (transform)(item)!!;
+    }
+    result
+}
+
+public fn filter[T: type](items: T[], predicate: fn(T) -> bool) -> T[] {
+    var result: T[] = [];
+    for item in items {
+        if (predicate)(item)!! { result << item; }
+    }
+    result
+}
+
+public fn fold[T: type, U: type](
+    items: T[],
+    initial: U,
+    combine: fn(U, T) -> U,
+) -> U {
+    var result = initial;
+    for item in items {
+        result = (combine)(result, item)!!;
+    }
+    result
+}
+
 extend[T: type] T[] {
     // Swaps two existing elements after validating both indices and reads.
     public fn swap(mut self, left: int, right: int) -> nil {

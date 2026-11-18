@@ -17,7 +17,8 @@ remain usable after their source files are removed. See the
 The project entry point must include the standard package with
 `@!include("std")` before any source imports standard-library modules. Then
 import modules explicitly: `use io;`, `use str;`, or `use math::PI;`.
-The `clone`, `eq`, and `ord` modules define traits for generic code.
+The `clone`, `eq`, and `ord` modules define traits for generic code. The `iter`
+module defines the protocol for statically dispatched user-defined `for` loops.
 Selective and wildcard imports work for public members. The ordinary prelude
 contains `len(value)` and `exclusive(value)`. Imports do not grant host permissions.
 `exclusive` inspects runtime reference counts for supported shared values; it is
@@ -28,6 +29,18 @@ Runtime byte and resource quotas are optional embedder settings on `RuntimeLimit
 Their documented limits
 apply when an embedder explicitly sets `Some(n)`. This does not cap total process
 memory or make OS allocation failures recoverable.
+
+## User-defined iteration
+
+The `iter::IntoIterator[Iter, Item]` trait converts a collection into an iterator;
+`iter::Iterator[Item]` supplies `next(mut self) -> bool` and `current(self) -> Item`.
+`for` calls `current()` only after `next()` returns true. These methods are
+statically dispatched, and Errors they return use ordinary propagation and
+`try`/`catch` rules when explicitly propagated with `!!`. Implementations must
+target concrete types; generic target
+implementations and iteration through a generic trait bound are not supported.
+See [user-defined collection iteration](LANGUAGE.md#user-defined-collection-iteration)
+for a complete example.
 
 Source modules in `core/` and native functions share the resolver. The tables below
 describe successful results, not additional source annotation syntax. Native calls
@@ -132,6 +145,9 @@ A prompt printed to stdout is separate from the input returned by `io::read_line
 | `array::first(items)` / `array::last(items)` | First / last element, or nil for an empty array |
 | `array::index_of(items, value)` | First matching zero-based index, or nil when absent |
 | `array::contains(items, value)` | bool; stop at the first match |
+| `array::map(items, transform)` | Fresh array of callback results, in input order |
+| `array::filter(items, predicate)` | Fresh array containing elements whose predicate returns true |
+| `array::fold(items, initial, combine)` | Left fold in input order; returns `initial` for an empty input |
 | `array::position(items, value)` | Typed equality search; inferred element type `T` must implement `Eq[T]` |
 | `items.swap(left, right)` | Mutates one array, or returns IndexOutOfBounds without changing it |
 | `array::min(items)` / `array::max(items)` | Select the least / greatest element using `Ord`; empty input returns InvalidArgument |
@@ -139,10 +155,20 @@ A prompt printed to stdout is separate from the input returned by `io::read_line
 | `array::reversed(items)` | Fresh outer array in reverse order |
 | `array::concat(left, right)` | Fresh outer array containing both inputs in order |
 
-These functions accept arrays and leave their inputs unchanged. A nil element is
-indistinguishable from an empty array through first/last alone; use is_empty when
-that distinction matters. Slice accepts an empty range at the end; negative or
-out-of-bounds ranges produce InvalidArgument rather than clamping.
+All operations except `items.swap` leave their outer input arrays unchanged. A
+nil element is indistinguishable from an empty array through first/last alone; use
+is_empty when that distinction matters. Slice accepts an empty range at the end;
+negative or out-of-bounds ranges produce InvalidArgument rather than clamping.
+
+`map`, `filter`, and `fold` accept synchronous function values, including named
+functions and explicit-capture closures. They invoke callbacks from left to right,
+once per input element; `filter` appends an element only after its predicate
+returns true. Callback errors propagate immediately, and no partial result is
+returned. `map` and `filter` return fresh outer arrays while preserving shared
+element references. Indirect calls conservatively treat reference arguments as
+potentially mutable and reference-valued results as read-only. Callbacks over
+reference-valued elements may therefore require a writable source path, and
+reference results should be cloned before mutation when `.clone()` supports them.
 
 `index_of` and `contains` use Cog's `==`: mixed int/float comparisons compare
 the exact integer with the floating value without rounding the integer first,

@@ -1161,6 +1161,92 @@ impl<'a> Pass<'a> {
         self.observe();
         result
     }
+
+    fn closure_body(
+        &mut self,
+        captures: &'a [ClosureCapture],
+        params: &'a [Param],
+        body: &'a Block,
+        captured_values: Vec<Access>,
+    ) {
+        let closure_state = State {
+            bindings: BTreeMap::new(),
+            scopes: vec![HashMap::new()],
+            globals: self.state.globals.clone(),
+            heap: self.state.heap.clone(),
+            allocations: self.state.allocations.clone(),
+            many: self.state.many.clone(),
+            defers: Vec::new(),
+            alive: true,
+        };
+
+        let outer_state = std::mem::replace(&mut self.state, closure_state);
+        let outer_summary = std::mem::take(&mut self.summary);
+        let outer_loops = std::mem::take(&mut self.loops);
+        let outer_observations = std::mem::take(&mut self.observations);
+        let outer_locals = std::mem::take(&mut self.locals);
+        let outer_mutated = std::mem::take(&mut self.mutated);
+        let outer_attempted = std::mem::take(&mut self.attempted);
+        self.summary = Summary::default();
+
+        for (capture, value) in captures.iter().zip(captured_values) {
+            let value = if capture.mutable {
+                value
+            } else {
+                value.readonly(&capture.name)
+            };
+            self.define(
+                &capture.name,
+                capture as *const ClosureCapture as usize,
+                capture.mutable,
+                value,
+            );
+        }
+        for (index, parameter) in params.iter().enumerate() {
+            let value = if parameter.ty.as_ref().is_none_or(annotation_may_reference) {
+                Access::root(Root::Parameter(index))
+            } else {
+                Access::default()
+            };
+            self.define(
+                &parameter.name,
+                parameter as *const Param as usize,
+                true,
+                value,
+            );
+        }
+        self.block(body);
+
+        // Closure bodies are checked as their own functions. Keep their local
+        // `var` checks and diagnostics, but do not apply deferred effects to the
+        // function that merely creates the closure.
+        let closure_local_ids = self.locals.keys().copied().collect::<BTreeSet<_>>();
+        let closure_locals = std::mem::take(&mut self.locals);
+        let closure_mutated = self
+            .mutated
+            .iter()
+            .filter(|id| closure_local_ids.contains(*id))
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let closure_attempted = self
+            .attempted
+            .iter()
+            .filter(|id| closure_local_ids.contains(*id))
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        self.state = outer_state;
+        self.summary = outer_summary;
+        self.loops = outer_loops;
+        self.observations = outer_observations;
+        self.locals = outer_locals;
+        self.locals.extend(closure_locals);
+        self.mutated = outer_mutated;
+        self.mutated.extend(closure_mutated);
+        self.attempted = outer_attempted;
+        self.attempted.extend(closure_attempted);
+    }
+
     fn expr_inner(&mut self, expr: &'a Expr) -> Access {
         match expr.node() {
             Expr::Interpolated(parts) => {
@@ -1179,6 +1265,27 @@ impl<'a> Pass<'a> {
                     self.store(&result, Key::Index(i as i64), value, true);
                 }
                 result
+            }
+            Expr::Closure {
+                captures,
+                params,
+                body,
+                ..
+            } => {
+                let mut captured_values = Vec::with_capacity(captures.len());
+                for capture in captures {
+                    captured_values
+                        .push(self.read(&Expr::Ident(capture.name.clone()), &capture.name));
+                    if self.state.alive
+                        && capture.mutable
+                        && let Some(id) = self.local_id(&capture.name)
+                    {
+                        self.attempted.insert(id);
+                        self.mutated.insert(id);
+                    }
+                }
+                self.closure_body(captures, params, body, captured_values);
+                self.allocate(Root::Fresh(expr_id(expr), 0))
             }
             Expr::Record(fields) => {
                 let result = self.allocate(Root::Fresh(expr_id(expr), 0));
@@ -1419,7 +1526,21 @@ impl<'a> Pass<'a> {
             | Expr::Nil
             | Expr::TypeLiteral(_) => Access::default(),
             Expr::Bytes(_) => self.allocate(Root::Fresh(expr_id(expr), 0)),
-            Expr::BracketApply(_, _) | Expr::Apply(_, _) => Access::default(),
+            Expr::Apply(callee, arguments) => {
+                let _callable = self.expr(callee);
+                let mut result = if self.kind(expr) == ValueKind::Reference {
+                    Access::root(Root::Fresh(expr_id(expr), 0)).readonly("indirect call result")
+                } else {
+                    Access::default()
+                };
+                for argument in arguments {
+                    let value = self.expr(&argument.value);
+                    self.mutate(&value, &argument.value);
+                    result.union(&value);
+                }
+                result
+            }
+            Expr::BracketApply(_, _) => Access::default(),
             Expr::Located(..) => unreachable!(),
         }
     }

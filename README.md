@@ -11,8 +11,10 @@ construct structs; type-valued bindings, source-package inclusion, and basic
 statically dispatched extensions are also available. Runtime generic functions
 take inferred `[T: type]` parameters that are erased before runtime; trait
 bounds and parameterized trait contracts are checked during specialization. Generic
-structs and receiver methods are supported; source closures and JIT compilation
-remain planned.
+structs and receiver methods are supported, as are synchronous closures with
+explicit scalar captures and statically dispatched user-defined iteration over
+concrete types. The optional Cranelift JIT remains experimental and falls back to
+the VM for unsupported operations.
 
 ```cog
 @!include("std")

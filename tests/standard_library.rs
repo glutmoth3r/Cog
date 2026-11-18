@@ -49,6 +49,55 @@ fn math_domain_errors_are_recoverable_and_preserve_error_payloads() {
 }
 
 #[test]
+fn array_higher_order_operations_accept_named_functions_and_capturing_closures() {
+    assert_eq!(
+        run(r#"
+        use array;
+        use str;
+        fn is_even(value: int) -> bool { value % 2 == 0 }
+        fn divide(value: int) -> int { 10 / (value - 2) }
+
+        fn main() {
+            const bias = 3;
+            const add_bias = fn[bias](value: int) -> str {
+                str::to_str(value + bias)
+            };
+            const mapped = array::map([1, 2, 3, 4], add_bias);
+            const evens = array::filter([4, 5, 6, 7], is_even);
+            const total = array::fold(
+                [4, 6],
+                "",
+                fn[](sum: str, value: int) -> str { sum + str::to_str(value) },
+            );
+            if mapped[0]!! != "4" { crash("map inferred the wrong result type"); }
+            io::println(mapped)!!;
+            io::println(evens)!!;
+            io::println(total)!!;
+
+            var calls = 0;
+            const count = fn[var calls](value: int) -> bool {
+                calls += 1;
+                true
+            };
+            var empty: int[] = [1];
+            empty = [];
+            const no_values = array::filter(empty, count);
+            io::println(no_values.len())!!;
+            io::println(calls)!!;
+
+            try {
+                array::map([1, 2, 3], divide);
+                crash("map should propagate a callback error");
+            } catch(error) {
+                io::println(error.error_kind())!!;
+            }
+        }
+    "#),
+        "[4, 5, 6, 7]\n[4, 6]\n46\n0\n0\nDivisionByZero\n"
+    );
+}
+
+#[test]
 fn random_validates_range_bounds_before_requesting_entropy() {
     let caps = VmCapabilities {
         allow_print: true,
@@ -860,7 +909,9 @@ fn collection_iteration_evaluates_once_uses_unicode_scalars_and_detects_structur
     )
     .unwrap_err()
     .to_string();
-    assert!(not_iterable.contains("for-in requires an array or str"));
+    assert!(not_iterable.contains(
+        "for-in over int requires the `iter` module and an `IntoIterator` implementation"
+    ));
 
     let comptime_iteration = project::compile_source(
         "comptime-iteration.cog",

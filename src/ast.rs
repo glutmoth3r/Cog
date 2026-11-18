@@ -292,6 +292,10 @@ pub enum TypeKind {
     SelfType,
     Array(Box<TypeAnnotation>),
     Tuple(Vec<TypeAnnotation>),
+    Function {
+        parameters: Vec<TypeAnnotation>,
+        result: Box<TypeAnnotation>,
+    },
 }
 
 impl TypeAnnotation {
@@ -331,6 +335,15 @@ impl TypeAnnotation {
                     .collect::<Vec<_>>()
                     .join(",")
             ),
+            TypeKind::Function { parameters, result } => format!(
+                "fn({})->{}",
+                parameters
+                    .iter()
+                    .map(TypeAnnotation::canonical)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                result.canonical()
+            ),
         };
         if self.nilable {
             format!("{base}?")
@@ -368,6 +381,15 @@ impl TypeAnnotation {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            TypeKind::Function { parameters, result } => format!(
+                "fn({}) -> {}",
+                parameters
+                    .iter()
+                    .map(TypeAnnotation::display)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                result.display()
+            ),
         };
         if self.nilable {
             format!("{base}?")
@@ -377,8 +399,9 @@ impl TypeAnnotation {
     }
 }
 
-// A single `struct` field: `name`, `name: Type`, `name: Type?`, or any of
-// those with `= default_expr` appended. `ty: None` means dynamic (any
+// A single record field: `name`, `name: Type`, `name: Type?`, or any of
+// those with `= default_expr` appended. Tuple-struct fields use their decimal
+// position as `name` and always have a type. `ty: None` means dynamic (any
 // value, including Nil, already legal — same as an unannotated `var`).
 // `default` is only usable on trailing fields — see
 // `hlparser::parse_struct_decl`, which rejects a non-defaulted field after
@@ -407,6 +430,13 @@ pub type Param = StructField;
 pub struct CallArgument {
     pub name: Option<String>,
     pub value: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosureCapture {
+    pub name: String,
+    /// Mutable captures share a cell with the outer binding.
+    pub mutable: bool,
 }
 
 impl CallArgument {
@@ -549,6 +579,12 @@ pub enum Expr {
     Tuple(Vec<Expr>),
     Record(Vec<(String, Expr)>),
     Call(String, Vec<CallArgument>),
+    Closure {
+        captures: Vec<ClosureCapture>,
+        params: Vec<Param>,
+        result_type: Option<TypeAnnotation>,
+        body: Block,
+    },
     /// Brackets are classified by lexical resolution as specialization or indexing.
     BracketApply(Box<Expr>, Vec<Expr>),
     /// A postfix call whose callee has not yet been resolved.

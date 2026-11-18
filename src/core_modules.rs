@@ -9,6 +9,7 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
     ("err", include_str!("../core/err.cog")),
     ("hex", include_str!("../core/hex.cog")),
     ("io", include_str!("../core/io.cog")),
+    ("iter", include_str!("../core/iter.cog")),
     ("math", include_str!("../core/math.cog")),
     ("ord", include_str!("../core/ord.cog")),
     ("random", include_str!("../core/random.cog")),

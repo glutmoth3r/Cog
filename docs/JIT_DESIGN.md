@@ -138,6 +138,6 @@ The `slot-pressure` benchmark declares 200 temporary bindings in a hot loop. The
 
 - JIT compilation in the background, preemptible compilation, and hard compile-latency guarantees.
 - Machine-code eviction, persistent native code, and cross-process code caches.
-- General calls across Cog/native frames, nested or effectful direct calls, closures, async functions, I/O, and metered executions.
+- Dynamic callback dispatch from native code, mutable-cell capture access, async functions, I/O, and metered executions. Synchronous closure bodies with captured values can enter OSR; `LoadCapture` roots scalar and reference values alike. Unsupported operations, including aggregate access through a capture, and callback calls resume at the exact VM instruction. The VM preserves the captured alias across that handoff. No closure-specific performance result has been recorded.
 - Direct string and aggregate operations beyond the numeric `str::to_bigint` and indexed `bytes::set` fast paths. Opaque values may be carried through the frame without being inspected.
 - Training a portable CPU model from benchmark data or adapting coefficients across unrelated bytecode artifacts.

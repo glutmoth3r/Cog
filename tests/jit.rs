@@ -21,6 +21,82 @@ fn main() -> nil {
 }
 "#;
 
+const CAPTURED_CLOSURE_SOURCE: &str = r#"
+@!include("std")
+use io;
+
+fn make_adder(bias: int) -> fn(int) -> int {
+    const add = fn[bias](count: int) -> int {
+        var index = 0;
+        var total = 0;
+        while index < count {
+            total += bias;
+            index += 1;
+        }
+        total
+    };
+    add
+}
+
+fn main() {
+    const add_seven = make_adder(7);
+    const add_eleven = make_adder(11);
+    io::println((add_seven)(6000))!!;
+    io::println((add_eleven)(6000))!!;
+}
+"#;
+
+const REFERENCE_CAPTURE_FALLBACK_SOURCE: &str = r#"
+@!include("std")
+use io;
+
+fn make_sum(values: int[]) -> fn(int) -> int {
+    const sum = fn[values](count: int) -> int {
+        var index = 0;
+        var total = 0;
+        while index < count {
+            total += values[0];
+            index += 1;
+        }
+        total
+    };
+    sum
+}
+
+fn main() {
+    const sum = make_sum([7]);
+    io::println((sum)(6000))!!;
+}
+"#;
+
+const USER_ITERATOR_FALLBACK_SOURCE: &str = r#"
+@!include("std")
+use io;
+use iter;
+
+struct Source { limit: int }
+struct Cursor { limit: int, value: int }
+
+extend Source with iter::IntoIterator[Cursor, int] {
+    fn into_iter(self) -> Cursor { Cursor(self.limit, 0) }
+}
+
+extend Cursor with iter::Iterator[int] {
+    fn next(mut self) -> bool {
+        if self.value >= self.limit { return false; }
+        self.value += 1;
+        true
+    }
+    fn current(self) -> int { self.value }
+}
+
+fn main() {
+    var total = 0;
+    for value in Source(6000) { total += value; }
+    io::println(total)!!;
+}
+"#;
+
 const DESCENDING_SOURCE: &str = r#"
 @!include("std")
 use io;
@@ -596,6 +672,56 @@ fn assert_jit_fallback_matches_vm(source: &str, suffix: &str, expected: &str) {
 fn jit_conditional_jumps_match_vm_for_true_and_false_paths() {
     assert_jit_matches_vm(ASCENDING_SOURCE, "ascending", "17997000\n");
     assert_jit_matches_vm(DESCENDING_SOURCE, "descending", "18003000\n");
+}
+
+#[test]
+fn jit_osr_reads_distinct_scalar_captures_from_closure_instances() {
+    assert_jit_matches_vm(
+        CAPTURED_CLOSURE_SOURCE,
+        "captured-closure",
+        "42000\n66000\n",
+    );
+}
+
+#[test]
+fn jit_reference_capture_fallback_matches_vm() {
+    assert_jit_fallback_matches_vm(
+        REFERENCE_CAPTURE_FALLBACK_SOURCE,
+        "reference-capture",
+        "42000\n",
+    );
+}
+
+#[test]
+fn jit_higher_order_array_callback_fallback_matches_vm() {
+    assert_jit_fallback_matches_vm(
+        r#"
+        @!include("std")
+        use io;
+        use array;
+
+        fn main() {
+            var values: int[] = [];
+            var index = 0;
+            while index < 6000 {
+                values << index;
+                index += 1;
+            }
+            const bias = 7;
+            const add_bias = fn[bias](value: int) -> int { value + bias };
+            const mapped = array::map(values, add_bias);
+            io::println(mapped.len())!!;
+            io::println(mapped[5999]!!)!!;
+        }
+        "#,
+        "array-callback",
+        "6000\n6006\n",
+    );
+}
+
+#[test]
+fn jit_user_iterator_fallback_matches_vm() {
+    assert_jit_fallback_matches_vm(USER_ITERATOR_FALLBACK_SOURCE, "user-iterator", "18003000\n");
 }
 
 #[test]

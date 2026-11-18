@@ -5,7 +5,6 @@ fuzz/coverage/
 *.cogb
 
 /dev_docs/
-
-/.idea/
-/.codex/
 /graphify-out/
+/.codex/
+/.idea/

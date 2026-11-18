@@ -16,12 +16,40 @@ pub(crate) fn expand(
     source: &Program,
     function_modules: &std::collections::HashMap<String, String>,
 ) -> Result<(Program, CheckResult), Vec<Diagnostic>> {
-    expand_with_analysis_limit(source, function_modules, MAX_SPECIALIZATION_ANALYSIS_COST)
+    expand_with_names(source, function_modules, &std::collections::BTreeMap::new())
 }
 
+pub(crate) fn expand_with_names(
+    source: &Program,
+    function_modules: &std::collections::HashMap<String, String>,
+    names: &std::collections::BTreeMap<String, String>,
+) -> Result<(Program, CheckResult), Vec<Diagnostic>> {
+    expand_with_analysis_limit_and_names(
+        source,
+        function_modules,
+        names,
+        MAX_SPECIALIZATION_ANALYSIS_COST,
+    )
+}
+
+#[cfg(test)]
 fn expand_with_analysis_limit(
     source: &Program,
     function_modules: &std::collections::HashMap<String, String>,
+    analysis_limit: usize,
+) -> Result<(Program, CheckResult), Vec<Diagnostic>> {
+    expand_with_analysis_limit_and_names(
+        source,
+        function_modules,
+        &std::collections::BTreeMap::new(),
+        analysis_limit,
+    )
+}
+
+fn expand_with_analysis_limit_and_names(
+    source: &Program,
+    function_modules: &std::collections::HashMap<String, String>,
+    names: &std::collections::BTreeMap<String, String>,
     analysis_limit: usize,
 ) -> Result<(Program, CheckResult), Vec<Diagnostic>> {
     let mut allocation_cost = crate::ast_budget::program(source).map_err(budget_error)?;
@@ -30,7 +58,7 @@ fn expand_with_analysis_limit(
     let mut generated = HashSet::new();
     for _ in 0..MAX_SPECIALIZATIONS {
         analysis_cost = check_analysis_cost(analysis_cost, allocation_cost, analysis_limit)?;
-        let checked = analysis::check_with_methods(&program, function_modules);
+        let checked = analysis::check_with_methods_and_names(&program, function_modules, names);
         if !checked.diagnostics.is_empty() {
             return Err(checked.diagnostics);
         }
@@ -221,6 +249,12 @@ fn substitute_type(
                 substitute_type(element, arguments);
             }
         }
+        TypeKind::Function { parameters, result } => {
+            for parameter in parameters {
+                substitute_type(parameter, arguments);
+            }
+            substitute_type(result, arguments);
+        }
         TypeKind::Primitive(_)
         | TypeKind::Named(_)
         | TypeKind::ResolvedName { .. }
@@ -335,6 +369,22 @@ fn substitute_expr(expr: &mut Expr, arguments: &std::collections::HashMap<String
         | Expr::Unary(_, inner)
         | Expr::Cast(inner, _) => substitute_expr(inner, arguments),
         Expr::TypeLiteral(ty) => substitute_type(ty, arguments),
+        Expr::Closure {
+            params,
+            result_type,
+            body,
+            ..
+        } => {
+            for parameter in params {
+                if let Some(ty) = &mut parameter.ty {
+                    substitute_type(ty, arguments);
+                }
+            }
+            if let Some(ty) = result_type {
+                substitute_type(ty, arguments);
+            }
+            substitute_block(body, arguments);
+        }
         Expr::Array(items) | Expr::Tuple(items) => {
             for item in items {
                 substitute_expr(item, arguments);

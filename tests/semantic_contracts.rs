@@ -33,6 +33,493 @@ fn output(body: &str, expected: &str) {
     assert_eq!(actual, expected);
 }
 
+#[test]
+fn mutable_closure_capture_supports_compound_assignment() {
+    output(
+        r#"
+        fn make_counter() -> fn() -> int {
+            var total = 0;
+            const next = fn[var total]() -> int {
+                total += 1;
+                total
+            };
+            next
+        }
+        fn main() {
+            const next = make_counter();
+            io::println((next)());
+            io::println((next)());
+        }
+        "#,
+        "1\n2\n",
+    );
+}
+
+#[test]
+fn closure_value_captures_keep_reference_identity_after_nested_escape() {
+    output(
+        r#"
+        struct Buffer { values: int[] }
+
+        fn make_reader(buffer: Buffer) -> fn() -> int {
+            const outer = fn[buffer]() -> fn() -> int {
+                const inner = fn[buffer]() -> int { buffer.values[0] };
+                inner
+            };
+            (outer)()
+        }
+
+        fn main() {
+            var buffer = Buffer([7]);
+            const read = make_reader(buffer);
+            buffer.values[0] = 41;
+            io::println((read)());
+        }
+        "#,
+        "41\n",
+    );
+}
+
+#[test]
+fn nested_mutable_closure_captures_forward_shared_cells() {
+    output(
+        r#"
+        fn make_replacer() -> fn(int) -> int {
+            var values = [0];
+            const outer = fn[var values]() -> fn(int) -> int {
+                const inner = fn[var values](value: int) -> int {
+                    values = [value];
+                    values[0]
+                };
+                inner
+            };
+            (outer)()
+        }
+
+        fn main() {
+            const replace = make_replacer();
+            io::println((replace)(17));
+            io::println((replace)(23));
+        }
+        "#,
+        "17\n23\n",
+    );
+}
+
+#[test]
+fn closure_captures_can_store_and_invoke_function_values() {
+    output(
+        r#"
+        fn make_adder(bias: int) -> fn(int) -> int {
+            const add = fn[bias](value: int) -> int { value + bias };
+            add
+        }
+
+        fn duplicate(callback: fn(int) -> int) -> fn(int) -> int {
+            const twice = fn[callback](value: int) -> int {
+                (callback)(value) + (callback)(value)
+            };
+            twice
+        }
+
+        fn main() {
+            const add_three = make_adder(3);
+            const twice = duplicate(add_three);
+            io::println((twice)(4));
+        }
+        "#,
+        "14\n",
+    );
+}
+
+#[test]
+fn closure_body_keeps_statically_resolved_user_iterator_calls() {
+    output(
+        r#"
+        use iter;
+
+        struct Source { limit: int }
+        struct Cursor { limit: int, value: int }
+
+        extend Source with iter::IntoIterator[Cursor, int] {
+            fn into_iter(self) -> Cursor { Cursor(self.limit, 0) }
+        }
+
+        extend Cursor with iter::Iterator[int] {
+            fn next(mut self) -> bool {
+                if self.value >= self.limit { return false; }
+                self.value += 1;
+                true
+            }
+            fn current(self) -> int { self.value }
+        }
+
+        fn make_sum(source: Source) -> fn() -> int {
+            const sum = fn[source]() -> int {
+                var total = 0;
+                for value in source { total += value; }
+                total
+            };
+            sum
+        }
+
+        fn main() {
+            const sum = make_sum(Source(3));
+            io::println((sum)());
+        }
+        "#,
+        "6\n",
+    );
+}
+
+#[test]
+fn closure_can_clone_a_readonly_reference_without_mutating_its_source() {
+    output(
+        r#"
+        fn make_copy(values: int[]) -> fn() -> int[] {
+            const copy = fn[values]() -> int[] {
+                var duplicate = values.clone();
+                duplicate << 2;
+                duplicate
+            };
+            copy
+        }
+
+        fn main() {
+            const values = [1];
+            const copy_values = make_copy(values);
+            const copy = (copy_values)();
+            io::println(values.len());
+            io::println(copy.len());
+        }
+        "#,
+        "1\n2\n",
+    );
+}
+
+#[test]
+fn closure_can_capture_an_error_value_from_its_catch_scope() {
+    output(
+        r#"
+        fn main() {
+            var inspect = fn[]() -> str { "no error" };
+            try {
+                const failed = 1 / 0;
+            } catch(error) {
+                inspect = fn[error]() -> str { error.error_kind() };
+            }
+            io::println((inspect)());
+        }
+        "#,
+        "DivisionByZero\n",
+    );
+}
+
+#[test]
+fn closure_error_propagation_runs_cleanup_before_the_caller_catch() {
+    output(
+        r#"
+        fn make_failure() -> fn() -> nil {
+            const fail = fn[]() -> nil {
+                defer { io::print("D")!!; }
+                (1 / 0)!!;
+                nil
+            };
+            fail
+        }
+
+        fn main() {
+            const fail = make_failure();
+            try {
+                (fail)();
+            } catch(error) {
+                io::println(error.error_kind())!!;
+            }
+        }
+        "#,
+        "DDivisionByZero\n",
+    );
+}
+
+#[test]
+fn closure_value_capture_cannot_mutate_a_readonly_reference() {
+    rejects_semantically(
+        r#"
+        fn make_bad(values: int[]) {
+            const append = fn[values]() -> nil {
+                values << 2;
+                nil
+            };
+        }
+
+        fn main() {
+            const values = [1];
+            make_bad(values);
+        }
+        "#,
+        &["cannot mutate", "read-only access"],
+    );
+}
+
+#[test]
+fn closure_return_cannot_escalate_a_readonly_capture() {
+    rejects_semantically(
+        r#"
+        fn make_reader(values: int[]) -> fn() -> int[] {
+            const read = fn[values]() -> int[] { values };
+            read
+        }
+
+        fn main() {
+            const values = [1];
+            const read = make_reader(values);
+            const returned = (read)();
+            returned << 2;
+        }
+        "#,
+        &["cannot mutate", "read-only access"],
+    );
+}
+
+#[test]
+fn closure_value_capture_cannot_call_a_mutating_helper() {
+    rejects_semantically(
+        r#"
+        fn append(values: int[]) -> nil {
+            values << 2;
+            nil
+        }
+
+        fn make_bad(values: int[]) {
+            const append_later = fn[values]() -> nil {
+                append(values);
+                nil
+            };
+        }
+
+        fn main() {
+            const values = [1];
+            make_bad(values);
+        }
+        "#,
+        &["cannot mutate", "read-only access"],
+    );
+}
+
+#[test]
+fn nested_mutable_capture_requires_mutable_forwarding() {
+    rejects_semantically(
+        r#"
+        fn make_bad(values: int[]) {
+            const outer = fn[values]() -> fn() -> nil {
+                const inner = fn[var values]() -> nil {
+                    values << 2;
+                    nil
+                };
+                inner
+            };
+        }
+
+        fn main() {
+            const values = [1];
+            make_bad(values);
+        }
+        "#,
+        &["mutable capture", "requires a `var` binding"],
+    );
+}
+
+#[test]
+fn closure_body_locals_keep_the_reachable_mutation_rule() {
+    rejects_semantically(
+        r#"
+        fn main() {
+            const read = fn[]() -> int {
+                var value = 7;
+                value
+            };
+        }
+        "#,
+        &["local var `value`", "reachable mutation"],
+    );
+}
+
+#[test]
+fn dead_mutable_capture_does_not_justify_an_outer_var() {
+    rejects_semantically(
+        r#"
+        fn main() {
+            var value = 0;
+            if false {
+                const ignored = fn[var value]() -> int {
+                    value += 1;
+                    value
+                };
+            }
+        }
+        "#,
+        &["local var `value`", "reachable mutation"],
+    );
+}
+
+#[test]
+fn user_iterators_preserve_zip_order_and_stop_on_first_exhaustion() {
+    output(
+        r#"
+        use iter;
+
+        struct Source { label: str, limit: int }
+        struct Cursor { label: str, limit: int, value: int }
+
+        extend Source with iter::IntoIterator[Cursor, int] {
+            fn into_iter(self) -> Cursor {
+                io::print(self.label)!!;
+                io::print("I")!!;
+                Cursor(self.label, self.limit, 0)
+            }
+        }
+
+        extend Cursor with iter::Iterator[int] {
+            fn next(mut self) -> bool {
+                io::print(self.label)!!;
+                io::print("N")!!;
+                if self.value >= self.limit { return false; }
+                self.value += 1;
+                true
+            }
+            fn current(self) -> int {
+                io::print(self.label)!!;
+                io::print("C")!!;
+                self.value
+            }
+        }
+
+        fn source(label: str, limit: int) -> Source {
+            io::print(label)!!;
+            io::print("S")!!;
+            Source(label, limit)
+        }
+
+        fn main() {
+            var total = 0;
+            for left in source("A", 2), right in source("B", 3) {
+                total += left + right;
+            }
+            io::println(total)!!;
+        }
+        "#,
+        "ASAIBSBIANACBNBCANACBNBCAN6\n",
+    );
+}
+
+#[test]
+fn user_iterator_errors_from_each_protocol_method_are_catchable() {
+    output(
+        r#"
+        use iter;
+
+        struct Source { mode: int }
+        struct Cursor { mode: int, value: int }
+
+        extend Source with iter::IntoIterator[Cursor, int] {
+            fn into_iter(self) -> Cursor {
+                io::print("I")!!;
+                if self.mode == 1 {
+                    return Error::InvalidArgument("into_iter")!!;
+                }
+                Cursor(self.mode, 0)
+            }
+        }
+
+        extend Cursor with iter::Iterator[int] {
+            fn next(mut self) -> bool {
+                io::print("N")!!;
+                if self.mode == 2 {
+                    return Error::InvalidArgument("next")!!;
+                }
+                self.value += 1;
+                true
+            }
+            fn current(self) -> int {
+                io::print("C")!!;
+                if self.mode == 3 {
+                    return Error::InvalidArgument("current")!!;
+                }
+                self.value
+            }
+        }
+
+        fn main() {
+            for mode in [1, 2, 3] {
+                try {
+                    for value in Source(mode) { io::println(value)!!; }
+                } catch(error) {
+                    io::println(error.error_kind())!!;
+                }
+            }
+        }
+        "#,
+        "IInvalidArgument\nINInvalidArgument\nINCInvalidArgument\n",
+    );
+}
+
+#[test]
+fn user_iterator_break_and_continue_run_loop_cleanup() {
+    output(
+        r#"
+        use iter;
+
+        struct Source { limit: int }
+        struct Cursor { limit: int, value: int }
+
+        extend Source with iter::IntoIterator[Cursor, int] {
+            fn into_iter(self) -> Cursor { Cursor(self.limit, 0) }
+        }
+
+        extend Cursor with iter::Iterator[int] {
+            fn next(mut self) -> bool {
+                if self.value >= self.limit { return false; }
+                self.value += 1;
+                true
+            }
+            fn current(self) -> int { self.value }
+        }
+
+        fn main() {
+            var total = 0;
+            for value in Source(4) {
+                defer { io::print("D")!!; }
+                if value == 1 { continue; }
+                total += value;
+                break;
+            }
+            io::println(total)!!;
+        }
+        "#,
+        "DD2\n",
+    );
+}
+
+#[test]
+fn user_iterator_rejects_protocol_receiver_mutability_mismatches() {
+    rejects_semantically(
+        r#"
+        use iter;
+        struct Source { limit: int }
+        struct Cursor { limit: int, value: int }
+        extend Source with iter::IntoIterator[Cursor, int] {
+            fn into_iter(self) -> Cursor { Cursor(self.limit, 0) }
+        }
+        extend Cursor with iter::Iterator[int] {
+            fn next(self) -> bool { true }
+            fn current(self) -> int { self.value }
+        }
+        fn main() { for value in Source(1) { value; } }
+        "#,
+        &["mutability of the `self` receiver for `next()`"],
+    );
+}
+
 fn rejects_semantically(body: &str, concepts: &[&str]) {
     let text = source(body);
     let parsed = frontend::parse("contract.cog", &text);
@@ -1309,7 +1796,7 @@ fn phase_08_runtime_storage_and_indirect_calls_cannot_hide_a_comptime_callable()
 }
 
 #[test]
-fn phase_09_closure_expression_syntax_is_not_in_the_current_grammar() {
+fn phase_09_legacy_closure_keyword_syntax_is_not_in_the_current_grammar() {
     let text = source(
         r#"
         @comptime fn twice(value: int) -> int { return value * 2; }
@@ -1324,7 +1811,7 @@ fn phase_09_closure_expression_syntax_is_not_in_the_current_grammar() {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "E0002"),
-        "closure-expression syntax must remain explicitly unsupported until it has a language contract"
+        "legacy `closure(...)` syntax must remain rejected; closures use `fn[...]` syntax"
     );
 }
 
@@ -1973,5 +2460,43 @@ fn comptime_and_runtime_mixed_numeric_comparisons_agree() {
         }
         "#,
         "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n",
+    );
+}
+
+#[test]
+fn unit_and_tuple_structs_construct_index_and_mutate_nominal_values() {
+    output(
+        r#"
+        struct Marker;
+        struct Empty {}
+        struct UserId(int);
+        struct Position(float, float);
+        struct Box[T: type](T);
+
+        fn identity(value: UserId) -> UserId { value }
+
+        fn main() {
+            const marker = Marker();
+            const empty = Empty();
+            var id = identity(UserId(42));
+            var position = Position(1.5, 2.5);
+            const boxed = Box(7);
+            position.1 = 3.5;
+            id.0 = 43;
+            io::println(id.0);
+            io::println(position.0);
+            io::println(position.1);
+            io::println(boxed.0);
+        }
+        "#,
+        "43\n1.5\n3.5\n7\n",
+    );
+}
+
+#[test]
+fn tuple_structs_keep_nominal_type_identity() {
+    rejects_semantically(
+        "struct UserId(int); fn take_id(value: UserId) {} fn main() { take_id(42); }",
+        &["declared as userid", "given int"],
     );
 }

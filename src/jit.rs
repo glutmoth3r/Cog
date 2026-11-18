@@ -98,6 +98,8 @@ struct JitSlot {
 struct JitFrame {
     locals: *mut JitSlot,
     stack: *mut JitSlot,
+    captures: *mut JitSlot,
+    capture_count: u64,
     roots: *mut Vec<Value>,
     runtime_context: *mut std::ffi::c_void,
     pc: u64,
@@ -131,6 +133,8 @@ impl JitCallFrame {
         let frame = JitFrame {
             locals: locals.as_mut_ptr(),
             stack: stack.as_mut_ptr(),
+            captures: std::ptr::null_mut(),
+            capture_count: 0,
             roots: std::ptr::null_mut(),
             runtime_context,
             pc: 0,
@@ -566,10 +570,14 @@ impl JitState {
         bp: usize,
         stack: &mut Vec<Value>,
         operand_base: usize,
+        captures: &crate::interpreter::CaptureValues,
         propagation_pending: &mut bool,
         debug: bool,
     ) -> Option<JitExit> {
         let plan = Arc::clone(self.plans.get(&entry)?);
+        if artifact.callables.get(&entry)?.captures != captures.len() {
+            return None;
+        }
         if !self.contains(entry, target) {
             return None;
         }
@@ -774,6 +782,14 @@ impl JitState {
         if debug && probe_pending {
             eprintln!("[jit] osr function={entry} pc={target} locals={jit_locals:?}");
         }
+        let mut jit_captures = Vec::with_capacity(captures.len());
+        for index in 0..captures.len() {
+            jit_captures.push(to_slot(
+                &captures.get(index)?,
+                &mut roots,
+                &self.variant_tags,
+            ));
+        }
         let mut jit_stack = vec![JitSlot::default(); plan.max_stack.max(remaining)];
         for (index, value) in stack[operand_base..].iter().enumerate() {
             jit_stack[index] = to_slot(value, &mut roots, &self.variant_tags);
@@ -781,6 +797,8 @@ impl JitState {
         let mut frame = JitFrame {
             locals: jit_locals.as_mut_ptr(),
             stack: jit_stack.as_mut_ptr(),
+            captures: jit_captures.as_mut_ptr(),
+            capture_count: jit_captures.len() as u64,
             roots: &mut roots,
             runtime_context,
             pc: target as u64,
@@ -1141,7 +1159,7 @@ fn analyze_program(artifact: &CompiledProgram) -> BTreeMap<usize, Arc<FunctionPl
             .get(index + 1)
             .copied()
             .unwrap_or(artifact.instructions.len());
-        if signature.asynchronous || signature.captures != 0 || entry >= end {
+        if signature.asynchronous || entry >= end {
             continue;
         }
         if let Some(plan) = analyze_function(artifact, entry, end, signature.parameters) {
@@ -2406,6 +2424,7 @@ fn jit_reachable_pcs(
                 next.into_iter().collect()
             }
             Instruction::Load(_)
+            | Instruction::LoadCapture(_)
             | Instruction::Store(_)
             | Instruction::Call(_, _)
             | Instruction::Add
@@ -2613,6 +2632,54 @@ fn lower_function(
                 store_slot_field(&mut builder, frame, true, depth, 0, tag);
                 store_slot_field(&mut builder, frame, true, depth, 8, payload);
                 jump_to(&mut builder, next, "load fallthrough")?;
+            }
+            Instruction::LoadCapture(index) => {
+                let capture_count = load_frame(
+                    &mut builder,
+                    frame,
+                    offset_of!(JitFrame, capture_count) as i32,
+                    types::I64,
+                );
+                let valid_capture = builder.ins().icmp_imm_s(
+                    IntCC::UnsignedGreaterThan,
+                    capture_count,
+                    *index as i64,
+                );
+                let valid = builder.create_block();
+                let invalid = builder.create_block();
+                builder.ins().brif(valid_capture, valid, &[], invalid, &[]);
+                builder.switch_to_block(invalid);
+                emit_exit(
+                    &mut builder,
+                    frame,
+                    &local_state,
+                    pc,
+                    depth,
+                    EXIT_RESUME,
+                    REASON_NORMAL,
+                );
+                builder.switch_to_block(valid);
+                let capture_base = load_frame(
+                    &mut builder,
+                    frame,
+                    offset_of!(JitFrame, captures) as i32,
+                    types::I64,
+                );
+                let capture_address = builder
+                    .ins()
+                    .iadd_imm_s(capture_base, (*index * size_of::<JitSlot>()) as i64);
+                let tag =
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlagsData::trusted(), capture_address, 0);
+                let payload_address = builder.ins().iadd_imm_s(capture_address, 8);
+                let payload =
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlagsData::trusted(), payload_address, 0);
+                store_slot_field(&mut builder, frame, true, depth, 0, tag);
+                store_slot_field(&mut builder, frame, true, depth, 8, payload);
+                jump_to(&mut builder, next, "capture load fallthrough")?;
             }
             Instruction::Store(index) => {
                 let (tag_variable, payload_variable) = local_state.variables[*index];
@@ -5276,6 +5343,8 @@ mod tests {
         let frame = JitFrame {
             locals: std::ptr::null_mut(),
             stack: std::ptr::null_mut(),
+            captures: std::ptr::null_mut(),
+            capture_count: 0,
             roots: std::ptr::null_mut(),
             runtime_context: std::ptr::null_mut(),
             pc: 0,
