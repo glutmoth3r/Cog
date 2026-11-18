@@ -42,6 +42,7 @@ const MAX_JIT_CALL_ARGS: usize = 16;
 const MAX_BOOTSTRAP_PROBES: usize = 3;
 const WINDOW_BACKEDGES: u64 = 256;
 const REQUIRED_WINDOWS: u32 = 3;
+const HOT_CALL_THRESHOLD: u64 = 128;
 const MAX_HORIZON_NS: u64 = 1_000_000_000;
 const MAX_ACTIVITY_GAP_NS: u64 = 1_000_000_000;
 const TOKEN_CAPACITY_NS: u64 = 20_000_000;
@@ -190,6 +191,7 @@ struct FunctionPlan {
     max_stack: usize,
     stack_depths: Vec<Option<usize>>,
     osr_entries: Vec<usize>,
+    has_backedges: bool,
     callable_from_jit: bool,
 }
 
@@ -369,6 +371,8 @@ struct FunctionProfile {
     #[serde(skip)]
     total_backedges: u64,
     #[serde(skip)]
+    total_calls: u64,
+    #[serde(skip)]
     hot_series_ns: u64,
     #[serde(skip)]
     active_windows: u32,
@@ -410,6 +414,8 @@ struct Candidate {
     last_backedge_at: Option<Instant>,
     last_selection_window: u32,
     retry_after_backedges: u64,
+    retry_after_calls: u64,
+    last_selection_call: u64,
     compiled: Option<CompiledFunction>,
     disabled: bool,
 }
@@ -424,6 +430,8 @@ impl Candidate {
             last_backedge_at: None,
             last_selection_window: 0,
             retry_after_backedges: 0,
+            retry_after_calls: 0,
+            last_selection_call: 0,
             compiled: None,
             disabled: false,
         }
@@ -433,6 +441,7 @@ impl Candidate {
 struct CompiledFunction {
     entry: JitEntry,
     probe_pending: bool,
+    call_compiled: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -489,7 +498,7 @@ fn log_ape_decision(entry: usize, decision: ApeDecision) {
 pub(crate) enum JitPlanState {
     NotInitialized,
     Unavailable,
-    Ready(JitState),
+    Ready(Box<JitState>),
 }
 
 pub(crate) struct JitState {
@@ -515,7 +524,7 @@ impl JitState {
         let variant_tags = VariantTags::from_program(artifact);
         let plans = analyze_program(artifact);
         if plans.is_empty() {
-            return Err("no synchronous function has a supported empty-stack OSR point".into());
+            return Err("no synchronous function is eligible for JIT compilation".into());
         }
         let (compiler, host_key) = JitCompiler::new()?;
         let encoded = crate::bytecode::encode(artifact).map_err(|error| error.to_string())?;
@@ -560,6 +569,7 @@ impl JitState {
             .is_some_and(|plan| plan.osr_entries.binary_search(&target).is_ok())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_osr(
         &mut self,
         artifact: &CompiledProgram,
@@ -602,15 +612,16 @@ impl JitState {
             }
             update_heat(candidate, now)
         };
-        if debug && window_closed {
-            if let Some(candidate) = self.candidates.get(&entry) {
-                eprintln!(
-                    "[jit] profile function={entry} backedges={} active_windows={} vm_ns_per_backedge={}",
-                    candidate.profile.total_backedges,
-                    candidate.profile.active_windows,
-                    candidate.profile.vm_ns_per_backedge
-                );
-            }
+        if debug
+            && window_closed
+            && let Some(candidate) = self.candidates.get(&entry)
+        {
+            eprintln!(
+                "[jit] profile function={entry} backedges={} active_windows={} vm_ns_per_backedge={}",
+                candidate.profile.total_backedges,
+                candidate.profile.active_windows,
+                candidate.profile.vm_ns_per_backedge
+            );
         }
         self.refill_tokens(now);
         if self.candidates.get(&entry).is_some_and(|candidate| {
@@ -701,6 +712,7 @@ impl JitState {
                         // Measure this function's first native slice even when
                         // adaptive APE used a conservative cross-function rate.
                         probe_pending: true,
+                        call_compiled: false,
                     });
                     if debug {
                         eprintln!(
@@ -751,10 +763,13 @@ impl JitState {
             .filter_map(|(&candidate_entry, candidate)| {
                 let compiled = candidate.compiled.as_ref()?;
                 let plan = Arc::clone(self.plans.get(&candidate_entry)?);
+                let call_profiled = compiled.call_compiled
+                    && candidate.profile.total_calls >= HOT_CALL_THRESHOLD
+                    && candidate.profile.total_calls >= candidate.retry_after_calls;
                 (plan.callable_from_jit
                     && !compiled.probe_pending
                     && !candidate.disabled
-                    && candidate.profile.calibrated
+                    && (candidate.profile.calibrated || call_profiled)
                     && candidate.profile.total_backedges >= candidate.retry_after_backedges)
                     .then_some((
                         candidate_entry,
@@ -915,6 +930,241 @@ impl JitState {
                 eprintln!(
                     "[jit] fault function={entry} exit={exit:?}; retry_after_backedges={}",
                     candidate.retry_after_backedges
+                );
+            }
+        }
+        Some(exit)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_call(
+        &mut self,
+        artifact: &CompiledProgram,
+        entry: usize,
+        pc: &mut usize,
+        locals: &mut Vec<Option<Value>>,
+        bp: usize,
+        stack: &mut Vec<Value>,
+        operand_base: usize,
+        captures: &crate::interpreter::CaptureValues,
+        propagation_pending: &mut bool,
+        debug: bool,
+    ) -> Option<JitExit> {
+        let plan = Arc::clone(self.plans.get(&entry)?);
+        let signature = artifact.callables.get(&entry)?;
+        if plan.has_backedges
+            || !plan.callable_from_jit
+            || signature.asynchronous
+            || signature.captures != 0
+            || captures.len() != 0
+        {
+            if debug {
+                eprintln!(
+                    "[jit] call-profile-skip function={entry} backedges={} async={} captures={}",
+                    plan.has_backedges, signature.asynchronous, signature.captures
+                );
+            }
+            return None;
+        }
+        let remaining = stack.len().checked_sub(operand_base)?;
+        if plan.stack_depths.first().copied().flatten()? != remaining {
+            return None;
+        }
+
+        let now = Instant::now();
+        self.refill_tokens(now);
+        {
+            let candidate = self.candidates.get_mut(&entry)?;
+            candidate.profile.total_calls = candidate.profile.total_calls.saturating_add(1);
+            if debug
+                && (candidate.profile.total_calls == 1
+                    || candidate.profile.total_calls % HOT_CALL_THRESHOLD == 0)
+            {
+                eprintln!(
+                    "[jit] call-profile function={entry} calls={}",
+                    candidate.profile.total_calls
+                );
+            }
+            if candidate.disabled || candidate.profile.total_calls < candidate.retry_after_calls {
+                return None;
+            }
+        }
+
+        if self
+            .candidates
+            .get(&entry)
+            .is_some_and(|candidate| candidate.compiled.is_none())
+        {
+            let candidate = self.candidates.get(&entry)?;
+            if candidate.profile.total_calls < HOT_CALL_THRESHOLD
+                || candidate
+                    .profile
+                    .total_calls
+                    .saturating_sub(candidate.last_selection_call)
+                    < HOT_CALL_THRESHOLD
+            {
+                return None;
+            }
+            let calls = candidate.profile.total_calls;
+            if let Some(candidate) = self.candidates.get_mut(&entry) {
+                candidate.last_selection_call = calls;
+            }
+            if self.compiler.functions >= MAX_JIT_FUNCTIONS
+                || self.compiler.cache_full.load(Ordering::Relaxed)
+                || self.compiler.code_bytes.load(Ordering::Relaxed) >= MAX_JIT_CODE_BYTES
+            {
+                if debug {
+                    log_ape_decision(entry, ApeDecision::SkipCacheFull);
+                }
+                return None;
+            }
+            let estimated_cost = plan.upper_compile_ns(&self.coefficients);
+            let reserved_cost =
+                match reserve_compile_budget(&mut self.compile_tokens_ns, estimated_cost) {
+                    Ok(reserved) => reserved,
+                    Err(available_ns) => {
+                        if debug {
+                            log_ape_decision(
+                                entry,
+                                ApeDecision::DeferBudget {
+                                    estimated_cost_ns: estimated_cost,
+                                    available_ns,
+                                },
+                            );
+                        }
+                        return None;
+                    }
+                };
+            let started = Instant::now();
+            match self.compiler.compile(&plan, artifact, &self.variant_tags) {
+                Ok(function) => {
+                    let actual = nanos(started.elapsed());
+                    self.settle_compile_budget(reserved_cost, actual);
+                    self.coefficients.update(&plan, actual);
+                    let candidate = self.candidates.get_mut(&entry)?;
+                    candidate.profile.compile_ns = actual;
+                    candidate.compiled = Some(CompiledFunction {
+                        entry: function,
+                        probe_pending: false,
+                        call_compiled: true,
+                    });
+                    if debug {
+                        eprintln!(
+                            "[jit] call-compile function={entry} calls={} compile_ns={actual} estimated_compile_ns={estimated_cost}",
+                            candidate.profile.total_calls
+                        );
+                    }
+                    self.persist();
+                }
+                Err(error) => {
+                    let actual = nanos(started.elapsed());
+                    self.settle_compile_budget(reserved_cost, actual);
+                    self.coefficients.update(&plan, actual);
+                    if !self.compiler.cache_full.load(Ordering::Relaxed) {
+                        if let Some(candidate) = self.candidates.get_mut(&entry) {
+                            candidate.disabled = true;
+                        }
+                        if debug {
+                            eprintln!("[jit] call-compile-failed function={entry} error={error}");
+                        }
+                    }
+                    self.persist();
+                    return None;
+                }
+            }
+        }
+
+        let entry_function = {
+            let candidate = self.candidates.get(&entry)?;
+            if candidate.profile.total_calls < candidate.retry_after_calls {
+                return None;
+            }
+            let compiled = candidate.compiled.as_ref()?;
+            compiled.entry
+        };
+        let mut runtime = JitExecutionContext {
+            artifact,
+            variant_tags: &self.variant_tags,
+            callables: HashMap::new(),
+            call_frame: None,
+        };
+        let runtime_context = (&mut runtime as *mut JitExecutionContext<'_>).cast();
+        let mut roots = Vec::new();
+        let mut jit_locals = vec![JitSlot::default(); plan.local_count];
+        for (index, slot) in jit_locals.iter_mut().enumerate() {
+            if let Some(value) = locals.get(bp + index).and_then(Option::as_ref) {
+                *slot = to_slot(value, &mut roots, &self.variant_tags);
+            }
+        }
+        let mut jit_stack = vec![JitSlot::default(); plan.max_stack.max(remaining)];
+        for (index, value) in stack[operand_base..].iter().enumerate() {
+            jit_stack[index] = to_slot(value, &mut roots, &self.variant_tags);
+        }
+        let mut frame = JitFrame {
+            locals: jit_locals.as_mut_ptr(),
+            stack: jit_stack.as_mut_ptr(),
+            captures: std::ptr::null_mut(),
+            capture_count: 0,
+            roots: &mut roots,
+            runtime_context,
+            pc: entry as u64,
+            stack_len: remaining as u64,
+            propagation_pending: u64::from(*propagation_pending),
+            backedge_budget: 0,
+            backedge_count: 0,
+            exit_reason: REASON_NORMAL,
+        };
+        let status = unsafe { (entry_function)(&mut frame) };
+        drop(runtime);
+        let exit = match decode_exit(&plan, artifact, &frame, status) {
+            Ok(exit) => exit,
+            Err(()) => {
+                if let Some(candidate) = self.candidates.get_mut(&entry) {
+                    candidate.disabled = true;
+                }
+                *pc = entry;
+                if debug {
+                    eprintln!("[jit] call-exit-invalid function={entry}; resuming interpreter");
+                }
+                return Some(JitExit::ResumeAt { pc: entry });
+            }
+        };
+        if restore_frame(
+            &plan,
+            &frame,
+            &jit_locals,
+            &jit_stack,
+            &roots,
+            &self.variant_tags,
+            locals,
+            bp,
+            stack,
+            operand_base,
+        )
+        .is_err()
+        {
+            if let Some(candidate) = self.candidates.get_mut(&entry) {
+                candidate.disabled = true;
+            }
+            *pc = entry;
+            if debug {
+                eprintln!("[jit] call-frame-invalid function={entry}; resuming interpreter");
+            }
+            return Some(JitExit::ResumeAt { pc: entry });
+        }
+        *pc = frame.pc as usize;
+        *propagation_pending = frame.propagation_pending != 0;
+        if matches!(exit, JitExit::ResumeAt { .. } | JitExit::FaultAt { .. })
+            && let Some(candidate) = self.candidates.get_mut(&entry)
+        {
+            candidate.retry_after_calls = candidate
+                .profile
+                .total_calls
+                .saturating_add(HOT_CALL_THRESHOLD);
+            if debug {
+                eprintln!(
+                    "[jit] call-fallback function={entry} exit={exit:?}; retry_after_calls={}",
+                    candidate.retry_after_calls
                 );
             }
         }
@@ -1088,7 +1338,7 @@ fn adaptive_gain_at(candidate: &Candidate, jit_ns_per_backedge: u64, compile_upp
     if vm == 0 || jit == 0 || jit >= vm {
         return 0.0;
     }
-    let horizon_ns = candidate.profile.hot_series_ns.min(MAX_HORIZON_NS).max(1);
+    let horizon_ns = candidate.profile.hot_series_ns.clamp(1, MAX_HORIZON_NS);
     let rate = (1_000_000_000u64 / vm).max(1) / 2;
     let future_edges =
         ((rate as u128 * horizon_ns as u128) / 1_000_000_000).min(u64::MAX as u128) as u64;
@@ -1163,9 +1413,7 @@ fn analyze_program(artifact: &CompiledProgram) -> BTreeMap<usize, Arc<FunctionPl
             continue;
         }
         if let Some(plan) = analyze_function(artifact, entry, end, signature.parameters) {
-            if !plan.osr_entries.is_empty() {
-                plans.insert(entry, Arc::new(plan));
-            }
+            plans.insert(entry, Arc::new(plan));
         }
     }
     plans
@@ -1226,9 +1474,7 @@ fn analyze_function(
             _ => {}
         }
     }
-    if backedges.is_empty() {
-        return None;
-    }
+    let has_backedges = !backedges.is_empty();
 
     let mut depths = vec![None; count];
     depths[0] = Some(parameters);
@@ -1368,6 +1614,7 @@ fn analyze_function(
         max_stack,
         stack_depths: depths,
         osr_entries,
+        has_backedges,
         callable_from_jit,
     })
 }
@@ -1503,9 +1750,32 @@ impl JitCompiler {
             variant_tags,
             self.helpers,
         )?;
+        // These environment switches keep expensive diagnostics opt-in and
+        // use Cranelift's own post-register-allocation VCode printer.
+        if std::env::var_os("COG_JIT_DUMP_IR").is_some() {
+            eprintln!("[jit] Cranelift IR function={}", plan.entry);
+            eprintln!("{}", context.func.display());
+        }
+        let dump_disassembly = std::env::var_os("COG_JIT_DISASM").is_some();
+        context.set_disasm(dump_disassembly);
         self.module
             .define_function(function_id, &mut context)
             .map_err(|error| error.to_string())?;
+        if dump_disassembly {
+            match context
+                .compiled_code()
+                .and_then(|code| code.vcode.as_deref())
+            {
+                Some(disassembly) => {
+                    eprintln!("[jit] machine code function={}", plan.entry);
+                    eprintln!("{disassembly}");
+                }
+                None => eprintln!(
+                    "[jit] machine code disassembly unavailable function={}",
+                    plan.entry
+                ),
+            }
+        }
         self.module.clear_context(&mut context);
         self.module
             .finalize_definitions()
@@ -1845,7 +2115,7 @@ unsafe fn jit_bigint_binary_inner(frame: *mut JitFrame, depth: u64, operation: i
     let Ok(depth) = usize::try_from(depth) else {
         return false;
     };
-    if depth < 2 || depth > MAX_STACK || frame.stack.is_null() || frame.roots.is_null() {
+    if !(2..=MAX_STACK).contains(&depth) || frame.stack.is_null() || frame.roots.is_null() {
         return false;
     }
     let left_slot = unsafe { *frame.stack.add(depth - 2) };
@@ -1890,7 +2160,7 @@ unsafe fn jit_bigint_compare_inner(frame: *mut JitFrame, depth: u64, operation: 
     let Ok(depth) = usize::try_from(depth) else {
         return false;
     };
-    if depth < 2 || depth > MAX_STACK || frame.stack.is_null() || frame.roots.is_null() {
+    if !(2..=MAX_STACK).contains(&depth) || frame.stack.is_null() || frame.roots.is_null() {
         return false;
     }
     let left_slot = unsafe { *frame.stack.add(depth - 2) };
@@ -2161,7 +2431,7 @@ unsafe fn jit_direct_call_inner(
             let result_depth = usize::try_from(child.frame.stack_len).ok()?;
             let result_index = result_depth.checked_sub(1)?;
             let result_slot = child.stack.get(result_index).copied()?;
-            let Ok(Some(mut result)) = from_slot(result_slot, &child.roots, &context.variant_tags)
+            let Ok(Some(mut result)) = from_slot(result_slot, &child.roots, context.variant_tags)
             else {
                 return None;
             };
@@ -2173,7 +2443,7 @@ unsafe fn jit_direct_call_inner(
             append_owned_value(
                 result,
                 unsafe { &mut *frame_ref.roots },
-                &context.variant_tags,
+                context.variant_tags,
             )
         })();
     unsafe { (&mut *context_ptr).call_frame = Some(child) };
@@ -2284,6 +2554,7 @@ fn decode_exit(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn restore_frame(
     plan: &FunctionPlan,
     frame: &JitFrame,
@@ -2445,6 +2716,7 @@ fn jit_reachable_pcs(
             | Instruction::Dup
             | Instruction::Pop
             | Instruction::Swap
+            | Instruction::StackTruncate(_)
             | Instruction::ConstrainArrayFrom => next.into_iter().collect(),
             Instruction::CallNative(index)
                 if artifact.imports.get(*index).is_some_and(|import| {
@@ -2489,6 +2761,7 @@ fn jit_reachable_pcs(
 
 struct JitLocalState {
     variables: Vec<(Variable, Variable)>,
+    stack_variables: Vec<(Variable, Variable)>,
     dirty: Variable,
     exit_block: cranelift_codegen::ir::Block,
 }
@@ -2510,10 +2783,10 @@ fn lower_function(
 ) -> Result<(), String> {
     let mut builder = FunctionBuilder::new(&mut context.func, builder_context);
     let helpers = JitHelperRefs {
-        bigint_binary: module.declare_func_in_func(helpers.bigint_binary, &mut builder.func),
-        bigint_compare: module.declare_func_in_func(helpers.bigint_compare, &mut builder.func),
-        direct_call: module.declare_func_in_func(helpers.direct_call, &mut builder.func),
-        native_call: module.declare_func_in_func(helpers.native_call, &mut builder.func),
+        bigint_binary: module.declare_func_in_func(helpers.bigint_binary, builder.func),
+        bigint_compare: module.declare_func_in_func(helpers.bigint_compare, builder.func),
+        direct_call: module.declare_func_in_func(helpers.direct_call, builder.func),
+        native_call: module.declare_func_in_func(helpers.native_call, builder.func),
     };
     let dispatch = builder.create_block();
     let exit_block = builder.create_block();
@@ -2525,6 +2798,14 @@ fn lower_function(
     let frame = builder.block_params(dispatch)[0];
     let local_state = JitLocalState {
         variables: (0..plan.local_count)
+            .map(|_| {
+                (
+                    builder.declare_var(types::I64),
+                    builder.declare_var(types::I64),
+                )
+            })
+            .collect(),
+        stack_variables: (0..plan.max_stack)
             .map(|_| {
                 (
                     builder.declare_var(types::I64),
@@ -2555,6 +2836,25 @@ fn lower_function(
     for (index, (tag_variable, payload_variable)) in local_state.variables.iter().enumerate() {
         let tag = load_slot_field(&mut builder, frame, false, index, 0);
         let payload = load_slot_field(&mut builder, frame, false, index, 8);
+        builder.def_var(*tag_variable, tag);
+        builder.def_var(*payload_variable, payload);
+    }
+    let entry_depth = plan
+        .stack_depths
+        .first()
+        .copied()
+        .flatten()
+        .ok_or("function entry has no verified stack depth")?;
+    for (index, (tag_variable, payload_variable)) in local_state.stack_variables.iter().enumerate()
+    {
+        let (tag, payload) = if index < entry_depth {
+            (
+                load_slot_field(&mut builder, frame, true, index, 0),
+                load_slot_field(&mut builder, frame, true, index, 8),
+            )
+        } else {
+            (iconst_i64(&mut builder, 0), iconst_i64(&mut builder, 0))
+        };
         builder.def_var(*tag_variable, tag);
         builder.def_var(*payload_variable, payload);
     }
@@ -2593,7 +2893,7 @@ fn lower_function(
         match &artifact.instructions[pc] {
             Instruction::Push(value) => {
                 if let Some(slot) = constant_slot(value) {
-                    store_slot_const(&mut builder, frame, true, depth, slot);
+                    store_stack_const(&mut builder, &local_state, depth, slot);
                     jump_to(&mut builder, next, "push fallthrough")?;
                 } else {
                     emit_exit(
@@ -2629,8 +2929,8 @@ fn lower_function(
                 );
                 builder.switch_to_block(valid);
                 let payload = builder.use_var(payload_variable);
-                store_slot_field(&mut builder, frame, true, depth, 0, tag);
-                store_slot_field(&mut builder, frame, true, depth, 8, payload);
+                store_stack_field(&mut builder, &local_state, depth, 0, tag);
+                store_stack_field(&mut builder, &local_state, depth, 8, payload);
                 jump_to(&mut builder, next, "load fallthrough")?;
             }
             Instruction::LoadCapture(index) => {
@@ -2677,14 +2977,14 @@ fn lower_function(
                     builder
                         .ins()
                         .load(types::I64, MemFlagsData::trusted(), payload_address, 0);
-                store_slot_field(&mut builder, frame, true, depth, 0, tag);
-                store_slot_field(&mut builder, frame, true, depth, 8, payload);
+                store_stack_field(&mut builder, &local_state, depth, 0, tag);
+                store_stack_field(&mut builder, &local_state, depth, 8, payload);
                 jump_to(&mut builder, next, "capture load fallthrough")?;
             }
             Instruction::Store(index) => {
                 let (tag_variable, payload_variable) = local_state.variables[*index];
-                let tag = load_slot_field(&mut builder, frame, true, depth - 1, 0);
-                let payload = load_slot_field(&mut builder, frame, true, depth - 1, 8);
+                let tag = load_stack_field(&mut builder, &local_state, depth - 1, 0);
+                let payload = load_stack_field(&mut builder, &local_state, depth - 1, 8);
                 builder.def_var(tag_variable, tag);
                 builder.def_var(payload_variable, payload);
                 let dirty = builder.ins().iconst(types::I8, 1);
@@ -2819,7 +3119,6 @@ fn lower_function(
                     offset_of!(JitFrame, propagation_pending) as i32,
                     0,
                 );
-                set_stack_len(&mut builder, frame, depth);
                 builder.ins().jump(fallthrough, &[]);
             }
             Instruction::JumpIfFalse(target) | Instruction::JumpIfTrue(target) => {
@@ -2862,7 +3161,7 @@ fn lower_function(
             }
             Instruction::IsType(value_type) => {
                 if let Some(expected_tag) = type_tag(value_type) {
-                    let actual_tag = load_slot_field(&mut builder, frame, true, depth - 1, 0);
+                    let actual_tag = load_stack_field(&mut builder, &local_state, depth - 1, 0);
                     let condition = if matches!(value_type, ValueType::BigInt) {
                         let rooted_bigint =
                             builder
@@ -2876,17 +3175,16 @@ fn lower_function(
                             .icmp_imm_s(IntCC::Equal, actual_tag, expected_tag as i64)
                     };
                     let payload = builder.ins().uextend(types::I64, condition);
-                    store_slot_const(
+                    store_stack_const(
                         &mut builder,
-                        frame,
-                        true,
+                        &local_state,
                         depth - 1,
                         JitSlot {
                             tag: TAG_BOOL,
                             payload: 0,
                         },
                     );
-                    store_slot_field(&mut builder, frame, true, depth - 1, 8, payload);
+                    store_stack_field(&mut builder, &local_state, depth - 1, 8, payload);
                     jump_to(&mut builder, next, "type-test fallthrough")?;
                 } else if matches!(value_type, ValueType::Enum(_) | ValueType::Variant(_)) {
                     emit_variant_type_test(
@@ -2925,7 +3223,7 @@ fn lower_function(
                 );
             }
             Instruction::Not => {
-                let tag = load_slot_field(&mut builder, frame, true, depth - 1, 0);
+                let tag = load_stack_field(&mut builder, &local_state, depth - 1, 0);
                 let is_bool = builder.ins().icmp_imm_s(IntCC::Equal, tag, TAG_BOOL as i64);
                 let valid = builder.create_block();
                 let invalid = builder.create_block();
@@ -2941,32 +3239,35 @@ fn lower_function(
                     REASON_NORMAL,
                 );
                 builder.switch_to_block(valid);
-                let payload = load_slot_field(&mut builder, frame, true, depth - 1, 8);
+                let payload = load_stack_field(&mut builder, &local_state, depth - 1, 8);
                 let is_false = builder.ins().icmp_imm_s(IntCC::Equal, payload, 0);
                 let payload = builder.ins().uextend(types::I64, is_false);
-                store_slot_field(&mut builder, frame, true, depth - 1, 8, payload);
+                store_stack_field(&mut builder, &local_state, depth - 1, 8, payload);
                 jump_to(&mut builder, next, "not fallthrough")?;
             }
             Instruction::Dup => {
-                copy_slot(&mut builder, frame, true, depth - 1, true, depth);
+                copy_stack_slot(&mut builder, &local_state, depth - 1, depth);
                 jump_to(&mut builder, next, "dup fallthrough")?;
             }
             Instruction::Pop => jump_to(&mut builder, next, "pop fallthrough")?,
+            Instruction::StackTruncate(_) => {
+                jump_to(&mut builder, next, "stack truncate fallthrough")?;
+            }
             Instruction::Swap => {
-                let a_tag = load_slot_field(&mut builder, frame, true, depth - 1, 0);
-                let a_payload = load_slot_field(&mut builder, frame, true, depth - 1, 8);
-                let b_tag = load_slot_field(&mut builder, frame, true, depth - 2, 0);
-                let b_payload = load_slot_field(&mut builder, frame, true, depth - 2, 8);
-                store_slot_field(&mut builder, frame, true, depth - 1, 0, b_tag);
-                store_slot_field(&mut builder, frame, true, depth - 1, 8, b_payload);
-                store_slot_field(&mut builder, frame, true, depth - 2, 0, a_tag);
-                store_slot_field(&mut builder, frame, true, depth - 2, 8, a_payload);
+                let a_tag = load_stack_field(&mut builder, &local_state, depth - 1, 0);
+                let a_payload = load_stack_field(&mut builder, &local_state, depth - 1, 8);
+                let b_tag = load_stack_field(&mut builder, &local_state, depth - 2, 0);
+                let b_payload = load_stack_field(&mut builder, &local_state, depth - 2, 8);
+                store_stack_field(&mut builder, &local_state, depth - 1, 0, b_tag);
+                store_stack_field(&mut builder, &local_state, depth - 1, 8, b_payload);
+                store_stack_field(&mut builder, &local_state, depth - 2, 0, a_tag);
+                store_stack_field(&mut builder, &local_state, depth - 2, 8, a_payload);
                 jump_to(&mut builder, next, "swap fallthrough")?;
             }
             Instruction::ConstrainArrayFrom => {
                 // For scalars the VM operation preserves the assigned value.
                 // Arrays may carry mutable type constraints, so let the VM own it.
-                let tag = load_slot_field(&mut builder, frame, true, depth - 2, 0);
+                let tag = load_stack_field(&mut builder, &local_state, depth - 2, 0);
                 let is_array = builder
                     .ins()
                     .icmp_imm_s(IntCC::Equal, tag, TAG_ARRAY as i64);
@@ -2984,7 +3285,6 @@ fn lower_function(
                     REASON_NORMAL,
                 );
                 builder.switch_to_block(scalar);
-                set_stack_len(&mut builder, frame, depth - 1);
                 jump_to(&mut builder, next, "array-context fallthrough")?;
             }
             _ => emit_exit(
@@ -3057,7 +3357,7 @@ fn emit_variant_type_test(
         return Ok(());
     };
     let next = next.ok_or("variant type-test fallthrough is missing")?;
-    let actual_tag = load_slot_field(builder, frame, true, site.stack_depth - 1, 0);
+    let actual_tag = load_stack_field(builder, local_state, site.stack_depth - 1, 0);
     // Unknown variants and Error values may carry a nominal tag that is not
     // present in this artifact's registry. Resume the VM so it can compare the
     // full Cog tag instead of treating an absent native tag as a false match.
@@ -3098,17 +3398,16 @@ fn emit_variant_type_test(
     }
     let matches = matches.ok_or("variant test has no registered tags")?;
     let payload = builder.ins().uextend(types::I64, matches);
-    store_slot_const(
+    store_stack_const(
         builder,
-        frame,
-        true,
+        local_state,
         site.stack_depth - 1,
         JitSlot {
             tag: TAG_BOOL,
             payload: 0,
         },
     );
-    store_slot_field(builder, frame, true, site.stack_depth - 1, 8, payload);
+    store_stack_field(builder, local_state, site.stack_depth - 1, 8, payload);
     jump_to(builder, Some(next), "variant type-test fallthrough")
 }
 
@@ -3233,31 +3532,77 @@ fn store_slot_field(
         .store(MemFlagsData::trusted(), value, address, 0);
 }
 
-fn store_slot_const(
+fn load_stack_field(
     builder: &mut FunctionBuilder<'_>,
-    frame: cranelift_codegen::ir::Value,
-    stack: bool,
+    local_state: &JitLocalState,
+    index: usize,
+    field: i32,
+) -> cranelift_codegen::ir::Value {
+    let (tag, payload) = local_state.stack_variables[index];
+    builder.use_var(if field == 0 { tag } else { payload })
+}
+
+fn store_stack_field(
+    builder: &mut FunctionBuilder<'_>,
+    local_state: &JitLocalState,
+    index: usize,
+    field: i32,
+    value: cranelift_codegen::ir::Value,
+) {
+    let (tag, payload) = local_state.stack_variables[index];
+    builder.def_var(if field == 0 { tag } else { payload }, value);
+}
+
+fn store_stack_const(
+    builder: &mut FunctionBuilder<'_>,
+    local_state: &JitLocalState,
     index: usize,
     slot: JitSlot,
 ) {
-    let tag = builder.ins().iconst(types::I64, slot.tag as i64);
-    let payload = builder.ins().iconst(types::I64, slot.payload as i64);
-    store_slot_field(builder, frame, stack, index, 0, tag);
-    store_slot_field(builder, frame, stack, index, 8, payload);
+    let tag = iconst_i64(builder, slot.tag as i64);
+    let payload = iconst_i64(builder, slot.payload as i64);
+    store_stack_field(builder, local_state, index, 0, tag);
+    store_stack_field(builder, local_state, index, 8, payload);
 }
 
-fn copy_slot(
+fn copy_stack_slot(
     builder: &mut FunctionBuilder<'_>,
-    frame: cranelift_codegen::ir::Value,
-    source_stack: bool,
+    local_state: &JitLocalState,
     source: usize,
-    target_stack: bool,
     target: usize,
 ) {
-    let tag = load_slot_field(builder, frame, source_stack, source, 0);
-    let payload = load_slot_field(builder, frame, source_stack, source, 8);
-    store_slot_field(builder, frame, target_stack, target, 0, tag);
-    store_slot_field(builder, frame, target_stack, target, 8, payload);
+    let tag = load_stack_field(builder, local_state, source, 0);
+    let payload = load_stack_field(builder, local_state, source, 8);
+    store_stack_field(builder, local_state, target, 0, tag);
+    store_stack_field(builder, local_state, target, 8, payload);
+}
+
+fn materialize_stack(
+    builder: &mut FunctionBuilder<'_>,
+    frame: cranelift_codegen::ir::Value,
+    local_state: &JitLocalState,
+    depth: usize,
+) {
+    for index in 0..depth {
+        let tag = load_stack_field(builder, local_state, index, 0);
+        let payload = load_stack_field(builder, local_state, index, 8);
+        store_slot_field(builder, frame, true, index, 0, tag);
+        store_slot_field(builder, frame, true, index, 8, payload);
+    }
+}
+
+fn reload_stack(
+    builder: &mut FunctionBuilder<'_>,
+    frame: cranelift_codegen::ir::Value,
+    local_state: &JitLocalState,
+    depth: usize,
+) {
+    for index in 0..depth {
+        let tag = load_slot_field(builder, frame, true, index, 0);
+        let payload = load_slot_field(builder, frame, true, index, 8);
+        store_stack_field(builder, local_state, index, 0, tag);
+        store_stack_field(builder, local_state, index, 8, payload);
+    }
 }
 
 fn load_frame(
@@ -3298,13 +3643,14 @@ fn set_stack_len(
 
 fn emit_exit(
     builder: &mut FunctionBuilder<'_>,
-    _frame: cranelift_codegen::ir::Value,
+    frame: cranelift_codegen::ir::Value,
     local_state: &JitLocalState,
     pc: usize,
     stack_depth: usize,
     status: i32,
     reason: i64,
 ) {
+    materialize_stack(builder, frame, local_state, stack_depth);
     let exit_reason = builder.ins().iconst(types::I64, reason);
     let result = builder.ins().iconst(types::I32, i64::from(status));
     let pc = builder.ins().iconst(types::I64, pc as i64);
@@ -3320,6 +3666,7 @@ fn emit_exit(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_numeric_binary(
     builder: &mut FunctionBuilder<'_>,
     frame: cranelift_codegen::ir::Value,
@@ -3330,8 +3677,8 @@ fn emit_numeric_binary(
     instruction: &Instruction,
     helpers: JitHelperRefs,
 ) {
-    let left_tag = load_slot_field(builder, frame, true, depth - 2, 0);
-    let right_tag = load_slot_field(builder, frame, true, depth - 1, 0);
+    let left_tag = load_stack_field(builder, local_state, depth - 2, 0);
+    let right_tag = load_stack_field(builder, local_state, depth - 1, 0);
     let left_is_int = builder
         .ins()
         .icmp_imm_s(IntCC::Equal, left_tag, TAG_INT as i64);
@@ -3481,6 +3828,7 @@ fn emit_numeric_binary(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_helper_call(
     builder: &mut FunctionBuilder<'_>,
     frame: cranelift_codegen::ir::Value,
@@ -3512,6 +3860,7 @@ fn emit_helper_call(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_native_call(
     builder: &mut FunctionBuilder<'_>,
     frame: cranelift_codegen::ir::Value,
@@ -3541,6 +3890,7 @@ fn emit_native_call(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_runtime_helper(
     builder: &mut FunctionBuilder<'_>,
     frame: cranelift_codegen::ir::Value,
@@ -3552,6 +3902,8 @@ fn emit_runtime_helper(
     arguments: &[cranelift_codegen::ir::Value],
     result_depth: usize,
 ) {
+    materialize_stack(builder, frame, local_state, depth);
+    set_stack_len(builder, frame, depth);
     let mut call_arguments = Vec::with_capacity(arguments.len() + 1);
     call_arguments.push(frame);
     call_arguments.extend_from_slice(arguments);
@@ -3572,6 +3924,7 @@ fn emit_runtime_helper(
         REASON_NORMAL,
     );
     builder.switch_to_block(success);
+    reload_stack(builder, frame, local_state, result_depth);
     set_stack_len(builder, frame, result_depth);
     builder.ins().jump(next, &[]);
 }
@@ -3607,6 +3960,7 @@ fn bigint_comparison_code(instruction: &Instruction) -> i32 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_bigint_binary(
     builder: &mut FunctionBuilder<'_>,
     frame: cranelift_codegen::ir::Value,
@@ -3622,8 +3976,8 @@ fn emit_bigint_binary(
     let left_signed = small_bigint_signed_tag_test(builder, left_tag);
     let right_signed = small_bigint_signed_tag_test(builder, right_tag);
     let both_signed = builder.ins().band(left_signed, right_signed);
-    let left = load_slot_field(builder, frame, true, depth - 2, 8);
-    let right = load_slot_field(builder, frame, true, depth - 1, 8);
+    let left = load_stack_field(builder, local_state, depth - 2, 8);
+    let right = load_stack_field(builder, local_state, depth - 1, 8);
     let fallback = builder.create_block();
     let signed = builder.create_block();
     let check_unsigned = builder.create_block();
@@ -3707,7 +4061,14 @@ fn emit_bigint_binary(
     let safe = builder.create_block();
     builder.ins().brif(overflow, fallback, &[], safe, &[]);
     builder.switch_to_block(safe);
-    emit_bigint_result(builder, frame, depth, next, result, TAG_BIGINT_JIT_SIGNED);
+    emit_bigint_result(
+        builder,
+        local_state,
+        depth,
+        next,
+        result,
+        TAG_BIGINT_JIT_SIGNED,
+    );
 
     builder.switch_to_block(unsigned);
     let (result, overflow) = match instruction {
@@ -3733,18 +4094,25 @@ fn emit_bigint_binary(
         let result_tag = builder
             .ins()
             .select(negative_fits, signed_tag, unsigned_tag);
-        emit_bigint_dynamic_result(builder, frame, depth, next, result, result_tag);
+        emit_bigint_dynamic_result(builder, local_state, depth, next, result, result_tag);
     } else {
         let safe = builder.create_block();
         builder.ins().brif(overflow, fallback, &[], safe, &[]);
         builder.switch_to_block(safe);
-        emit_bigint_result(builder, frame, depth, next, result, TAG_BIGINT_JIT_UNSIGNED);
+        emit_bigint_result(
+            builder,
+            local_state,
+            depth,
+            next,
+            result,
+            TAG_BIGINT_JIT_UNSIGNED,
+        );
     }
 
     builder.switch_to_block(mixed);
     emit_bigint_mixed_arithmetic(
         builder,
-        frame,
+        local_state,
         depth,
         next,
         instruction,
@@ -3774,7 +4142,7 @@ fn emit_bigint_binary(
 #[allow(clippy::too_many_arguments)]
 fn emit_bigint_mixed_arithmetic(
     builder: &mut FunctionBuilder<'_>,
-    frame: cranelift_codegen::ir::Value,
+    local_state: &JitLocalState,
     depth: usize,
     next: cranelift_codegen::ir::Block,
     instruction: &Instruction,
@@ -3824,7 +4192,7 @@ fn emit_bigint_mixed_arithmetic(
         .ins()
         .iconst(types::I64, TAG_BIGINT_JIT_UNSIGNED as i64);
     let result_tag = builder.ins().select(negative, signed_tag, unsigned_tag);
-    emit_bigint_dynamic_result(builder, frame, depth, next, payload, result_tag);
+    emit_bigint_dynamic_result(builder, local_state, depth, next, payload, result_tag);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3876,7 +4244,7 @@ fn emit_bigint_divmod(
     };
     emit_bigint_result(
         builder,
-        frame,
+        local_state,
         depth,
         next,
         result,
@@ -3890,38 +4258,35 @@ fn emit_bigint_divmod(
 
 fn emit_bigint_result(
     builder: &mut FunctionBuilder<'_>,
-    frame: cranelift_codegen::ir::Value,
+    local_state: &JitLocalState,
     depth: usize,
     next: cranelift_codegen::ir::Block,
     result: cranelift_codegen::ir::Value,
     result_tag: u64,
 ) {
-    store_slot_const(
+    store_stack_const(
         builder,
-        frame,
-        true,
+        local_state,
         depth - 2,
         JitSlot {
             tag: result_tag,
             payload: 0,
         },
     );
-    store_slot_field(builder, frame, true, depth - 2, 8, result);
-    set_stack_len(builder, frame, depth - 1);
+    store_stack_field(builder, local_state, depth - 2, 8, result);
     builder.ins().jump(next, &[]);
 }
 
 fn emit_bigint_dynamic_result(
     builder: &mut FunctionBuilder<'_>,
-    frame: cranelift_codegen::ir::Value,
+    local_state: &JitLocalState,
     depth: usize,
     next: cranelift_codegen::ir::Block,
     result: cranelift_codegen::ir::Value,
     result_tag: cranelift_codegen::ir::Value,
 ) {
-    store_slot_field(builder, frame, true, depth - 2, 0, result_tag);
-    store_slot_field(builder, frame, true, depth - 2, 8, result);
-    set_stack_len(builder, frame, depth - 1);
+    store_stack_field(builder, local_state, depth - 2, 0, result_tag);
+    store_stack_field(builder, local_state, depth - 2, 8, result);
     builder.ins().jump(next, &[]);
 }
 
@@ -3934,8 +4299,8 @@ fn emit_float_binary(
     next: cranelift_codegen::ir::Block,
     instruction: &Instruction,
 ) {
-    let left_bits = load_slot_field(builder, frame, true, depth - 2, 8);
-    let right_bits = load_slot_field(builder, frame, true, depth - 1, 8);
+    let left_bits = load_stack_field(builder, local_state, depth - 2, 8);
+    let right_bits = load_stack_field(builder, local_state, depth - 1, 8);
     let left = builder
         .ins()
         .bitcast(types::F64, MemFlagsData::new(), left_bits);
@@ -3970,21 +4335,20 @@ fn emit_float_binary(
     let result = builder
         .ins()
         .bitcast(types::I64, MemFlagsData::new(), result);
-    store_slot_const(
+    store_stack_const(
         builder,
-        frame,
-        true,
+        local_state,
         depth - 2,
         JitSlot {
             tag: TAG_FLOAT,
             payload: 0,
         },
     );
-    store_slot_field(builder, frame, true, depth - 2, 8, result);
-    set_stack_len(builder, frame, depth - 1);
+    store_stack_field(builder, local_state, depth - 2, 8, result);
     builder.ins().jump(next, &[]);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_integer_binary_kind(
     builder: &mut FunctionBuilder<'_>,
     frame: cranelift_codegen::ir::Value,
@@ -3996,8 +4360,8 @@ fn emit_integer_binary_kind(
     result_tag: u64,
     signed: bool,
 ) {
-    let left = load_slot_field(builder, frame, true, depth - 2, 8);
-    let right = load_slot_field(builder, frame, true, depth - 1, 8);
+    let left = load_stack_field(builder, local_state, depth - 2, 8);
+    let right = load_stack_field(builder, local_state, depth - 1, 8);
 
     let (result, overflow) = match instruction {
         Instruction::Add => {
@@ -4065,18 +4429,16 @@ fn emit_integer_binary_kind(
                 (Instruction::Mod, false) => builder.ins().urem(left, right),
                 _ => unreachable!("integer division lowering only handles div and mod"),
             };
-            store_slot_const(
+            store_stack_const(
                 builder,
-                frame,
-                true,
+                local_state,
                 depth - 2,
                 JitSlot {
                     tag: result_tag,
                     payload: 0,
                 },
             );
-            store_slot_field(builder, frame, true, depth - 2, 8, result);
-            set_stack_len(builder, frame, depth - 1);
+            store_stack_field(builder, local_state, depth - 2, 8, result);
             builder.ins().jump(next, &[]);
             return;
         }
@@ -4102,18 +4464,16 @@ fn emit_integer_binary_kind(
         REASON_NORMAL,
     );
     builder.switch_to_block(safe);
-    store_slot_const(
+    store_stack_const(
         builder,
-        frame,
-        true,
+        local_state,
         depth - 2,
         JitSlot {
             tag: result_tag,
             payload: 0,
         },
     );
-    store_slot_field(builder, frame, true, depth - 2, 8, result);
-    set_stack_len(builder, frame, depth - 1);
+    store_stack_field(builder, local_state, depth - 2, 8, result);
     builder.ins().jump(next, &[]);
 }
 
@@ -4278,6 +4638,7 @@ fn emit_integer_comparison(
     builder.ins().select(mixed, mixed_result, same_signedness)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_numeric_compare(
     builder: &mut FunctionBuilder<'_>,
     frame: cranelift_codegen::ir::Value,
@@ -4288,8 +4649,8 @@ fn emit_numeric_compare(
     instruction: &Instruction,
     helpers: JitHelperRefs,
 ) {
-    let left_tag = load_slot_field(builder, frame, true, depth - 2, 0);
-    let right_tag = load_slot_field(builder, frame, true, depth - 1, 0);
+    let left_tag = load_stack_field(builder, local_state, depth - 2, 0);
+    let right_tag = load_stack_field(builder, local_state, depth - 1, 0);
     let left_is_int = builder
         .ins()
         .icmp_imm_s(IntCC::Equal, left_tag, TAG_INT as i64);
@@ -4457,11 +4818,11 @@ fn emit_numeric_compare(
     } else {
         builder.ins().icmp_imm_s(IntCC::Equal, both_nil, 0)
     };
-    emit_compare_result(builder, frame, depth, next, result);
+    emit_compare_result(builder, local_state, depth, next, result);
 
     builder.switch_to_block(bigint_block);
-    let left_payload = load_slot_field(builder, frame, true, depth - 2, 8);
-    let right_payload = load_slot_field(builder, frame, true, depth - 1, 8);
+    let left_payload = load_stack_field(builder, local_state, depth - 2, 8);
+    let right_payload = load_stack_field(builder, local_state, depth - 1, 8);
     let has_float = builder.ins().bor(left_is_float, right_is_float);
     let bigint_float_block = builder.create_block();
     let bigint_integer_block = builder.create_block();
@@ -4498,13 +4859,13 @@ fn emit_numeric_compare(
     let (less, equal, greater) =
         emit_integer_float_ordering(builder, integer_payload, float_value, true);
     let result = emit_order_predicate(builder, instruction, less, equal, greater, left_is_float);
-    emit_compare_result(builder, frame, depth, next, result);
+    emit_compare_result(builder, local_state, depth, next, result);
 
     builder.switch_to_block(unsigned_block);
     let (less, equal, greater) =
         emit_integer_float_ordering(builder, integer_payload, float_value, false);
     let result = emit_order_predicate(builder, instruction, less, equal, greater, left_is_float);
-    emit_compare_result(builder, frame, depth, next, result);
+    emit_compare_result(builder, local_state, depth, next, result);
 
     builder.switch_to_block(bigint_integer_block);
     let left_small_signed = small_bigint_signed_tag_test(builder, left_tag);
@@ -4519,11 +4880,11 @@ fn emit_numeric_compare(
         left_signed,
         right_signed,
     );
-    emit_compare_result(builder, frame, depth, next, result);
+    emit_compare_result(builder, local_state, depth, next, result);
 
     builder.switch_to_block(mixed_float_block);
-    let left_payload = load_slot_field(builder, frame, true, depth - 2, 8);
-    let right_payload = load_slot_field(builder, frame, true, depth - 1, 8);
+    let left_payload = load_stack_field(builder, local_state, depth - 2, 8);
+    let right_payload = load_stack_field(builder, local_state, depth - 1, 8);
     let integer_payload = builder
         .ins()
         .select(left_is_float, right_payload, left_payload);
@@ -4544,17 +4905,17 @@ fn emit_numeric_compare(
     let (less, equal, greater) =
         emit_integer_float_ordering(builder, integer_payload, float_value, true);
     let result = emit_order_predicate(builder, instruction, less, equal, greater, left_is_float);
-    emit_compare_result(builder, frame, depth, next, result);
+    emit_compare_result(builder, local_state, depth, next, result);
 
     builder.switch_to_block(unsigned_block);
     let (less, equal, greater) =
         emit_integer_float_ordering(builder, integer_payload, float_value, false);
     let result = emit_order_predicate(builder, instruction, less, equal, greater, left_is_float);
-    emit_compare_result(builder, frame, depth, next, result);
+    emit_compare_result(builder, local_state, depth, next, result);
 
     builder.switch_to_block(regular_block);
-    let left = load_slot_field(builder, frame, true, depth - 2, 8);
-    let right = load_slot_field(builder, frame, true, depth - 1, 8);
+    let left = load_stack_field(builder, local_state, depth - 2, 8);
+    let right = load_stack_field(builder, local_state, depth - 1, 8);
     let integer_condition = match instruction {
         Instruction::Eq => builder.ins().icmp(IntCC::Equal, left, right),
         Instruction::Ne => builder.ins().icmp(IntCC::NotEqual, left, right),
@@ -4671,42 +5032,38 @@ fn emit_numeric_compare(
         .ins()
         .select(both_float, float_condition, integer_condition);
     let payload = builder.ins().uextend(types::I64, condition);
-    store_slot_const(
+    store_stack_const(
         builder,
-        frame,
-        true,
+        local_state,
         depth - 2,
         JitSlot {
             tag: TAG_BOOL,
             payload: 0,
         },
     );
-    store_slot_field(builder, frame, true, depth - 2, 8, payload);
-    set_stack_len(builder, frame, depth - 1);
+    store_stack_field(builder, local_state, depth - 2, 8, payload);
     builder.ins().jump(next, &[]);
 }
 
 /// Writes a boolean comparison result and consumes the two input stack slots.
 fn emit_compare_result(
     builder: &mut FunctionBuilder<'_>,
-    frame: cranelift_codegen::ir::Value,
+    local_state: &JitLocalState,
     depth: usize,
     next: cranelift_codegen::ir::Block,
     result: cranelift_codegen::ir::Value,
 ) {
     let payload = builder.ins().uextend(types::I64, result);
-    store_slot_const(
+    store_stack_const(
         builder,
-        frame,
-        true,
+        local_state,
         depth - 2,
         JitSlot {
             tag: TAG_BOOL,
             payload: 0,
         },
     );
-    store_slot_field(builder, frame, true, depth - 2, 8, payload);
-    set_stack_len(builder, frame, depth - 1);
+    store_stack_field(builder, local_state, depth - 2, 8, payload);
     builder.ins().jump(next, &[]);
 }
 
@@ -4852,8 +5209,8 @@ fn emit_bool_binary(
     next: cranelift_codegen::ir::Block,
     instruction: &Instruction,
 ) {
-    let left_tag = load_slot_field(builder, frame, true, depth - 2, 0);
-    let right_tag = load_slot_field(builder, frame, true, depth - 1, 0);
+    let left_tag = load_stack_field(builder, local_state, depth - 2, 0);
+    let right_tag = load_stack_field(builder, local_state, depth - 1, 0);
     let left_bool = builder
         .ins()
         .icmp_imm_s(IntCC::Equal, left_tag, TAG_BOOL as i64);
@@ -4875,26 +5232,24 @@ fn emit_bool_binary(
         REASON_NORMAL,
     );
     builder.switch_to_block(valid);
-    let left = load_slot_field(builder, frame, true, depth - 2, 8);
-    let right = load_slot_field(builder, frame, true, depth - 1, 8);
+    let left = load_stack_field(builder, local_state, depth - 2, 8);
+    let right = load_stack_field(builder, local_state, depth - 1, 8);
     let result = match instruction {
         Instruction::And => builder.ins().band(left, right),
         Instruction::Or => builder.ins().bor(left, right),
         Instruction::Xor => builder.ins().bxor(left, right),
         _ => unreachable!("emit_bool_binary is used only for boolean operations"),
     };
-    store_slot_const(
+    store_stack_const(
         builder,
-        frame,
-        true,
+        local_state,
         depth - 2,
         JitSlot {
             tag: TAG_BOOL,
             payload: 0,
         },
     );
-    store_slot_field(builder, frame, true, depth - 2, 8, result);
-    set_stack_len(builder, frame, depth - 1);
+    store_stack_field(builder, local_state, depth - 2, 8, result);
     builder.ins().jump(next, &[]);
 }
 
@@ -4908,7 +5263,6 @@ fn emit_jump(
     target_block: cranelift_codegen::ir::Block,
 ) {
     if target > pc {
-        set_stack_len(builder, frame, target_depth);
         builder.ins().jump(target_block, &[]);
         return;
     }
@@ -4937,7 +5291,6 @@ fn emit_jump(
         .ins()
         .brif(bounded, profile_path, &[], unbounded_path, &[]);
     builder.switch_to_block(unbounded_path);
-    set_stack_len(builder, frame, target_depth);
     builder.ins().jump(target_block, &[]);
 
     builder.switch_to_block(profile_path);
@@ -4966,10 +5319,10 @@ fn emit_jump(
         REASON_PROFILE_SLICE,
     );
     builder.switch_to_block(keep_running);
-    set_stack_len(builder, frame, target_depth);
     builder.ins().jump(target_block, &[]);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_conditional_jump(
     builder: &mut FunctionBuilder<'_>,
     frame: cranelift_codegen::ir::Value,
@@ -4983,7 +5336,7 @@ fn emit_conditional_jump(
     instruction: &Instruction,
 ) -> Result<(), String> {
     let next = next.ok_or("conditional fallthrough is missing")?;
-    let tag = load_slot_field(builder, frame, true, depth - 1, 0);
+    let tag = load_stack_field(builder, local_state, depth - 1, 0);
     let is_bool = builder.ins().icmp_imm_s(IntCC::Equal, tag, TAG_BOOL as i64);
     let valid = builder.create_block();
     let fallback = builder.create_block();
@@ -5000,7 +5353,7 @@ fn emit_conditional_jump(
     );
 
     builder.switch_to_block(valid);
-    let payload = load_slot_field(builder, frame, true, depth - 1, 8);
+    let payload = load_stack_field(builder, local_state, depth - 1, 8);
     let take_target = match instruction {
         Instruction::JumpIfFalse(_) => builder.ins().icmp_imm_s(IntCC::Equal, payload, 0),
         Instruction::JumpIfTrue(_) => builder.ins().icmp_imm_s(IntCC::NotEqual, payload, 0),
@@ -5028,9 +5381,6 @@ fn emit_conditional_jump(
     );
 
     builder.switch_to_block(fallthrough);
-    let fall_depth = plan.stack_depths[pc + 1 - plan.entry]
-        .ok_or("invalid conditional fallthrough stack depth")?;
-    set_stack_len(builder, frame, fall_depth);
     builder.ins().jump(next, &[]);
     Ok(())
 }
@@ -5090,6 +5440,8 @@ mod tests {
             last_backedge_at: (windows_this_run > 0).then_some(now),
             last_selection_window: 0,
             retry_after_backedges: 0,
+            retry_after_calls: 0,
+            last_selection_call: 0,
             compiled: None,
             disabled: false,
         }
@@ -5144,6 +5496,7 @@ mod tests {
             max_stack: 1,
             stack_depths: Vec::new(),
             osr_entries: vec![entry + 4],
+            has_backedges: true,
             callable_from_jit: false,
         };
         let stale_entry = entry + 100;
@@ -5153,6 +5506,7 @@ mod tests {
                 vm_ns_per_backedge: 1_000_000,
                 jit_ns_per_backedge: 1,
                 total_backedges: WINDOW_BACKEDGES * u64::from(REQUIRED_WINDOWS),
+                total_calls: 0,
                 hot_series_ns: MAX_HORIZON_NS,
                 active_windows: REQUIRED_WINDOWS,
                 calibrated: true,
@@ -5239,6 +5593,7 @@ mod tests {
             max_stack: 1,
             stack_depths: Vec::new(),
             osr_entries: vec![entry + 4],
+            has_backedges: true,
             callable_from_jit: false,
         };
         let (compiler, _) = JitCompiler::new().expect("native JIT should initialize");
@@ -5284,17 +5639,20 @@ mod tests {
             vm_ns_per_backedge: 20,
             jit_ns_per_backedge: 5,
             total_backedges: 900,
+            total_calls: 7,
             hot_series_ns: MAX_HORIZON_NS,
             active_windows: REQUIRED_WINDOWS,
             calibrated: true,
         };
         let encoded = serde_json::to_value(profile).expect("profile serializes");
         assert!(encoded.get("total_backedges").is_none());
+        assert!(encoded.get("total_calls").is_none());
         assert!(encoded.get("hot_series_ns").is_none());
         assert!(encoded.get("active_windows").is_none());
         let restored: FunctionProfile =
             serde_json::from_value(encoded).expect("profile deserializes");
         assert_eq!(restored.total_backedges, 0);
+        assert_eq!(restored.total_calls, 0);
         assert_eq!(restored.hot_series_ns, 0);
         assert_eq!(restored.active_windows, 0);
     }
@@ -5338,6 +5696,7 @@ mod tests {
             max_stack: 1,
             stack_depths: vec![Some(1)],
             osr_entries: Vec::new(),
+            has_backedges: false,
             callable_from_jit: false,
         };
         let frame = JitFrame {

@@ -60,6 +60,32 @@ fn main() -> nil {{
     )
 }
 
+fn function_calls_source(iterations: u64) -> String {
+    format!(
+        r#"
+@!include("std")
+use io;
+
+@inline("never")
+fn add_one(value: int) -> int {{ value + 1 }}
+
+fn work(n: int) -> int {{
+    var index = 0;
+    var total = 0;
+    while index < n {{
+        total += add_one(index);
+        index += 1;
+    }}
+    total
+}}
+
+fn main() -> nil {{
+    io::println(work({iterations}))!!;
+}}
+"#
+    )
+}
+
 fn uint_source(iterations: u64) -> String {
     format!(
         r#"
@@ -584,6 +610,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Case {
             name: "slot-pressure",
             source: slot_pressure_source,
+        },
+        Case {
+            name: "function-calls",
+            source: function_calls_source,
         },
         Case {
             name: "uint",
