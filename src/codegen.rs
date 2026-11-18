@@ -1,13 +1,13 @@
 use crate::ast::{
-    BinOp, BindingPattern, Block, CallArgument, EnumVariant, Expr, FallbackKind, ForClause,
-    FunctionDecl, InlineMode, Item, MatchPattern, Param, Program, Stmt, StringPart, TypeAnnotation,
-    TypeKind, UnOp, VarType, Visibility,
+    BinOp, BindingPattern, Block, CallArgument, ClosureCapture, EnumVariant, Expr, FallbackKind,
+    ForClause, FunctionDecl, InlineMode, Item, MatchPattern, Param, Program, Stmt, StringPart,
+    TypeAnnotation, TypeKind, UnOp, VarType, Visibility,
 };
 use crate::backend::{CompiledProgram, Emitter, Label};
 use crate::builtins::Builtin;
 use crate::instruction::{Instruction, ValueType};
 use crate::value::{RuntimeType, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 const MAX_INLINE_BODY_NODES: usize = 32;
@@ -20,6 +20,214 @@ enum DeclaredCall {
     Function,
     Record,
     Variant,
+}
+
+#[derive(Clone)]
+struct ClosureDef {
+    name: String,
+    captures: Vec<ClosureCapture>,
+    params: Vec<Param>,
+    result_type: Option<TypeAnnotation>,
+    // Original AST body, retained so semantic facts keyed by node identity apply.
+    body: std::ptr::NonNull<Block>,
+    imports: Vec<HashMap<String, String>>,
+    modules: Vec<HashMap<String, String>>,
+    module: Option<String>,
+    callsite_function: Option<String>,
+}
+
+fn mutable_capture_names(block: &Block) -> HashSet<String> {
+    fn visit_expr(expr: &Expr, names: &mut HashSet<String>) {
+        match expr.node() {
+            Expr::Closure { captures, body, .. } => {
+                names.extend(
+                    captures
+                        .iter()
+                        .filter(|capture| capture.mutable)
+                        .map(|capture| capture.name.clone()),
+                );
+                visit_block(body, names);
+            }
+            Expr::Array(items) | Expr::Tuple(items) => {
+                items.iter().for_each(|item| visit_expr(item, names))
+            }
+            Expr::Record(fields) => fields
+                .iter()
+                .for_each(|(_, value)| visit_expr(value, names)),
+            Expr::Interpolated(parts) => parts.iter().for_each(|part| {
+                if let StringPart::Expression(value) = part {
+                    visit_expr(value, names)
+                }
+            }),
+            Expr::Call(_, args) | Expr::SpecializedCall(_, _, args) => {
+                args.iter().for_each(|arg| visit_expr(&arg.value, names))
+            }
+            Expr::AssociatedCall { args, .. } => {
+                args.iter().for_each(|arg| visit_expr(&arg.value, names))
+            }
+            Expr::Apply(callee, args) => {
+                visit_expr(callee, names);
+                args.iter().for_each(|arg| visit_expr(&arg.value, names));
+            }
+            Expr::BracketApply(target, args) => {
+                visit_expr(target, names);
+                args.iter().for_each(|arg| visit_expr(arg, names));
+            }
+            Expr::MethodCall(target, _, args) => {
+                visit_expr(target, names);
+                args.iter().for_each(|arg| visit_expr(arg, names));
+            }
+            Expr::Index(left, right) | Expr::Binary(_, left, right) => {
+                visit_expr(left, names);
+                visit_expr(right, names);
+            }
+            Expr::Unary(_, value) | Expr::Propagate(value) | Expr::Cast(value, _) => {
+                visit_expr(value, names)
+            }
+            Expr::Fallback {
+                value, fallback, ..
+            } => {
+                visit_expr(value, names);
+                visit_expr(fallback, names);
+            }
+            Expr::Block(body) => visit_block(body, names),
+            Expr::Match { value, arms, .. } => {
+                visit_expr(value, names);
+                for arm in arms {
+                    if let Some(guard) = &arm.guard {
+                        visit_expr(guard, names);
+                    }
+                    visit_block(&arm.body, names);
+                }
+            }
+            Expr::Try {
+                body, catch_block, ..
+            } => {
+                visit_block(body, names);
+                visit_block(catch_block, names);
+            }
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                visit_expr(cond, names);
+                visit_expr(then_branch, names);
+                if let Some(branch) = else_branch {
+                    visit_expr(branch, names);
+                }
+            }
+            Expr::Located(_, _) => unreachable!("node removes locations"),
+            Expr::Int(_)
+            | Expr::UInt(_)
+            | Expr::BigInt(_)
+            | Expr::Float(_)
+            | Expr::Char(_)
+            | Expr::Str(_)
+            | Expr::Bytes(_)
+            | Expr::Bool(_)
+            | Expr::Nil
+            | Expr::TypeLiteral(_)
+            | Expr::Ident(_) => {}
+        }
+    }
+    fn visit_block(block: &Block, names: &mut HashSet<String>) {
+        for statement in &block.stmts {
+            match statement.node() {
+                Stmt::VarDecl { value, .. }
+                | Stmt::Const { value, .. }
+                | Stmt::Comptime { value, .. }
+                | Stmt::Expr(value)
+                | Stmt::Crash { value, .. } => visit_expr(value, names),
+                Stmt::Assign { target, value } | Stmt::CompoundAssign { target, value, .. } => {
+                    visit_expr(target, names);
+                    visit_expr(value, names);
+                }
+                Stmt::Return(value) => {
+                    if let Some(value) = value {
+                        visit_expr(value, names);
+                    }
+                }
+                Stmt::Defer { body } => visit_block(body, names),
+                Stmt::Try {
+                    body, catch_block, ..
+                } => {
+                    visit_block(body, names);
+                    visit_block(catch_block, names);
+                }
+                Stmt::If {
+                    cond,
+                    then_block,
+                    else_block,
+                } => {
+                    visit_expr(cond, names);
+                    visit_block(then_block, names);
+                    if let Some(block) = else_block {
+                        visit_block(block, names);
+                    }
+                }
+                Stmt::When {
+                    value,
+                    then_block,
+                    else_block,
+                    ..
+                } => {
+                    visit_expr(value, names);
+                    visit_block(then_block, names);
+                    if let Some(block) = else_block {
+                        visit_block(block, names);
+                    }
+                }
+                Stmt::While { cond, body } => {
+                    visit_expr(cond, names);
+                    visit_block(body, names);
+                }
+                Stmt::For {
+                    start,
+                    end,
+                    step,
+                    body,
+                    ..
+                } => {
+                    visit_expr(start, names);
+                    visit_expr(end, names);
+                    if let Some(step) = step {
+                        visit_expr(step, names);
+                    }
+                    visit_block(body, names);
+                }
+                Stmt::ForEach { iterable, body, .. } => {
+                    visit_expr(iterable, names);
+                    visit_block(body, names);
+                }
+                Stmt::ForZip { clauses, body } => {
+                    for clause in clauses {
+                        match clause {
+                            ForClause::Range {
+                                start, end, step, ..
+                            } => {
+                                visit_expr(start, names);
+                                visit_expr(end, names);
+                                if let Some(step) = step {
+                                    visit_expr(step, names);
+                                }
+                            }
+                            ForClause::Each { iterable, .. } => visit_expr(iterable, names),
+                        }
+                    }
+                    visit_block(body, names);
+                }
+                Stmt::Located(_, _) => unreachable!("node removes locations"),
+                Stmt::Invalid { .. } | Stmt::Use { .. } | Stmt::Break | Stmt::Continue => {}
+            }
+        }
+        if let Some(tail) = &block.tail {
+            visit_expr(tail, names);
+        }
+    }
+    let mut names = HashSet::new();
+    visit_block(block, &mut names);
+    names
 }
 
 #[derive(Clone)]
@@ -329,6 +537,9 @@ struct Scopes {
     // Binding properties use slot identity, so shadowing cannot leak constness or types.
     const_vars: std::collections::HashSet<usize>,
     const_values: HashMap<usize, Value>,
+    capture_slots: HashMap<String, (usize, bool)>,
+    cell_names: HashSet<String>,
+    cell_slots: HashSet<usize>,
     next_slot: usize,
 }
 
@@ -340,6 +551,9 @@ impl Scopes {
             modules: vec![HashMap::new()],
             const_vars: std::collections::HashSet::new(),
             const_values: HashMap::new(),
+            capture_slots: HashMap::new(),
+            cell_names: HashSet::new(),
+            cell_slots: HashSet::new(),
             next_slot: 0,
         }
     }
@@ -416,6 +630,10 @@ impl Scopes {
     fn resolve(&self, name: &str) -> Option<usize> {
         self.stack.iter().rev().find_map(|s| s.get(name).copied())
     }
+
+    fn resolve_capture(&self, name: &str) -> Option<(usize, bool)> {
+        self.capture_slots.get(name).copied()
+    }
 }
 
 #[derive(Clone)]
@@ -474,6 +692,7 @@ enum ForZipState {
         bindings: Vec<PatternBindingSlot>,
         item_slot: usize,
         iterator_slot: usize,
+        iteration: Option<crate::analysis::IterationMethods>,
     },
 }
 
@@ -549,6 +768,7 @@ fn runtime_type(annotation: &crate::ast::TypeAnnotation) -> Option<RuntimeType> 
         TypeKind::Tuple(items) => {
             RuntimeType::Tuple(items.iter().map(runtime_type).collect::<Option<Vec<_>>>()?)
         }
+        TypeKind::Function { .. } => RuntimeType::Function,
     };
     if annotation.nilable {
         ty = RuntimeType::Nullable(Box::new(ty));
@@ -559,6 +779,8 @@ fn runtime_type(annotation: &crate::ast::TypeAnnotation) -> Option<RuntimeType> 
 struct Codegen<'a> {
     functions: &'a HashMap<String, FunctionSig>,
     method_calls: &'a HashMap<crate::analysis::CallSite, String>,
+    iteration_calls:
+        &'a HashMap<crate::analysis::CallSite, Vec<Option<crate::analysis::IterationMethods>>>,
     call_specializations: &'a HashMap<crate::analysis::CallSite, String>,
     struct_call_specializations: &'a HashMap<crate::analysis::CallSite, String>,
     uint_literals: &'a std::collections::HashSet<usize>,
@@ -566,6 +788,8 @@ struct Codegen<'a> {
     bigint_literals: &'a std::collections::HashSet<usize>,
     inline_functions: HashMap<String, InlineFunction>,
     inline_nodes_remaining: usize,
+    closures: Vec<ClosureDef>,
+    next_closure: usize,
     current_function: Option<String>,
     current_module: Option<String>,
     struct_defs: HashMap<String, Vec<crate::ast::StructField>>,
@@ -594,8 +818,18 @@ pub fn compile(program: &Program) -> Result<CompiledProgram, CodegenError> {
     compile_with_modules(program, &HashMap::new())
 }
 
-pub(crate) fn compile_library(program: &Program) -> Result<CompiledProgram, CodegenError> {
-    compile_with_modules_and_entry(program, &HashMap::new(), false)
+pub(crate) fn compile_library(
+    program: &Program,
+    names: &std::collections::BTreeMap<String, String>,
+) -> Result<CompiledProgram, CodegenError> {
+    compile_with_modules_and_names(program, &HashMap::new(), names, false)
+}
+
+pub(crate) fn compile_with_names(
+    program: &Program,
+    names: &std::collections::BTreeMap<String, String>,
+) -> Result<CompiledProgram, CodegenError> {
+    compile_with_modules_and_names(program, &HashMap::new(), names, true)
 }
 
 fn is_main_arguments_parameter(parameters: &[Param]) -> bool {
@@ -631,8 +865,26 @@ fn compile_with_modules_and_entry(
     function_modules: &HashMap<String, String>,
     require_main: bool,
 ) -> Result<CompiledProgram, CodegenError> {
-    let (program, checked) = crate::generics::expand(program, function_modules)
-        .map_err(CodegenError::from_diagnostics)?;
+    compile_with_modules_and_names(
+        program,
+        function_modules,
+        &std::collections::BTreeMap::new(),
+        require_main,
+    )
+}
+
+fn compile_with_modules_and_names(
+    program: &Program,
+    function_modules: &HashMap<String, String>,
+    names: &std::collections::BTreeMap<String, String>,
+    require_main: bool,
+) -> Result<CompiledProgram, CodegenError> {
+    let expanded = if names.is_empty() {
+        crate::generics::expand(program, function_modules)
+    } else {
+        crate::generics::expand_with_names(program, function_modules, names)
+    };
+    let (program, checked) = expanded.map_err(CodegenError::from_diagnostics)?;
     let program = &program;
     if program
         .items
@@ -825,6 +1077,7 @@ fn compile_with_modules_and_entry(
     let mut cg = Codegen {
         functions: &functions,
         method_calls: &checked.method_calls,
+        iteration_calls: &checked.iteration_calls,
         call_specializations: &checked.call_specializations,
         struct_call_specializations: &checked.struct_call_specializations,
         uint_literals: &checked.uint_literals,
@@ -832,6 +1085,8 @@ fn compile_with_modules_and_entry(
         bigint_literals: &checked.bigint_literals,
         inline_functions,
         inline_nodes_remaining: MAX_INLINE_NODES_PER_FUNCTION,
+        closures: Vec::new(),
+        next_closure: 0,
         current_function: None,
         current_module: None,
         struct_defs,
@@ -930,12 +1185,134 @@ fn compile_with_modules_and_entry(
         }
     }
 
+    let mut closure_index = 0;
+    while closure_index < cg.closures.len() {
+        let closure = cg.closures[closure_index].clone();
+        cg.compile_closure(&closure)?;
+        closure_index += 1;
+    }
+
     cg.out.finish().map_err(CodegenError::new)
 }
 
 impl<'a> Codegen<'a> {
     fn fresh_label(&mut self, _prefix: &str) -> Label {
         self.out.label()
+    }
+
+    fn compile_closure(&mut self, closure: &ClosureDef) -> Result<(), CodegenError> {
+        let saved_function = self.current_function.clone();
+        let saved_module = self.current_module.clone();
+        let saved_result = self.function_result_type.clone();
+        let saved_in_function = self.in_function;
+        let saved_async = self.in_async;
+        let saved_defers = self.active_defers.clone();
+        self.current_function = closure.callsite_function.clone();
+        self.current_module = closure.module.clone();
+        self.function_result_type = closure.result_type.clone();
+        self.in_function = true;
+        self.in_async = false;
+        self.active_defers.clear();
+
+        // SAFETY: `compile_with_modules_and_names` drains the closure queue
+        // synchronously before it drops the expanded program.
+        let body = unsafe { closure.body.as_ref() };
+
+        let mut scopes = Scopes::new();
+        scopes.cell_names = mutable_capture_names(body);
+        scopes.imports = closure.imports.clone();
+        scopes.modules = closure.modules.clone();
+        for (index, capture) in closure.captures.iter().enumerate() {
+            scopes
+                .capture_slots
+                .insert(capture.name.clone(), (index, capture.mutable));
+        }
+        for parameter in &closure.params {
+            scopes.define(&parameter.name);
+        }
+        let parameter_types = closure
+            .params
+            .iter()
+            .map(|parameter| parameter.ty.as_ref().and_then(runtime_type))
+            .collect();
+        self.out.function_with_capture_types(
+            &closure.name,
+            parameter_types,
+            closure.result_type.as_ref().and_then(runtime_type),
+            closure.captures.len(),
+        );
+        for index in (0..closure.params.len()).rev() {
+            self.out.emit(Instruction::Store(index));
+        }
+        for (slot, parameter) in closure.params.iter().enumerate() {
+            if scopes.cell_names.contains(&parameter.name) {
+                self.out.extend([
+                    Instruction::Load(slot),
+                    Instruction::MakeCell,
+                    Instruction::Store(slot),
+                ]);
+                scopes.cell_slots.insert(slot);
+            }
+        }
+        self.compile_block_result(
+            body,
+            &mut scopes,
+            Vec::new(),
+            true,
+            closure.result_type.as_ref(),
+        )?;
+        self.out.emit(Instruction::Return);
+
+        self.current_function = saved_function;
+        self.current_module = saved_module;
+        self.function_result_type = saved_result;
+        self.in_function = saved_in_function;
+        self.in_async = saved_async;
+        self.active_defers = saved_defers;
+        Ok(())
+    }
+
+    fn compile_capture_value(
+        &mut self,
+        capture: &ClosureCapture,
+        scopes: &mut Scopes,
+    ) -> Result<(), CodegenError> {
+        if let Some(slot) = scopes.resolve(&capture.name) {
+            if !capture.mutable
+                && let Some(value) = scopes.const_values.get(&slot)
+            {
+                self.out.emit(Instruction::Push(value.clone()));
+                return Ok(());
+            }
+            if capture.mutable && !scopes.cell_slots.contains(&slot) {
+                return Err(CodegenError::new(format!(
+                    "mutable capture `{}` was not boxed at its binding",
+                    capture.name
+                )));
+            }
+            self.out.emit(Instruction::Load(slot));
+            if !capture.mutable && scopes.cell_slots.contains(&slot) {
+                self.out.emit(Instruction::CellGet);
+            }
+            return Ok(());
+        }
+        if let Some((index, parent_mutable)) = scopes.resolve_capture(&capture.name) {
+            if capture.mutable && !parent_mutable {
+                return Err(CodegenError::new(format!(
+                    "mutable capture `{}` requires a mutable outer capture",
+                    capture.name
+                )));
+            }
+            self.out.emit(Instruction::LoadCapture(index));
+            if !capture.mutable && parent_mutable {
+                self.out.emit(Instruction::CellGet);
+            }
+            return Ok(());
+        }
+        Err(CodegenError::new(format!(
+            "undefined closure capture `{}`",
+            capture.name
+        )))
     }
 
     fn compile_function(
@@ -949,6 +1326,7 @@ impl<'a> Codegen<'a> {
         let saved_async = self.in_async;
         self.in_async = f.asynchronous;
         let mut scopes = Scopes::new();
+        scopes.cell_names = mutable_capture_names(&f.body);
         scopes
             .imports
             .last_mut()
@@ -977,6 +1355,16 @@ impl<'a> Codegen<'a> {
         self.in_function = true;
         for i in (0..f.params.len()).rev() {
             self.out.emit(Instruction::Store(i));
+        }
+        for (slot, parameter) in f.params.iter().enumerate() {
+            if scopes.cell_names.contains(&parameter.name) {
+                self.out.extend([
+                    Instruction::Load(slot),
+                    Instruction::MakeCell,
+                    Instruction::Store(slot),
+                ]);
+                scopes.cell_slots.insert(slot);
+            }
         }
 
         self.function_result_type = f.result_type.clone();
@@ -1329,6 +1717,10 @@ impl<'a> Codegen<'a> {
                 scopes.push();
                 let bound_slot = scopes.define(name);
                 self.out.emit(Instruction::Load(temp_slot));
+                if scopes.cell_names.contains(name) {
+                    self.out.emit(Instruction::MakeCell);
+                    scopes.cell_slots.insert(bound_slot);
+                }
                 self.out.emit(Instruction::Store(bound_slot));
                 self.compile_block_with_deferred(then_block, scopes, deferred.clone())?;
                 scopes.pop();
@@ -1390,6 +1782,10 @@ impl<'a> Codegen<'a> {
                     .extend([Instruction::Push(start_zero), Instruction::Sub]);
                 self.propagate_control_error(scopes)?;
                 let var_slot = scopes.define(var);
+                if scopes.cell_names.contains(var) {
+                    self.out.emit(Instruction::MakeCell);
+                    scopes.cell_slots.insert(var_slot);
+                }
                 self.out.emit(Instruction::Store(var_slot));
                 let end_zero = self.range_zero(end);
                 self.compile_expr(end, scopes)?;
@@ -1445,12 +1841,12 @@ impl<'a> Codegen<'a> {
                 self.out.emit(Instruction::Lt);
                 self.propagate_control_error(scopes)?;
                 self.out.jump(Instruction::JumpIfTrue(0), desc_label);
-                self.out.emit(Instruction::Load(var_slot));
+                self.load_loop_binding(var_slot, scopes);
                 self.out.emit(Instruction::Load(end_slot));
                 self.out.emit(Instruction::Lt);
                 self.out.jump(Instruction::Jump(0), cmp_done_label);
                 self.out.bind(desc_label);
-                self.out.emit(Instruction::Load(var_slot));
+                self.load_loop_binding(var_slot, scopes);
                 self.out.emit(Instruction::Load(end_slot));
                 self.out.emit(Instruction::Gt);
                 self.out.bind(cmp_done_label);
@@ -1473,11 +1869,7 @@ impl<'a> Codegen<'a> {
                 self.loop_continue_stack.pop();
                 self.loop_end_stack.pop();
                 self.out.bind(next_label);
-                self.out.emit(Instruction::Load(var_slot));
-                self.out.emit(Instruction::Load(step_slot));
-                self.out.emit(Instruction::Add);
-                self.propagate_control_error(scopes)?;
-                self.out.emit(Instruction::Store(var_slot));
+                self.increment_loop_binding(var_slot, step_slot, scopes)?;
                 self.out.jump(Instruction::Jump(0), cond_label);
                 self.out.bind(end_label);
                 scopes.pop();
@@ -1487,31 +1879,55 @@ impl<'a> Codegen<'a> {
                 iterable,
                 body,
             } => {
+                let call_site =
+                    crate::analysis::statement_site(self.current_function.as_deref(), stmt);
+                let iteration = self
+                    .iteration_calls
+                    .get(&call_site)
+                    .and_then(|methods| methods.first())
+                    .cloned()
+                    .flatten();
                 let condition_label = self.fresh_label("foreach_condition");
                 let end_label = self.fresh_label("foreach_end");
                 scopes.push();
                 let iterator_slot = scopes.next_slot;
                 scopes.next_slot += 1;
                 self.compile_expr(iterable, scopes)?;
-                self.out.call_native(crate::runtime::iterator_new_import());
-                self.propagate_control_error(scopes)?;
+                if let Some(methods) = &iteration {
+                    self.out.call(&methods.into_iter, 1);
+                    self.propagate_call_error(scopes, &call_site)?;
+                } else {
+                    self.out.call_native(crate::runtime::iterator_new_import());
+                    self.propagate_control_error(scopes)?;
+                }
                 self.out.emit(Instruction::Store(iterator_slot));
                 let item_slot = scopes.reserve_slot();
                 let bindings = allocate_pattern_slots(pattern, scopes);
                 for binding in &bindings {
                     scopes.bind_slot(&binding.name, binding.slot);
                 }
+                self.initialize_loop_cells(&bindings, scopes);
 
                 self.out.bind(condition_label);
                 self.out.emit(Instruction::Load(iterator_slot));
-                self.out.call_native(crate::runtime::iterator_next_import());
-                self.propagate_control_error(scopes)?;
+                if let Some(methods) = &iteration {
+                    self.out.call(&methods.next, 1);
+                    self.propagate_call_error(scopes, &call_site)?;
+                } else {
+                    self.out.call_native(crate::runtime::iterator_next_import());
+                    self.propagate_control_error(scopes)?;
+                }
                 self.out.jump(Instruction::JumpIfFalse(0), end_label);
                 self.out.emit(Instruction::Load(iterator_slot));
-                self.out
-                    .call_native(crate::runtime::iterator_current_import());
+                if let Some(methods) = &iteration {
+                    self.out.call(&methods.current, 1);
+                    self.propagate_call_error(scopes, &call_site)?;
+                } else {
+                    self.out
+                        .call_native(crate::runtime::iterator_current_import());
+                }
                 self.out.emit(Instruction::Store(item_slot));
-                self.store_pattern_bindings(item_slot, &bindings);
+                self.store_loop_pattern_bindings(item_slot, &bindings, scopes)?;
 
                 let transfer = LoopTransfer {
                     label: end_label,
@@ -1537,7 +1953,9 @@ impl<'a> Codegen<'a> {
                 scopes.pop();
             }
             Stmt::ForZip { clauses, body } => {
-                self.compile_for_zip(clauses, body, scopes, deferred)?;
+                let call_site =
+                    crate::analysis::statement_site(self.current_function.as_deref(), stmt);
+                self.compile_for_zip(clauses, body, &call_site, scopes, deferred)?;
             }
         }
         Ok(())
@@ -1554,6 +1972,88 @@ impl<'a> Codegen<'a> {
             }
             self.out.emit(Instruction::Store(binding.slot));
         }
+    }
+
+    fn initialize_loop_cells(&mut self, bindings: &[PatternBindingSlot], scopes: &mut Scopes) {
+        for binding in bindings {
+            if scopes.cell_names.contains(&binding.name) {
+                self.out.extend([
+                    Instruction::Push(Value::Nil),
+                    Instruction::MakeCell,
+                    Instruction::Store(binding.slot),
+                ]);
+                scopes.cell_slots.insert(binding.slot);
+            }
+        }
+    }
+
+    fn store_loop_pattern_bindings(
+        &mut self,
+        item_slot: usize,
+        bindings: &[PatternBindingSlot],
+        scopes: &mut Scopes,
+    ) -> Result<(), CodegenError> {
+        for binding in bindings {
+            let cell = scopes.cell_slots.contains(&binding.slot);
+            if cell {
+                self.out.emit(Instruction::Load(binding.slot));
+            }
+            self.out.emit(Instruction::Load(item_slot));
+            for index in &binding.path {
+                self.out.extend([
+                    Instruction::Push(Value::Int(*index as i64)),
+                    Instruction::Index,
+                ]);
+            }
+            if cell {
+                self.out.emit(Instruction::CellSet);
+                self.guard_error(scopes)?;
+                self.out.emit(Instruction::Pop);
+            } else {
+                self.out.emit(Instruction::Store(binding.slot));
+            }
+        }
+        Ok(())
+    }
+
+    fn load_loop_binding(&mut self, slot: usize, scopes: &Scopes) {
+        self.out.emit(Instruction::Load(slot));
+        if scopes.cell_slots.contains(&slot) {
+            self.out.emit(Instruction::CellGet);
+        }
+    }
+
+    fn increment_loop_binding(
+        &mut self,
+        var_slot: usize,
+        step_slot: usize,
+        scopes: &mut Scopes,
+    ) -> Result<(), CodegenError> {
+        if !scopes.cell_slots.contains(&var_slot) {
+            self.out.emit(Instruction::Load(var_slot));
+            self.out.emit(Instruction::Load(step_slot));
+            self.out.emit(Instruction::Add);
+            self.propagate_control_error(scopes)?;
+            self.out.emit(Instruction::Store(var_slot));
+            return Ok(());
+        }
+
+        let next_slot = scopes.reserve_slot();
+        self.load_loop_binding(var_slot, scopes);
+        self.out.emit(Instruction::Load(step_slot));
+        self.out.emit(Instruction::Add);
+        self.propagate_control_error(scopes)?;
+        self.out.emit(Instruction::Store(next_slot));
+        self.out.emit(Instruction::Load(var_slot));
+        self.out.emit(Instruction::Load(next_slot));
+        self.out.emit(Instruction::CellSet);
+        self.guard_error(scopes)?;
+        self.out.extend([
+            Instruction::Pop,
+            Instruction::Push(Value::Nil),
+            Instruction::Store(next_slot),
+        ]);
+        Ok(())
     }
 
     fn range_zero(&self, expression: &Expr) -> Value {
@@ -1604,6 +2104,10 @@ impl<'a> Codegen<'a> {
             if let Some(value) = constant_value {
                 scopes.const_values.insert(slot, value);
             } else {
+                if !is_const && scopes.cell_names.contains(name) {
+                    self.out.emit(Instruction::MakeCell);
+                    scopes.cell_slots.insert(slot);
+                }
                 self.out.emit(Instruction::Store(slot));
             }
             return Ok(());
@@ -1624,6 +2128,18 @@ impl<'a> Codegen<'a> {
             }
         }
         self.store_pattern_bindings(value_slot, &bindings);
+        if !is_const {
+            for binding in &bindings {
+                if scopes.cell_names.contains(&binding.name) {
+                    self.out.extend([
+                        Instruction::Load(binding.slot),
+                        Instruction::MakeCell,
+                        Instruction::Store(binding.slot),
+                    ]);
+                    scopes.cell_slots.insert(binding.slot);
+                }
+            }
+        }
         // Do not keep an extra reference to the tuple alive after its fields
         // have been stored in their local bindings.
         self.out.extend([
@@ -1637,6 +2153,7 @@ impl<'a> Codegen<'a> {
         &mut self,
         clauses: &[ForClause],
         body: &Block,
+        call_site: &crate::analysis::CallSite,
         scopes: &mut Scopes,
         deferred: &mut Vec<Deferred>,
     ) -> Result<(), CodegenError> {
@@ -1646,10 +2163,13 @@ impl<'a> Codegen<'a> {
         scopes.push();
 
         let mut states = Vec::with_capacity(clauses.len());
-        for clause in clauses {
+        for (clause_index, clause) in clauses.iter().enumerate() {
             match clause {
                 ForClause::Range {
-                    start, end, step, ..
+                    var,
+                    start,
+                    end,
+                    step,
                 } => {
                     let var_slot = scopes.reserve_slot();
                     let start_zero = self.range_zero(start);
@@ -1657,6 +2177,10 @@ impl<'a> Codegen<'a> {
                     self.out
                         .extend([Instruction::Push(start_zero), Instruction::Sub]);
                     self.propagate_control_error(scopes)?;
+                    if scopes.cell_names.contains(var) {
+                        self.out.emit(Instruction::MakeCell);
+                        scopes.cell_slots.insert(var_slot);
+                    }
                     self.out.emit(Instruction::Store(var_slot));
 
                     let end_slot = scopes.reserve_slot();
@@ -1710,14 +2234,27 @@ impl<'a> Codegen<'a> {
                     let bindings = allocate_pattern_slots(pattern, scopes);
                     let item_slot = scopes.reserve_slot();
                     let iterator_slot = scopes.reserve_slot();
+                    self.initialize_loop_cells(&bindings, scopes);
+                    let iteration = self
+                        .iteration_calls
+                        .get(call_site)
+                        .and_then(|methods| methods.get(clause_index))
+                        .cloned()
+                        .flatten();
                     self.compile_expr(iterable, scopes)?;
-                    self.out.call_native(crate::runtime::iterator_new_import());
-                    self.propagate_control_error(scopes)?;
+                    if let Some(methods) = &iteration {
+                        self.out.call(&methods.into_iter, 1);
+                        self.propagate_call_error(scopes, call_site)?;
+                    } else {
+                        self.out.call_native(crate::runtime::iterator_new_import());
+                        self.propagate_control_error(scopes)?;
+                    }
                     self.out.emit(Instruction::Store(iterator_slot));
                     states.push(ForZipState::Each {
                         bindings,
                         item_slot,
                         iterator_slot,
+                        iteration,
                     });
                 }
             }
@@ -1754,18 +2291,14 @@ impl<'a> Codegen<'a> {
                     ]);
                     self.propagate_control_error(scopes)?;
                     self.out.jump(Instruction::JumpIfTrue(0), descending_label);
-                    self.out.extend([
-                        Instruction::Load(*var_slot),
-                        Instruction::Load(*end_slot),
-                        Instruction::Lt,
-                    ]);
+                    self.load_loop_binding(*var_slot, scopes);
+                    self.out.emit(Instruction::Load(*end_slot));
+                    self.out.emit(Instruction::Lt);
                     self.out.jump(Instruction::Jump(0), comparison_done);
                     self.out.bind(descending_label);
-                    self.out.extend([
-                        Instruction::Load(*var_slot),
-                        Instruction::Load(*end_slot),
-                        Instruction::Gt,
-                    ]);
+                    self.load_loop_binding(*var_slot, scopes);
+                    self.out.emit(Instruction::Load(*end_slot));
+                    self.out.emit(Instruction::Gt);
                     self.out.bind(comparison_done);
                     self.propagate_control_error(scopes)?;
                     self.out.jump(Instruction::JumpIfFalse(0), end_label);
@@ -1774,16 +2307,27 @@ impl<'a> Codegen<'a> {
                     bindings,
                     item_slot,
                     iterator_slot,
+                    iteration,
                 } => {
                     self.out.emit(Instruction::Load(*iterator_slot));
-                    self.out.call_native(crate::runtime::iterator_next_import());
-                    self.propagate_control_error(scopes)?;
+                    if let Some(methods) = iteration {
+                        self.out.call(&methods.next, 1);
+                        self.propagate_call_error(scopes, call_site)?;
+                    } else {
+                        self.out.call_native(crate::runtime::iterator_next_import());
+                        self.propagate_control_error(scopes)?;
+                    }
                     self.out.jump(Instruction::JumpIfFalse(0), end_label);
                     self.out.emit(Instruction::Load(*iterator_slot));
-                    self.out
-                        .call_native(crate::runtime::iterator_current_import());
+                    if let Some(methods) = iteration {
+                        self.out.call(&methods.current, 1);
+                        self.propagate_call_error(scopes, call_site)?;
+                    } else {
+                        self.out
+                            .call_native(crate::runtime::iterator_current_import());
+                    }
                     self.out.emit(Instruction::Store(*item_slot));
-                    self.store_pattern_bindings(*item_slot, bindings);
+                    self.store_loop_pattern_bindings(*item_slot, bindings, scopes)?;
                 }
             }
         }
@@ -1810,13 +2354,7 @@ impl<'a> Codegen<'a> {
                 ..
             } = state
             {
-                self.out.extend([
-                    Instruction::Load(*var_slot),
-                    Instruction::Load(*step_slot),
-                    Instruction::Add,
-                ]);
-                self.propagate_control_error(scopes)?;
-                self.out.emit(Instruction::Store(*var_slot));
+                self.increment_loop_binding(*var_slot, *step_slot, scopes)?;
             }
         }
         self.out.jump(Instruction::Jump(0), condition_label);
@@ -1896,10 +2434,31 @@ impl<'a> Codegen<'a> {
                     )));
                 }
                 if let Some(slot) = scopes.resolve(name) {
+                    if scopes.cell_slots.contains(&slot) {
+                        self.out.emit(Instruction::Load(slot));
+                        self.compile_expr(value, scopes)?;
+                        self.out.emit(Instruction::CellSet);
+                        self.guard_error(scopes)?;
+                        self.out.emit(Instruction::Pop);
+                    } else {
+                        self.compile_expr(value, scopes)?;
+                        self.out.emit(Instruction::Load(slot));
+                        self.out.emit(Instruction::ConstrainArrayFrom);
+                        self.out.emit(Instruction::Store(slot));
+                    }
+                    return Ok(());
+                }
+                if let Some((index, mutable)) = scopes.resolve_capture(name) {
+                    if !mutable {
+                        return Err(CodegenError::new(format!(
+                            "cannot assign to immutable capture `{name}`"
+                        )));
+                    }
+                    self.out.emit(Instruction::LoadCapture(index));
                     self.compile_expr(value, scopes)?;
-                    self.out.emit(Instruction::Load(slot));
-                    self.out.emit(Instruction::ConstrainArrayFrom);
-                    self.out.emit(Instruction::Store(slot));
+                    self.out.emit(Instruction::CellSet);
+                    self.guard_error(scopes)?;
+                    self.out.emit(Instruction::Pop);
                     return Ok(());
                 }
                 let resolved = scopes
@@ -1953,7 +2512,15 @@ impl<'a> Codegen<'a> {
                         "cannot assign to const `{name}`"
                     )));
                 }
-                if scopes.resolve(name).is_none() {
+                if scopes
+                    .resolve_capture(name)
+                    .is_some_and(|(_, mutable)| !mutable)
+                {
+                    return Err(CodegenError::new(format!(
+                        "cannot assign to immutable capture `{name}`"
+                    )));
+                }
+                if scopes.resolve(name).is_none() && scopes.resolve_capture(name).is_none() {
                     let resolved = scopes
                         .resolve_import(name)
                         .unwrap_or_else(|| name.to_string());
@@ -2057,17 +2624,6 @@ impl<'a> Codegen<'a> {
         call_site: crate::analysis::CallSite,
         scopes: &mut Scopes,
     ) -> Result<(), CodegenError> {
-        if matches!(target, DeclaredCall::Function) {
-            let expressions = args
-                .iter()
-                .map(|argument| argument.name.is_none().then_some(&argument.value))
-                .collect::<Option<Vec<_>>>();
-            if let Some(expressions) = expressions
-                && self.try_inline_expressions(name, &expressions, scopes)?
-            {
-                return Ok(());
-            }
-        }
         let bindings = crate::arguments::bind(name, fields, args);
         if let Some(error) = bindings.errors.first() {
             return Err(CodegenError::new(error.message.clone()));
@@ -2077,7 +2633,16 @@ impl<'a> Codegen<'a> {
         let prefix = args
             .iter()
             .enumerate()
-            .all(|(i, _)| bindings.by_parameter[i] == Some(i));
+            .all(|(i, _)| bindings.by_argument[i] == Some(i));
+        if matches!(target, DeclaredCall::Function) && prefix {
+            let expressions = args
+                .iter()
+                .map(|argument| &argument.value)
+                .collect::<Vec<_>>();
+            if self.try_inline_expressions(name, &expressions, scopes)? {
+                return Ok(());
+            }
+        }
         let mut slots = Vec::new();
         if !prefix {
             for (argument_index, arg) in args.iter().enumerate() {
@@ -2806,6 +3371,10 @@ impl<'a> Codegen<'a> {
         for (parameter, slot) in function.parameters.iter().zip(slots) {
             scopes.bind_slot(&parameter.name, slot);
         }
+        // Inlined expressions still form a function boundary: errors in the
+        // callee must reach the caller's handler only as the call result.
+        let saved_error_handler = self.error_handler.take();
+        let saved_cleanup_boundary = self.cleanup_boundary.take();
         let result = (|| {
             let mut deferred = self.active_defers.clone();
             for binding in &function.bindings {
@@ -2813,6 +3382,8 @@ impl<'a> Codegen<'a> {
             }
             self.compile_expr(&function.body, scopes)
         })();
+        self.cleanup_boundary = saved_cleanup_boundary;
+        self.error_handler = saved_error_handler;
         scopes.pop();
         result?;
         Ok(true)
@@ -2941,17 +3512,42 @@ impl<'a> Codegen<'a> {
         scopes: &Scopes,
         nodes: &mut usize,
     ) -> Option<Value> {
-        if args.iter().any(|argument| argument.name.is_some()) {
-            return None;
-        }
         let resolved = self.resolve_function_name(name, scopes).ok()?;
         let function = self.inline_functions.get(&resolved)?;
         if args.len() != function.parameters.len() || nodes.saturating_add(function.nodes) > 64 {
             return None;
         }
 
+        let mut by_parameter = vec![None; function.parameters.len()];
+        let mut positional = 0;
+        let mut named_seen = false;
+        for (argument_index, argument) in args.iter().enumerate() {
+            let parameter_index = if let Some(name) = &argument.name {
+                named_seen = true;
+                function
+                    .parameters
+                    .iter()
+                    .position(|parameter| parameter.name == *name)?
+            } else {
+                if named_seen {
+                    return None;
+                }
+                let index = positional;
+                positional += 1;
+                index
+            };
+            let binding = by_parameter.get_mut(parameter_index)?;
+            if binding.replace(argument_index).is_some() {
+                return None;
+            }
+        }
+        if by_parameter.iter().any(Option::is_none) {
+            return None;
+        }
+
         let mut values = Vec::with_capacity(args.len());
-        for argument in args {
+        for argument_index in by_parameter.into_iter().flatten() {
+            let argument = &args[argument_index];
             let expression = self.constant_expression(&argument.value, scopes, nodes, false)?;
             let value = crate::comptime::fold_constant_expression(&expression)?;
             values.push(Self::constant_value_expression(&value)?);
@@ -3049,6 +3645,7 @@ impl<'a> Codegen<'a> {
         let observed_call = self.observed_propagation_call.clone();
         self.observed_propagation_call = match expr.node() {
             Expr::Call(..)
+            | Expr::Apply(..)
             | Expr::SpecializedCall(..)
             | Expr::MethodCall(..)
             | Expr::AssociatedCall { .. } => Some(crate::analysis::expression_site(
@@ -3290,10 +3887,49 @@ impl<'a> Codegen<'a> {
 
     fn compile_expr_inner(&mut self, expr: &Expr, scopes: &mut Scopes) -> Result<(), CodegenError> {
         match expr.node() {
-            Expr::BracketApply(_, _) | Expr::Apply(_, _) => {
-                return Err(CodegenError::new(
-                    "unresolved bracket or callable expression",
-                ));
+            Expr::BracketApply(_, _) => {
+                return Err(CodegenError::new("unresolved bracket expression"));
+            }
+            Expr::Apply(callee, arguments) => {
+                self.compile_expr(callee, scopes)?;
+                let callable_slot = scopes.reserve_slot();
+                self.out.emit(Instruction::Store(callable_slot));
+                for argument in arguments {
+                    if argument.name.is_some() {
+                        return Err(CodegenError::new(
+                            "indirect calls accept positional arguments only",
+                        ));
+                    }
+                    self.compile_call_argument(&argument.value, None, scopes)?;
+                }
+                self.out.extend([
+                    Instruction::Load(callable_slot),
+                    Instruction::CallValue(arguments.len()),
+                ]);
+            }
+            Expr::Closure {
+                captures,
+                params,
+                result_type,
+                body,
+            } => {
+                let name = format!("$closure{}", self.next_closure);
+                self.next_closure += 1;
+                for capture in captures {
+                    self.compile_capture_value(capture, scopes)?;
+                }
+                self.out.make_closure(&name, captures.len());
+                self.closures.push(ClosureDef {
+                    name,
+                    captures: captures.clone(),
+                    params: params.clone(),
+                    result_type: result_type.clone(),
+                    body: std::ptr::NonNull::from(body),
+                    imports: scopes.imports.clone(),
+                    modules: scopes.modules.clone(),
+                    module: self.current_module.clone(),
+                    callsite_function: self.current_function.clone(),
+                });
             }
             Expr::Located(_, _) => unreachable!("node removes locations"),
             Expr::Int(n)
@@ -3367,20 +4003,31 @@ impl<'a> Codegen<'a> {
                 self.compile_expr(fallback, scopes)?;
                 self.out.bind(end);
             }
-            Expr::Ident(name) => match scopes.resolve(name) {
-                Some(slot) => self.out.emit(Instruction::Load(slot)),
-                None => {
+            Expr::Ident(name) => {
+                if let Some(slot) = scopes.resolve(name) {
+                    self.out.emit(Instruction::Load(slot));
+                    if scopes.cell_slots.contains(&slot) {
+                        self.out.emit(Instruction::CellGet);
+                    }
+                } else if let Some((index, mutable)) = scopes.resolve_capture(name) {
+                    self.out.emit(Instruction::LoadCapture(index));
+                    if mutable {
+                        self.out.emit(Instruction::CellGet);
+                    }
+                } else {
                     let resolved = scopes
                         .resolve_import(name)
                         .unwrap_or_else(|| name.to_string());
                     let candidate = self.resolve_global_name(&resolved, Some(scopes))?;
                     if let Some(idx) = self.global_indices.get(&candidate) {
                         self.out.emit(Instruction::LoadGlobal(*idx));
+                    } else if self.functions.contains_key(&resolved) {
+                        self.out.push_function(&resolved);
                     } else {
                         return Err(CodegenError::new(format!("undefined variable `{name}`")));
                     }
                 }
-            },
+            }
             Expr::Array(items) | Expr::Tuple(items) => {
                 for item in items {
                     self.compile_expr(item, scopes)?;
@@ -4172,7 +4819,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
-                    inline: InlineMode::Auto,
+                    inline: InlineMode::Never,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -4629,23 +5276,35 @@ mod tests {
                 params: vec![],
                 body: Block {
                     tail: None,
-                    stmts: vec![Stmt::Return(Some(Expr::If {
-                        cond: Box::new(Expr::Bool(true)),
-                        then_branch: Box::new(Expr::Block(Block {
-                            tail: Some(Box::new(Expr::Int(7))),
-                            stmts: vec![],
+                    stmts: vec![
+                        Stmt::VarDecl {
+                            pattern: BindingPattern::Name("condition".into()),
+                            ty: None,
+                            value: Expr::Bool(true),
+                        },
+                        Stmt::Assign {
+                            target: Expr::Ident("condition".into()),
+                            value: Expr::Bool(false),
+                        },
+                        Stmt::Return(Some(Expr::If {
+                            cond: Box::new(Expr::Ident("condition".into())),
+                            then_branch: Box::new(Expr::Block(Block {
+                                tail: Some(Box::new(Expr::Int(7))),
+                                stmts: vec![],
+                            })),
+                            else_branch: Some(Box::new(Expr::Block(Block {
+                                tail: Some(Box::new(Expr::Int(9))),
+                                stmts: vec![],
+                            }))),
                         })),
-                        else_branch: Some(Box::new(Expr::Block(Block {
-                            tail: Some(Box::new(Expr::Int(9))),
-                            stmts: vec![],
-                        }))),
-                    }))],
+                    ],
                 },
             })],
         };
         let out = compile(&program).expect("should compile");
-        assert!(out.contains("push true\nnot\nnot\n"));
+        assert!(out.contains("jz "));
         assert!(out.contains("push 7\n"));
+        assert!(out.contains("push 9\n"));
     }
 
     #[test]
@@ -4896,7 +5555,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
-                    inline: InlineMode::Auto,
+                    inline: InlineMode::Never,
                     type_params: vec![],
                     result_type: None,
                     result_span: None,
@@ -5075,7 +5734,8 @@ mod tests {
         let out = compile(&program).expect("global declarations should compile");
         assert!(out.contains("store_global 0\n"));
         assert!(out.contains("store_global 1\n"));
-        assert!(out.contains("load_global 0\n"));
+        assert!(out.contains("push 42\n"));
+        assert!(out.contains("load_global 1\n"));
         assert!(out.contains("store_global 1\n"));
     }
 
@@ -5122,7 +5782,7 @@ mod tests {
                         stmts: vec![Stmt::Return(Some(Expr::Ident("hidden::VERSION".into())))],
                     },
                 }),
-                Item::GlobalConst {
+                Item::GlobalVar {
                     name: "hidden::VERSION".into(),
                     visibility: Visibility::Public,
                     ty: None,

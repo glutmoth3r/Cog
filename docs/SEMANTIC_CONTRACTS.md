@@ -195,9 +195,9 @@ The broader comptime foundation remains incomplete. Accepted boundaries:
   Runtime information cannot flow into Comptime. Runtime-representable computed
   values may flow from Comptime to Runtime after materialization.
 - Ordinary fn is runtime-only in v1, even when pure; @comptime fn is compile-time-only.
-  Direct calls enforce this boundary. Function values and indirect calls are not
-  supported; a comptime-only function cannot be used as a runtime value or passed
-  through an alias/container. Runtime artifacts have no CT-only entries.
+  Direct calls enforce this boundary. Comptime-only functions cannot be used as
+  runtime values or passed through an alias/container. Runtime artifacts have no
+  CT-only entries.
 - Ordinary local const/var inside an `@comptime fn` execute in its current phase
   without a modifier on every statement. Reassignment statements remain
   unimplemented; `@comptime var` is not yet supported.
@@ -218,12 +218,25 @@ The broader comptime foundation remains incomplete. Accepted boundaries:
   a separate effect category, not general runtime I/O authority.
 
 Cross-phase references to comptime-only functions are rejected before they can be
-stored or passed through aliases, callbacks, arrays, or record fields. Cog v1 does
-not support function-valued expressions or indirect calls. Closure-expression
-syntax is not in the grammar, so closure phase/capture behavior has no source
-contract yet. Compiler quota exhaustion must be distinguished from a
-program's computational ResourceLimit; the evaluator's precise quota contract is
-open.
+stored or passed through aliases, callbacks, arrays, or record fields. Runtime
+function values and synchronous closures are implemented with positional indirect
+calls. Captures are explicit. `[name]` copies the value at creation, including a
+shared reference when the value is an array, record, struct, or function; `[var
+name]` shares a mutable local through a cell. A copied capture may hold a shared
+reference value; its binding is read-only, while mutations through other writable
+aliases remain visible. Nested captures are explicit, and forwarding a mutable
+capture requires a mutable capture in every enclosing closure. Capture bodies are
+checked for read-only violations even when the closure is not called. Closure
+parameter and result types must be explicit. Named function values require fully
+annotated, synchronous, non-generic signatures without defaults. Async and
+comptime closures and implicit capture remain unsupported. Callback calls retain
+the VM's call/error boundary; the JIT roots captured values and resumes at dynamic
+callback dispatch or the first unsupported operation. Closure captures are traced
+by the regular cycle collector. Until callable effect types exist, indirect calls
+conservatively treat reference arguments as potentially mutated and reference
+results as read-only; `.clone()` can produce an independent writable copy when
+supported. Compiler quota exhaustion must be distinguished from a program's
+computational ResourceLimit; the evaluator's precise quota contract is open.
 
 Conceptually main is the first user Runtime function after compilation, evaluation,
 specialization/generation, and materialization. **Current code executes global
@@ -353,6 +366,16 @@ is intrinsic for arrays and tuples whose leaves are supported primitive values o
 nested cloneable containers. Other types can implement `Clone` for generic use, but
 their custom implementations are not automatically composed through arrays/tuples.
 
+The `iter` module defines `IntoIterator[Iter, Item]` and `Iterator[Item]` for
+statically dispatched user-defined `for` iteration. Collection implementations
+must use a concrete target type, and the loop must have a statically known
+concrete collection type; generic target implementations and iteration through a
+generic trait bound remain outside the current contract. Zip clauses evaluate
+each source and call its `into_iter()` from left to right before advancing to the
+next clause. Iterator-method Errors propagate through the loop's normal lexical
+error handling when the method uses `!!`. Array, string, and dynamic iteration
+keep their built-in paths.
+
 ## Implemented: source package inclusion and extensions
 
 The package entry point supports `@!include("alias")` for the built-in standard
@@ -386,6 +409,8 @@ trusted registration mechanisms are proposals awaiting implementation decisions.
 Separate token macros, derive/decorators, arbitrary AST rewriting, and text emission
 are not current prerequisites.
 
-Closure capture modes, escaping lifetime/mutable invocation/equality, resource/cycle
-handling, raw-string delimiters/extended escapes, collection iteration/mutation,
-sequence chaining changes, and the existing when-var redesign remain open.
+Move-style captures, mutable closure receivers, closure equality, and a
+closure-specific resource quota remain open. Reference-valued and nested captures
+use the ordinary value, cell, and cycle-collection rules. Raw-string
+delimiters/extended escapes, additional collection mutation protocols, sequence
+chaining changes, and the existing when-var redesign also remain open.

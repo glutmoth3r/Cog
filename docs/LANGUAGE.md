@@ -86,6 +86,55 @@ Scalar assignment copies a value. Array/record assignment shares an object witho
 moving or invalidating the original binding. A const alias observes changes through
 an existing mutable alias; creating it does not freeze the object globally.
 
+## Function values and closures
+
+Cog supports function types, named function values, and synchronous closures.
+Closure captures are always explicit. `[name]` copies the value when the closure
+is created. For arrays, records, structs, and other reference values, that copies
+the reference, so the closure sees changes made through existing mutable aliases.
+The captured binding is read-only, and a closure cannot mutate the object through
+that capture. `[var name]` shares a mutable local through a cell, allowing the
+closure to reassign the binding or mutate the referenced object. Nested closures
+must list their own captures; a mutable capture can be forwarded only through a
+mutable capture in the enclosing closure. An omitted capture list means the
+closure captures no locals.
+
+```cog
+fn add_bias(bias: int) -> fn(int) -> int {
+    const add = fn[bias](value: int) -> int { value + bias };
+    add
+}
+
+fn main() -> int {
+    var total = 0;
+    const next = fn[var total]() -> int {
+        total += 1;
+        total
+    };
+    (next)();
+    (next)()
+}
+```
+
+Reference captures keep the same object alive after the creating function
+returns. For example, a returned reader of an array observes updates made through
+another mutable alias, while it cannot update that array itself through its
+read-only capture. Function values can also be captured and called from another
+closure. Captured references participate in the VM's ordinary cycle collection.
+
+Function types use `fn(ArgumentTypes...) -> ResultType`. Closure parameters and
+results require annotations in this release. Named function values must have
+fully annotated parameters and result types; async, generic, and defaulted
+functions cannot be used as values. Indirect calls are positional and require an
+exact argument count. JIT can OSR into synchronous closure bodies with captures;
+captured values remain rooted, and unsupported operations and dynamic callback
+dispatch resume in the VM. Indirect calls do not yet carry mutation-effect types,
+so reference arguments are treated as potentially mutated and reference-valued
+results are read-only. Use `.clone()` to obtain an independent writable copy
+where the value supports cloning.
+Generic type parameters can be inferred through callback signatures such as
+`fn(T) -> U`, as used by `array::map`.
+
 Aliasing cannot increase mutation capability. `var b = const_array` creates a
 reassignable binding whose current object remains read-only through that path.
 Reassigning `b` to a fresh array can restore writable access. The analysis follows
@@ -355,8 +404,10 @@ conditional uses block tails; known normal branch types must be compatible.
 uses an exclusive end bound with `int` or `uint` bounds; the default step matches
 the bound type, and zero step produces Error. Unsigned ranges ascend.
 Comma-separated `for` clauses iterate in parallel and stop when the first source
-is exhausted. Each source expression is evaluated once, left to right, before the
-loop starts; each clause may be a range or an array/string iteration. A collection
+is exhausted. For each clause, Cog evaluates its source and initializes its
+iterator before moving to the next clause; a custom `into_iter()` call is part of
+that clause's initialization. Each clause may be a range, an array/string
+iteration, or a user-defined iterator described below. A collection
 clause binds either one name or a tuple pattern whose shape must match the element
 tuple. Patterns may be nested, and their names are available only in the loop body.
 For example, `for (key, value) in map.entries()` binds both positions of each
@@ -369,8 +420,7 @@ the iterated array through any alias invalidates the iterator and produces
 `Error::InvalidArgument` when it next advances. Replacing an existing element does
 not invalidate it. Iterate an ordered-map snapshot with
 `for entry in items.entries()`; each entry is a `(key, value)` tuple, with fields
-available as `entry.0` and `entry.1`. User-defined iterators and loop labels are
-not implemented.
+available as `entry.0` and `entry.1`. Loop labels are not implemented.
 
 ## Patterns: when and match
 
@@ -470,6 +520,9 @@ and formatting.
 use io;
 
 struct Point { x: int, y: int = 0 }
+struct Marker;
+struct UserId(int);
+struct Position(float, float);
 enum Status { Ready, Failed(code: int) }
 
 fn main() -> nil {
@@ -488,10 +541,21 @@ fn main() -> nil {
     io::println(record["name"])!!;
 
     const point = Point(10, y: 20);
+    const marker = Marker();
+    const user = UserId(42);
+    const position = Position(1.5, 2.5);
     const status = Status::Failed(code: 7);
-    io::println($"{point.x}, {point.y}; {status.code}")!!;
+    io::println($"{point.x}, {point.y}; {user.0}; {position.0}, {position.1}; {status.code}")!!;
 }
 ```
+
+Structs with named fields use `{}` declarations. An empty struct can use either
+`struct Marker {}` or the shorter `struct Marker;`; both are constructed with
+`Marker()`. Tuple structs declare one or more typed positional fields, such as
+`struct UserId(int);` or `struct Position(float, float);`. Their constructors
+take positional arguments, and fields use the same numeric access as tuples
+(`user.0`, `position.1`). Tuple structs keep their own nominal type, so `UserId`
+is distinct from `int` and from other tuple structs with the same field types.
 
 
 Arrays use zero-based indexing and share mutable storage. Out-of-bounds access
@@ -532,6 +596,49 @@ evaluated once, and a type annotation applies to the complete tuple, for example
 remains unsupported. `T[N]` and general user-container operators remain future work.
 `len(array)` or `array.len()` returns the element count; `len(str)`
 counts Unicode scalars, not UTF-8 bytes.
+
+User-defined collection types can participate in `for` loops through the
+`iter::IntoIterator[Iter, Item]` and `iter::Iterator[Item]` traits. Import the
+standard `iter` module, implement `into_iter()` on the collection, then implement
+`next()` and `current()` on the returned iterator type. `next()` advances the
+iterator and reports whether an item is available; the loop calls `current()`
+only after `next()` returns `true`.
+
+```cog
+@!include("std")
+use io;
+use iter;
+
+struct Counter { limit: int, value: int }
+struct CounterIter { limit: int, value: int }
+
+extend Counter with iter::IntoIterator[CounterIter, int] {
+    fn into_iter(self) -> CounterIter {
+        CounterIter(self.limit, self.value)
+    }
+}
+
+extend CounterIter with iter::Iterator[int] {
+    fn next(mut self) -> bool {
+        if self.value >= self.limit { return false; }
+        self.value += 1;
+        true
+    }
+    fn current(self) -> int { self.value }
+}
+
+fn main() {
+    const counter = Counter(3, 0);
+    for value in counter { io::println(value)!!; }
+}
+```
+
+The compiler resolves these trait methods statically. Arrays, strings, and
+dynamic values keep their existing runtime iteration paths. User-defined
+iteration requires a statically known concrete collection type; a generic
+function cannot currently iterate a parameter through an `IntoIterator` bound.
+When JIT is enabled, custom iterator calls may resume in the VM; native execution
+of these methods is not guaranteed.
 
 Runtime functions declare compile-time type parameters in square brackets, such as
 `fn identity[T: type](value: T)`. Cog infers each type from statically known runtime argument

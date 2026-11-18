@@ -6,6 +6,7 @@ use crate::diagnostic::{Diagnostic, DiagnosticSuggestion, SourceSpan};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 const CLONE_TRAIT: &str = "$core::clone::Clone";
+const MAX_TRAIT_COHERENCE_WORK: usize = 1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Type {
@@ -16,6 +17,7 @@ enum Type {
     Array(Box<Type>),
     Task(Box<Type>),
     Tuple(Vec<Type>),
+    Function(Vec<Type>, Box<Type>),
     Bytes,
     StrBuf,
     Handle,
@@ -57,6 +59,13 @@ fn type_compatible(expected: &Type, actual: &Type) -> bool {
         (Type::Task(expected), Type::Task(actual)) => type_compatible(expected, actual),
         (Type::Tuple(a), Type::Tuple(b)) => {
             a.len() == b.len() && a.iter().zip(b).all(|(x, y)| type_compatible(x, y))
+        }
+        (Type::Function(a, ar), Type::Function(b, br)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|(x, y)| type_compatible(x, y) && type_compatible(y, x))
+                && type_compatible(ar, br)
         }
         (a, b) => a == b,
     }
@@ -364,6 +373,12 @@ fn extension_target_uses_parameter(ty: &TypeAnnotation, name: &str) -> bool {
         TypeKind::Tuple(elements) => elements
             .iter()
             .any(|element| extension_target_uses_parameter(element, name)),
+        TypeKind::Function { parameters, result } => {
+            parameters
+                .iter()
+                .any(|ty| extension_target_uses_parameter(ty, name))
+                || extension_target_uses_parameter(result, name)
+        }
         TypeKind::Primitive(_)
         | TypeKind::Named(_)
         | TypeKind::ResolvedName { .. }
@@ -474,9 +489,373 @@ fn match_extension_type(
             }
             _ => false,
         },
+        TypeKind::Function {
+            parameters: pattern_parameters,
+            result,
+        } => match actual {
+            Type::Function(actual_parameters, actual_result)
+                if pattern_parameters.len() == actual_parameters.len() =>
+            {
+                pattern_parameters
+                    .iter()
+                    .zip(actual_parameters)
+                    .all(|(pattern, actual)| {
+                        match_extension_type(pattern, actual, parameters, substitutions)
+                    })
+                    && match_extension_type(result, actual_result, parameters, substitutions)
+            }
+            _ => false,
+        },
         TypeKind::SelfType => false,
         TypeKind::TypeParameter(_) => false,
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TraitTypePattern {
+    Variable(u32),
+    Primitive(VarType),
+    Nil,
+    Named(String, Vec<Self>),
+    Array(Box<Self>),
+    Tuple(Vec<Self>),
+    Function(Vec<Self>, Box<Self>),
+    Nullable(Box<Self>),
+    Opaque(String),
+}
+
+fn trait_type_pattern(
+    ty: &TypeAnnotation,
+    generic_parameters: &HashMap<&str, u32>,
+) -> TraitTypePattern {
+    let pattern = match &ty.kind {
+        TypeKind::Primitive(base) if *base == VarType::Nil && !ty.nilable => TraitTypePattern::Nil,
+        TypeKind::Primitive(base) => TraitTypePattern::Primitive(*base),
+        TypeKind::TypeParameter(name) => generic_parameters
+            .get(name.as_str())
+            .copied()
+            .map(TraitTypePattern::Variable)
+            .unwrap_or_else(|| TraitTypePattern::Opaque(format!("type parameter `{name}`"))),
+        TypeKind::Named(name) => TraitTypePattern::Named(name.clone(), Vec::new()),
+        TypeKind::ResolvedName { symbol, .. } => {
+            TraitTypePattern::Named(symbol.clone(), Vec::new())
+        }
+        TypeKind::Applied { source, arguments } => TraitTypePattern::Named(
+            source.clone(),
+            arguments
+                .iter()
+                .map(|argument| trait_type_pattern(argument, generic_parameters))
+                .collect(),
+        ),
+        TypeKind::ResolvedApplied {
+            symbol, arguments, ..
+        } => TraitTypePattern::Named(
+            symbol.clone(),
+            arguments
+                .iter()
+                .map(|argument| trait_type_pattern(argument, generic_parameters))
+                .collect(),
+        ),
+        TypeKind::Array(element) => {
+            TraitTypePattern::Array(Box::new(trait_type_pattern(element, generic_parameters)))
+        }
+        TypeKind::Tuple(elements) => TraitTypePattern::Tuple(
+            elements
+                .iter()
+                .map(|element| trait_type_pattern(element, generic_parameters))
+                .collect(),
+        ),
+        TypeKind::Function { parameters, result } => TraitTypePattern::Function(
+            parameters
+                .iter()
+                .map(|parameter| trait_type_pattern(parameter, generic_parameters))
+                .collect(),
+            Box::new(trait_type_pattern(result, generic_parameters)),
+        ),
+        TypeKind::SelfType => TraitTypePattern::Opaque("Self".to_owned()),
+    };
+    if ty.nilable {
+        TraitTypePattern::Nullable(Box::new(pattern))
+    } else {
+        pattern
+    }
+}
+
+fn concrete_trait_type_pattern(ty: &Type) -> TraitTypePattern {
+    match ty {
+        Type::Primitive(base, true) => {
+            TraitTypePattern::Nullable(Box::new(TraitTypePattern::Primitive(*base)))
+        }
+        Type::Primitive(base, false) => TraitTypePattern::Primitive(*base),
+        Type::Nil => TraitTypePattern::Nil,
+        Type::Array(element) => {
+            TraitTypePattern::Array(Box::new(concrete_trait_type_pattern(element)))
+        }
+        Type::Task(result) => {
+            TraitTypePattern::Named("Task".to_owned(), vec![concrete_trait_type_pattern(result)])
+        }
+        Type::Tuple(elements) => {
+            TraitTypePattern::Tuple(elements.iter().map(concrete_trait_type_pattern).collect())
+        }
+        Type::Function(parameters, result) => TraitTypePattern::Function(
+            parameters.iter().map(concrete_trait_type_pattern).collect(),
+            Box::new(concrete_trait_type_pattern(result)),
+        ),
+        Type::Struct(_, name, arguments) => TraitTypePattern::Named(
+            name.clone(),
+            arguments.iter().map(concrete_trait_type_pattern).collect(),
+        ),
+        Type::Enum(_, name) | Type::Named(name) => {
+            TraitTypePattern::Named(name.clone(), Vec::new())
+        }
+        Type::Generic(name) => TraitTypePattern::Opaque(format!("generic `{name}`")),
+        Type::Dynamic => TraitTypePattern::Opaque("dynamic".to_owned()),
+        Type::EmptyArray => TraitTypePattern::Opaque("empty array".to_owned()),
+        Type::Never => TraitTypePattern::Opaque("never".to_owned()),
+        Type::Bytes => TraitTypePattern::Opaque("bytes".to_owned()),
+        Type::StrBuf => TraitTypePattern::Opaque("strbuf".to_owned()),
+        Type::Handle => TraitTypePattern::Opaque("handle".to_owned()),
+        Type::Record => TraitTypePattern::Opaque("record".to_owned()),
+        Type::ErrorValue => TraitTypePattern::Opaque("Error".to_owned()),
+        Type::Poison => TraitTypePattern::Opaque("poison".to_owned()),
+    }
+}
+
+fn unify_trait_patterns(
+    left: &TraitTypePattern,
+    right: &TraitTypePattern,
+    bindings: &mut HashMap<u32, TraitTypePattern>,
+) -> bool {
+    fn dereference(
+        pattern: &TraitTypePattern,
+        bindings: &HashMap<u32, TraitTypePattern>,
+    ) -> TraitTypePattern {
+        let mut current = pattern.clone();
+        while let TraitTypePattern::Variable(variable) = current {
+            let Some(next) = bindings.get(&variable) else {
+                return TraitTypePattern::Variable(variable);
+            };
+            current = next.clone();
+        }
+        current
+    }
+
+    fn occurs(
+        variable: u32,
+        pattern: &TraitTypePattern,
+        bindings: &HashMap<u32, TraitTypePattern>,
+    ) -> bool {
+        match dereference(pattern, bindings) {
+            TraitTypePattern::Variable(other) => variable == other,
+            TraitTypePattern::Named(_, arguments) | TraitTypePattern::Tuple(arguments) => arguments
+                .iter()
+                .any(|argument| occurs(variable, argument, bindings)),
+            TraitTypePattern::Array(element) | TraitTypePattern::Nullable(element) => {
+                occurs(variable, &element, bindings)
+            }
+            TraitTypePattern::Function(parameters, result) => {
+                parameters
+                    .iter()
+                    .any(|parameter| occurs(variable, parameter, bindings))
+                    || occurs(variable, &result, bindings)
+            }
+            TraitTypePattern::Primitive(_)
+            | TraitTypePattern::Nil
+            | TraitTypePattern::Opaque(_) => false,
+        }
+    }
+
+    let left = dereference(left, bindings);
+    let right = dereference(right, bindings);
+    if left == right {
+        return true;
+    }
+    match (&left, &right) {
+        (TraitTypePattern::Variable(variable), _) => {
+            if !occurs(*variable, &right, bindings) {
+                bindings.insert(*variable, right);
+                true
+            } else {
+                false
+            }
+        }
+        (_, TraitTypePattern::Variable(variable)) => {
+            if !occurs(*variable, &left, bindings) {
+                bindings.insert(*variable, left);
+                true
+            } else {
+                false
+            }
+        }
+        (TraitTypePattern::Primitive(left), TraitTypePattern::Primitive(right)) => left == right,
+        (TraitTypePattern::Nil, TraitTypePattern::Nil) => true,
+        (
+            TraitTypePattern::Named(left_name, left_args),
+            TraitTypePattern::Named(right_name, right_args),
+        ) => {
+            left_name == right_name
+                && left_args.len() == right_args.len()
+                && left_args
+                    .iter()
+                    .zip(right_args)
+                    .all(|(left, right)| unify_trait_patterns(left, right, bindings))
+        }
+        (TraitTypePattern::Array(left), TraitTypePattern::Array(right))
+        | (TraitTypePattern::Nullable(left), TraitTypePattern::Nullable(right)) => {
+            unify_trait_patterns(left, right, bindings)
+        }
+        (TraitTypePattern::Tuple(left), TraitTypePattern::Tuple(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| unify_trait_patterns(left, right, bindings))
+        }
+        (
+            TraitTypePattern::Function(left_params, left_result),
+            TraitTypePattern::Function(right_params, right_result),
+        ) => {
+            left_params.len() == right_params.len()
+                && left_params
+                    .iter()
+                    .zip(right_params)
+                    .all(|(left, right)| unify_trait_patterns(left, right, bindings))
+                && unify_trait_patterns(left_result, right_result, bindings)
+        }
+        (TraitTypePattern::Opaque(left), TraitTypePattern::Opaque(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn generic_trait_implementations_overlap(left: &ExtendDecl, right: &ExtendDecl) -> bool {
+    if left.trait_name != right.trait_name
+        || left.trait_arguments.len() != right.trait_arguments.len()
+    {
+        return false;
+    }
+    let left_parameters: HashMap<_, _> = left
+        .type_params
+        .iter()
+        .enumerate()
+        .map(|(index, parameter)| (parameter.name.as_str(), index as u32))
+        .collect();
+    let right_parameters: HashMap<_, _> = right
+        .type_params
+        .iter()
+        .enumerate()
+        .map(|(index, parameter)| (parameter.name.as_str(), (index as u32) | (1 << 31)))
+        .collect();
+    let left_target = trait_type_pattern(&left.target, &left_parameters);
+    let right_target = trait_type_pattern(&right.target, &right_parameters);
+    let mut bindings = HashMap::new();
+    unify_trait_patterns(&left_target, &right_target, &mut bindings)
+        && left
+            .trait_arguments
+            .iter()
+            .zip(&right.trait_arguments)
+            .all(|(left, right)| {
+                unify_trait_patterns(
+                    &trait_type_pattern(left, &left_parameters),
+                    &trait_type_pattern(right, &right_parameters),
+                    &mut bindings,
+                )
+            })
+}
+
+fn generic_trait_implementation_overlaps_exact(
+    generic: &ExtendDecl,
+    target: &Type,
+    trait_name: &str,
+    arguments: &[Type],
+) -> bool {
+    if generic.trait_name.as_deref() != Some(trait_name)
+        || generic.trait_arguments.len() != arguments.len()
+    {
+        return false;
+    }
+    let parameters: HashMap<_, _> = generic
+        .type_params
+        .iter()
+        .enumerate()
+        .map(|(index, parameter)| (parameter.name.as_str(), index as u32))
+        .collect();
+    let mut bindings = HashMap::new();
+    if !unify_trait_patterns(
+        &trait_type_pattern(&generic.target, &parameters),
+        &concrete_trait_type_pattern(target),
+        &mut bindings,
+    ) {
+        return false;
+    }
+    generic
+        .trait_arguments
+        .iter()
+        .zip(arguments)
+        .all(|(pattern, actual)| {
+            unify_trait_patterns(
+                &trait_type_pattern(pattern, &parameters),
+                &concrete_trait_type_pattern(actual),
+                &mut bindings,
+            )
+        })
+}
+
+fn trait_annotation_cost(ty: &TypeAnnotation) -> usize {
+    1usize.saturating_add(match &ty.kind {
+        TypeKind::Applied { arguments, .. } | TypeKind::ResolvedApplied { arguments, .. } => {
+            arguments.iter().map(trait_annotation_cost).sum()
+        }
+        TypeKind::Array(element) => trait_annotation_cost(element),
+        TypeKind::Tuple(elements) => elements.iter().map(trait_annotation_cost).sum(),
+        TypeKind::Function { parameters, result } => parameters
+            .iter()
+            .map(trait_annotation_cost)
+            .sum::<usize>()
+            .saturating_add(trait_annotation_cost(result)),
+        TypeKind::Primitive(_)
+        | TypeKind::Named(_)
+        | TypeKind::ResolvedName { .. }
+        | TypeKind::TypeParameter(_)
+        | TypeKind::SelfType => 0,
+    })
+}
+
+fn concrete_trait_type_cost(ty: &Type) -> usize {
+    1usize.saturating_add(match ty {
+        Type::Array(element) | Type::Task(element) => concrete_trait_type_cost(element),
+        Type::Tuple(elements) => elements.iter().map(concrete_trait_type_cost).sum(),
+        Type::Function(parameters, result) => parameters
+            .iter()
+            .map(concrete_trait_type_cost)
+            .sum::<usize>()
+            .saturating_add(concrete_trait_type_cost(result)),
+        Type::Struct(_, _, arguments) => arguments.iter().map(concrete_trait_type_cost).sum(),
+        Type::Primitive(_, _)
+        | Type::Nil
+        | Type::Never
+        | Type::EmptyArray
+        | Type::Bytes
+        | Type::StrBuf
+        | Type::Handle
+        | Type::Record
+        | Type::Enum(_, _)
+        | Type::Named(_)
+        | Type::Generic(_)
+        | Type::Dynamic
+        | Type::ErrorValue
+        | Type::Poison => 0,
+    })
+}
+
+fn trait_implementation_cost(extension: &ExtendDecl) -> usize {
+    extension
+        .trait_arguments
+        .iter()
+        .map(trait_annotation_cost)
+        .fold(
+            trait_annotation_cost(&extension.target),
+            usize::saturating_add,
+        )
 }
 
 fn contains_unresolved_empty_array(ty: &Type) -> bool {
@@ -484,6 +863,10 @@ fn contains_unresolved_empty_array(ty: &Type) -> bool {
         Type::EmptyArray => true,
         Type::Array(element) => contains_unresolved_empty_array(element),
         Type::Tuple(items) => items.iter().any(contains_unresolved_empty_array),
+        Type::Function(parameters, result) => {
+            parameters.iter().any(contains_unresolved_empty_array)
+                || contains_unresolved_empty_array(result)
+        }
         _ => false,
     }
 }
@@ -505,6 +888,12 @@ fn replace_self_type(ty: &mut TypeAnnotation, target: &TypeAnnotation) {
             for element in elements {
                 replace_self_type(element, target);
             }
+        }
+        TypeKind::Function { parameters, result } => {
+            for parameter in parameters {
+                replace_self_type(parameter, target);
+            }
+            replace_self_type(result, target);
         }
         TypeKind::Primitive(_)
         | TypeKind::Named(_)
@@ -534,6 +923,12 @@ fn substitute_trait_type(ty: &mut TypeAnnotation, substitutions: &HashMap<String
                 substitute_trait_type(element, substitutions);
             }
         }
+        TypeKind::Function { parameters, result } => {
+            for parameter in parameters {
+                substitute_trait_type(parameter, substitutions);
+            }
+            substitute_trait_type(result, substitutions);
+        }
         TypeKind::Primitive(_)
         | TypeKind::Named(_)
         | TypeKind::ResolvedName { .. }
@@ -547,6 +942,9 @@ fn is_concrete_trait_argument(ty: &Type) -> bool {
         Type::Dynamic | Type::Generic(_) | Type::EmptyArray | Type::Never | Type::Poison => false,
         Type::Array(element) => is_concrete_trait_argument(element),
         Type::Tuple(elements) => elements.iter().all(is_concrete_trait_argument),
+        Type::Function(parameters, result) => {
+            parameters.iter().all(is_concrete_trait_argument) && is_concrete_trait_argument(result)
+        }
         _ => true,
     }
 }
@@ -578,6 +976,15 @@ impl Type {
                     .map(Type::display)
                     .collect::<Vec<_>>()
                     .join(", ")
+            ),
+            Self::Function(parameters, result) => format!(
+                "fn({}) -> {}",
+                parameters
+                    .iter()
+                    .map(Type::display)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                result.display()
             ),
             Self::Bytes => "bytes".into(),
             Self::StrBuf => "string builder".into(),
@@ -618,6 +1025,7 @@ impl Type {
             }
             (Self::Array(a), Self::Array(b)) if a == b => Self::Array(a),
             (Self::Task(a), Self::Task(b)) => Self::Task(Box::new((*a).join(*b))),
+            (a @ Self::Function(_, _), b @ Self::Function(_, _)) if a == b => a,
             (Self::Array(a), Self::Array(b)) => {
                 let element = (*a).join(*b);
                 if element == Self::Dynamic {
@@ -889,8 +1297,10 @@ struct Checker<'a> {
     associated_extension_methods: Vec<(&'a ExtendDecl, &'a ExtensionMethod)>,
     trait_implementations: std::collections::HashSet<(Type, String, Vec<Type>)>,
     generic_trait_implementations: Vec<&'a ExtendDecl>,
+    trait_coherence_work: usize,
     current_function: Option<String>,
     method_calls: HashMap<CallSite, String>,
+    iteration_calls: HashMap<CallSite, Vec<Option<IterationMethods>>>,
     call_specializations: HashMap<CallSite, String>,
     struct_call_specializations: HashMap<CallSite, String>,
     specializations: Vec<Specialization>,
@@ -921,6 +1331,7 @@ pub(crate) struct StructSpecialization {
 pub(crate) struct CheckResult {
     pub diagnostics: Vec<Diagnostic>,
     pub method_calls: HashMap<CallSite, String>,
+    pub iteration_calls: HashMap<CallSite, Vec<Option<IterationMethods>>>,
     pub call_specializations: HashMap<CallSite, String>,
     pub struct_call_specializations: HashMap<CallSite, String>,
     pub specializations: Vec<Specialization>,
@@ -930,8 +1341,19 @@ pub(crate) struct CheckResult {
     pub bigint_literals: HashSet<usize>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct IterationMethods {
+    pub into_iter: String,
+    pub next: String,
+    pub current: String,
+}
+
 pub(crate) fn expression_site(function: Option<&str>, expr: &Expr) -> CallSite {
     (function.map(str::to_owned), expr as *const Expr as usize)
+}
+
+pub(crate) fn statement_site(function: Option<&str>, stmt: &Stmt) -> CallSite {
+    (function.map(str::to_owned), stmt as *const Stmt as usize)
 }
 
 pub fn check(program: &Program, function_modules: &HashMap<String, String>) -> Vec<Diagnostic> {
@@ -986,8 +1408,10 @@ pub(crate) fn check_with_methods_and_names(
         associated_extension_methods: Vec::new(),
         trait_implementations: Default::default(),
         generic_trait_implementations: Vec::new(),
+        trait_coherence_work: 0,
         current_function: None,
         method_calls: HashMap::new(),
+        iteration_calls: HashMap::new(),
         call_specializations: HashMap::new(),
         struct_call_specializations: HashMap::new(),
         specializations: Vec::new(),
@@ -1296,6 +1720,7 @@ pub(crate) fn check_with_methods_and_names(
     CheckResult {
         diagnostics: c.diagnostics,
         method_calls: c.method_calls,
+        iteration_calls: c.iteration_calls,
         call_specializations: c.call_specializations,
         struct_call_specializations: c.struct_call_specializations,
         specializations: c.specializations,
@@ -1319,6 +1744,288 @@ impl<'a> Checker<'a> {
         self.implements_trait_inner(ty, trait_name, arguments, &mut HashSet::new())
     }
 
+    fn standard_trait_symbol(&self, source_name: &str) -> Option<String> {
+        self.access_facts
+            .symbol_names
+            .iter()
+            .find_map(|(symbol, source)| (source == source_name).then(|| symbol.clone()))
+    }
+
+    fn implemented_trait_argument_candidates(&self, ty: &Type, trait_name: &str) -> Vec<Vec<Type>> {
+        let mut matches = self
+            .trait_implementations
+            .iter()
+            .filter_map(|(target, name, arguments)| {
+                (target == ty && name == trait_name).then(|| arguments.clone())
+            })
+            .collect::<Vec<_>>();
+        for extension in &self.generic_trait_implementations {
+            let mut visiting = HashSet::new();
+            if let Some(arguments) = self.generic_trait_implementation_arguments(
+                extension,
+                ty,
+                trait_name,
+                None,
+                &mut visiting,
+            ) {
+                matches.push(arguments);
+            }
+        }
+        let mut seen = HashSet::new();
+        matches.retain(|arguments| seen.insert(arguments.clone()));
+        matches
+    }
+
+    fn generic_trait_implementation_arguments(
+        &self,
+        extension: &ExtendDecl,
+        target: &Type,
+        trait_name: &str,
+        requested_arguments: Option<&[Type]>,
+        visiting: &mut HashSet<(Type, String, Vec<Type>)>,
+    ) -> Option<Vec<Type>> {
+        if extension.trait_name.as_deref() != Some(trait_name)
+            || requested_arguments
+                .is_some_and(|arguments| arguments.len() != extension.trait_arguments.len())
+        {
+            return None;
+        }
+        let parameters: HashSet<_> = extension
+            .type_params
+            .iter()
+            .map(|parameter| parameter.name.as_str())
+            .collect();
+        let mut substitutions = HashMap::new();
+        if !match_extension_type(&extension.target, target, &parameters, &mut substitutions) {
+            return None;
+        }
+        if let Some(arguments) = requested_arguments {
+            if !extension
+                .trait_arguments
+                .iter()
+                .zip(arguments)
+                .all(|(pattern, actual)| {
+                    match_extension_type(pattern, actual, &parameters, &mut substitutions)
+                })
+            {
+                return None;
+            }
+        }
+        if extension
+            .type_params
+            .iter()
+            .any(|parameter| !substitutions.contains_key(&parameter.name))
+        {
+            return None;
+        }
+        let arguments = extension
+            .trait_arguments
+            .iter()
+            .map(|argument| self.concrete_annotation(argument, &substitutions, target))
+            .collect::<Option<Vec<_>>>()?;
+        let query = (target.clone(), trait_name.to_owned(), arguments.clone());
+        if !visiting.insert(query.clone()) {
+            return None;
+        }
+        let valid = extension.type_params.iter().all(|parameter| {
+            let Some(actual) = substitutions.get(&parameter.name) else {
+                return false;
+            };
+            parameter.bounds.iter().all(|bound| {
+                let Some(bound_arguments) = bound
+                    .arguments
+                    .iter()
+                    .map(|argument| self.concrete_annotation(argument, &substitutions, target))
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    return false;
+                };
+                self.implements_trait_inner(actual, &bound.name, &bound_arguments, visiting)
+            })
+        });
+        visiting.remove(&query);
+        valid.then_some(arguments)
+    }
+
+    fn check_iteration_method(
+        &mut self,
+        receiver_type: &Type,
+        method: &str,
+        span: Option<SourceSpan>,
+    ) -> Option<(Type, String)> {
+        let binding_name = format!("$iteration_receiver_{}", self.next_binding);
+        let binding_id = self.next_binding;
+        self.next_binding += 1;
+        self.scopes.push(Scope::default());
+        self.define(
+            &binding_name,
+            Binding {
+                id: binding_id,
+                error_only: false,
+                inferred: None,
+                ty: receiver_type.clone(),
+                mutable: true,
+            },
+            span.as_ref(),
+        );
+
+        let call = Expr::MethodCall(
+            Box::new(Expr::Ident(binding_name)),
+            method.to_owned(),
+            Vec::new(),
+        );
+        let previous_flow = self.flow_facts.clone();
+        let result = self.expr(&call);
+        self.flow_facts = previous_flow;
+        let site = expression_site(self.current_function.as_deref(), &call);
+        let resolved = self
+            .call_specializations
+            .get(&site)
+            .or_else(|| self.method_calls.get(&site))
+            .cloned();
+        self.scopes.pop();
+
+        resolved
+            .filter(|_| result != Type::Poison)
+            .map(|name| (result, name))
+    }
+
+    fn custom_iteration(
+        &mut self,
+        collection: &Type,
+        span: Option<SourceSpan>,
+    ) -> Option<(Type, IterationMethods)> {
+        let Some(into_iterator_trait) = self.standard_trait_symbol("iter::IntoIterator") else {
+            self.error(
+                "E2001",
+                format!(
+                    "for-in over {} requires the `iter` module and an `IntoIterator` implementation",
+                    collection.display()
+                ),
+                span.as_ref(),
+            );
+            return None;
+        };
+        let implemented =
+            self.implemented_trait_argument_candidates(collection, &into_iterator_trait);
+        let arguments = match implemented.as_slice() {
+            [arguments] => arguments,
+            [] => {
+                self.error(
+                    "E2001",
+                    format!(
+                        "type {} does not implement `iter::IntoIterator[Iter, Item]`",
+                        collection.display()
+                    ),
+                    span.as_ref(),
+                );
+                return None;
+            }
+            _ => {
+                self.error(
+                    "E2001",
+                    format!(
+                        "type {} has multiple applicable `iter::IntoIterator` implementations",
+                        collection.display()
+                    ),
+                    span.as_ref(),
+                );
+                return None;
+            }
+        };
+        let [iterator_type, item_type] = arguments.as_slice() else {
+            self.error(
+                "E2001",
+                "`iter::IntoIterator` must have `Iter` and `Item` type arguments",
+                span.as_ref(),
+            );
+            return None;
+        };
+        let Some(iterator_trait) = self.standard_trait_symbol("iter::Iterator") else {
+            self.error(
+                "E2001",
+                "the `iter::Iterator` trait is unavailable; import the `iter` module",
+                span.as_ref(),
+            );
+            return None;
+        };
+        if !self.implements_trait(
+            iterator_type,
+            &iterator_trait,
+            std::slice::from_ref(item_type),
+        ) {
+            self.error(
+                "E2001",
+                format!(
+                    "iterator type {} does not implement `iter::Iterator[{}]`",
+                    iterator_type.display(),
+                    item_type.display()
+                ),
+                span.as_ref(),
+            );
+            return None;
+        }
+
+        let Some((actual_iterator_type, into_iter)) =
+            self.check_iteration_method(collection, "into_iter", span.clone())
+        else {
+            return None;
+        };
+        if !type_compatible(iterator_type, &actual_iterator_type) {
+            self.error(
+                "E2001",
+                format!(
+                    "`into_iter()` returns {}, expected {}",
+                    actual_iterator_type.display(),
+                    iterator_type.display()
+                ),
+                span.as_ref(),
+            );
+            return None;
+        }
+
+        let Some((next_type, next)) =
+            self.check_iteration_method(iterator_type, "next", span.clone())
+        else {
+            return None;
+        };
+        if !type_compatible(&Type::concrete(VarType::Bool), &next_type) {
+            self.error(
+                "E2001",
+                format!("`next()` returns {}, expected bool", next_type.display()),
+                span.as_ref(),
+            );
+            return None;
+        }
+
+        let Some((current_type, current)) =
+            self.check_iteration_method(iterator_type, "current", span.clone())
+        else {
+            return None;
+        };
+        if !type_compatible(item_type, &current_type) {
+            self.error(
+                "E2001",
+                format!(
+                    "`current()` returns {}, expected {}",
+                    current_type.display(),
+                    item_type.display()
+                ),
+                span.as_ref(),
+            );
+            return None;
+        }
+
+        Some((
+            item_type.clone(),
+            IterationMethods {
+                into_iter,
+                next,
+                current,
+            },
+        ))
+    }
+
     fn implements_trait_inner(
         &self,
         ty: &Type,
@@ -1335,57 +2042,16 @@ impl<'a> Checker<'a> {
             return true;
         }
 
-        let query = (ty.clone(), trait_name.to_owned(), arguments.to_vec());
-        if !visiting.insert(query.clone()) {
-            return false;
-        }
-        let implemented = self.generic_trait_implementations.iter().any(|extension| {
-            if extension.trait_name.as_deref() != Some(trait_name)
-                || extension.trait_arguments.len() != arguments.len()
-            {
-                return false;
-            }
-            let parameters: HashSet<_> = extension
-                .type_params
-                .iter()
-                .map(|parameter| parameter.name.as_str())
-                .collect();
-            let mut substitutions = HashMap::new();
-            if !match_extension_type(&extension.target, ty, &parameters, &mut substitutions)
-                || !extension
-                    .trait_arguments
-                    .iter()
-                    .zip(arguments)
-                    .all(|(pattern, actual)| {
-                        match_extension_type(pattern, actual, &parameters, &mut substitutions)
-                    })
-            {
-                return false;
-            }
-
-            for parameter in &extension.type_params {
-                let Some(actual) = substitutions.get(&parameter.name) else {
-                    return false;
-                };
-                for bound in &parameter.bounds {
-                    let Some(bound_arguments) = bound
-                        .arguments
-                        .iter()
-                        .map(|argument| self.concrete_annotation(argument, &substitutions, ty))
-                        .collect::<Option<Vec<_>>>()
-                    else {
-                        return false;
-                    };
-                    if !self.implements_trait_inner(actual, &bound.name, &bound_arguments, visiting)
-                    {
-                        return false;
-                    }
-                }
-            }
-            true
-        });
-        visiting.remove(&query);
-        implemented
+        self.generic_trait_implementations.iter().any(|extension| {
+            self.generic_trait_implementation_arguments(
+                extension,
+                ty,
+                trait_name,
+                Some(arguments),
+                visiting,
+            )
+            .is_some()
+        })
     }
 
     fn concrete_annotation(
@@ -1409,6 +2075,13 @@ impl<'a> Checker<'a> {
                     .iter()
                     .map(|element| self.concrete_annotation(element, substitutions, self_type))
                     .collect::<Option<Vec<_>>>()?,
+            ),
+            TypeKind::Function { parameters, result } => Type::Function(
+                parameters
+                    .iter()
+                    .map(|parameter| self.concrete_annotation(parameter, substitutions, self_type))
+                    .collect::<Option<Vec<_>>>()?,
+                Box::new(self.concrete_annotation(result, substitutions, self_type)?),
             ),
             TypeKind::Applied { source, arguments } if source == "Task" => {
                 if arguments.len() != 1 {
@@ -1513,6 +2186,13 @@ impl<'a> Checker<'a> {
                     .map(|item| self.type_annotation_for(item))
                     .collect::<Option<Vec<_>>>()?,
             ),
+            Type::Function(parameters, result) => TypeKind::Function {
+                parameters: parameters
+                    .iter()
+                    .map(|ty| self.type_annotation_for(ty))
+                    .collect::<Option<Vec<_>>>()?,
+                result: Box::new(self.type_annotation_for(result)?),
+            },
             Type::Struct(_, name, arguments) if !arguments.is_empty() => {
                 TypeKind::ResolvedApplied {
                     source: name.clone(),
@@ -1544,6 +2224,23 @@ impl<'a> Checker<'a> {
             kind,
             nilable: matches!(ty, Type::Primitive(_, true)),
         })
+    }
+
+    fn charge_trait_coherence(&mut self, amount: usize, span: Option<&SourceSpan>) -> bool {
+        let Some(work) = self
+            .trait_coherence_work
+            .checked_add(amount)
+            .filter(|work| *work <= MAX_TRAIT_COHERENCE_WORK)
+        else {
+            self.error(
+                "E4003",
+                "trait implementation coherence analysis limit exceeded",
+                span,
+            );
+            return false;
+        };
+        self.trait_coherence_work = work;
+        true
     }
 
     fn register_trait_implementation(
@@ -1617,34 +2314,113 @@ impl<'a> Checker<'a> {
             );
             return;
         }
-        let duplicate_generic = self.generic_trait_implementations.iter().any(|existing| {
-            existing.trait_name.as_deref() == Some(trait_name)
-                && existing.target.canonical() == extension.target.canonical()
-                && existing
-                    .trait_arguments
-                    .iter()
-                    .map(TypeAnnotation::canonical)
-                    .eq(extension
-                        .trait_arguments
-                        .iter()
-                        .map(TypeAnnotation::canonical))
-        });
-        if self
+        let span = extension
+            .methods
+            .first()
+            .and_then(|method| method.function.result_span.as_ref());
+        let new_cost = trait_implementation_cost(extension);
+        let mut overlaps = false;
+        for existing in self.generic_trait_implementations.clone() {
+            if existing.trait_name.as_deref() != Some(trait_name)
+                || existing.trait_arguments.len() != extension.trait_arguments.len()
+            {
+                continue;
+            }
+            let cost = new_cost.saturating_add(trait_implementation_cost(existing));
+            if !self.charge_trait_coherence(cost, span) {
+                return;
+            }
+            let matches = if generic {
+                generic_trait_implementations_overlap(extension, existing)
+            } else {
+                generic_trait_implementation_overlaps_exact(
+                    existing,
+                    target,
+                    trait_name,
+                    &trait_arguments,
+                )
+            };
+            if matches {
+                overlaps = true;
+                break;
+            }
+        }
+        if generic && !overlaps {
+            let exact_implementations = self
+                .trait_implementations
+                .iter()
+                .filter(|(_, name, _)| name == trait_name)
+                .cloned()
+                .collect::<Vec<_>>();
+            for (existing_target, existing_trait, existing_arguments) in exact_implementations {
+                if existing_trait != trait_name
+                    || existing_arguments.len() != extension.trait_arguments.len()
+                {
+                    continue;
+                }
+                let cost = new_cost.saturating_add(
+                    concrete_trait_type_cost(&existing_target).saturating_add(
+                        existing_arguments
+                            .iter()
+                            .map(concrete_trait_type_cost)
+                            .sum::<usize>(),
+                    ),
+                );
+                if !self.charge_trait_coherence(cost, span) {
+                    return;
+                }
+                if generic_trait_implementation_overlaps_exact(
+                    extension,
+                    &existing_target,
+                    &existing_trait,
+                    &existing_arguments,
+                ) {
+                    overlaps = true;
+                    break;
+                }
+            }
+        }
+        if !generic && !overlaps {
+            for existing in self.generic_trait_implementations.clone() {
+                if existing.trait_name.as_deref() != Some(trait_name)
+                    || existing.trait_arguments.len() != trait_arguments.len()
+                {
+                    continue;
+                }
+                let cost = trait_implementation_cost(existing).saturating_add(
+                    concrete_trait_type_cost(target).saturating_add(
+                        trait_arguments
+                            .iter()
+                            .map(concrete_trait_type_cost)
+                            .sum::<usize>(),
+                    ),
+                );
+                if !self.charge_trait_coherence(cost, span) {
+                    return;
+                }
+                if generic_trait_implementation_overlaps_exact(
+                    existing,
+                    target,
+                    trait_name,
+                    &trait_arguments,
+                ) {
+                    overlaps = true;
+                    break;
+                }
+            }
+        }
+        let duplicate_exact = self
             .trait_implementations
             .iter()
-            .any(|(implemented, name, _)| implemented == target && name == trait_name)
-            || duplicate_generic
-        {
+            .any(|(implemented, name, _)| implemented == target && name == trait_name);
+        if overlaps || duplicate_exact {
             self.error(
                 "E1001",
                 format!(
-                    "trait `{trait_name}` is implemented more than once for `{}`",
-                    target.display()
+                    "trait `{trait_name}` has overlapping implementations for `{}`; implementation bounds do not make overlaps distinct",
+                    extension.target.display(),
                 ),
-                extension
-                    .methods
-                    .first()
-                    .and_then(|method| method.function.result_span.as_ref()),
+                span,
             );
             return;
         }
@@ -1925,6 +2701,47 @@ impl<'a> Checker<'a> {
                 &mut substitutions,
                 expr.span(),
             );
+        }
+
+        for _ in 0..function.type_params.len() {
+            let before = substitutions.len();
+            for parameter in &function.type_params {
+                let Some(actual_type) = substitutions.get(&parameter.name).cloned() else {
+                    continue;
+                };
+                for bound in &parameter.bounds {
+                    let candidates =
+                        self.implemented_trait_argument_candidates(&actual_type, &bound.name);
+                    let mut matching = Vec::new();
+                    for candidate in candidates {
+                        if candidate.len() != bound.arguments.len() {
+                            continue;
+                        }
+                        let mut inferred = substitutions.clone();
+                        if bound
+                            .arguments
+                            .iter()
+                            .zip(&candidate)
+                            .all(|(pattern, actual)| {
+                                match_extension_type(
+                                    pattern,
+                                    actual,
+                                    &type_parameters,
+                                    &mut inferred,
+                                )
+                            })
+                        {
+                            matching.push(inferred);
+                        }
+                    }
+                    if matching.len() == 1 {
+                        substitutions = matching.pop().expect("one matching trait impl");
+                    }
+                }
+            }
+            if substitutions.len() == before {
+                break;
+            }
         }
 
         for parameter in &function.type_params {
@@ -2284,6 +3101,31 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
+            TypeKind::Function {
+                parameters: expected_parameters,
+                result: expected_result,
+            } => {
+                if let Type::Function(actual_parameters, actual_result) = actual
+                    && expected_parameters.len() == actual_parameters.len()
+                {
+                    for (expected, actual) in expected_parameters.iter().zip(actual_parameters) {
+                        self.infer_generic_type(
+                            expected,
+                            actual,
+                            parameters,
+                            substitutions,
+                            span,
+                        );
+                    }
+                    self.infer_generic_type(
+                        expected_result,
+                        actual_result,
+                        parameters,
+                        substitutions,
+                        span,
+                    );
+                }
+            }
             TypeKind::Applied {
                 source, arguments, ..
             }
@@ -2350,6 +3192,13 @@ impl<'a> Checker<'a> {
                     .iter()
                     .map(|element| self.substituted_type(element, substitutions))
                     .collect(),
+            ),
+            TypeKind::Function { parameters, result } => Type::Function(
+                parameters
+                    .iter()
+                    .map(|parameter| self.substituted_type(parameter, substitutions))
+                    .collect(),
+                Box::new(self.substituted_type(result, substitutions)),
             ),
             TypeKind::Applied { source, arguments } if source == "Task" => {
                 if arguments.len() != 1 {
@@ -2583,6 +3432,13 @@ impl<'a> Checker<'a> {
                     .iter()
                     .map(|item| self.annotation_type(item))
                     .collect(),
+            ),
+            TypeKind::Function { parameters, result } => Type::Function(
+                parameters
+                    .iter()
+                    .map(|item| self.annotation_type(item))
+                    .collect(),
+                Box::new(self.annotation_type(result)),
             ),
         }
     }
@@ -3605,24 +4461,21 @@ impl<'a> Checker<'a> {
                         stmt.span(),
                     );
                 }
-                let element = match &collection {
-                    Type::Array(element) => (**element).clone(),
-                    Type::EmptyArray | Type::Dynamic => Type::Dynamic,
-                    Type::Primitive(VarType::Str, _) => Type::concrete(VarType::Char),
-                    Type::ErrorValue | Type::Never => Type::Never,
-                    Type::Poison => Type::Poison,
-                    _ => {
-                        self.error(
-                            "E2001",
-                            format!(
-                                "for-in requires an array or str, got {}",
-                                collection.display()
-                            ),
-                            iterable.span(),
-                        );
-                        Type::Poison
-                    }
+                let (element, iteration) = match &collection {
+                    Type::Array(element) => ((**element).clone(), None),
+                    Type::EmptyArray | Type::Dynamic => (Type::Dynamic, None),
+                    Type::Primitive(VarType::Str, _) => (Type::concrete(VarType::Char), None),
+                    Type::ErrorValue | Type::Never => (Type::Never, None),
+                    Type::Poison => (Type::Poison, None),
+                    _ => self
+                        .custom_iteration(&collection, iterable.span().cloned())
+                        .map(|(element, methods)| (element, Some(methods)))
+                        .unwrap_or((Type::Poison, None)),
                 };
+                self.iteration_calls.insert(
+                    statement_site(self.current_function.as_deref(), stmt),
+                    vec![iteration],
+                );
                 let mut bindings = Vec::new();
                 self.collect_binding_types(pattern, element, iterable.span(), &mut bindings);
                 self.scopes.push(Scope::default());
@@ -3654,6 +4507,7 @@ impl<'a> Checker<'a> {
             }
             Stmt::ForZip { clauses, body } => {
                 let mut bindings = Vec::with_capacity(clauses.len());
+                let mut iteration_methods = Vec::with_capacity(clauses.len());
                 let mut never = false;
                 for clause in clauses {
                     match clause {
@@ -3667,6 +4521,7 @@ impl<'a> Checker<'a> {
                                 self.range_types(start, end, step.as_ref());
                             never |= range_type == Type::Never || step_type == Some(Type::Never);
                             bindings.push((var.clone(), range_type, start.span().cloned()));
+                            iteration_methods.push(None);
                         }
                         ForClause::Each { pattern, iterable } => {
                             let collection = self.expr(iterable);
@@ -3677,24 +4532,20 @@ impl<'a> Checker<'a> {
                                     stmt.span(),
                                 );
                             }
-                            let element = match &collection {
-                                Type::Array(element) => (**element).clone(),
-                                Type::EmptyArray | Type::Dynamic => Type::Dynamic,
-                                Type::Primitive(VarType::Str, _) => Type::concrete(VarType::Char),
-                                Type::ErrorValue | Type::Never => Type::Never,
-                                Type::Poison => Type::Poison,
-                                _ => {
-                                    self.error(
-                                        "E2001",
-                                        format!(
-                                            "for-in requires an array or str, got {}",
-                                            collection.display()
-                                        ),
-                                        iterable.span(),
-                                    );
-                                    Type::Poison
+                            let (element, methods) = match &collection {
+                                Type::Array(element) => ((**element).clone(), None),
+                                Type::EmptyArray | Type::Dynamic => (Type::Dynamic, None),
+                                Type::Primitive(VarType::Str, _) => {
+                                    (Type::concrete(VarType::Char), None)
                                 }
+                                Type::ErrorValue | Type::Never => (Type::Never, None),
+                                Type::Poison => (Type::Poison, None),
+                                _ => self
+                                    .custom_iteration(&collection, iterable.span().cloned())
+                                    .map(|(element, methods)| (element, Some(methods)))
+                                    .unwrap_or((Type::Poison, None)),
                             };
+                            iteration_methods.push(methods);
                             never |= collection == Type::Never || collection == Type::ErrorValue;
                             self.collect_binding_types(
                                 pattern,
@@ -3705,6 +4556,10 @@ impl<'a> Checker<'a> {
                         }
                     }
                 }
+                self.iteration_calls.insert(
+                    statement_site(self.current_function.as_deref(), stmt),
+                    iteration_methods,
+                );
                 self.scopes.push(Scope::default());
                 for (name, ty, span) in bindings {
                     self.define(
@@ -4435,13 +5290,65 @@ impl<'a> Checker<'a> {
 
     fn expr_inner(&mut self, expr: &Expr) -> Type {
         match expr.node() {
-            Expr::BracketApply(_, _) | Expr::Apply(_, _) => {
+            Expr::BracketApply(_, _) => {
                 self.error(
                     "E1003",
                     "resolve brackets and callable names before semantic analysis",
                     expr.span(),
                 );
                 Type::Poison
+            }
+            Expr::Apply(callee, arguments) => {
+                let callable = self.expr(callee);
+                let Type::Function(parameters, result) = callable else {
+                    if callable != Type::Poison {
+                        self.error(
+                            "E2001",
+                            format!("value of type {} is not callable", callable.display()),
+                            expr.span(),
+                        );
+                    }
+                    return Type::Poison;
+                };
+                if arguments.len() != parameters.len() {
+                    self.error(
+                        "E1005",
+                        format!(
+                            "call expects {} argument(s), got {}",
+                            parameters.len(),
+                            arguments.len()
+                        ),
+                        expr.span(),
+                    );
+                }
+                let mut valid = true;
+                for (index, argument) in arguments.iter().enumerate() {
+                    if argument.name.is_some() {
+                        self.error(
+                            "E1005",
+                            "indirect calls accept positional arguments only",
+                            argument.value.span(),
+                        );
+                        valid = false;
+                    }
+                    let actual = self.expr(&argument.value);
+                    if let Some(expected) = parameters.get(index)
+                        && !type_compatible(expected, &actual)
+                    {
+                        self.error(
+                            "E2001",
+                            format!(
+                                "argument {} expects {}, got {}",
+                                index + 1,
+                                expected.display(),
+                                actual.display()
+                            ),
+                            argument.value.span(),
+                        );
+                        valid = false;
+                    }
+                }
+                if valid { *result } else { Type::Poison }
             }
             Expr::Located(_, _) => unreachable!("node removes locations"),
             Expr::Int(_)
@@ -4499,7 +5406,7 @@ impl<'a> Checker<'a> {
                         .insert(crate::mutability::expr_id(expr), resolved);
                     return self.effective_type(binding);
                 }
-                if let Some(function) = self.functions.get(&resolved) {
+                if let Some(function) = self.functions.get(&resolved).cloned() {
                     let function_name = function.name.clone();
                     let comptime = function.comptime;
                     if comptime != self.in_comptime {
@@ -4517,17 +5424,183 @@ impl<'a> Checker<'a> {
                         );
                         return Type::Poison;
                     }
+                    if function.asynchronous
+                        || !function.type_params.is_empty()
+                        || function
+                            .params
+                            .iter()
+                            .any(|parameter| parameter.default.is_some())
+                        || function.result_type.is_none()
+                        || function
+                            .params
+                            .iter()
+                            .any(|parameter| parameter.ty.is_none())
+                    {
+                        self.error(
+                            "E4002",
+                            format!("`{function_name}` cannot be used as a function value; async, generic, or defaulted callables are not supported here"),
+                            expr.span(),
+                        );
+                        return Type::Poison;
+                    }
+                    return Type::Function(
+                        function
+                            .params
+                            .iter()
+                            .map(|parameter| {
+                                parameter
+                                    .ty
+                                    .as_ref()
+                                    .map_or(Type::Dynamic, |ty| self.annotation_type(ty))
+                            })
+                            .collect(),
+                        Box::new(
+                            function
+                                .result_type
+                                .as_ref()
+                                .map_or(Type::Dynamic, |ty| self.annotation_type(ty)),
+                        ),
+                    );
+                }
+                self.error("E1002", format!("undefined variable `{name}`"), expr.span());
+                Type::Poison
+            }
+            Expr::Closure {
+                captures,
+                params,
+                result_type,
+                body,
+            } => {
+                if self.in_comptime {
                     self.error(
                         "E4002",
-                        format!(
-                            "function values are not supported; call `{function_name}` directly"
-                        ),
+                        "closures cannot be created in compile-time code",
                         expr.span(),
                     );
                     return Type::Poison;
                 }
-                self.error("E1002", format!("undefined variable `{name}`"), expr.span());
-                Type::Poison
+                let mut capture_bindings = Vec::with_capacity(captures.len());
+                let mut valid = true;
+                for capture in captures {
+                    let Some(binding) = self.local(&capture.name) else {
+                        self.error(
+                            "E1002",
+                            format!("closure capture `{}` is not a local binding", capture.name),
+                            expr.span(),
+                        );
+                        valid = false;
+                        continue;
+                    };
+                    if capture.mutable && !binding.mutable {
+                        self.error(
+                            "E1003",
+                            format!(
+                                "mutable capture `{}` requires a `var` binding",
+                                capture.name
+                            ),
+                            expr.span(),
+                        );
+                        valid = false;
+                    }
+                    let ty = self.effective_type(&binding);
+                    capture_bindings.push((capture.name.clone(), ty, capture.mutable));
+                }
+                let mut parameter_types = Vec::with_capacity(params.len());
+                for parameter in params {
+                    let Some(annotation) = &parameter.ty else {
+                        self.error(
+                            "E2001",
+                            format!(
+                                "closure parameter `{}` requires an explicit type",
+                                parameter.name
+                            ),
+                            expr.span(),
+                        );
+                        valid = false;
+                        parameter_types.push(Type::Poison);
+                        continue;
+                    };
+                    parameter_types.push(self.annotation_type(annotation));
+                }
+                let Some(result_annotation) = result_type.as_ref() else {
+                    self.error(
+                        "E2001",
+                        "closure requires an explicit result type",
+                        expr.span(),
+                    );
+                    return Type::Poison;
+                };
+                let declared_result = self.annotation_type(result_annotation);
+                let saved_bindings = self
+                    .scopes
+                    .iter()
+                    .map(|scope| scope.bindings.clone())
+                    .collect::<Vec<_>>();
+                for scope in &mut self.scopes {
+                    scope.bindings.clear();
+                }
+                self.scopes.push(Scope::default());
+                for (name, ty, mutable) in capture_bindings {
+                    self.define(
+                        &name,
+                        Binding {
+                            id: 0,
+                            error_only: false,
+                            inferred: None,
+                            ty,
+                            mutable,
+                        },
+                        expr.span(),
+                    );
+                }
+                for (parameter, ty) in params.iter().zip(parameter_types.iter().cloned()) {
+                    self.define(
+                        &parameter.name,
+                        Binding {
+                            id: 0,
+                            error_only: false,
+                            inferred: None,
+                            ty,
+                            mutable: true,
+                        },
+                        expr.span(),
+                    );
+                }
+                let saved_function = self.in_function;
+                let saved_async = self.in_async;
+                let saved_result = self.result_type.replace(result_annotation.clone());
+                let saved_loops = std::mem::replace(&mut self.loops, 0);
+                let saved_loop_breaks = std::mem::take(&mut self.loop_breaks);
+                let saved_flow = std::mem::take(&mut self.flow_facts);
+                let saved_reachable = self.normal_reachable;
+                self.in_function = true;
+                self.in_async = false;
+                self.normal_reachable = true;
+                let body_type = self.block(body);
+                if body_type != Type::Never {
+                    valid &= self.assignable(
+                        result_annotation.clone(),
+                        body_type,
+                        body.tail.as_deref().and_then(Expr::span),
+                        "closure result",
+                    );
+                }
+                self.scopes.pop();
+                for (scope, bindings) in self.scopes.iter_mut().zip(saved_bindings) {
+                    scope.bindings = bindings;
+                }
+                self.in_function = saved_function;
+                self.in_async = saved_async;
+                self.result_type = saved_result;
+                self.loops = saved_loops;
+                self.loop_breaks = saved_loop_breaks;
+                self.flow_facts = saved_flow;
+                self.normal_reachable = saved_reachable;
+                if !valid {
+                    Type::Poison
+                } else {
+                    Type::Function(parameter_types, Box::new(declared_result))
+                }
             }
             Expr::Array(items) => {
                 let mut never = false;
@@ -4701,34 +5774,73 @@ impl<'a> Checker<'a> {
                 if receiver == Type::Never || index == Type::Never {
                     return Type::Never;
                 }
-                if let (Type::Struct(id, struct_name, type_arguments), Expr::Str(name)) =
-                    (&receiver, b.node())
-                {
-                    if let Some(field) = self.struct_fields[*id]
-                        .iter()
-                        .find(|field| &field.name == name)
-                    {
-                        if field.visibility == Visibility::Private && !self.owns_struct(*id) {
-                            self.error("E1002", format!("field `{name}` is private"), b.span());
+                if let Type::Struct(id, struct_name, type_arguments) = &receiver {
+                    let field_name = match b.node() {
+                        Expr::Str(name) => Some(name.clone()),
+                        Expr::Int(index) if *index >= 0 => Some(index.to_string()),
+                        _ => None,
+                    };
+                    if let Some(name) = field_name {
+                        if let Some(field) = self.struct_fields[*id]
+                            .iter()
+                            .find(|field| field.name == name)
+                        {
+                            if field.visibility == Visibility::Private && !self.owns_struct(*id) {
+                                self.error("E1002", format!("field `{name}` is private"), b.span());
+                                return Type::Poison;
+                            }
+                            return field.ty.as_ref().map_or(Type::Dynamic, |field_type| {
+                                let parameters = self
+                                    .struct_parameters
+                                    .get(struct_name)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let substitutions: HashMap<_, _> = parameters
+                                    .iter()
+                                    .zip(type_arguments)
+                                    .map(|(parameter, argument)| {
+                                        (parameter.name.clone(), argument.clone())
+                                    })
+                                    .collect();
+                                self.substituted_type(field_type, &substitutions)
+                            });
+                        }
+                        let fields = self.struct_fields[*id];
+                        let positional = fields
+                            .iter()
+                            .enumerate()
+                            .all(|(index, field)| field.name == index.to_string());
+                        if positional && matches!(b.node(), Expr::Int(_)) {
+                            self.error(
+                                "E2001",
+                                format!("struct field position `{name}` is out of range"),
+                                b.span(),
+                            );
                             return Type::Poison;
                         }
-                        return field.ty.as_ref().map_or(Type::Dynamic, |field_type| {
-                            let parameters = self
-                                .struct_parameters
-                                .get(struct_name)
-                                .cloned()
-                                .unwrap_or_default();
-                            let substitutions: HashMap<_, _> = parameters
-                                .iter()
-                                .zip(type_arguments)
-                                .map(|(parameter, argument)| {
-                                    (parameter.name.clone(), argument.clone())
-                                })
-                                .collect();
-                            self.substituted_type(field_type, &substitutions)
-                        });
+                        self.error("E1002", format!("unknown field `{name}`"), b.span());
+                        return Type::Poison;
                     }
-                    self.error("E1002", format!("unknown field `{name}`"), b.span());
+                    if let Expr::Int(index) = b.node() {
+                        let fields = self.struct_fields[*id];
+                        let positional = fields
+                            .iter()
+                            .enumerate()
+                            .all(|(index, field)| field.name == index.to_string());
+                        if positional {
+                            self.error(
+                                "E2001",
+                                format!("invalid struct field position `{index}`"),
+                                b.span(),
+                            );
+                            return Type::Poison;
+                        }
+                    }
+                    self.error(
+                        "E1002",
+                        "struct field access requires a field name",
+                        b.span(),
+                    );
                     return Type::Poison;
                 }
                 match (&receiver, b.node()) {

@@ -36,11 +36,15 @@ const MAX_ASYNC_TASKS: usize = 1_000_000;
 const MAX_STACK_EFFECT_CACHE_INSTRUCTIONS: usize = 4096;
 
 #[derive(Clone, Default)]
-struct CaptureValues(Option<HeapRef<ClosureCaptures>>);
+pub(crate) struct CaptureValues(Option<HeapRef<ClosureCaptures>>);
 
 impl CaptureValues {
-    fn get(&self, index: usize) -> Option<Value> {
+    pub(crate) fn get(&self, index: usize) -> Option<Value> {
         self.0.as_ref()?.get(index)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.as_ref().map_or(0, |captures| captures.len())
     }
 
     fn into_root(self) -> Option<Value> {
@@ -162,6 +166,7 @@ impl VmExecutionPlan {
         bp: usize,
         stack: &mut Vec<Value>,
         operand_base: usize,
+        captures: &CaptureValues,
         propagation_pending: &mut bool,
         context: &RuntimeContext<'_>,
     ) -> Option<JitExit> {
@@ -193,6 +198,7 @@ impl VmExecutionPlan {
             bp,
             stack,
             operand_base,
+            captures,
             propagation_pending,
             context.jit_debug,
         )
@@ -4905,6 +4911,7 @@ fn execute_vm(
                             bp,
                             &mut stack,
                             operand_base,
+                            &captures,
                             &mut propagation_pending,
                             context,
                         )
@@ -4935,6 +4942,7 @@ fn execute_vm(
                                     bp,
                                     &mut stack,
                                     operand_base,
+                                    &captures,
                                     &mut propagation_pending,
                                     context,
                                 )
@@ -4973,6 +4981,7 @@ fn execute_vm(
                                     bp,
                                     &mut stack,
                                     operand_base,
+                                    &captures,
                                     &mut propagation_pending,
                                     context,
                                 )
@@ -5737,6 +5746,12 @@ fn execute_vm(
                 }
                 Instruction::Index => {
                     let (object, key) = pop2(&mut stack)?;
+                    let key = match (&object, key) {
+                        (Value::Record(_), Value::Int(index)) if index >= 0 => {
+                            Value::Str(Rc::from(index.to_string()))
+                        }
+                        (_, key) => key,
+                    };
                     // Type metadata is unspellable in source. This generic query
                     // lets lowered patterns inspect nominal identity without a
                     // match/enum instruction or a forgeable record field.
@@ -5779,6 +5794,12 @@ fn execute_vm(
                 }
                 Instruction::IndexSet => {
                     let (array, idx, value) = pop3(&mut stack)?;
+                    let idx = match (&array, idx) {
+                        (Value::Record(_), Value::Int(index)) if index >= 0 => {
+                            Value::Str(Rc::from(index.to_string()))
+                        }
+                        (_, index) => index,
+                    };
                     if let Value::Error(_) = array {
                         stack.push(array);
                     } else if let Value::Error(_) = idx {

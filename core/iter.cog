@@ -1,0 +1,9 @@
+// Static iteration contracts for user-defined collections and iterators.
+public trait Iterator[Item: type] {
+    fn next(mut self) -> bool;
+    fn current(self) -> Item;
+}
+
+public trait IntoIterator[Iter: type, Item: type] {
+    fn into_iter(self) -> Iter;
+}

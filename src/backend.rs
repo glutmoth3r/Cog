@@ -177,7 +177,17 @@ impl Emitter {
         parameter_types: Vec<Option<crate::value::RuntimeType>>,
         result_type: Option<crate::value::RuntimeType>,
     ) {
-        self.function_with_async_types(name, parameter_types, result_type, false);
+        self.function_with_capture_types(name, parameter_types, result_type, 0);
+    }
+
+    pub fn function_with_capture_types(
+        &mut self,
+        name: &str,
+        parameter_types: Vec<Option<crate::value::RuntimeType>>,
+        result_type: Option<crate::value::RuntimeType>,
+        captures: usize,
+    ) {
+        self.register_function(name, parameter_types, result_type, false, captures);
     }
 
     pub fn function_with_async_types(
@@ -186,6 +196,17 @@ impl Emitter {
         parameter_types: Vec<Option<crate::value::RuntimeType>>,
         result_type: Option<crate::value::RuntimeType>,
         asynchronous: bool,
+    ) {
+        self.register_function(name, parameter_types, result_type, asynchronous, 0);
+    }
+
+    fn register_function(
+        &mut self,
+        name: &str,
+        parameter_types: Vec<Option<crate::value::RuntimeType>>,
+        result_type: Option<crate::value::RuntimeType>,
+        asynchronous: bool,
+        captures: usize,
     ) {
         let parameters = parameter_types.len();
         let parameter_types = parameter_types
@@ -206,7 +227,7 @@ impl Emitter {
             address,
             CallableSignature {
                 parameters,
-                captures: 0,
+                captures,
                 asynchronous,
                 parameter_types,
                 result_type,
@@ -243,6 +264,24 @@ impl Emitter {
         self.patches
             .push((self.instructions.len(), Target::Function(name.to_owned())));
         self.emit(Instruction::CallAsync(0, arity));
+    }
+
+    pub fn make_closure(&mut self, name: &str, captures: usize) {
+        if self.unreachable {
+            return;
+        }
+        self.patches
+            .push((self.instructions.len(), Target::Function(name.to_owned())));
+        self.emit(Instruction::MakeClosure(0, captures));
+    }
+
+    pub fn push_function(&mut self, name: &str) {
+        if self.unreachable {
+            return;
+        }
+        self.patches
+            .push((self.instructions.len(), Target::Function(name.to_owned())));
+        self.emit(Instruction::Push(Value::Function(0)));
     }
 
     pub fn call_native(&mut self, import: crate::runtime::NativeImport) {
@@ -285,10 +324,12 @@ impl Emitter {
             match &mut self.instructions[index] {
                 Instruction::Call(target, _)
                 | Instruction::CallAsync(target, _)
+                | Instruction::MakeClosure(target, _)
                 | Instruction::Jump(target)
                 | Instruction::JumpIfFalse(target)
                 | Instruction::JumpIfTrue(target)
                 | Instruction::JumpIfNoPropagation(target) => *target = address,
+                Instruction::Push(Value::Function(target)) => *target = address,
                 _ => return Err("internal error: invalid bytecode fixup".into()),
             }
         }

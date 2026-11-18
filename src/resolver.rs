@@ -49,6 +49,7 @@ pub struct Resolver {
     references: BTreeMap<String, BTreeSet<String>>,
     current: Option<String>,
     generic_symbols: BTreeSet<String>,
+    function_symbols: BTreeSet<String>,
     type_symbols: BTreeSet<String>,
     active_type_parameters: BTreeSet<String>,
     loaded_source_bytes: usize,
@@ -105,6 +106,12 @@ impl Resolver {
                     self.type_annotation(item, owner, scopes);
                 }
             }
+            TypeKind::Function { parameters, result } => {
+                for parameter in parameters {
+                    self.type_annotation(parameter, owner, scopes);
+                }
+                self.type_annotation(result, owner, scopes);
+            }
             TypeKind::Primitive(_) => {}
         }
     }
@@ -129,6 +136,7 @@ impl Resolver {
             references: BTreeMap::new(),
             current: None,
             generic_symbols: BTreeSet::new(),
+            function_symbols: BTreeSet::new(),
             type_symbols: BTreeSet::new(),
             active_type_parameters: BTreeSet::new(),
             loaded_source_bytes: 0,
@@ -266,6 +274,9 @@ impl Resolver {
             } else {
                 self.fresh()
             };
+            if matches!(item, Item::Function(_)) {
+                self.function_symbols.insert(bound.clone());
+            }
             if matches!(item, Item::Function(f) if !f.type_params.is_empty())
                 || matches!(item, Item::StructDecl {type_params, ..} if !type_params.is_empty())
                 || matches!(item, Item::Trait(t) if !t.type_params.is_empty())
@@ -794,14 +805,17 @@ impl Resolver {
                         return;
                     }
                 }
+                let local_callee = matches!(callee.node(), Expr::Ident(name)
+                    if scopes.iter().rev().any(|scope| matches!(scope.get(name), Some(Binding::Local))));
                 self.expr(callee, owner, scopes, location.clone());
                 for arg in args.iter_mut() {
                     self.expr(&mut arg.value, owner, scopes, location.clone());
                 }
-                if let Expr::Ident(name) = callee.node() {
+                if let Expr::Ident(name) = callee.node()
+                    && !local_callee
+                    && (self.function_symbols.contains(name) || Builtin::from_name(name).is_some())
+                {
                     *expr = Expr::Call(name.clone(), std::mem::take(args));
-                } else {
-                    self.error("this expression is not a named callable", location);
                 }
             }
             Expr::BracketApply(receiver, arguments) => {
@@ -914,6 +928,46 @@ impl Resolver {
                 for (_, x) in xs {
                     self.expr(x, owner, scopes, location.clone());
                 }
+            }
+            Expr::Closure {
+                captures,
+                params,
+                result_type,
+                body,
+            } => {
+                for capture in captures.iter() {
+                    if !scopes
+                        .iter()
+                        .rev()
+                        .any(|scope| matches!(scope.get(&capture.name), Some(Binding::Local)))
+                    {
+                        self.error(
+                            format!(
+                                "closure capture `{}` does not name a local binding",
+                                capture.name
+                            ),
+                            location.clone(),
+                        );
+                    }
+                }
+                for parameter in params.iter_mut() {
+                    if let Some(ty) = &mut parameter.ty {
+                        self.type_annotation(ty, owner, scopes);
+                    }
+                }
+                if let Some(ty) = result_type {
+                    self.type_annotation(ty, owner, scopes);
+                }
+                let mut closure_scope = BTreeMap::new();
+                for capture in captures.iter() {
+                    closure_scope.insert(capture.name.clone(), Binding::Local);
+                }
+                for parameter in params.iter() {
+                    closure_scope.insert(parameter.name.clone(), Binding::Local);
+                }
+                scopes.push(closure_scope);
+                self.block(body, owner, scopes, location);
+                scopes.pop();
             }
             Expr::MethodCall(x, _, args) => {
                 self.expr(x, owner, scopes, location.clone());
@@ -1583,6 +1637,12 @@ fn replace_self_type(ty: &mut TypeAnnotation, target: &TypeAnnotation) {
             for element in elements {
                 replace_self_type(element, target);
             }
+        }
+        TypeKind::Function { parameters, result } => {
+            for parameter in parameters {
+                replace_self_type(parameter, target);
+            }
+            replace_self_type(result, target);
         }
         TypeKind::Primitive(_)
         | TypeKind::Named(_)

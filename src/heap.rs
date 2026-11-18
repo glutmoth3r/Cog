@@ -1094,6 +1094,18 @@ mod tests {
     }
 
     #[test]
+    fn collection_traces_reference_values_through_closure_captures() {
+        let record = HeapRef::new(RecordValue::new(HashMap::new()));
+        let captures = HeapRef::new(ClosureCaptures::new(vec![Value::Record(record.clone())]));
+        record
+            .try_set_field("callback", Value::Closure(7, captures.clone()))
+            .unwrap();
+        drop(record);
+        drop(captures);
+        assert_eq!(collect(&[]).unwrap(), 2);
+    }
+
+    #[test]
     fn external_root_keeps_entire_ring_alive_across_graph_sizes() {
         for count in 1..=128 {
             let cells = (0..count)

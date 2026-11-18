@@ -31,7 +31,15 @@ not a release schedule. See the [language reference](docs/LANGUAGE.md),
 - Structs, enums, typed arrays/tuples, generic functions and structs, trait
   bounds, generic receiver methods, nullable/Error flow analysis, and compile-
   time functions with error handling.
-- Arrays, Unicode-scalar string traversal, insertion-ordered hashed `Map`,
+- Synchronous source closures with explicit value and cell captures, including
+  reference-valued and nested captures, first-class function values, and positional
+  indirect calls. Captured closure bodies can enter JIT OSR; dynamic callback
+  dispatch and unsupported operations resume in the VM.
+- Statically dispatched user-defined `for-in` iteration through concrete
+  `iter::IntoIterator` and `iter::Iterator` implementations. Generic target
+  implementations and iteration through a generic trait bound are not supported.
+- Arrays with generic higher-order `map`, `filter`, and `fold`, Unicode-scalar
+  string traversal, insertion-ordered hashed `Map`,
   bounded JSON, process arguments/environment, path and filesystem
   APIs, byte streams, and Cog implementations of common search, sort, string,
   and encoding utilities.
@@ -130,14 +138,12 @@ thread-safe scheduler wakeups. Detach and async closures remain future work.
 
 ## After Beta: language completeness
 
-1. Add first-class function values and source-level closures, including capture,
-   aliasing, and error semantics. The runtime has closure-related support, but
-   the source grammar does not yet expose closures or indirect calls.
-2. Extend compile-time programming with value parameters, canonical
+1. Extend compile-time programming with value parameters, canonical
    specialization, and materialization of arrays, tuples, and enum values.
-3. Resolve trait implementation coherence/visibility rules and user-defined
-   iteration before expanding generic abstractions further.
-4. Continue measured compiler/runtime optimization. The opt-in Cranelift JIT
+2. Resolve trait implementation coherence/visibility rules and decide whether
+   generic target implementations or iteration through generic trait bounds are
+   needed before expanding generic abstractions further.
+3. Continue measured compiler/runtime optimization. The opt-in Cranelift JIT
    and APE bootstrap/adaptive selector remain experimental. JIT V1 now validates
    native exit states, charges oversized compilations as refillable budget debt,
    caches locals in Cranelift SSA across OSR blocks and writes them back at
@@ -152,7 +158,7 @@ thread-safe scheduler wakeups. Detach and async closures remain future work.
    small statically typed helpers with pure expressions and local `const`
    bindings can be inlined to expose more work to constant propagation and JIT
    lowering.
-5. Implement Windows process-tree termination to match Unix process-group
+4. Implement Windows process-tree termination to match Unix process-group
    cancellation. Buffered TCP framing helpers and detached tasks need separate memory,
    ownership, cancellation, and shutdown contracts.
 

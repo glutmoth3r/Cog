@@ -473,6 +473,25 @@ impl Linter {
                 self.expr(value, report);
                 self.expr(fallback, report);
             }
+            Expr::Closure {
+                captures,
+                params,
+                body,
+                ..
+            } => {
+                for capture in captures {
+                    self.expr(&Expr::Ident(capture.name.clone()), report);
+                }
+                self.scopes.push(HashMap::new());
+                for capture in captures {
+                    self.define(&capture.name, report, expression.span());
+                }
+                for parameter in params {
+                    self.define(&parameter.name, report, expression.span());
+                }
+                self.block(body, report);
+                self.pop_scope();
+            }
             Expr::Block(block) => self.block(block, report),
             Expr::Match { value, arms, .. } => {
                 self.expr(value, report);

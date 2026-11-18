@@ -979,7 +979,7 @@ pub fn check_with_inputs_and_warnings(
         ));
         return Err(render(diagnostics));
     }
-    crate::codegen::compile_library(&program).map_err(|error| render(error.diagnostics))?;
+    crate::codegen::compile_library(&program, names).map_err(|error| render(error.diagnostics))?;
     Ok(crate::lint::check_with_names(&program, names))
 }
 
@@ -1030,7 +1030,8 @@ pub fn compile_with_inputs_and_warnings(
         return Err(render(diagnostics));
     }
     let warnings = crate::lint::check_with_names(&program, names);
-    let mut compiled = crate::codegen::compile(&program).map_err(|e| render(e.diagnostics))?;
+    let mut compiled =
+        crate::codegen::compile_with_names(&program, names).map_err(|e| render(e.diagnostics))?;
     for name in compiled.functions.values_mut() {
         if let Some(original) = names.get(name) {
             *name = original.clone();

@@ -1,8 +1,8 @@
 use crate::ast::{
-    BinOp, BindingPattern, Block, CallArgument, Expr, ExtendDecl, ExtensionMethod, FallbackKind,
-    ForClause, FunctionDecl, InlineMode, Item, MatchArm, MatchPattern, Param, Program, Stmt,
-    StringPart, StructField, TraitBound, TraitDecl, TraitMethod, TypeAnnotation, TypeKind,
-    TypeParameter, UnOp, UseDecl, VarType, Visibility,
+    BinOp, BindingPattern, Block, CallArgument, ClosureCapture, Expr, ExtendDecl, ExtensionMethod,
+    FallbackKind, ForClause, FunctionDecl, InlineMode, Item, MatchArm, MatchPattern, Param,
+    Program, Stmt, StringPart, StructField, TraitBound, TraitDecl, TraitMethod, TypeAnnotation,
+    TypeKind, TypeParameter, UnOp, UseDecl, VarType, Visibility,
 };
 use crate::diagnostic::{Diagnostic, SourceFile, SourceSpan};
 use crate::lexer::{InterpolationToken, InterpolationTokenPart, SpannedToken, Token};
@@ -735,7 +735,7 @@ impl<'a> Parser<'a> {
     ) -> Result<(String, Vec<TypeParameter>, Vec<StructField>), HlParseError> {
         self.expect(&Token::Struct)?;
         let name = self.expect_ident()?;
-        if matches!(self.peek(), Some(Token::LParen | Token::Lt)) {
+        if self.peek() == Some(&Token::Lt) {
             return Err(self.err("declare generic parameters with `[T: type]`"));
         }
         let generic = self.peek() == Some(&Token::LBracket);
@@ -752,57 +752,83 @@ impl<'a> Parser<'a> {
             }
         };
         let parsed = (|| {
-            self.expect(&Token::LBrace)?;
-            let mut fields = Vec::new();
-            while self.peek() != Some(&Token::RBrace) {
-                if self.at_end() {
-                    return Err(self.err("unterminated struct declaration, expected `}`"));
-                }
-                let visibility = match self.peek() {
-                    Some(Token::Private) => {
-                        self.advance();
-                        Visibility::Private
-                    }
-                    Some(Token::Public) => {
-                        self.advance();
-                        Visibility::Public
-                    }
-                    _ => Visibility::Public,
-                };
-                let mut field = self.parse_struct_field()?;
-                field.visibility = visibility;
-                // A defaulted field can't be followed by a non-defaulted one —
-                // same rule as trailing-optional parameters in any language
-                // that has them: once a field can be omitted, everything after
-                // it must be omittable too, or `Point(1)` couldn't tell which
-                // field the `1` was for.
-                if let Some(prev) = fields.last() {
-                    let prev_has_default = matches!(
-                        prev,
-                        StructField {
-                            default: Some(_),
-                            ..
-                        }
-                    );
-                    if prev_has_default && field.default.is_none() {
-                        return Err(self.err(format!(
-                        "struct `{name}`: field `{}` has no default but follows a field with one — \
-                         fields with defaults must come last",
-                        field.name
-                    )));
-                    }
-                }
-                fields.push(field);
-                if self.peek() == Some(&Token::Comma) {
+            let mut fields: Vec<StructField> = Vec::new();
+            match self.peek() {
+                Some(Token::LBrace) => {
                     self.advance();
-                    if self.peek() == Some(&Token::RBrace) {
-                        break;
+                    while self.peek() != Some(&Token::RBrace) {
+                        if self.at_end() {
+                            return Err(self.err("unterminated struct declaration, expected `}`"));
+                        }
+                        let visibility = match self.peek() {
+                            Some(Token::Private) => {
+                                self.advance();
+                                Visibility::Private
+                            }
+                            Some(Token::Public) => {
+                                self.advance();
+                                Visibility::Public
+                            }
+                            _ => Visibility::Public,
+                        };
+                        let mut field = self.parse_struct_field()?;
+                        field.visibility = visibility;
+                        // Once a field has a default, every following field
+                        // must also have one so positional construction stays unambiguous.
+                        if let Some(prev) = fields.last()
+                            && prev.default.is_some()
+                            && field.default.is_none()
+                        {
+                            return Err(self.err(format!(
+                                "struct `{name}`: field `{}` has no default but follows a field with one — \
+                                 fields with defaults must come last",
+                                field.name
+                            )));
+                        }
+                        fields.push(field);
+                        if self.peek() == Some(&Token::Comma) {
+                            self.advance();
+                            if self.peek() == Some(&Token::RBrace) {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
                     }
-                } else {
-                    break;
+                    self.expect(&Token::RBrace)?;
+                }
+                Some(Token::LParen) => {
+                    self.advance();
+                    if self.peek() == Some(&Token::RParen) {
+                        return Err(self.err(format!(
+                            "tuple struct `{name}` requires at least one field; use `struct {name};` for an empty struct"
+                        )));
+                    }
+                    loop {
+                        let ty = self.parse_type()?;
+                        let index = fields.len();
+                        fields.push(StructField {
+                            name: index.to_string(),
+                            ty: Some(ty),
+                            default: None,
+                            visibility: Visibility::Public,
+                        });
+                        if !self.list_separator(&Token::RParen) {
+                            break;
+                        }
+                    }
+                    self.expect(&Token::RParen)?;
+                    self.expect(&Token::Semi)?;
+                }
+                Some(Token::Semi) => {
+                    self.advance();
+                }
+                _ => {
+                    return Err(self.err(format!(
+                        "expected `{{`, a tuple field list, or `;` after struct `{name}`"
+                    )));
                 }
             }
-            self.expect(&Token::RBrace)?;
             Ok((name, type_params.clone(), fields))
         })();
         if generic {
@@ -1732,7 +1758,26 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_type_bounded(&mut self) -> Result<TypeAnnotation, HlParseError> {
-        let mut ty = if self.peek() == Some(&Token::LParen) {
+        let mut ty = if self.peek() == Some(&Token::Fn) {
+            self.advance();
+            self.expect(&Token::LParen)?;
+            let mut parameters = Vec::new();
+            while self.peek() != Some(&Token::RParen) {
+                parameters.push(self.parse_type()?);
+                if !self.list_separator(&Token::RParen) {
+                    break;
+                }
+            }
+            self.expect(&Token::RParen)?;
+            self.expect(&Token::Arrow)?;
+            TypeAnnotation {
+                kind: TypeKind::Function {
+                    parameters,
+                    result: Box::new(self.parse_type()?),
+                },
+                nilable: false,
+            }
+        } else if self.peek() == Some(&Token::LParen) {
             self.advance();
             let mut items = vec![self.parse_type()?];
             if self.peek() != Some(&Token::Comma) {
@@ -2665,12 +2710,58 @@ impl<'a> Parser<'a> {
                 self.advance();
                 self.parse_ident_trailer(name)
             }
+            Some(Token::Fn) => self.parse_closure(),
             Some(t) => Err(self.err(format!(
                 "unexpected {} in expression",
                 token_description(&t)
             ))),
             None => Err(self.err("unexpected end of input in expression")),
         }
+    }
+
+    fn parse_closure(&mut self) -> Result<Expr, HlParseError> {
+        self.expect(&Token::Fn)?;
+        let mut captures = Vec::new();
+        if self.peek() == Some(&Token::LBracket) {
+            self.advance();
+            while self.peek() != Some(&Token::RBracket) {
+                let mutable = self.peek() == Some(&Token::Var);
+                if mutable {
+                    self.advance();
+                }
+                let name = self.expect_ident()?;
+                if captures
+                    .iter()
+                    .any(|capture: &ClosureCapture| capture.name == name)
+                {
+                    return Err(self.err(format!("duplicate closure capture `{name}`")));
+                }
+                captures.push(ClosureCapture { name, mutable });
+                if !self.list_separator(&Token::RBracket) {
+                    break;
+                }
+            }
+            self.expect(&Token::RBracket)?;
+        }
+        self.expect(&Token::LParen)?;
+        let (params, mutating_receiver) = self.parse_function_params()?;
+        self.expect(&Token::RParen)?;
+        if mutating_receiver || params.iter().any(|parameter| parameter.default.is_some()) {
+            return Err(self.err("closure parameters cannot use `mut self` or defaults"));
+        }
+        let result_type = if self.peek() == Some(&Token::Arrow) {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        let body = self.parse_block()?;
+        Ok(Expr::Closure {
+            captures,
+            params,
+            result_type,
+            body,
+        })
     }
 
     fn parse_record_literal(&mut self) -> Result<Expr, HlParseError> {
@@ -3087,6 +3178,38 @@ mod tests {
             matches!(&program.items[1], Item::EnumDecl { name, variants, .. } if name == "Status" && variants.len() == 2 && variants[1].payload.len() == 1 && variants[1].payload[0].name == "code")
         );
         assert!(matches!(&program.items[2], Item::Function(_)));
+    }
+
+    #[test]
+    fn parses_unit_and_tuple_structs() {
+        let program = parse(
+            "struct Marker; struct Empty {} struct UserId(int); struct Position(float, float,);",
+        )
+        .expect("unit and tuple struct declarations should parse");
+
+        assert!(matches!(
+            &program.items[0],
+            Item::StructDecl { name, fields, .. } if name == "Marker" && fields.is_empty()
+        ));
+        assert!(matches!(
+            &program.items[1],
+            Item::StructDecl { name, fields, .. } if name == "Empty" && fields.is_empty()
+        ));
+        assert!(matches!(
+            &program.items[2],
+            Item::StructDecl { name, fields, .. }
+                if name == "UserId"
+                    && fields.len() == 1
+                    && fields[0].name == "0"
+                    && fields[0].ty.as_ref().is_some_and(|ty| ty.kind == TypeKind::Primitive(VarType::Int))
+        ));
+        assert!(matches!(
+            &program.items[3],
+            Item::StructDecl { name, fields, .. }
+                if name == "Position"
+                    && fields.len() == 2
+                    && fields.iter().enumerate().all(|(index, field)| field.name == index.to_string())
+        ));
     }
 
     #[test]

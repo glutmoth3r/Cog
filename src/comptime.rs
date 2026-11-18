@@ -1433,6 +1433,7 @@ fn rewrite_expr(
         | Expr::Bool(_)
         | Expr::Nil
         | Expr::TypeLiteral(_)
+        | Expr::Closure { .. }
         | Expr::Ident(_) => {}
     }
 }
@@ -2070,6 +2071,12 @@ fn substitute_type(ty: &mut TypeAnnotation, aliases: &HashMap<String, TypeAnnota
                 substitute_type(element, aliases);
             }
         }
+        TypeKind::Function { parameters, result } => {
+            for parameter in parameters {
+                substitute_type(parameter, aliases);
+            }
+            substitute_type(result, aliases);
+        }
         TypeKind::Primitive(_) | TypeKind::TypeParameter(_) | TypeKind::SelfType => {}
     }
 }
@@ -2087,6 +2094,22 @@ fn substitute_program_types(program: &mut Program, aliases: &HashMap<String, Typ
             | Expr::Unary(_, inner)
             | Expr::Cast(inner, _) => expr(inner, aliases),
             Expr::TypeLiteral(ty) => substitute_type(ty, aliases),
+            Expr::Closure {
+                params,
+                result_type,
+                body,
+                ..
+            } => {
+                for parameter in params {
+                    if let Some(ty) = &mut parameter.ty {
+                        substitute_type(ty, aliases);
+                    }
+                }
+                if let Some(ty) = result_type {
+                    substitute_type(ty, aliases);
+                }
+                block(body, aliases);
+            }
             Expr::Array(items) | Expr::Tuple(items) => {
                 for item in items {
                     expr(item, aliases);
