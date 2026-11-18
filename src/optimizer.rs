@@ -214,11 +214,11 @@ pub(crate) fn optimize(program: &CompiledProgram) -> CompiledProgram {
         let facts = analyze_region(program, start, end)
             .unwrap_or_else(|| RegionFacts::conservative(end - start));
 
-        for pc in start..end {
+        for (pc, old_pc) in old_to_new.iter_mut().enumerate().take(end).skip(start) {
             if !facts.reachable[pc - start] {
                 continue;
             }
-            old_to_new[pc] = Some(rewritten.len());
+            *old_pc = Some(rewritten.len());
             let location = source_location(program, pc, &mut source_index);
             match &program.instructions[pc] {
                 Instruction::Load(slot) if facts.load_constants.contains_key(&pc) => {
@@ -386,10 +386,8 @@ fn local_slot_mapping(program: &CompiledProgram, start: usize, end: usize) -> Op
         let row = block_index * words;
         for pc in block.start..block.end {
             match &program.instructions[pc] {
-                Instruction::Load(slot) => {
-                    if !bit_is_set(&definitions[row..row + words], *slot) {
-                        bit_set(&mut uses[row..row + words], *slot);
-                    }
+                Instruction::Load(slot) if !bit_is_set(&definitions[row..row + words], *slot) => {
+                    bit_set(&mut uses[row..row + words], *slot);
                 }
                 Instruction::Store(slot) => bit_set(&mut definitions[row..row + words], *slot),
                 _ => {}
@@ -651,10 +649,11 @@ fn analyze_region(program: &CompiledProgram, start: usize, end: usize) -> Option
                         facts.load_constants.insert(pc, value);
                     }
                 }
-                Instruction::Store(slot) => {
-                    if state.peek().is_some() && state.peek() == state.locals.get(slot).copied() {
-                        facts.redundant_stores.insert(pc);
-                    }
+                Instruction::Store(slot)
+                    if state.peek().is_some()
+                        && state.peek() == state.locals.get(slot).copied() =>
+                {
+                    facts.redundant_stores.insert(pc);
                 }
                 _ => {}
             }
@@ -692,6 +691,7 @@ fn is_block_terminator(instruction: &Instruction) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn block_successors(
     instruction: &Instruction,
     pc: usize,

@@ -244,7 +244,7 @@ fn every_standalone_example_compiles() {
             let name = path.file_name().unwrap().to_str().unwrap();
             if matches!(name, "async_plugin.cog" | "async_plugin_cancel.cog") {
                 let source = std::fs::read_to_string(&path).unwrap();
-                let parsed = cog::frontend::parse(&path.display().to_string(), &source);
+                let parsed = cog::frontend::parse(path.display().to_string(), &source);
                 assert!(
                     parsed.diagnostics.is_empty(),
                     "{name}: {}",

@@ -75,14 +75,11 @@ fn integer_literal_expression(expr: &Expr) -> bool {
     match expr.node() {
         Expr::Int(value) => *value >= 0,
         Expr::UInt(_) => true,
-        Expr::Binary(op, left, right)
-            if matches!(
-                op,
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
-            ) =>
-        {
-            integer_literal_expression(left) && integer_literal_expression(right)
-        }
+        Expr::Binary(
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod,
+            left,
+            right,
+        ) => integer_literal_expression(left) && integer_literal_expression(right),
         _ => false,
     }
 }
@@ -91,14 +88,11 @@ fn bigint_literal_expression(expr: &Expr) -> bool {
     match expr.node() {
         Expr::Int(_) | Expr::UInt(_) | Expr::BigInt(_) => true,
         Expr::Unary(UnOp::Neg, value) => bigint_literal_expression(value),
-        Expr::Binary(op, left, right)
-            if matches!(
-                op,
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
-            ) =>
-        {
-            bigint_literal_expression(left) && bigint_literal_expression(right)
-        }
+        Expr::Binary(
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod,
+            left,
+            right,
+        ) => bigint_literal_expression(left) && bigint_literal_expression(right),
         _ => false,
     }
 }
@@ -671,22 +665,16 @@ fn unify_trait_patterns(
         return true;
     }
     match (&left, &right) {
-        (TraitTypePattern::Variable(variable), _) => {
-            if !occurs(*variable, &right, bindings) {
-                bindings.insert(*variable, right);
-                true
-            } else {
-                false
-            }
+        (TraitTypePattern::Variable(variable), _) if !occurs(*variable, &right, bindings) => {
+            bindings.insert(*variable, right);
+            true
         }
-        (_, TraitTypePattern::Variable(variable)) => {
-            if !occurs(*variable, &left, bindings) {
-                bindings.insert(*variable, left);
-                true
-            } else {
-                false
-            }
+        (TraitTypePattern::Variable(_), _) => false,
+        (_, TraitTypePattern::Variable(variable)) if !occurs(*variable, &left, bindings) => {
+            bindings.insert(*variable, left);
+            true
         }
+        (_, TraitTypePattern::Variable(_)) => false,
         (TraitTypePattern::Primitive(left), TraitTypePattern::Primitive(right)) => left == right,
         (TraitTypePattern::Nil, TraitTypePattern::Nil) => true,
         (
@@ -1755,9 +1743,8 @@ impl<'a> Checker<'a> {
         let mut matches = self
             .trait_implementations
             .iter()
-            .filter_map(|(target, name, arguments)| {
-                (target == ty && name == trait_name).then(|| arguments.clone())
-            })
+            .filter(|&(target, name, _)| target == ty && name == trait_name)
+            .map(|(_, _, arguments)| arguments.clone())
             .collect::<Vec<_>>();
         for extension in &self.generic_trait_implementations {
             let mut visiting = HashSet::new();
@@ -1799,17 +1786,16 @@ impl<'a> Checker<'a> {
         if !match_extension_type(&extension.target, target, &parameters, &mut substitutions) {
             return None;
         }
-        if let Some(arguments) = requested_arguments {
-            if !extension
+        if let Some(arguments) = requested_arguments
+            && !extension
                 .trait_arguments
                 .iter()
                 .zip(arguments)
                 .all(|(pattern, actual)| {
                     match_extension_type(pattern, actual, &parameters, &mut substitutions)
                 })
-            {
-                return None;
-            }
+        {
+            return None;
         }
         if extension
             .type_params
@@ -1966,11 +1952,8 @@ impl<'a> Checker<'a> {
             return None;
         }
 
-        let Some((actual_iterator_type, into_iter)) =
-            self.check_iteration_method(collection, "into_iter", span.clone())
-        else {
-            return None;
-        };
+        let (actual_iterator_type, into_iter) =
+            self.check_iteration_method(collection, "into_iter", span.clone())?;
         if !type_compatible(iterator_type, &actual_iterator_type) {
             self.error(
                 "E2001",
@@ -1984,11 +1967,7 @@ impl<'a> Checker<'a> {
             return None;
         }
 
-        let Some((next_type, next)) =
-            self.check_iteration_method(iterator_type, "next", span.clone())
-        else {
-            return None;
-        };
+        let (next_type, next) = self.check_iteration_method(iterator_type, "next", span.clone())?;
         if !type_compatible(&Type::concrete(VarType::Bool), &next_type) {
             self.error(
                 "E2001",
@@ -1998,11 +1977,8 @@ impl<'a> Checker<'a> {
             return None;
         }
 
-        let Some((current_type, current)) =
-            self.check_iteration_method(iterator_type, "current", span.clone())
-        else {
-            return None;
-        };
+        let (current_type, current) =
+            self.check_iteration_method(iterator_type, "current", span.clone())?;
         if !type_compatible(item_type, &current_type) {
             self.error(
                 "E2001",
@@ -4422,7 +4398,7 @@ impl<'a> Checker<'a> {
                 step,
                 body,
             } => {
-                let (range_type, step_type) = self.range_types(start, end, step.as_ref());
+                let (range_type, step_type) = self.range_types(start, end, step.as_deref());
                 self.scopes.push(Scope::default());
                 self.define(
                     var,
@@ -4518,7 +4494,7 @@ impl<'a> Checker<'a> {
                             step,
                         } => {
                             let (range_type, step_type) =
-                                self.range_types(start, end, step.as_ref());
+                                self.range_types(start, end, step.as_deref());
                             never |= range_type == Type::Never || step_type == Some(Type::Never);
                             bindings.push((var.clone(), range_type, start.span().cloned()));
                             iteration_methods.push(None);
@@ -5185,12 +5161,14 @@ impl<'a> Checker<'a> {
             (Type::Primitive(VarType::UInt, _), Expr::Int(value)) if *value >= 0 => {
                 self.uint_literals.insert(crate::mutability::expr_id(expr));
             }
-            (Type::Primitive(VarType::UInt, _), Expr::Binary(op, left, right))
-                if matches!(
-                    op,
-                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
-                ) =>
-            {
+            (
+                Type::Primitive(VarType::UInt, _),
+                Expr::Binary(
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod,
+                    left,
+                    right,
+                ),
+            ) => {
                 self.contextualize_integer_literals(left, expected);
                 self.contextualize_integer_literals(right, expected);
             }
@@ -5201,12 +5179,14 @@ impl<'a> Checker<'a> {
             (Type::Primitive(VarType::BigInt, _), Expr::Unary(UnOp::Neg, value)) => {
                 self.contextualize_integer_literals(value, expected);
             }
-            (Type::Primitive(VarType::BigInt, _), Expr::Binary(op, left, right))
-                if matches!(
-                    op,
-                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
-                ) =>
-            {
+            (
+                Type::Primitive(VarType::BigInt, _),
+                Expr::Binary(
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod,
+                    left,
+                    right,
+                ),
+            ) => {
                 self.contextualize_integer_literals(left, expected);
                 self.contextualize_integer_literals(right, expected);
             }

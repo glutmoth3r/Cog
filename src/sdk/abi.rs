@@ -143,6 +143,7 @@ impl FunctionV3 {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub const fn new_async(
         name: &'static str,
         parameters: &'static [Type],
