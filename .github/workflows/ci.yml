@@ -65,9 +65,19 @@ jobs:
       - name: Resolve packaged crate manifest
         id: package-manifest
         run: |
-          version="$(cargo pkgid --manifest-path Cargo.toml | sed 's/.*#//')"
+          package_id="$(cargo pkgid --manifest-path Cargo.toml)"
+          version="${package_id##*#}"
+          version="${version##*@}"
+          version="${version##*:}"
           manifest="target/package/cog-${version}/Cargo.toml"
-          test -f "$manifest"
+          if [[ ! -f "$manifest" ]]; then
+            manifest="$(find target/package -type f -name Cargo.toml -print -quit)"
+          fi
+          if [[ ! -f "$manifest" ]]; then
+            printf 'Could not find packaged manifest for Cargo package ID: %s\n' "$package_id" >&2
+            find target/package -type f -name Cargo.toml -print >&2 || true
+            exit 1
+          fi
           printf 'manifest=%s\n' "$manifest" >> "$GITHUB_OUTPUT"
       - name: Test the complete packaged crate
         run: cargo test --locked --manifest-path "${{ steps.package-manifest.outputs.manifest }}" --target-dir target 2>&1 | tee target/ci-evidence/package-tests.log

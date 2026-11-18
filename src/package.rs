@@ -2250,10 +2250,11 @@ fn replace_output(temporary: &Path, output: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArchivePlan, CountingWriter, install_cache_directory, open_application_cache_directory,
-        package_archive_path, preflight_tar, read_package_manifest, relative_package_path,
-        validate_archive_path, validate_cached_package,
+        ArchivePlan, CountingWriter, install_cache_directory, package_archive_path, preflight_tar,
+        relative_package_path, validate_archive_path, validate_cached_package,
     };
+    #[cfg(unix)]
+    use super::{open_application_cache_directory, read_package_manifest};
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::path::Path;
     use std::sync::atomic::Ordering;
