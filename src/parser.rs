@@ -535,6 +535,13 @@ pub fn assemble(source: &str) -> Result<crate::backend::CompiledProgram, ParseEr
             "dup" => require_no_operand(&r, Instruction::Dup)?,
             "pop" => require_no_operand(&r, Instruction::Pop)?,
             "swap" => require_no_operand(&r, Instruction::Swap)?,
+            "stack_truncate" => {
+                let operand = r.operand.ok_or_else(|| ParseError::MissingOperand {
+                    line: r.line,
+                    instr: r.mnemonic.to_owned(),
+                })?;
+                Instruction::StackTruncate(parse_index(operand, r.line)?)
+            }
             "callv" | "array" => {
                 let op = r.operand.ok_or_else(|| ParseError::MissingOperand {
                     line: r.line,

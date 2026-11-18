@@ -21,6 +21,55 @@ fn main() -> nil {
 }
 "#;
 
+const VIRTUAL_STACK_ASSEMBLY: &str = r#"
+call main 0
+call emit_value 1
+pop
+halt
+
+.function main 0 0
+main:
+push 0
+store 0
+loop:
+load 0
+push 1
+add
+dup
+swap
+push 999
+pop
+store 0
+stack_truncate 0
+load 0
+push 6000
+lt
+jnz loop
+load 0
+ret
+
+.function emit_value 1 0
+emit_value:
+store 0
+call_native io::stdout
+load 0
+call_native bytes::render
+store 1
+load 1
+push 0
+load 1
+call_native bytes::len
+call_native io::write_all
+dup
+is_type error
+jnz emit_done
+pop
+call_native io::stdout
+call_native io::flush
+emit_done:
+ret
+"#;
+
 const CAPTURED_CLOSURE_SOURCE: &str = r#"
 @!include("std")
 use io;
@@ -593,6 +642,20 @@ fn execute_result(source: &str, jit: bool, profile_path: Option<&Path>) -> Resul
     Ok(String::from_utf8(output).expect("Cog output should be UTF-8"))
 }
 
+fn execute_assembly_result(
+    source: &str,
+    jit: bool,
+    profile_path: Option<&Path>,
+) -> Result<String, String> {
+    let artifact = cog::parser::assemble(source).map_err(|error| error.to_string())?;
+    let mut output = Vec::new();
+    let mut context = RuntimeContext::new(&mut output, VmCapabilities::default());
+    context.configure_jit(jit, profile_path, false);
+    interpreter::run_with_context(&artifact, &mut context).map_err(|error| error.to_string())?;
+    drop(context);
+    String::from_utf8(output).map_err(|error| error.to_string())
+}
+
 fn execute(source: &str, jit: bool, profile_path: Option<&Path>) -> String {
     execute_result(source, jit, profile_path)
         .unwrap_or_else(|error| panic!("branch smoke program should complete: {error}"))
@@ -672,6 +735,138 @@ fn assert_jit_fallback_matches_vm(source: &str, suffix: &str, expected: &str) {
 fn jit_conditional_jumps_match_vm_for_true_and_false_paths() {
     assert_jit_matches_vm(ASCENDING_SOURCE, "ascending", "17997000\n");
     assert_jit_matches_vm(DESCENDING_SOURCE, "descending", "18003000\n");
+}
+
+#[test]
+fn jit_virtual_operand_stack_matches_vm_for_stack_manipulation_and_truncation() {
+    let profile_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("jit-virtual-stack-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&profile_path);
+
+    let vm_output = execute_assembly_result(VIRTUAL_STACK_ASSEMBLY, false, None)
+        .expect("interpreter should execute the stack-manipulation fixture");
+    let jit_output = execute_assembly_result(VIRTUAL_STACK_ASSEMBLY, true, Some(&profile_path))
+        .expect("JIT should execute the stack-manipulation fixture");
+
+    assert_eq!(vm_output, "6000");
+    assert_eq!(jit_output, vm_output);
+    let profile: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&profile_path).expect("JIT should persist its compiled profile"),
+    )
+    .expect("APE profile should be valid JSON");
+    assert!(profile["functions"].as_object().is_some_and(|functions| {
+        functions
+            .values()
+            .any(|function| function["compile_ns"].as_u64().unwrap_or(0) > 0)
+    }));
+
+    let _ = std::fs::remove_file(profile_path);
+}
+
+#[test]
+fn jit_compiles_hot_direct_calls_to_functions_without_loops() {
+    let source = r#"
+call main 0
+call emit_value 1
+pop
+halt
+
+.function main 0 0
+main:
+push 0
+store 0
+push 0
+store 1
+loop:
+load 0
+call add_one 1
+load 1
+add
+store 1
+load 0
+push 1
+add
+store 0
+load 0
+push 6000
+lt
+jnz loop
+load 1
+ret
+
+.function add_one 1 0
+add_one:
+store 0
+load 0
+push 1
+add
+ret
+
+.function emit_value 1 0
+emit_value:
+store 0
+call_native io::stdout
+load 0
+call_native bytes::render
+store 1
+load 1
+push 0
+load 1
+call_native bytes::len
+call_native io::write_all
+dup
+is_type error
+jnz emit_done
+pop
+call_native io::stdout
+call_native io::flush
+emit_done:
+ret
+"#;
+    let artifact = cog::parser::assemble(source).expect("fixture assembly should be valid");
+    let main_entry = *artifact
+        .callables
+        .keys()
+        .next()
+        .expect("assembly should declare main");
+    let main_end = artifact
+        .callables
+        .range((
+            std::ops::Bound::Excluded(main_entry),
+            std::ops::Bound::Unbounded,
+        ))
+        .next()
+        .map_or(artifact.instructions.len(), |(entry, _)| *entry);
+    let helper_entry = artifact.instructions[main_entry..main_end]
+        .iter()
+        .find_map(|instruction| match instruction {
+            cog::instruction::Instruction::Call(target, 1) => Some(*target),
+            _ => None,
+        })
+        .expect("main should call the loop-free helper");
+    let profile_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("jit-hot-call-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&profile_path);
+
+    let vm_output = execute_assembly_result(source, false, None)
+        .expect("interpreter should execute the hot direct-call fixture");
+    let jit_output = execute_assembly_result(source, true, Some(&profile_path))
+        .expect("JIT should execute the hot direct-call fixture");
+
+    assert_eq!(vm_output, "18003000");
+    assert_eq!(jit_output, vm_output);
+    let profile: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&profile_path).expect("JIT should persist compiled call profiles"),
+    )
+    .expect("APE profile should be valid JSON");
+    let helper_profile = &profile["functions"][helper_entry.to_string()];
+    assert!(
+        helper_profile["compile_ns"].as_u64().unwrap_or(0) > 0,
+        "expected loop-free helper at {helper_entry} to compile, got {profile}"
+    );
+    let _ = std::fs::remove_file(profile_path);
 }
 
 #[test]

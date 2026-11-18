@@ -156,6 +156,7 @@ impl VmExecutionPlan {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn try_jit_osr(
         &self,
         artifact: &CompiledProgram,
@@ -177,7 +178,7 @@ impl VmExecutionPlan {
         let mut state = self.jit.borrow_mut();
         if matches!(*state, JitPlanState::NotInitialized) {
             *state = match JitState::new(artifact, context.jit_profile_path.as_deref()) {
-                Ok(jit) => JitPlanState::Ready(jit),
+                Ok(jit) => JitPlanState::Ready(Box::new(jit)),
                 Err(error) => {
                     if context.jit_debug {
                         eprintln!("[jit] unavailable: {error}");
@@ -193,6 +194,53 @@ impl VmExecutionPlan {
             artifact,
             entry,
             target,
+            pc,
+            locals,
+            bp,
+            stack,
+            operand_base,
+            captures,
+            propagation_pending,
+            context.jit_debug,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_jit_call(
+        &self,
+        artifact: &CompiledProgram,
+        entry: usize,
+        pc: &mut usize,
+        locals: &mut Vec<Option<Value>>,
+        bp: usize,
+        stack: &mut Vec<Value>,
+        operand_base: usize,
+        captures: &CaptureValues,
+        propagation_pending: &mut bool,
+        context: &RuntimeContext<'_>,
+    ) -> Option<JitExit> {
+        if !context.jit_enabled || context.limits.any_active() {
+            return None;
+        }
+
+        let mut state = self.jit.borrow_mut();
+        if matches!(*state, JitPlanState::NotInitialized) {
+            *state = match JitState::new(artifact, context.jit_profile_path.as_deref()) {
+                Ok(jit) => JitPlanState::Ready(Box::new(jit)),
+                Err(error) => {
+                    if context.jit_debug {
+                        eprintln!("[jit] unavailable: {error}");
+                    }
+                    JitPlanState::Unavailable
+                }
+            };
+        }
+        let JitPlanState::Ready(jit) = &mut *state else {
+            return None;
+        };
+        jit.try_call(
+            artifact,
+            entry,
             pc,
             locals,
             bp,
@@ -943,14 +991,11 @@ impl AsyncScheduler {
         if !abandoned_pending.replace(false) {
             return;
         }
-        loop {
-            let Some(id) = self
-                .abandoned_receiver
-                .as_ref()
-                .and_then(|receiver| receiver.try_recv().ok())
-            else {
-                break;
-            };
+        while let Some(id) = self
+            .abandoned_receiver
+            .as_ref()
+            .and_then(|receiver| receiver.try_recv().ok())
+        {
             if let Some(task) = self.tasks.get_mut(&id) {
                 task.abandoned = true;
             }
@@ -2051,9 +2096,9 @@ impl AsyncScheduler {
                 })?;
         }
         let targets = Rc::new(targets);
-        for (target, _) in targets.iter().copied() {
+        for (target, _) in targets.iter() {
             self.waiters
-                .get_mut(&target)
+                .get_mut(target)
                 .expect("waiter list was reserved above")
                 .push(id);
         }
@@ -2540,6 +2585,7 @@ impl AsyncScheduler {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_process_run(
         &mut self,
         id: usize,
@@ -3301,9 +3347,9 @@ impl AsyncScheduler {
                 Err(error) => Err(error.into_runtime_error()),
                 Ok(AsyncIoResult::Cancelled) => Ok(Value::Nil),
                 Ok(AsyncIoResult::Nil) => Ok(Value::Nil),
-                Ok(AsyncIoResult::Bytes(bytes)) => HeapRef::try_new(RefCell::new(bytes))
-                    .map(Value::Bytes)
-                    .map_err(|error| error),
+                Ok(AsyncIoResult::Bytes(bytes)) => {
+                    HeapRef::try_new(RefCell::new(bytes)).map(Value::Bytes)
+                }
                 Ok(AsyncIoResult::Text(text)) => Ok(Value::Str(text.into())),
                 Ok(AsyncIoResult::UInt(value)) => Ok(Value::UInt(value)),
                 Ok(AsyncIoResult::Int(value)) => Ok(Value::Int(value)),
@@ -3644,7 +3690,7 @@ pub(crate) fn matches_runtime_type(expected: &RuntimeType, value: &Value) -> boo
     if matches!(value, Value::Error(_)) {
         return true;
     }
-    let matches_primitive = match expected {
+    match expected {
         RuntimeType::Int => matches!(value, Value::Int(_)),
         RuntimeType::UInt => matches!(value, Value::UInt(_)),
         RuntimeType::BigInt => matches!(value, Value::BigInt(_)),
@@ -3653,9 +3699,8 @@ pub(crate) fn matches_runtime_type(expected: &RuntimeType, value: &Value) -> boo
         RuntimeType::Char => matches!(value, Value::Char(_)),
         RuntimeType::Nil => matches!(value, Value::Nil),
         RuntimeType::Str => matches!(value, Value::Str(_) | Value::StrBuf(_)),
-        _ => return expected.accepts(&RuntimeType::of(value)),
-    };
-    matches_primitive
+        _ => expected.accepts(&RuntimeType::of(value)),
+    }
 }
 
 pub(crate) fn call_arguments_match(signature: &CallableSignature, arguments: &[Value]) -> bool {
@@ -3690,6 +3735,7 @@ fn check_branch(
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn numeric_binop(
     a: Value,
     b: Value,
@@ -4204,7 +4250,7 @@ fn execute_top_level_vm(
         artifact,
         context,
         owner,
-        &execution_plan,
+        execution_plan,
         scheduler,
         &mut globals,
         &mut remaining_steps,
@@ -4214,13 +4260,13 @@ fn execute_top_level_vm(
         None,
     ) {
         VmExecution::Complete(Ok(value)) => {
-            if value.is_heap_managed() {
-                if let Err(error) = heap::collect(std::slice::from_ref(&value)) {
-                    // Preserve the result graph if the collector cannot reserve
-                    // its tracing storage; recursive destruction could overflow.
-                    std::mem::forget(value);
-                    return Err(error);
-                }
+            if value.is_heap_managed()
+                && let Err(error) = heap::collect(std::slice::from_ref(&value))
+            {
+                // Preserve the result graph if the collector cannot reserve
+                // its tracing storage; recursive destruction could overflow.
+                std::mem::forget(value);
+                return Err(error);
             }
             drop(value);
             Ok(())
@@ -4297,6 +4343,7 @@ fn prepare_stack_effect_cache(
     Some(cache)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_vm(
     artifact: &CompiledProgram,
     context: &mut RuntimeContext<'_>,
@@ -4347,7 +4394,7 @@ fn execute_vm(
             }));
         }
         None => {
-            let (pc, stack) = start.map_or_else(|| (0, Vec::new()), |(entry, args)| (entry, args));
+            let (pc, stack) = start.unwrap_or_else(|| (0, Vec::new()));
             (
                 pc,
                 stack,
@@ -5530,6 +5577,23 @@ fn execute_vm(
                         captures = CaptureValues::default();
                         bp = locals.len();
                         pc = check_jump(program, *index)?;
+                        if let Some(exit) = execution_plan.try_jit_call(
+                            artifact,
+                            callable_start,
+                            &mut pc,
+                            &mut locals,
+                            bp,
+                            &mut stack,
+                            operand_base,
+                            &captures,
+                            &mut propagation_pending,
+                            context,
+                        ) {
+                            pc = match exit {
+                                JitExit::Completed => pc,
+                                JitExit::ResumeAt { pc } | JitExit::FaultAt { pc } => pc,
+                            };
+                        }
                         continue;
                     }
                 }
