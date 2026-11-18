@@ -45,6 +45,51 @@ fn cargo_link_search_directives(output: &str) -> impl Iterator<Item = &str> {
     })
 }
 
+fn find_cog_rlib(profile_directory: &Path) -> Option<(PathBuf, PathBuf)> {
+    let mut directories = vec![(profile_directory.to_path_buf(), 0usize)];
+    let mut candidates = Vec::new();
+
+    while let Some((directory, depth)) = directories.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+
+            if file_type.is_dir() {
+                if depth < 8 && entry.file_name() != "incremental" {
+                    directories.push((path, depth + 1));
+                }
+                continue;
+            }
+
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            let is_cog_library = file_name == "libcog.rlib"
+                || file_name.starts_with("libcog-")
+                || file_name == "cog.rlib"
+                || file_name.starts_with("cog-");
+            if is_cog_library
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "rlib")
+            {
+                candidates.push((directory.clone(), path));
+            }
+        }
+    }
+
+    candidates.into_iter().max_by_key(|(_, library)| {
+        std::fs::metadata(library)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+    })
+}
+
 #[test]
 fn cargo_link_search_directives_accept_both_cargo_output_syntaxes() {
     let output = concat!(
@@ -63,21 +108,16 @@ fn cargo_link_search_directives_accept_both_cargo_output_syntaxes() {
 fn separately_compiled_rust_plugin_uses_c_abi_and_contains_panics() {
     let directory = Directory::new();
     let executable = std::env::current_exe().expect("locate plugin test executable");
-    let (dependency_directory, library) = executable
+    let profile_directory = executable
         .ancestors()
-        .flat_map(|ancestor| [ancestor.to_path_buf(), ancestor.join("deps")])
-        .find_map(|directory| {
-            let library = std::fs::read_dir(&directory)
-                .ok()?
-                .filter_map(Result::ok)
-                .filter(|entry| {
-                    entry.file_name().to_string_lossy().starts_with("libcog-")
-                        && entry.path().extension().is_some_and(|e| e == "rlib")
-                })
-                .max_by_key(|entry| entry.metadata().ok()?.modified().ok())
-                .map(|entry| entry.path())?;
-            Some((directory, library))
+        .find(|ancestor| {
+            ancestor
+                .file_name()
+                .is_some_and(|name| name == "debug" || name == "release")
         })
+        .map(Path::to_path_buf)
+        .expect("find the Cargo profile directory for the plugin test");
+    let (dependency_directory, library) = find_cog_rlib(&profile_directory)
         .expect("find the compiled Cog library in Cargo's test profile");
     let output = directory.library("rust_plugin");
     let mut compiler = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()));
@@ -93,16 +133,18 @@ fn separately_compiled_rust_plugin_uses_c_abi_and_contains_panics() {
         .arg("-o")
         .arg(&output);
     // Explicit-target Cargo builds keep host proc macros in a separate directory.
-    let profile = dependency_directory.parent().unwrap().file_name().unwrap();
-    for parent in dependency_directory.ancestors().take(4) {
-        let profile_directory = parent.join(profile);
-        let host_dependencies = profile_directory.join("deps");
+    let profile = profile_directory
+        .file_name()
+        .expect("Cargo profile directory has a name");
+    for parent in profile_directory.ancestors().skip(1).take(3) {
+        let host_profile_directory = parent.join(profile);
+        let host_dependencies = host_profile_directory.join("deps");
         if host_dependencies.is_dir() {
             compiler
                 .arg("-L")
                 .arg(format!("dependency={}", host_dependencies.display()));
         }
-        if let Ok(build_outputs) = std::fs::read_dir(profile_directory.join("build")) {
+        if let Ok(build_outputs) = std::fs::read_dir(host_profile_directory.join("build")) {
             for build in build_outputs.flatten() {
                 let build_directory = build.path();
                 let generated_output = build_directory.join("out");
