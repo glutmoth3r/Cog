@@ -45,8 +45,9 @@ fn cargo_link_search_directives(output: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-fn find_cog_rlib(profile_directory: &Path) -> Option<(PathBuf, PathBuf)> {
+fn find_cog_rlib(profile_directory: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
     let mut directories = vec![(profile_directory.to_path_buf(), 0usize)];
+    let mut dependency_directories = Vec::new();
     let mut candidates = Vec::new();
 
     while let Some((directory, depth)) = directories.pop() {
@@ -69,6 +70,13 @@ fn find_cog_rlib(profile_directory: &Path) -> Option<(PathBuf, PathBuf)> {
 
             let file_name = entry.file_name();
             let file_name = file_name.to_string_lossy();
+            let is_rust_dependency = ["rlib", "rmeta", "so", "dylib", "dll"]
+                .iter()
+                .any(|extension| path.extension().is_some_and(|actual| actual == *extension));
+            if is_rust_dependency && !dependency_directories.contains(&directory) {
+                dependency_directories.push(directory.clone());
+            }
+
             let is_cog_library = file_name == "libcog.rlib"
                 || file_name.starts_with("libcog-")
                 || file_name == "cog.rlib"
@@ -83,11 +91,15 @@ fn find_cog_rlib(profile_directory: &Path) -> Option<(PathBuf, PathBuf)> {
         }
     }
 
-    candidates.into_iter().max_by_key(|(_, library)| {
-        std::fs::metadata(library)
-            .and_then(|metadata| metadata.modified())
-            .ok()
-    })
+    let library = candidates
+        .into_iter()
+        .max_by_key(|(_, library)| {
+            std::fs::metadata(library)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+        })
+        .map(|(_, library)| library)?;
+    Some((library, dependency_directories))
 }
 
 #[test]
@@ -117,7 +129,7 @@ fn separately_compiled_rust_plugin_uses_c_abi_and_contains_panics() {
         })
         .map(Path::to_path_buf)
         .expect("find the Cargo profile directory for the plugin test");
-    let (dependency_directory, library) = find_cog_rlib(&profile_directory)
+    let (library, dependency_directories) = find_cog_rlib(&profile_directory)
         .expect("find the compiled Cog library in Cargo's test profile");
     let output = directory.library("rust_plugin");
     let mut compiler = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()));
@@ -128,10 +140,13 @@ fn separately_compiled_rust_plugin_uses_c_abi_and_contains_panics() {
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/native_plugin.rs"))
         .arg("--extern")
         .arg(format!("cog={}", library.display()))
-        .arg("-L")
-        .arg(format!("dependency={}", dependency_directory.display()))
         .arg("-o")
         .arg(&output);
+    for dependency_directory in dependency_directories {
+        compiler
+            .arg("-L")
+            .arg(format!("dependency={}", dependency_directory.display()));
+    }
     // Explicit-target Cargo builds keep host proc macros in a separate directory.
     let profile = profile_directory
         .file_name()
