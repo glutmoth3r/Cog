@@ -2148,7 +2148,7 @@ impl<'a> Parser<'a> {
             var,
             start,
             end,
-            step,
+            step: step.map(Box::new),
         })
     }
 
@@ -3444,7 +3444,7 @@ mod tests {
             other => panic!("expected Function at items[0], got {:?}", other),
         };
         match &f.body.stmts[0] {
-            Stmt::For { step, .. } => assert_eq!(*step, None),
+            Stmt::For { step, .. } => assert_eq!(step.as_deref(), None),
             other => panic!("expected For, got {:?}", other),
         }
     }
@@ -3474,7 +3474,10 @@ mod tests {
                 assert_eq!(var, "i");
                 assert_eq!(*start, Expr::Int(10));
                 assert_eq!(*end, Expr::Int(0));
-                assert_eq!(*step, Some(Expr::Unary(UnOp::Neg, Box::new(Expr::Int(2)))));
+                assert_eq!(
+                    step.as_deref(),
+                    Some(&Expr::Unary(UnOp::Neg, Box::new(Expr::Int(2))))
+                );
             }
             other => panic!("expected For, got {:?}", other),
         }
@@ -3498,7 +3501,7 @@ mod tests {
         };
         match &f.body.stmts[0] {
             Stmt::For { step, .. } => {
-                assert_eq!(*step, Some(Expr::Ident("n".to_string())));
+                assert_eq!(step.as_deref(), Some(&Expr::Ident("n".to_string())));
             }
             other => panic!("expected For, got {:?}", other),
         }

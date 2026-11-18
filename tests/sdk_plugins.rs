@@ -62,21 +62,23 @@ fn cargo_link_search_directives_accept_both_cargo_output_syntaxes() {
 #[test]
 fn separately_compiled_rust_plugin_uses_c_abi_and_contains_panics() {
     let directory = Directory::new();
-    let dependency_directory = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    let library = std::fs::read_dir(&dependency_directory)
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry.file_name().to_string_lossy().starts_with("libcog-")
-                && entry.path().extension().is_some_and(|e| e == "rlib")
+    let executable = std::env::current_exe().expect("locate plugin test executable");
+    let (dependency_directory, library) = executable
+        .ancestors()
+        .flat_map(|ancestor| [ancestor.to_path_buf(), ancestor.join("deps")])
+        .find_map(|directory| {
+            let library = std::fs::read_dir(&directory)
+                .ok()?
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry.file_name().to_string_lossy().starts_with("libcog-")
+                        && entry.path().extension().is_some_and(|e| e == "rlib")
+                })
+                .max_by_key(|entry| entry.metadata().ok()?.modified().ok())
+                .map(|entry| entry.path())?;
+            Some((directory, library))
         })
-        .max_by_key(|entry| entry.metadata().unwrap().modified().unwrap())
-        .expect("compiled Cog library")
-        .path();
+        .expect("find the compiled Cog library in Cargo's test profile");
     let output = directory.library("rust_plugin");
     let mut compiler = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()));
     compiler

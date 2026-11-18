@@ -270,25 +270,24 @@ fn constant_foldable(expr: &Expr, nodes: &mut usize, allow_bigint: bool) -> bool
         | Expr::Nil => true,
         Expr::BigInt(_) => allow_bigint,
         Expr::Unary(UnOp::Neg | UnOp::Not, value) => constant_foldable(value, nodes, allow_bigint),
-        Expr::Binary(op, left, right)
-            if matches!(
-                op,
-                BinOp::Add
-                    | BinOp::Sub
-                    | BinOp::Mul
-                    | BinOp::Div
-                    | BinOp::Mod
-                    | BinOp::Eq
-                    | BinOp::NotEq
-                    | BinOp::Lt
-                    | BinOp::LtEq
-                    | BinOp::Gt
-                    | BinOp::GtEq
-                    | BinOp::And
-                    | BinOp::Or
-                    | BinOp::Xor
-            ) =>
-        {
+        Expr::Binary(
+            BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Mod
+            | BinOp::Eq
+            | BinOp::NotEq
+            | BinOp::Lt
+            | BinOp::LtEq
+            | BinOp::Gt
+            | BinOp::GtEq
+            | BinOp::And
+            | BinOp::Or
+            | BinOp::Xor,
+            left,
+            right,
+        ) => {
             constant_foldable(left, nodes, allow_bigint)
                 && constant_foldable(right, nodes, allow_bigint)
         }

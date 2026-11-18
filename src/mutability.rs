@@ -905,7 +905,7 @@ impl<'a> Pass<'a> {
                 }
                 self.state.scopes.push(HashMap::new());
                 self.define(var, stmt_id(stmt), true, Access::default());
-                self.loop_body(None, body, range_empty(start, end, step.as_ref()));
+                self.loop_body(None, body, range_empty(start, end, step.as_deref()));
                 self.state.scopes.pop();
             }
             Stmt::ForEach {
@@ -933,7 +933,7 @@ impl<'a> Pass<'a> {
                             if let Some(step) = step {
                                 self.expr(step);
                             }
-                            empty = match (empty, range_empty(start, end, step.as_ref())) {
+                            empty = match (empty, range_empty(start, end, step.as_deref())) {
                                 (Some(true), _) | (_, Some(true)) => Some(true),
                                 (Some(false), Some(false)) => Some(false),
                                 _ => None,

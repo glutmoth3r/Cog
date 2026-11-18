@@ -228,7 +228,7 @@ pub enum ForClause {
         var: String,
         start: Expr,
         end: Expr,
-        step: Option<Expr>,
+        step: Option<Box<Expr>>,
     },
     Each {
         pattern: BindingPattern,
@@ -532,7 +532,7 @@ pub enum Stmt {
         // thing. The end bound stays exclusive either way, matching the
         // existing ascending-range convention rather than Kotlin's inclusive
         // `downTo` — one exclusivity rule regardless of direction.
-        step: Option<Expr>,
+        step: Option<Box<Expr>>,
         body: Block,
     },
     /// Iterate array elements or Unicode scalar strings, evaluating the

@@ -372,9 +372,7 @@ impl Resolver {
             }
             Binding::Native(module) => {
                 let name = format!("{module}::{tail}");
-                if Builtin::from_name(&name).is_some() {
-                    Some(Binding::Native(name))
-                } else if crate::builtins::native_module(&name) {
+                if Builtin::from_name(&name).is_some() || crate::builtins::native_module(&name) {
                     Some(Binding::Native(name))
                 } else {
                     None

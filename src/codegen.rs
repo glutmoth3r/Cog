@@ -366,25 +366,24 @@ fn is_inlineable_body(expr: &Expr, parameters: &[String], nodes: &mut usize) -> 
         | Expr::Nil => true,
         Expr::Ident(name) => parameters.iter().any(|parameter| parameter == name),
         Expr::Unary(UnOp::Neg | UnOp::Not, value) => is_inlineable_body(value, parameters, nodes),
-        Expr::Binary(op, left, right)
-            if matches!(
-                op,
-                BinOp::Add
-                    | BinOp::Sub
-                    | BinOp::Mul
-                    | BinOp::Div
-                    | BinOp::Mod
-                    | BinOp::Eq
-                    | BinOp::NotEq
-                    | BinOp::Lt
-                    | BinOp::LtEq
-                    | BinOp::Gt
-                    | BinOp::GtEq
-                    | BinOp::And
-                    | BinOp::Or
-                    | BinOp::Xor
-            ) =>
-        {
+        Expr::Binary(
+            BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Mod
+            | BinOp::Eq
+            | BinOp::NotEq
+            | BinOp::Lt
+            | BinOp::LtEq
+            | BinOp::Gt
+            | BinOp::GtEq
+            | BinOp::And
+            | BinOp::Or
+            | BinOp::Xor,
+            left,
+            right,
+        ) => {
             is_inlineable_body(left, parameters, nodes)
                 && is_inlineable_body(right, parameters, nodes)
         }
@@ -2155,7 +2154,7 @@ impl<'a> Codegen<'a> {
         body: &Block,
         call_site: &crate::analysis::CallSite,
         scopes: &mut Scopes,
-        deferred: &mut Vec<Deferred>,
+        deferred: &mut [Deferred],
     ) -> Result<(), CodegenError> {
         let condition_label = self.fresh_label("for_zip_condition");
         let next_label = self.fresh_label("for_zip_next");
@@ -2342,7 +2341,7 @@ impl<'a> Codegen<'a> {
             label: next_label,
             ..transfer
         });
-        self.compile_block_with_deferred(body, scopes, deferred.clone())?;
+        self.compile_block_with_deferred(body, scopes, deferred.to_owned())?;
         self.loop_continue_stack.pop();
         self.loop_end_stack.pop();
 
@@ -2614,6 +2613,7 @@ impl<'a> Codegen<'a> {
         self.guard_error(scopes)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn compile_declared_call(
         &mut self,
         name: &str,
@@ -2725,6 +2725,7 @@ impl<'a> Codegen<'a> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn compile_declared_method_call(
         &mut self,
         name: &str,
@@ -3393,19 +3394,18 @@ impl<'a> Codegen<'a> {
         let mut nodes = 0;
         let expression = self.constant_expression(expr, scopes, &mut nodes, true)?;
         crate::comptime::fold_constant_expression(&expression).map(|value| {
-            if self
+            if (self
                 .uint_expressions
                 .contains(&crate::mutability::expr_id(expr))
                 || self
                     .uint_literals
-                    .contains(&crate::mutability::expr_id(expr))
+                    .contains(&crate::mutability::expr_id(expr)))
+                && let Value::Int(value) = value
             {
-                if let Value::Int(value) = value {
-                    if let Ok(value) = u64::try_from(value) {
-                        return Value::UInt(value);
-                    }
-                    return Value::Int(value);
+                if let Ok(value) = u64::try_from(value) {
+                    return Value::UInt(value);
                 }
+                return Value::Int(value);
             }
             value
         })
@@ -3485,10 +3485,10 @@ impl<'a> Codegen<'a> {
                 ) =>
             {
                 let left = self.constant_expression(left, scopes, nodes, allow_constant_calls)?;
-                if let Some(Value::Bool(value)) = crate::comptime::fold_scalar_expression(&left) {
-                    if (*op == BinOp::And && !value) || (*op == BinOp::Or && value) {
-                        return Some(Expr::Bool(value));
-                    }
+                if let Some(Value::Bool(value)) = crate::comptime::fold_scalar_expression(&left)
+                    && ((*op == BinOp::And && !value) || (*op == BinOp::Or && value))
+                {
+                    return Some(Expr::Bool(value));
                 }
                 Some(Expr::Binary(
                     *op,

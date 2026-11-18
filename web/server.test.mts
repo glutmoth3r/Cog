@@ -35,9 +35,9 @@ test("all thirteen tutorial programs compile and execute through real bytecode",
 });
 
 test("syntax and type errors return compiler diagnostics without executing", async () => {
-    for (const source of ['fn main() { const x = ; }', 'include std; use io; fn main() { io::println("should not run"); const n: int = "wrong"; }']) {
+    for (const source of ['fn main() { const x = ; }', '@!include("std")\nuse io;\nfn main() { io::println("should not run"); const n: int = "wrong"; }']) {
         const result = await run(source);
-        assert.equal(result.ok, false);
+        assert.equal(result.ok, false, source);
         assert.equal(result.phase, "compile");
         assert.equal(result.stdout, "");
         assert.match(result.diagnostics, /error\[E\d+\]/);
@@ -46,28 +46,28 @@ test("syntax and type errors return compiler diagnostics without executing", asy
 });
 
 test("runtime failure preserves earlier output and stdin reaches read_line", async () => {
-    const failed = await run('include std; use io; fn main() { io::println("before"); (1 / 0)!!; }');
+    const failed = await run('@!include("std")\nuse io;\nfn main() { io::println("before"); (1 / 0)!!; }');
     assert.equal(failed.ok, false);
     assert.equal(failed.phase, "run");
     assert.equal(failed.stdout, "before\n");
     assert.match(failed.diagnostics, /division by zero/);
-    const read = await run('include std; use io; fn main() { io::println(io::read_line()!!)!!; }', "café λ\n");
+    const read = await run('@!include("std")\nuse io;\nfn main() { io::println(io::read_line()!!)!!; }', "café λ\n");
     assert.equal(read.ok, true, read.diagnostics);
     assert.equal(read.stdout, "café λ\n");
-    const eof = await run('include std; use io; fn main() { io::read_line()!!; }');
+    const eof = await run('@!include("std")\nuse io;\nfn main() { io::read_line()!!; }');
     assert.equal(eof.ok, false);
 });
 
 test("runtime host effects are denied before touching files or starting processes", async () => {
     const path = new URL("./tutorial-must-not-create.txt", import.meta.url).pathname;
     for (const source of [
-        `include std; use io; fn main() { io::open(${JSON.stringify(path)}, "w", 0)!!; }`,
-        'include std; use process; fn main() { const args: str[] = []; process::run("unused", args)!!; }',
-        'include std; use time; fn main() { time::now()!!; }',
-        'include std; use entropy; fn main() { entropy::bytes(1)!!; }',
+        `@!include("std")\nuse io;\nfn main() { io::open(${JSON.stringify(path)}, "w", 0)!!; }`,
+        '@!include("std")\nuse process;\nfn main() { const args: str[] = []; process::run_sync("unused", args)!!; }',
+        '@!include("std")\nuse time;\nfn main() { time::now()!!; }',
+        '@!include("std")\nuse entropy;\nfn main() { entropy::bytes(1)!!; }',
     ]) {
         const result = await run(source);
-        assert.equal(result.ok, false);
+        assert.equal(result.ok, false, source);
         assert.match(result.diagnostics, /permission denied/i);
     }
     await assert.rejects(access(path));
@@ -77,10 +77,10 @@ test("infinite loops and excess output stop and subsequent runs still work", asy
     const timeout = await run("fn main() { while true {} }");
     assert.equal(timeout.ok, false);
     assert.match(timeout.diagnostics, /time limit/);
-    const output = await run('include std; use io; fn main() { while true { io::println("too much output"); } }');
+    const output = await run('@!include("std")\nuse io;\nfn main() { while true { io::println("too much output"); } }');
     assert.equal(output.ok, false);
     assert.match(output.diagnostics, /Output limit/);
-    const next = await run('include std; use io; fn main() { io::println("ready"); }');
+    const next = await run('@!include("std")\nuse io;\nfn main() { io::println("ready"); }');
     assert.equal(next.stdout, "ready\n");
     assert.equal(next.ok, true);
 });
