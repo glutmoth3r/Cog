@@ -54,6 +54,3 @@ static PLUGIN: PluginV3 = PluginV3::new(&FUNCTIONS);
 pub extern "C" fn cog_plugin_v3() -> *const PluginV3 {
     &PLUGIN
 }
-
-// Also allow cargo's ordinary all-target checks to compile this source.
-fn main() {}

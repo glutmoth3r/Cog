@@ -28,6 +28,11 @@ path = "src/lib.rs"
 name = "cog"
 path = "src/main.rs"
 
+[[example]]
+name = "native_plugin"
+path = "examples/native_plugin.rs"
+crate-type = ["cdylib"]
+
 [[bench]]
 name = "bench_interpreter"
 harness = false
