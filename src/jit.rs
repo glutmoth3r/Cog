@@ -2476,8 +2476,8 @@ unsafe fn jit_direct_call_int_slots(
         .unwrap_or_else(|| Box::new(JitCallFrame::new(context_ptr.cast())));
     child.prepare(&callable.plan, context_ptr.cast());
     child.frame.roots = frame.roots;
-    for index in 0..arity {
-        child.stack[index] = unsafe { *frame.stack.add(base + index) };
+    for (index, slot) in child.stack.get_mut(..arity)?.iter_mut().enumerate() {
+        *slot = unsafe { *frame.stack.add(base + index) };
     }
     child.frame.stack_len = arity as u64;
 

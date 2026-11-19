@@ -151,10 +151,12 @@ pub enum Token {
     #[regex(r"[0-9](?:_?[0-9])*(?:\.[0-9](?:_?[0-9])*(?:[eE][+-]?[0-9](?:_?[0-9])*)?|[eE][+-]?[0-9](?:_?[0-9])*)", parse_float)]
     Float(f64),
 
+    #[allow(unknown_lints, clippy::duplicated_attributes)]
     #[regex(r"0[xX][0-9A-Fa-f](?:_?[0-9A-Fa-f])*", parse_int)]
     #[regex(r"[0-9](?:_?[0-9])*", parse_int)]
     Int(u64),
 
+    #[allow(unknown_lints, clippy::duplicated_attributes)]
     #[regex(r"0[xX][0-9A-Fa-f](?:_?[0-9A-Fa-f]){16,}", parse_bigint)]
     #[regex(r"[0-9](?:_?[0-9]){19,}", parse_bigint)]
     BigInt(BigInt),

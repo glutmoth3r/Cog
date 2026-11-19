@@ -102,6 +102,49 @@ fn find_cog_rlib(profile_directory: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
     Some((library, dependency_directories))
 }
 
+fn add_native_search_paths(compiler: &mut Command, profile_directory: &Path) {
+    let mut directories = vec![(profile_directory.to_path_buf(), 0usize)];
+    let mut native_directories = Vec::new();
+
+    while let Some((directory, depth)) = directories.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+
+            if file_type.is_dir() {
+                if entry.file_name() == "out" {
+                    compiler.arg("-L").arg(format!("native={}", path.display()));
+                    native_directories.push(path.clone());
+                }
+                if depth < 8 && entry.file_name() != "incremental" {
+                    directories.push((path, depth + 1));
+                }
+            } else if ["lib", "a", "so", "dylib"]
+                .iter()
+                .any(|extension| path.extension().is_some_and(|actual| actual == *extension))
+                && !native_directories.contains(&directory)
+            {
+                compiler
+                    .arg("-L")
+                    .arg(format!("native={}", directory.display()));
+                native_directories.push(directory.clone());
+            } else if entry.file_name() == "output"
+                && let Ok(output) = std::fs::read_to_string(&path)
+            {
+                for search_path in cargo_link_search_directives(&output) {
+                    compiler.arg("-L").arg(search_path);
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn cargo_link_search_directives_accept_both_cargo_output_syntaxes() {
     let output = concat!(
@@ -148,6 +191,7 @@ fn separately_compiled_rust_plugin_uses_c_abi_and_contains_panics() {
             .arg(format!("dependency={}", dependency_directory.display()));
     }
     // Explicit-target Cargo builds keep host proc macros in a separate directory.
+    add_native_search_paths(&mut compiler, &profile_directory);
     let profile = profile_directory
         .file_name()
         .expect("Cargo profile directory has a name");
@@ -159,21 +203,8 @@ fn separately_compiled_rust_plugin_uses_c_abi_and_contains_panics() {
                 .arg("-L")
                 .arg(format!("dependency={}", host_dependencies.display()));
         }
-        if let Ok(build_outputs) = std::fs::read_dir(host_profile_directory.join("build")) {
-            for build in build_outputs.flatten() {
-                let build_directory = build.path();
-                let generated_output = build_directory.join("out");
-                if generated_output.is_dir() {
-                    compiler
-                        .arg("-L")
-                        .arg(format!("native={}", generated_output.display()));
-                }
-                if let Ok(build_output) = std::fs::read_to_string(build_directory.join("output")) {
-                    for search_path in cargo_link_search_directives(&build_output) {
-                        compiler.arg("-L").arg(search_path);
-                    }
-                }
-            }
+        if host_profile_directory != profile_directory {
+            add_native_search_paths(&mut compiler, &host_profile_directory);
         }
     }
     check(&mut compiler);
