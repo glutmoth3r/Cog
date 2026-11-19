@@ -691,18 +691,24 @@ fn region(
     let program = context.program;
     // A local store affects this frame only. Captures are supplied by the
     // checked constructor, and branches cannot enter another frame's region.
-    for pc in start..end {
+    for (pc, instruction) in program
+        .instructions
+        .iter()
+        .enumerate()
+        .take(end)
+        .skip(start)
+    {
         charge(flow.visits, 1, pc)?;
-        match program.instructions[pc] {
+        match instruction {
             Instruction::Jump(target)
             | Instruction::JumpIfFalse(target)
             | Instruction::JumpIfTrue(target)
             | Instruction::JumpIfNoPropagation(target)
-                if !(start..end).contains(&target) =>
+                if !(start..end).contains(target) =>
             {
                 return Err(failure(pc, "branch crosses a callable region"));
             }
-            Instruction::LoadCapture(index) if index >= captures => {
+            Instruction::LoadCapture(index) if *index >= captures => {
                 return Err(failure(pc, "capture index exceeds callable signature"));
             }
             Instruction::Return | Instruction::ReturnPropagate if start == 0 => {
@@ -958,13 +964,18 @@ fn verify_dead_stack_heights(
     // A value-proven impossible branch is still structurally stack-checked,
     // using the outgoing height at that branch. It must not be merged into a
     // feasible target state, since it cannot execute at runtime.
-    for pc in start..end {
+    for (pc, instruction) in program
+        .instructions
+        .iter()
+        .enumerate()
+        .take(end)
+        .skip(start)
+    {
         charge(visits, 1, pc)?;
         let index = pc - start;
         let Some(state) = reachable[index].as_ref() else {
             continue;
         };
-        let instruction = &program.instructions[pc];
         if let Instruction::JumpIfFalse(target) | Instruction::JumpIfTrue(target) = instruction
             && let Some(condition) = flow_at(&state.stack_values, state.height - 1).known_bool
         {

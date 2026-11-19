@@ -342,8 +342,13 @@ fn local_slot_mapping(program: &CompiledProgram, start: usize, end: usize) -> Op
     }
 
     let mut leaders = BTreeSet::from([start]);
-    for pc in start..end {
-        let instruction = &program.instructions[pc];
+    for (pc, instruction) in program
+        .instructions
+        .iter()
+        .enumerate()
+        .take(end)
+        .skip(start)
+    {
         if let Some(target) = branch_target(instruction) {
             if !(start..end).contains(&target) {
                 return None;
@@ -384,8 +389,13 @@ fn local_slot_mapping(program: &CompiledProgram, start: usize, end: usize) -> Op
     let mut predecessors = vec![Vec::new(); block_count];
     for (block_index, block) in blocks.iter().enumerate() {
         let row = block_index * words;
-        for pc in block.start..block.end {
-            match &program.instructions[pc] {
+        for instruction in program
+            .instructions
+            .iter()
+            .take(block.end)
+            .skip(block.start)
+        {
+            match instruction {
                 Instruction::Load(slot) if !bit_is_set(&definitions[row..row + words], *slot) => {
                     bit_set(&mut uses[row..row + words], *slot);
                 }
@@ -555,8 +565,13 @@ fn analyze_region(program: &CompiledProgram, start: usize, end: usize) -> Option
     }
 
     let mut leaders = BTreeSet::from([start]);
-    for pc in start..end {
-        let instruction = &program.instructions[pc];
+    for (pc, instruction) in program
+        .instructions
+        .iter()
+        .enumerate()
+        .take(end)
+        .skip(start)
+    {
         if let Some(target) = branch_target(instruction) {
             if !(start..end).contains(&target) {
                 return None;
