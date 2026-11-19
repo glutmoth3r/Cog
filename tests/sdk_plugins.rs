@@ -38,177 +38,6 @@ fn check(command: &mut Command) {
     );
 }
 
-fn cargo_link_search_directives(output: &str) -> impl Iterator<Item = &str> {
-    output.lines().filter_map(|line| {
-        line.strip_prefix("cargo:rustc-link-search=")
-            .or_else(|| line.strip_prefix("cargo::rustc-link-search="))
-    })
-}
-
-fn find_cog_rlib(profile_directory: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
-    let mut directories = vec![(profile_directory.to_path_buf(), 0usize)];
-    let mut dependency_directories = Vec::new();
-    let mut candidates = Vec::new();
-
-    while let Some((directory, depth)) = directories.pop() {
-        let Ok(entries) = std::fs::read_dir(&directory) else {
-            continue;
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-
-            if file_type.is_dir() {
-                if depth < 8 && entry.file_name() != "incremental" {
-                    directories.push((path, depth + 1));
-                }
-                continue;
-            }
-
-            let file_name = entry.file_name();
-            let file_name = file_name.to_string_lossy();
-            let is_rust_dependency = ["rlib", "rmeta", "so", "dylib", "dll"]
-                .iter()
-                .any(|extension| path.extension().is_some_and(|actual| actual == *extension));
-            if is_rust_dependency && !dependency_directories.contains(&directory) {
-                dependency_directories.push(directory.clone());
-            }
-
-            let is_cog_library = file_name == "libcog.rlib"
-                || file_name.starts_with("libcog-")
-                || file_name == "cog.rlib"
-                || file_name.starts_with("cog-");
-            if is_cog_library
-                && path
-                    .extension()
-                    .is_some_and(|extension| extension == "rlib")
-            {
-                candidates.push((directory.clone(), path));
-            }
-        }
-    }
-
-    let library = candidates
-        .into_iter()
-        .max_by_key(|(_, library)| {
-            std::fs::metadata(library)
-                .and_then(|metadata| metadata.modified())
-                .ok()
-        })
-        .map(|(_, library)| library)?;
-    Some((library, dependency_directories))
-}
-
-fn add_native_search_paths(compiler: &mut Command, profile_directory: &Path) {
-    let mut directories = vec![(profile_directory.join("build"), 0usize)];
-    let mut search_paths = Vec::new();
-
-    while let Some((directory, depth)) = directories.pop() {
-        let Ok(entries) = std::fs::read_dir(&directory) else {
-            continue;
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-
-            if file_type.is_dir() {
-                if depth < 8 && entry.file_name() != "incremental" {
-                    directories.push((path, depth + 1));
-                }
-            } else if entry.file_name() == "output"
-                && let Ok(output) = std::fs::read_to_string(&path)
-            {
-                for search_path in cargo_link_search_directives(&output) {
-                    if !search_paths.iter().any(|existing| existing == search_path) {
-                        search_paths.push(search_path.to_owned());
-                    }
-                }
-            } else if ["lib", "a", "so", "dylib"]
-                .iter()
-                .any(|extension| path.extension().is_some_and(|actual| actual == *extension))
-            {
-                let search_path = format!("native={}", directory.display());
-                if !search_paths.contains(&search_path) {
-                    search_paths.push(search_path);
-                }
-            }
-        }
-    }
-
-    for search_path in search_paths {
-        compiler.arg("-L").arg(search_path);
-    }
-}
-
-#[test]
-fn cargo_link_search_directives_accept_both_cargo_output_syntaxes() {
-    let output = concat!(
-        "cargo:rustc-link-search=native=C:\\sdk\\lib\n",
-        "cargo::rustc-link-search=all=C:\\other\\lib\n",
-        "cargo:rerun-if-changed=build.rs\n",
-    );
-
-    assert_eq!(
-        cargo_link_search_directives(output).collect::<Vec<_>>(),
-        [r"native=C:\sdk\lib", r"all=C:\other\lib"]
-    );
-}
-
-#[test]
-fn nested_cargo_native_search_paths_are_unique() {
-    let directory = Directory::new();
-    let profile_directory = &directory.0;
-    let dependency_directory = profile_directory.join("build/dependency/hash");
-    let build_output = dependency_directory.join("output");
-    let native_directory = profile_directory.join("generated native libraries");
-    let native_output_directory = dependency_directory.join("out");
-    let unrelated_output_directory = profile_directory.join("build/other/hash/out");
-    std::fs::create_dir_all(&dependency_directory).unwrap();
-    std::fs::create_dir_all(&native_directory).unwrap();
-    std::fs::create_dir_all(&native_output_directory).unwrap();
-    std::fs::create_dir_all(&unrelated_output_directory).unwrap();
-    std::fs::write(
-        build_output,
-        format!(
-            "cargo:rustc-link-search=native={}\ncargo:rustc-link-search=native={}\n",
-            native_directory.display(),
-            native_directory.display()
-        ),
-    )
-    .unwrap();
-    std::fs::write(
-        native_output_directory.join("windows.0.52.0.lib"),
-        b"fixture",
-    )
-    .unwrap();
-
-    let mut compiler = Command::new("rustc");
-    add_native_search_paths(&mut compiler, profile_directory);
-
-    let mut search_arguments = compiler
-        .get_args()
-        .filter_map(|argument| {
-            argument
-                .to_string_lossy()
-                .strip_prefix("native=")
-                .map(str::to_owned)
-        })
-        .collect::<Vec<_>>();
-    search_arguments.sort();
-    let mut expected = vec![
-        native_directory.display().to_string(),
-        native_output_directory.display().to_string(),
-    ];
-    expected.sort();
-    assert_eq!(search_arguments, expected);
-}
-
 #[test]
 fn separately_compiled_rust_plugin_uses_c_abi_and_contains_panics() {
     let directory = Directory::new();
@@ -222,42 +51,36 @@ fn separately_compiled_rust_plugin_uses_c_abi_and_contains_panics() {
         })
         .map(Path::to_path_buf)
         .expect("find the Cargo profile directory for the plugin test");
-    let (library, dependency_directories) = find_cog_rlib(&profile_directory)
-        .expect("find the compiled Cog library in Cargo's test profile");
+    let target_directory = profile_directory
+        .parent()
+        .expect("find the Cargo target directory for the plugin test");
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let mut cargo = Command::new("cargo");
+    cargo
+        .arg("build")
+        .arg("--offline")
+        .arg("--example")
+        .arg("native_plugin")
+        .arg("--manifest-path")
+        .arg(manifest)
+        .arg("--target-dir")
+        .arg(target_directory);
+    check(&mut cargo);
+
+    let library_name = format!(
+        "{}native_plugin{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_SUFFIX
+    );
+    let built_library = profile_directory.join("examples").join(library_name);
+    assert!(
+        built_library.is_file(),
+        "Cargo did not produce the native plugin at {}",
+        built_library.display()
+    );
     let output = directory.library("rust_plugin");
-    let mut compiler = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()));
-    compiler
-        .arg("--edition=2024")
-        .arg("--crate-type=cdylib")
-        .arg("--crate-name=cog_sdk_fixture")
-        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/native_plugin.rs"))
-        .arg("--extern")
-        .arg(format!("cog={}", library.display()))
-        .arg("-o")
-        .arg(&output);
-    for dependency_directory in dependency_directories {
-        compiler
-            .arg("-L")
-            .arg(format!("dependency={}", dependency_directory.display()));
-    }
-    // Explicit-target Cargo builds keep host proc macros in a separate directory.
-    add_native_search_paths(&mut compiler, &profile_directory);
-    let profile = profile_directory
-        .file_name()
-        .expect("Cargo profile directory has a name");
-    for parent in profile_directory.ancestors().skip(1).take(3) {
-        let host_profile_directory = parent.join(profile);
-        let host_dependencies = host_profile_directory.join("deps");
-        if host_dependencies.is_dir() {
-            compiler
-                .arg("-L")
-                .arg(format!("dependency={}", host_dependencies.display()));
-        }
-        if host_profile_directory != profile_directory {
-            add_native_search_paths(&mut compiler, &host_profile_directory);
-        }
-    }
-    check(&mut compiler);
+    std::fs::copy(&built_library, &output)
+        .expect("copy the compiled plugin into its test directory");
     let mut engine = Engine::new();
     unsafe { engine.load_plugin(&output) }.unwrap();
     let program = engine.compile("plugin.cog", "@!include(\"std\") use io; use host; use err; fn main() { io::println(host::double(21)); try { host::fail(); } catch(e) { io::println(e.error_kind()); } }").unwrap();
