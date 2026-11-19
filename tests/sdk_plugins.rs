@@ -129,6 +129,14 @@ fn add_native_search_paths(compiler: &mut Command, profile_directory: &Path) {
                         search_paths.push(search_path.to_owned());
                     }
                 }
+            } else if ["lib", "a", "so", "dylib"]
+                .iter()
+                .any(|extension| path.extension().is_some_and(|actual| actual == *extension))
+            {
+                let search_path = format!("native={}", directory.display());
+                if !search_paths.contains(&search_path) {
+                    search_paths.push(search_path);
+                }
             }
         }
     }
@@ -156,10 +164,15 @@ fn cargo_link_search_directives_accept_both_cargo_output_syntaxes() {
 fn nested_cargo_native_search_paths_are_unique() {
     let directory = Directory::new();
     let profile_directory = &directory.0;
-    let build_output = profile_directory.join("build/dependency/hash/output");
+    let dependency_directory = profile_directory.join("build/dependency/hash");
+    let build_output = dependency_directory.join("output");
     let native_directory = profile_directory.join("generated native libraries");
-    std::fs::create_dir_all(build_output.parent().unwrap()).unwrap();
+    let native_output_directory = dependency_directory.join("out");
+    let unrelated_output_directory = profile_directory.join("build/other/hash/out");
+    std::fs::create_dir_all(&dependency_directory).unwrap();
     std::fs::create_dir_all(&native_directory).unwrap();
+    std::fs::create_dir_all(&native_output_directory).unwrap();
+    std::fs::create_dir_all(&unrelated_output_directory).unwrap();
     std::fs::write(
         build_output,
         format!(
@@ -169,21 +182,31 @@ fn nested_cargo_native_search_paths_are_unique() {
         ),
     )
     .unwrap();
+    std::fs::write(
+        native_output_directory.join("windows.0.52.0.lib"),
+        b"fixture",
+    )
+    .unwrap();
 
     let mut compiler = Command::new("rustc");
     add_native_search_paths(&mut compiler, profile_directory);
 
-    let arguments = compiler
+    let mut search_arguments = compiler
         .get_args()
-        .map(|argument| argument.to_string_lossy().into_owned())
+        .filter_map(|argument| {
+            argument
+                .to_string_lossy()
+                .strip_prefix("native=")
+                .map(str::to_owned)
+        })
         .collect::<Vec<_>>();
-    assert_eq!(
-        arguments,
-        [
-            "-L".to_owned(),
-            format!("native={}", native_directory.display())
-        ]
-    );
+    search_arguments.sort();
+    let mut expected = vec![
+        native_directory.display().to_string(),
+        native_output_directory.display().to_string(),
+    ];
+    expected.sort();
+    assert_eq!(search_arguments, expected);
 }
 
 #[test]
