@@ -103,8 +103,8 @@ fn find_cog_rlib(profile_directory: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
 }
 
 fn add_native_search_paths(compiler: &mut Command, profile_directory: &Path) {
-    let mut directories = vec![(profile_directory.to_path_buf(), 0usize)];
-    let mut native_directories = Vec::new();
+    let mut directories = vec![(profile_directory.join("build"), 0usize)];
+    let mut search_paths = Vec::new();
 
     while let Some((directory, depth)) = directories.pop() {
         let Ok(entries) = std::fs::read_dir(&directory) else {
@@ -118,30 +118,23 @@ fn add_native_search_paths(compiler: &mut Command, profile_directory: &Path) {
             };
 
             if file_type.is_dir() {
-                if entry.file_name() == "out" {
-                    compiler.arg("-L").arg(format!("native={}", path.display()));
-                    native_directories.push(path.clone());
-                }
                 if depth < 8 && entry.file_name() != "incremental" {
                     directories.push((path, depth + 1));
                 }
-            } else if ["lib", "a", "so", "dylib"]
-                .iter()
-                .any(|extension| path.extension().is_some_and(|actual| actual == *extension))
-                && !native_directories.contains(&directory)
-            {
-                compiler
-                    .arg("-L")
-                    .arg(format!("native={}", directory.display()));
-                native_directories.push(directory.clone());
             } else if entry.file_name() == "output"
                 && let Ok(output) = std::fs::read_to_string(&path)
             {
                 for search_path in cargo_link_search_directives(&output) {
-                    compiler.arg("-L").arg(search_path);
+                    if !search_paths.iter().any(|existing| existing == search_path) {
+                        search_paths.push(search_path.to_owned());
+                    }
                 }
             }
         }
+    }
+
+    for search_path in search_paths {
+        compiler.arg("-L").arg(search_path);
     }
 }
 
@@ -156,6 +149,40 @@ fn cargo_link_search_directives_accept_both_cargo_output_syntaxes() {
     assert_eq!(
         cargo_link_search_directives(output).collect::<Vec<_>>(),
         [r"native=C:\sdk\lib", r"all=C:\other\lib"]
+    );
+}
+
+#[test]
+fn nested_cargo_native_search_paths_are_unique() {
+    let directory = Directory::new();
+    let profile_directory = &directory.0;
+    let build_output = profile_directory.join("build/dependency/hash/output");
+    let native_directory = profile_directory.join("generated native libraries");
+    std::fs::create_dir_all(build_output.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&native_directory).unwrap();
+    std::fs::write(
+        build_output,
+        format!(
+            "cargo:rustc-link-search=native={}\ncargo:rustc-link-search=native={}\n",
+            native_directory.display(),
+            native_directory.display()
+        ),
+    )
+    .unwrap();
+
+    let mut compiler = Command::new("rustc");
+    add_native_search_paths(&mut compiler, profile_directory);
+
+    let arguments = compiler
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        arguments,
+        [
+            "-L".to_owned(),
+            format!("native={}", native_directory.display())
+        ]
     );
 }
 
