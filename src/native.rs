@@ -388,9 +388,8 @@ fn find_runtime_archive(destination: &Path) -> Result<PathBuf, String> {
         .into_iter()
         .find(|path| path.is_file())
         .ok_or_else(|| {
-            format!(
-                "Cog AOT runtime archive not found. Build it from the same Cog checkout with `cargo rustc --release --locked --target x86_64-unknown-linux-gnu --lib --crate-type staticlib`, then retry. You can also set COG_NATIVE_RUNTIME to its path."
-            )
+            "Cog AOT runtime archive not found. Build it from the same Cog checkout with `cargo rustc --release --locked --target x86_64-unknown-linux-gnu --lib --crate-type staticlib`, then retry. You can also set COG_NATIVE_RUNTIME to its path."
+                .to_owned()
         })
         .and_then(|path| path.canonicalize().map_err(|error| error.to_string()))
 }
