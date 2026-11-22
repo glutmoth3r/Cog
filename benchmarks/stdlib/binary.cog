@@ -1,5 +1,5 @@
 @!include("std")
-use binary;
+use binary from std;
 use bytes;
 use io;
 
