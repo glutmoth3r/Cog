@@ -650,13 +650,6 @@ impl JitState {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn compiled_function_count(&self) -> usize {
-        self.compiler
-            .as_ref()
-            .map_or(0, |compiler| compiler.functions)
-    }
-
     pub(crate) fn contains(&self, entry: usize, target: usize) -> bool {
         self.plans
             .get(&entry)
@@ -6802,11 +6795,20 @@ fn main() -> nil {}
         let baked = entry("baked");
         let fallback = entry("fallback");
 
-        let state = JitState::from_aot(&artifact, &[(baked, unused_aot_entry)], true).unwrap();
+        let mut state = JitState::from_aot(&artifact, &[(baked, unused_aot_entry)], true).unwrap();
         assert!(state.compiler.is_some());
         assert!(state.aot_entries.contains(&baked));
         assert!(state.candidates[&baked].compiled.is_some());
         assert!(state.candidates[&fallback].compiled.is_none());
+
+        state.compile_deferred_calls(
+            baked,
+            &artifact,
+            BTreeMap::from([(fallback, HOT_CALL_THRESHOLD)]),
+            false,
+        );
+        assert!(state.candidates[&fallback].compiled.is_some());
+        assert_eq!(state.compiler.as_ref().unwrap().functions, 1);
 
         let vm_only = JitState::from_aot(&artifact, &[(baked, unused_aot_entry)], false).unwrap();
         assert!(vm_only.compiler.is_none());
