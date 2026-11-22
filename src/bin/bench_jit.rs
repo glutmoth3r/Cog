@@ -1,4 +1,4 @@
-use cog::sdk::{Engine, Program, RunContext};
+use cog::sdk::{Engine, Program, RunContext, Signature, Type, Value};
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
@@ -81,6 +81,129 @@ fn work(n: int) -> int {{
 
 fn main() -> nil {{
     io::println(work({iterations}))!!;
+}}
+"#
+    )
+}
+
+fn pipeline_source(n: u64) -> String {
+    format!(
+        r#"
+@!include("std")
+use io;
+@inline("never")
+fn step(x: int) -> int {{ x * 3 + 1 }}
+@inline("never")
+fn stage(x: int) -> int {{ step(x) + step(x + 1) }}
+fn work(n: int) -> int {{
+    var i = 0;
+    var checksum = 0;
+    while i < n {{
+        checksum += stage(i);
+        i += 1;
+    }}
+    checksum
+}}
+fn main() -> nil {{ io::println(work({n}))!!; }}
+"#
+    )
+}
+
+fn closures_source(n: u64) -> String {
+    format!(
+        r#"
+@!include("std")
+use io;
+fn work(n: int, first: fn(int) -> int, second: fn(int) -> int) -> int {{
+    var i = 0;
+    var checksum = 0;
+    var callback = first;
+    while i < n {{
+        if i == n / 2 {{ callback = second; }}
+        checksum += (callback)(i);
+        i += 1;
+    }}
+    checksum
+}}
+fn main() -> nil {{
+    var state = 0;
+    const first = fn[var state](x: int) -> int {{ state += 1; x + state }};
+    const bias = 5;
+    const second = fn[bias](x: int) -> int {{ x - bias }};
+    io::println(work({n}, first, second))!!;
+}}
+"#
+    )
+}
+
+fn collections_source(n: u64) -> String {
+    format!(
+        r#"
+@!include("std")
+use io;
+fn work(n: int) -> int {{
+    var values: int[] = [];
+    var i = 0;
+    while i < n {{ values << i; i += 1; }}
+    i = 0;
+    var checksum = 0;
+    while i < n {{
+        values[i] = values[i] + 3;
+        checksum += values[i];
+        i += 1;
+    }}
+    checksum
+}}
+fn main() -> nil {{ io::println(work({n}))!!; }}
+"#
+    )
+}
+
+fn native_source(n: u64) -> String {
+    format!(
+        r#"
+@!include("std")
+use io;
+use host;
+fn work(n: int) -> int {{
+    var i = 0;
+    var checksum = 0;
+    while i < n {{
+        checksum += host::step(i);
+        i += 1;
+    }}
+    checksum
+}}
+fn main() -> nil {{ io::println(work({n}))!!; }}
+"#
+    )
+}
+
+fn mixed_source(n: u64) -> String {
+    format!(
+        r#"
+@!include("std")
+use io;
+@inline("never")
+fn scale(x: int) -> int {{ x * 3 }}
+fn work(n: int, callback: fn(int) -> int) -> int {{
+    var items: int[] = [3, 1, 4, 1, 5, 9, 2, 6];
+    var i = 0;
+    var checksum = 0;
+    while i < n {{
+        const index = i % 8;
+        const value = (callback)(items[index]);
+        if value > 100 {{ items[index] = 1; }}
+        else {{ items[index] = value; }}
+        checksum += items[index];
+        i += 1;
+    }}
+    checksum
+}}
+fn main() -> nil {{
+    const bias = 2;
+    const transform = fn[bias](x: int) -> int {{ scale(x) + bias }};
+    io::println(work({n}, transform))!!;
 }}
 "#
     )
@@ -601,7 +724,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join("target")
         .join("jit-bench");
     fs::create_dir_all(&output_dir)?;
-    let engine = Engine::new();
+    let mut engine = Engine::new();
+    engine.register(
+        "host::step",
+        Signature::new(vec![Type::Int], Type::Int),
+        |_, args| {
+            Ok(Value::int(
+                args[0].as_int().expect("validated native int argument") + 1,
+            ))
+        },
+    )?;
     let cases = [
         Case {
             name: "int",
@@ -614,6 +746,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Case {
             name: "function-calls",
             source: function_calls_source,
+        },
+        Case {
+            name: "call-pipeline",
+            source: pipeline_source,
+        },
+        Case {
+            name: "closure-calls",
+            source: closures_source,
+        },
+        Case {
+            name: "collection-index",
+            source: collections_source,
+        },
+        Case {
+            name: "native-calls",
+            source: native_source,
+        },
+        Case {
+            name: "mixed-calls",
+            source: mixed_source,
         },
         Case {
             name: "uint",
@@ -679,7 +831,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "case,vm_median_us,jit_first_us,jit_enabled_retained_median_us,jit_p10_us,jit_p90_us,compile_us,vm_ns_per_backedge,jit_ns_per_backedge,calibrated"
     );
 
-    for case in cases {
+    let selected = std::env::var("COG_JIT_BENCH_CASE").ok();
+    if selected
+        .as_ref()
+        .is_some_and(|name| !cases.iter().any(|case| case.name == name))
+    {
+        return Err("COG_JIT_BENCH_CASE does not name a workload".into());
+    }
+    for case in cases
+        .into_iter()
+        .filter(|case| selected.as_deref().is_none_or(|name| case.name == name))
+    {
         let source = (case.source)(iterations);
         let vm_program = compile(&engine, case.name, &source)?;
         let jit_program = compile(&engine, case.name, &source)?;
@@ -758,12 +920,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             jit_ns_per_backedge,
             calibrated
         );
-        if case.name == "mandelbrot-render" {
+        if case.name == "mandelbrot-render" || std::env::var_os("COG_JIT_BENCH_DEBUG").is_some() {
             let names = function_entry_names(&jit_program);
             for (entry, compile, vm, jit, function_calibrated) in function_profiles {
                 if compile > 0 || vm > 0 {
                     eprintln!(
-                        "mandelbrot-render: function={} entry={entry} compile_us={} vm_ns/backedge={vm} jit_ns/backedge={jit} calibrated={function_calibrated}",
+                        "{}: function={} entry={entry} compile_us={} vm_ns/backedge={vm} jit_ns/backedge={jit} calibrated={function_calibrated}",
+                        case.name,
                         names.get(&entry).map_or("?", String::as_str),
                         compile / 1_000
                     );

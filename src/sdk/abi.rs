@@ -30,8 +30,10 @@ impl Bytes {
         }
     }
 }
-// Descriptors only borrow immutable plugin-owned storage; reading any pointer
-// requires the unsafe ABI contract. Host code never writes through this view.
+// SAFETY: `Bytes` is a copyable descriptor only; it never dereferences its raw
+// pointer in safe code. A caller that reads it must honor the ABI's immutable
+// storage and lifetime contract. Sharing the descriptor itself grants no access
+// to mutate the pointed-to bytes.
 unsafe impl Sync for Bytes {}
 
 /// Output from inspect, or input to make. Strings are UTF-8. For arrays make
@@ -184,7 +186,9 @@ pub struct PluginV3 {
     pub create: Option<unsafe extern "C" fn(*mut *mut c_void) -> Status>,
     pub destroy: Option<unsafe extern "C" fn(*mut c_void)>,
 }
-// Plugin descriptors remain immutable and valid until the library unloads.
+// SAFETY: plugin authors must keep the descriptor and function table immutable
+// and readable until unload; the host retains the library for that full period.
+// Safe Rust code treats the raw pointers as opaque and does not dereference them.
 unsafe impl Sync for PluginV3 {}
 impl PluginV3 {
     pub const fn new(functions: &'static [FunctionV3]) -> Self {
@@ -267,8 +271,8 @@ impl InspectedValue<'_> {
         if self.view.bytes.data.is_null() || self.view.bytes.len > isize::MAX as usize {
             return Err(Error::new("invalid byte view"));
         }
-        // The host roots inspected values until the callback returns. This
-        // wrapper's borrow is limited by the same callback-scoped lifetime.
+        // SAFETY: the host roots inspected values until the callback returns;
+        // this slice borrow is limited by `InspectedValue`'s callback lifetime.
         Ok(unsafe { std::slice::from_raw_parts(self.view.bytes.data, self.view.bytes.len) })
     }
 
@@ -296,6 +300,8 @@ impl PluginCall<'_> {
     }
     fn inspect_raw(&self, value: Handle) -> Result<ValueView, Error> {
         let mut result = ValueView::default();
+        // SAFETY: `PluginCall` is created only by `dispatch` from the validated,
+        // live host table and callback-scoped context; the host validates handles.
         Self::status(unsafe { (self.host.inspect)(self.context, value, &mut result) })?;
         Ok(result)
     }
@@ -337,11 +343,15 @@ impl PluginCall<'_> {
         if view.bytes.data.is_null() || view.bytes.len > isize::MAX as usize {
             return Err(Error::new("invalid byte view"));
         }
+        // SAFETY: successful host inspection roots this string through the
+        // callback, and the null/length checks above establish a valid byte range.
         let bytes = unsafe { std::slice::from_raw_parts(view.bytes.data, view.bytes.len) };
         std::str::from_utf8(bytes).map_err(|_| Error::new("host returned invalid UTF-8"))
     }
     fn make(&self, value: ValueView) -> Result<Handle, Error> {
         let mut result = 0;
+        // SAFETY: the live host table came from `dispatch`; it reads `value`
+        // synchronously and writes only to this local output slot.
         Self::status(unsafe { (self.host.make)(self.context, &value, &mut result) })?;
         Ok(result)
     }
@@ -379,13 +389,19 @@ impl PluginCall<'_> {
     }
     pub fn array_get(&self, array: Handle, index: usize) -> Result<Handle, Error> {
         let mut result = 0;
+        // SAFETY: the live host table came from `dispatch` and the output pointer
+        // remains writable for the synchronous callback.
         Self::status(unsafe { (self.host.array_get)(self.context, array, index, &mut result) })?;
         Ok(result)
     }
     pub fn array_set(&self, array: Handle, index: usize, value: Handle) -> Result<(), Error> {
+        // SAFETY: the live host table and context are callback-scoped; the host
+        // checks both handles and the array mutation contract.
         Self::status(unsafe { (self.host.array_set)(self.context, array, index, value) })
     }
     pub fn write_output(&self, value: &str) -> Result<(), Error> {
+        // SAFETY: `value` remains borrowed for the synchronous call and `Bytes`
+        // describes its exact UTF-8 byte range.
         Self::status(unsafe {
             (self.host.write_output)(self.context, Bytes::new(value.as_bytes()))
         })
@@ -414,11 +430,14 @@ pub unsafe fn dispatch(
     {
         return INVALID;
     }
-    // Read only the common header until the complete table has been checked.
+    // SAFETY: the caller guarantees at least the readable ABI header at `host`;
+    // this reads only its first `u32` before checking the declared full-table size.
     let size = unsafe { std::ptr::read(host.cast::<u32>()) };
     if size != size_of::<HostV3>() as u32 {
         return INVALID;
     }
+    // SAFETY: the caller guarantees a complete aligned table, and the size check
+    // above matches this Rust ABI v3 layout before any field is accessed.
     let host = unsafe { &*host };
     if host.version != VERSION {
         return INVALID;
@@ -426,6 +445,8 @@ pub unsafe fn dispatch(
     let arguments = if count == 0 {
         &[]
     } else {
+        // SAFETY: the caller guarantees `count` readable handles; count is capped
+        // above and a nonempty slice requires a non-null pointer.
         unsafe { std::slice::from_raw_parts(arguments, count) }
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -437,18 +458,22 @@ pub unsafe fn dispatch(
     }));
     match result {
         Ok(Ok(value)) => {
+            // SAFETY: the caller guarantees `output` is writable for one handle.
             unsafe {
                 output.write(value);
             }
             OK
         }
         Ok(Err(error)) => {
+            // SAFETY: the validated live host table provides a call-scoped
+            // `set_error`; the borrowed message lives through the synchronous call.
             unsafe {
                 (host.set_error)(context, Bytes::new(error.message().as_bytes()));
             }
             FAILURE
         }
         Err(_) => {
+            // SAFETY: same validated host/context contract as the error path.
             unsafe {
                 (host.set_error)(context, Bytes::new(b"Rust plugin callback panicked"));
             }
@@ -467,11 +492,14 @@ pub unsafe fn create_state<T: Default>(output: *mut *mut c_void) -> Status {
     if output.is_null() {
         return INVALID;
     }
+    // SAFETY: the caller's contract guarantees one writable output pointer.
     unsafe {
         output.write(std::ptr::null_mut());
     }
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Box::new(T::default()))) {
         Ok(state) => {
+            // SAFETY: the same writable output slot remains valid; ownership of
+            // the Box is intentionally transferred to the plugin, not the host.
             unsafe {
                 output.write(Box::into_raw(state).cast());
             }
@@ -488,6 +516,8 @@ pub unsafe fn create_state<T: Default>(output: *mut *mut c_void) -> Status {
 /// library. It must be destroyed once, after all calls have finished.
 pub unsafe fn destroy_state<T>(state: *mut c_void) {
     if !state.is_null() {
+        // SAFETY: the caller guarantees this is the live pointer returned by
+        // `create_state::<T>` and that it is destroyed exactly once after use.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             drop(Box::from_raw(state.cast::<T>()));
         }));

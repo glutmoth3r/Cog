@@ -5,6 +5,12 @@ singleton value, not an Error. Compiler type/phase/name errors cannot be caught 
 source code. Recoverable runtime failures produce Error; `crash` and invalid VM
 state are terminal outcomes.
 
+`nil` fills a normal absence role similar to Lua's `nil` or JavaScript's `null`,
+but it is not Cog's failure signal. Unlike Rust's `Result<T, E>`, Error is not part
+of a function's declared normal type. Unlike Python exceptions, a runtime failure
+does not always unwind immediately: it can remain a value until an observing
+operation or `!!` applies the documented handling rule.
+
 ## Runtime locations, warnings, and type hints
 
 The CLI reports the source file, line, and column for terminal runtime errors

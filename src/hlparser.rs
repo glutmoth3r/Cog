@@ -1,3 +1,9 @@
+//! High-level source parser from lexer tokens to the compiler AST.
+//!
+//! The source diagnostic entry point recovers at statement and declaration
+//! boundaries so one malformed source can report independent errors;
+//! `parse_program` is a convenience API that returns the first error. Parsing does
+//! not resolve module names or establish type and mutation contracts.
 use crate::ast::{
     BinOp, BindingPattern, Block, CallArgument, ClosureCapture, Expr, ExtendDecl, ExtensionMethod,
     FallbackKind, ForClause, FunctionDecl, InlineMode, Item, MatchArm, MatchPattern, Param,
@@ -486,7 +492,7 @@ impl<'a> Parser<'a> {
                             }
                             Some(Token::Const) => self.parse_global_const(visibility),
                             Some(Token::Var) => self.parse_global_var(visibility),
-                            _ => unreachable!(),
+                            _ => unreachable!("declaration lookahead admits only struct, enum, const, or var"),
                         }
                     } else {
                         self.parse_function_item()
@@ -1832,7 +1838,7 @@ impl<'a> Parser<'a> {
                         && self.peek_at(1) != Some(&Token::RBracket)
                     {
                         let TypeKind::Named(source) = kind else {
-                            unreachable!()
+                            unreachable!("the bracketed type was checked as a named type")
                         };
                         kind = TypeKind::Applied {
                             source,

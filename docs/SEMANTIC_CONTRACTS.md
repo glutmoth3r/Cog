@@ -1,17 +1,24 @@
 # Semantic contracts and future boundaries
 
-This is the canonical distinction between enforced behavior, accepted future
-requirements, and unresolved design questions. Implemented syntax is documented in
+This page distinguishes enforced behavior, current limits, accepted future work,
+and unresolved design questions. Implemented syntax is documented in
 [language](LANGUAGE.md) and [errors](ERRORS.md). A proposed example below does not
 imply compiler support.
 
 Executable contracts are in [tests/semantic_contracts.rs](../tests/semantic_contracts.rs)
 and [tests/build_input_contracts.rs](../tests/build_input_contracts.rs). Test-name
-prefixes are stable contract IDs. There are 100 active and 7 pending tests in these
-two suites; feature regressions also exist in separate suites. Pending tests
-have `#[ignore = "spec: ..."]` reasons and are not passing coverage. A negative
-semantic test must parse first: missing syntax is not a successful type/phase check.
-Output observations pass through bytecode encode/decode and VM execution.
+prefixes are stable contract IDs; these two suites currently contain 145 active
+tests. Feature regressions also exist in separate suites. A negative semantic test
+must parse first: missing syntax is not a successful type/phase check. Output
+observations pass through bytecode encode/decode and VM execution.
+
+Status labels have specific meanings here: **implemented contract** is enforced
+today; **intentional design decision** is a chosen language or architecture rule
+supported by code, tests, or an owner decision; **current implementation
+limitation** describes what the implementation cannot do and makes no schedule
+promise; **planned feature** is an accepted direction for development, not a delivery
+date; **open design question** has no settled contract. An unsupported feature is
+not automatically planned.
 
 ## Implemented invariants
 
@@ -28,14 +35,15 @@ Output observations pass through bytecode encode/decode and VM execution.
 | nullable_01/04/05/07/08 | Nullable boundaries remain declared; nonterminal arms/writes do not exclude nil; Error exclusion and !! do not unwrap nil; ?? can produce a nonnullable normal result |
 | phase_01..07, phase_10..17, comptime_01..03 | Scalar values and nominal struct construction evaluate before runtime lowering; type-valued bindings substitute recursively into annotations and are erased; arithmetic Error values can be inspected by patterns or diagnosed at the comptime root; `try`/`catch`, `!!`, and lazy `??`/`?!` preserve computational error boundaries; runtime inputs/calls and forbidden runtime effects are rejected, and comptime callables are omitted from runtime artifacts |
 
-Error is a computational state of an expression with normal type T; no mandatory
-Result/union/throws annotation is introduced. Compiler recovery poison is a
-separate invalid-source marker. Static violations cannot be caught. A computational
-failure does not automatically stop every statement outside an observing boundary.
+**Intentional design decision:** Error is a computational state of an expression
+with normal type T; no mandatory `Result`/union/throws annotation is introduced.
+Compiler recovery poison is a separate invalid-source marker. Static violations
+cannot be caught. A computational failure does not automatically stop every
+statement outside an observing boundary.
 
 Conceptual facts are `normal_type + error_state + normal_control_flow`, independent
-of mutability. Inferred may-error metadata is an accepted direction, not a complete
-implemented fallibility system. A normal array/struct/enum can contain Error leaves.
+of mutability. **Planned feature:** inferred may-error metadata is a future direction,
+not a complete fallibility system. A normal array/struct/enum can contain Error leaves.
 Typed consumption must not mistake a poisoned component for its normal type.
 
 Try restores the lexical operand-stack baseline and runs exited cleanup without
@@ -43,18 +51,21 @@ rolling back side effects. Explicit inspection handles its operand before outer
 observation. Ordinary return still observes locally; !! is a distinct control-flow
 exit that relays through synchronous callers. Its normal type is unchanged, and
 cleanup failures retain primary/secondary information. Async task completion is a
-propagation boundary. Complete source provenance and a public suppressed-error API
-are pending.
-Fatal cleanup precedence and diagnostic storage bounds remain unresolved.
+propagation boundary. **Current implementation limitation:** complete source
+provenance and a public suppressed-error API are absent. **Open design questions:**
+fatal cleanup precedence and diagnostic storage bounds remain unresolved.
 
-Const forbids mutation through its access path; var does not imply dynamic typing.
+**Intentional design decision:** `const` forbids mutation through its access path;
+`var` does not imply dynamic typing.
 Reference-like assignment shares without moves, and aliases cannot increase access
 capability. A const alias observes an existing mutable alias. The mutability pass
 tracks paths, returned aliases, containers, and inferred recursive/transitive effects.
-Joins, unknown indices, repeated allocation sites, and paths deeper than four selectors
-are conservative; acceptance of every safe program is not guaranteed. Resource handle
-use mutates a host resource, not its immutable Cog token. Bytes/builders are mutable
-Cog heap values. Const alone does not prove all reachable memory immutable for a JIT.
+**Current implementation limitation:** joins, unknown indices, repeated allocation
+sites, and paths deeper than four selectors are conservative; acceptance of every
+safe program is not guaranteed. Resource handle
+use mutates a host resource, not its immutable Cog token. Bytes/builders are
+mutable Cog heap values. Const alone does not prove all reachable memory immutable
+for a JIT.
 
 Aggregate construction and writes to array/tuple positions and record fields retain
 Error values at their leaves. The aggregate keeps its normal type; an Error in the
@@ -134,15 +145,16 @@ container elements. It preserves array and tuple type contracts. Custom nominal
 cloning of arrays or tuples is outside the Beta contract. Repeated nested references
 inside a cloned graph remain aliases of the same independent copied object.
 
-## Pending: fixed-size arrays and trait associated types
+## Current limitations: fixed-size arrays and trait associated types
 
-- `T[N]` waits for real comptime N values/expressions rather than a temporary size
-  evaluator. Layout/materialization/size limits still need implementation.
+- `T[N]` is unsupported. Its size, layout, materialization, and resource limits do
+  not yet have an accepted contract.
 - Trait associated types are not implemented. Type-associated functions such as
   `Type::new()` are a separate feature implemented by receiverless methods in
   `extend` declarations. Generic extension methods use static
   receiver matching and monomorphization; generic trait implementations remain
   unsupported. No implicit dynamic type or runtime trait object is introduced.
+  Associated types have no scheduled implementation in the roadmap.
 - Clone does not transfer ownership, provide a borrow checker, or add lifetime
   syntax. Copy-on-write or reference counting may optimize observable independence.
 
@@ -162,10 +174,9 @@ their resolved constructors. Comptime-only function definitions are omitted from
 runtime code. Top-level `@comptime const T: type = ...;` bindings can name primitive,
 nominal, array, tuple, and nullable types used by later annotations. These compiler
 type values are substituted recursively and removed before runtime lowering; they
-cannot be stored as runtime values. Compile-time evaluator functions still do not
-accept type parameters. Runtime functions may declare inferred compile-time type
-parameters, which are specialized and erased before runtime lowering as described
-below.
+cannot be stored as runtime values. Runtime functions may declare inferred
+compile-time type parameters, which are specialized and erased before runtime
+lowering as described below.
 
 Runtime parameters/locals/globals cannot flow into comptime evaluation, and ordinary
 functions remain runtime-only even when pure. Phase checks visit dead branches.
@@ -173,20 +184,24 @@ Native calls inside comptime functions are rejected. Recoverable division-by-zer
 and integer-overflow results flow as Error values through scalar operations and
 comptime calls. `when`/`match` patterns can inspect these errors inside a comptime
 function; an unhandled Error at a `comptime` binding root is a compile diagnostic.
-The evaluator cannot inspect struct fields. `try`/`catch` and `!!` work in
+`try`/`catch` and `!!` work in
 @comptime const functions: `!!` bypasses a catch in its own function and relays
 through comptime calls to the caller's lexical handler. An unhandled propagation
 reaches the initializer root as a compile diagnostic; using `!!` directly at an
 initializer root is rejected.
 Lazy `??` and `?!` select nil and Error fallbacks in compile-time expressions;
-`!!` propagation bypasses either fallback. Mutation statements, loops, array,
-tuple, and enum values, along with tuple destructuring, remain pending as comptime
-data. Evaluator limits produce compile diagnostics.
+`!!` propagation bypasses either fallback. **Current implementation limitation:**
+compile-time functions cannot inspect struct fields or use type parameters,
+mutation statements, loops, array/tuple/enum values, or tuple destructuring.
+Evaluator budget exhaustion produces a compile diagnostic. Array, tuple, and enum
+materialization is planned; the other unsupported forms have no accepted
+implementation schedule.
 `comptime const` without the `@` attribute prefix is invalid syntax.
 
-## Pending: Error semantics, indirect callables, and richer compile-time data
+## Current comptime boundaries and indirect callable contracts
 
-The broader comptime foundation remains incomplete. Accepted boundaries:
+The implemented phase rules and callable behavior below define the current
+boundary; unsupported data forms remain implementation limitations.
 
 - `@comptime const name[: T] = expression;` is a standalone local/global binding.
   Its initializer is evaluated before runtime lowering and its computed result is
@@ -207,15 +222,17 @@ The broader comptime foundation remains incomplete. Accepted boundaries:
   functions. `try`/`catch` handles computational errors, and `!!` bypasses a local
   handler and propagates to the caller's lexical handler. Lazy `??` and `?!` follow
   their runtime selection rules; `!!` propagation bypasses fallback selection.
-  Constructed Error payloads and the complete cross-phase operational contract
-  remain pending. Unhandled Error at a mandatory evaluation root is a compile error.
+  **Current implementation limitation:** constructed Error payloads and the
+  complete cross-phase operational contract are unsupported. Unhandled Error at a
+  mandatory evaluation root is a compile error.
   Static phase/effect violations cannot be recovered by catch or hidden in dead code.
 - !! requires a callable in the current execution context. A comptime initializer
   nested lexically in a runtime function does not provide a comptime callable;
   its root cannot return Error from that runtime function during compilation.
-- Runtime filesystem, processes, network, clock/sleep, entropy/random, and environment
-  effects are forbidden in comptime v1. Compiler-aware declared build inputs are
-  a separate effect category, not general runtime I/O authority.
+- **Implemented contract:** runtime filesystem, processes, network, clock/sleep,
+  entropy/random, and environment effects are forbidden in comptime v1.
+  Compiler-aware declared build inputs are a separate effect category, not general
+  runtime I/O authority.
 
 Cross-phase references to comptime-only functions are rejected before they can be
 stored or passed through aliases, callbacks, arrays, or record fields. Runtime
@@ -230,14 +247,15 @@ checked for read-only violations even when the closure is not called. Mutation
 effects on enclosing parameters and globals are conservatively checked
 when the closure is created. A shared mutable capture cannot be rebound to a
 reference graph containing read-only access, even if the closure is never called.
-Possible closure writes to captured graphs and globals are joined into the
-surrounding analysis at creation, including writes on early-return paths; this
-can reject a safe mutation even when the closure is never called.
-Closure parameter and result types must be explicit. Named function values require fully
-annotated, synchronous, non-generic signatures without defaults. Async and
-comptime closures and implicit capture remain unsupported. Callback calls retain
-the VM's call/error boundary; the JIT roots captured values and resumes at dynamic
-callback dispatch or the first unsupported operation. Closure captures are traced
+**Current implementation limitation:** possible closure writes to captured graphs
+and globals are joined into the surrounding analysis at creation, including writes
+on early-return paths; this can reject a safe mutation even when the closure is
+never called. Closure parameter and result types must be explicit. Named function
+values require fully annotated, synchronous, non-generic signatures without
+defaults. Async and comptime closures and implicit capture remain unsupported.
+Callback calls retain the VM's call/error boundary; the JIT roots captured values
+and resumes at dynamic callback dispatch or the first unsupported operation.
+Closure captures are traced
 by the regular cycle collector. Until callable effect types exist, indirect calls
 conservatively treat reference arguments as potentially mutated and reference
 results as read-only; `.clone()` can produce an independent writable copy when
@@ -245,39 +263,40 @@ supported. Reference-like results obtained through `await` are likewise treated
 as read-only until task result aliasing is represented precisely. Objects that
 may be mutated by an async task conservatively retain that possibility even if
 the task is not started or has already completed. Storing read-only references
-into such objects is rejected. Compiler quota exhaustion must be distinguished from a program's
-computational ResourceLimit; the evaluator's precise quota contract is open.
+into such objects is rejected. Compiler quota exhaustion must be distinguished
+from a program's computational `ResourceLimit`; **the evaluator's precise quota
+contract is an open design question.**
 
-Conceptually main is the first user Runtime function after compilation, evaluation,
-specialization/generation, and materialization. **Current code executes global
-initializers before main**, including function/native calls. A guarantee banning
-user runtime initializers before main is not finalized. Ordinary const initialization
-currently happens at runtime.
+**Current implementation behavior:** global initializers execute before `main`,
+including function/native calls; ordinary `const` initialization happens at
+runtime. **Open design question:** whether to guarantee that user runtime
+initializers cannot run before `main`.
 
-## Pending: comptime value parameters and canonical type identity
+## Planned: comptime value parameters and canonical specialization
 
 Runtime functions support inferred compile-time type parameters. A declaration such
 as `fn identity[T: type](value: T)` remains a runtime function; `T` is
 inferred from static argument types without evaluating runtime expressions and is
 erased from the runtime ABI. Parameters must precede ordinary runtime parameters.
 Ambiguous binding/inference diagnoses rather than choosing an arbitrary solution or
-substituting dynamic typing. Compile-time value parameters are not implemented; a
-runtime integer's current value does not infer a compile-time value parameter.
+substituting dynamic typing. **Planned feature:** compile-time value parameters are
+listed in the roadmap. A runtime integer's current value does not infer one today.
 
-Canonical specialization identity must use compiler structural identity rather than
-user equality, runtime addresses, hash iteration order, or RefCell identity. Cache
-correctness includes semantic revisions, compiler/configuration, transitive evaluation,
-type/layout, visibility/negative lookup, reflection, and generation dependencies.
-A hash accelerates lookup; canonical values still resolve collisions. Evaluation
-cycles and expanding specialization chains need diagnostics and resource bounds.
-Reuse and deterministic emission are required; persistent fine-grained caches can
-follow a conservative correctness boundary.
+**Planned feature:** canonical specialization identity must use compiler structural
+identity rather than user equality, runtime addresses, hash iteration order, or
+`RefCell` identity. Cache correctness includes semantic revisions,
+compiler/configuration, transitive evaluation, type/layout, visibility/negative
+lookup, reflection, and generation dependencies. A hash accelerates lookup;
+canonical values still resolve collisions. Evaluation cycles and expanding
+specialization chains need diagnostics and resource bounds. Reuse and deterministic
+emission are required; persistent fine-grained caches can follow a conservative
+correctness boundary.
 
 TypeValue uses semantic type identity, including package/module/nominal declaration
 and generic struct specialization arguments, not display names or field shape.
-Inference from result context, float value specialization
-keys, CT availability of ordinary runtime const, and aggregate materialization remain
-open.
+**Open design questions:** inference from result context, float value
+specialization keys, compile-time availability of ordinary runtime `const`, and
+aggregate materialization remain unsettled.
 Suggested internal data structures and cache encodings are implementation proposals,
 not finalized public syntax or guarantees.
 
@@ -313,7 +332,8 @@ without runtime filesystem permissions unless explicit independent runtime I/O e
 
 Binary inputs become fresh runtime byte-buffer initializers backed by an embedded
 compiler constant and a checked allocation intrinsic. No runtime file read is
-synthesized. General aggregate freezing, cycles, and materialization remain future work.
+synthesized. **Planned feature:** materialization of array, tuple, and enum values
+is listed in the roadmap. How to freeze aggregates and handle cycles remains open.
 
 Project/directory mode resolves input paths from the discovered package root, even
 when invoked in a subdirectory. Explicit source-file mode captures the invocation
@@ -369,7 +389,7 @@ parameters. Only one implementation of a trait is accepted per target type;
 generic target implementations are not supported. `Self` names the implementing
 type. Bounds are checked at specialization sites, and methods resolve statically
 against the concrete receiver. There is no runtime trait object or dynamic dispatch.
-The current cross-module visibility rules remain limited.
+**Current implementation limitation:** cross-module visibility rules remain limited.
 
 The `clone`, `eq`, and `ord` standard modules provide core traits. Structural clone
 is intrinsic for arrays and tuples whose leaves are supported primitive values or
@@ -407,8 +427,9 @@ a trait for the resolved type. Ordinary `fn` methods are statically dispatched b
 receiver type and lower as runtime functions. Compile-time type parameters and
 trait bounds are described above.
 
-Compile-time method calls and controlled generation from comptime functions remain
-pending; `@comptime extend` registers runtime methods and does not make those methods
+Compile-time method calls are unsupported today; their status is not scheduled.
+**Planned feature:** controlled typed generation from comptime functions is on the
+roadmap. `@comptime extend` registers runtime methods and does not make them
 callable during compile-time evaluation.
 
 The metaprogramming direction is typed values/specialization, read-only reflection,
@@ -419,8 +440,8 @@ trusted registration mechanisms are proposals awaiting implementation decisions.
 Separate token macros, derive/decorators, arbitrary AST rewriting, and text emission
 are not current prerequisites.
 
-Move-style captures, mutable closure receivers, closure equality, and a
-closure-specific resource quota remain open. Reference-valued and nested captures
+**Open design questions:** move-style captures, mutable closure receivers, closure
+equality, and a closure-specific resource quota. Reference-valued and nested captures
 use the ordinary value, cell, and cycle-collection rules. Raw-string
 delimiters/extended escapes, additional collection mutation protocols, sequence
 chaining changes, and the existing when-var redesign also remain open.

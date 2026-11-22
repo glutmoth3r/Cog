@@ -21,6 +21,7 @@ fn annotation_may_reference(ty: &TypeAnnotation) -> bool {
             | TypeKind::SelfType
             | TypeKind::Array(_)
             | TypeKind::Tuple(_)
+            | TypeKind::Function { .. }
     )
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -42,6 +43,9 @@ pub(crate) struct Facts {
     pub invalid_bindings: BTreeSet<usize>,
     pub fallback_possible: HashMap<usize, bool>,
     pub iterations: HashMap<usize, Vec<Option<crate::analysis::IterationMethods>>>,
+    pub function_values: BTreeMap<String, crate::analysis::Type>,
+    pub function_value_sites: HashMap<usize, String>,
+    pub indirect_signatures: HashMap<usize, crate::analysis::Type>,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -49,6 +53,7 @@ enum Root {
     Parameter(usize),
     Global(String),
     Fresh(usize, usize),
+    Function(String),
 }
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum Key {
@@ -679,14 +684,14 @@ impl<'a> Pass<'a> {
             let reachable = self.project(value, &Key::Descendant);
             if self.emit
                 && self.state.alive
-                && reachable
-                    .refs
-                    .iter()
-                    .any(|reference| !reference.readonly.is_empty())
+                && reachable.refs.iter().any(|reference| {
+                    !matches!(reference.path.root, Root::Function(_))
+                        && !reference.readonly.is_empty()
+                })
             {
                 self.diagnostics.push(Diagnostic::new(
                     "E1003",
-                    "cannot store const/read-only access into an object with deferred async mutations",
+                    "cannot store const/read-only access into an object with deferred mutations",
                     self.location.clone(),
                 ));
             }
@@ -697,6 +702,16 @@ impl<'a> Pass<'a> {
                     .map(|reference| reference.path.root),
             );
         }
+    }
+    fn defer_mutations(&mut self, access: &Access) {
+        let roots = self
+            .project(access, &Key::Descendant)
+            .refs
+            .into_iter()
+            .map(|reference| reference.path.root)
+            .collect::<BTreeSet<_>>();
+        self.state.many.extend(roots.iter().cloned());
+        self.state.deferred_roots.extend(roots);
     }
     fn store(&mut self, access: &Access, key: Key, value: Access, strong: bool) {
         self.retain_deferred_store(access, &value);
@@ -727,6 +742,7 @@ impl<'a> Pass<'a> {
         let readonly: BTreeSet<_> = access
             .refs
             .iter()
+            .filter(|r| !matches!(r.path.root, Root::Function(_)))
             .flat_map(|r| r.readonly.iter().cloned())
             .collect();
         if !readonly.is_empty() && self.emit {
@@ -741,6 +757,9 @@ impl<'a> Pass<'a> {
         }
         if self.state.alive {
             for r in &access.refs {
+                if matches!(r.path.root, Root::Function(_)) {
+                    continue;
+                }
                 self.attempted.extend(&r.locals);
                 if r.readonly.is_empty() {
                     self.mutated.extend(&r.locals);
@@ -839,11 +858,10 @@ impl<'a> Pass<'a> {
                             {
                                 if self.state.bindings[&id].shared {
                                     let reachable = self.project(&access, &Key::Descendant);
-                                    if reachable
-                                        .refs
-                                        .iter()
-                                        .any(|reference| !reference.readonly.is_empty())
-                                        && self.emit
+                                    if reachable.refs.iter().any(|reference| {
+                                        !matches!(reference.path.root, Root::Function(_))
+                                            && !reference.readonly.is_empty()
+                                    }) && self.emit
                                     {
                                         self.diagnostics.push(Diagnostic::new(
                                             "E1003",
@@ -1131,7 +1149,7 @@ impl<'a> Pass<'a> {
                 }
             }
             Stmt::Use { .. } => {}
-            Stmt::Located(..) => unreachable!(),
+            Stmt::Located(..) => unreachable!("node() removes source-location wrappers"),
         }
         self.location = location;
         self.observe();
@@ -1382,6 +1400,11 @@ impl<'a> Pass<'a> {
         body: &'a Block,
         captured_values: Vec<Access>,
     ) {
+        let mutable_capture_values = captures
+            .iter()
+            .zip(&captured_values)
+            .filter_map(|(capture, value)| capture.mutable.then_some(value.clone()))
+            .collect::<Vec<_>>();
         let captured_bindings = captures
             .iter()
             .map(|capture| self.local_id(&capture.name))
@@ -1464,6 +1487,12 @@ impl<'a> Pass<'a> {
             .collect::<Vec<_>>();
         closure_state.bindings.clear();
         let closure_globals = self.summary.globals.clone();
+        let mutated_roots = self
+            .summary
+            .mutations
+            .iter()
+            .map(|path| path.root.clone())
+            .collect::<BTreeSet<_>>();
         let closure_mutations = self
             .summary
             .mutations
@@ -1489,6 +1518,28 @@ impl<'a> Pass<'a> {
 
         self.state = outer_state;
         self.state.join(&closure_state);
+        for value in mutable_capture_values {
+            let reachable = self.project(&value, &Key::Descendant);
+            if reachable
+                .refs
+                .iter()
+                .any(|reference| mutated_roots.contains(&reference.path.root))
+            {
+                self.defer_mutations(&value);
+            }
+        }
+        for root in &mutated_roots {
+            if let Root::Global(name) = root {
+                let mut access = Access::root(root.clone());
+                if let Some(binding) = self.state.globals.get(name) {
+                    access.union(&binding.value);
+                }
+                self.defer_mutations(&access);
+            }
+        }
+        for name in closure_globals.keys() {
+            self.defer_mutations(&Access::root(Root::Global(name.clone())));
+        }
         for (id, value) in captured_updates {
             if let Some(binding) = self.state.bindings.get_mut(&id) {
                 binding.value.union(&value);
@@ -1519,7 +1570,14 @@ impl<'a> Pass<'a> {
                 }
                 Access::default()
             }
-            Expr::Ident(name) => self.read(expr, name),
+            Expr::Ident(name) => self
+                .facts
+                .function_value_sites
+                .get(&expr_id(expr))
+                .map_or_else(
+                    || self.read(expr, name),
+                    |name| Access::root(Root::Function(name.clone())),
+                ),
             Expr::Array(items) | Expr::Tuple(items) => {
                 let result = self.allocate(Root::Fresh(expr_id(expr), 0));
                 for (i, item) in items.iter().enumerate() {
@@ -1810,21 +1868,58 @@ impl<'a> Pass<'a> {
             | Expr::TypeLiteral(_) => Access::default(),
             Expr::Bytes(_) => self.allocate(Root::Fresh(expr_id(expr), 0)),
             Expr::Apply(callee, arguments) => {
-                let _callable = self.expr(callee);
+                let callable = self.expr(callee);
                 let mut result = if self.kind(expr) == ValueKind::Reference {
                     Access::root(Root::Fresh(expr_id(expr), 0)).readonly("indirect call result")
                 } else {
                     Access::default()
                 };
+                let mut call_arguments = Vec::with_capacity(arguments.len());
                 for argument in arguments {
                     let value = self.expr(&argument.value);
                     self.mutate(&value, &argument.value);
                     result.union(&value);
+                    call_arguments.push(value);
+                }
+                if let Some(signature) = self.facts.indirect_signatures.get(&expr_id(expr)) {
+                    let unknown = callable.refs.is_empty()
+                        || callable
+                            .refs
+                            .iter()
+                            .any(|reference| !matches!(reference.path.root, Root::Function(_)));
+                    let candidates = self
+                        .facts
+                        .function_values
+                        .iter()
+                        .filter_map(|(name, actual)| {
+                            let selected = unknown || callable.refs.iter().any(|reference| {
+                            matches!(&reference.path.root, Root::Function(target) if target == name)
+                        });
+                            (selected && crate::analysis::type_compatible(signature, actual))
+                                .then(|| {
+                                    self.summaries
+                                        .get(name)
+                                        .cloned()
+                                        .map(|summary| (name.clone(), summary))
+                                })
+                                .flatten()
+                        })
+                        .collect::<Vec<_>>();
+                    let before = self.state.clone();
+                    let mut joined = before.clone();
+                    for (name, summary) in candidates {
+                        self.state = before.clone();
+                        self.apply_call_summary(expr, &name, summary, &call_arguments);
+                        if self.state.alive {
+                            joined.join(&self.state);
+                        }
+                    }
+                    self.state = joined;
                 }
                 result
             }
             Expr::BracketApply(_, _) => Access::default(),
-            Expr::Located(..) => unreachable!(),
+            Expr::Located(..) => unreachable!("node() removes source-location wrappers"),
         }
     }
     fn substitute(&self, path: &Path, args: &[Access], site: usize) -> Access {
@@ -1844,6 +1939,7 @@ impl<'a> Pass<'a> {
                 Access::root(path.root.clone())
             }
             Root::Fresh(id, _) => Access::root(Root::Fresh(*id, site)),
+            Root::Function(_) => Access::root(path.root.clone()),
         };
         for key in &path.keys {
             result = self.project(&result, key);
@@ -2019,14 +2115,7 @@ impl<'a> Pass<'a> {
         };
         let result = self.apply_summary(expr, summary, args);
         for access in deferred_mutations {
-            let reachable = self.project(&access, &Key::Descendant);
-            let roots = reachable
-                .refs
-                .into_iter()
-                .map(|reference| reference.path.root)
-                .collect::<BTreeSet<_>>();
-            self.state.many.extend(roots.iter().cloned());
-            self.state.deferred_roots.extend(roots);
+            self.defer_mutations(&access);
         }
         result
     }
@@ -2051,6 +2140,20 @@ impl<'a> Pass<'a> {
                 .many
                 .extend(access.refs.into_iter().map(|r| r.path.root));
         }
+        for root in &summary.deferred_roots {
+            let mut access = self.substitute(
+                &Path {
+                    root: root.clone(),
+                    keys: vec![],
+                },
+                args,
+                site,
+            );
+            if matches!(root, Root::Global(_)) {
+                access.union(&Access::root(root.clone()));
+            }
+            self.defer_mutations(&access);
+        }
         // Validate before and after writes because actual arguments may alias.
         for path in &summary.mutations {
             let access = self.substitute(path, args, site);
@@ -2063,6 +2166,7 @@ impl<'a> Pass<'a> {
         }
         for (name, value) in &summary.globals {
             let value = self.substitute_access(value, args, site);
+            self.retain_deferred_store(&Access::root(Root::Global(name.clone())), &value);
             if let Some(binding) = self.state.globals.get_mut(name) {
                 binding.value.union(&value);
             }
@@ -2071,23 +2175,6 @@ impl<'a> Pass<'a> {
                 .entry(name.clone())
                 .or_default()
                 .union(&value);
-        }
-        for root in &summary.deferred_roots {
-            let access = self.substitute(
-                &Path {
-                    root: root.clone(),
-                    keys: vec![],
-                },
-                args,
-                site,
-            );
-            let reachable = self.project(&access, &Key::Descendant);
-            self.state.deferred_roots.extend(
-                reachable
-                    .refs
-                    .into_iter()
-                    .map(|reference| reference.path.root),
-            );
         }
         let result = self.substitute_access(&summary.returned, args, site);
         if !summary.returns {

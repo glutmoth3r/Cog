@@ -8,6 +8,10 @@ const MARKDOWN: &[(&str, &str)] = &[
     ("docs/LANGUAGE.md", include_str!("../docs/LANGUAGE.md")),
     ("docs/ERRORS.md", include_str!("../docs/ERRORS.md")),
     (
+        "docs/ASYNC_DESIGN.md",
+        include_str!("../docs/ASYNC_DESIGN.md"),
+    ),
+    (
         "docs/STANDARD_LIBRARY.md",
         include_str!("../docs/STANDARD_LIBRARY.md"),
     ),
@@ -23,6 +27,10 @@ const MARKDOWN: &[(&str, &str)] = &[
     (
         "docs/CONTRIBUTING.md",
         include_str!("../docs/CONTRIBUTING.md"),
+    ),
+    (
+        "docs/NUMERIC_TYPES.md",
+        include_str!("../docs/NUMERIC_TYPES.md"),
     ),
 ];
 

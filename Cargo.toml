@@ -1,6 +1,6 @@
 [package]
 name = "cog"
-version = "0.1.0-alpha.1"
+version = "0.1.0-beta.1"
 edition = "2024"
 rust-version = "1.95"
 default-run = "cog"
@@ -18,7 +18,7 @@ exclude = [
 ]
 
 [package.metadata.cog]
-codename = "Tiramisu"
+codename = "Cinamon Roll"
 
 [lib]
 name = "cog"

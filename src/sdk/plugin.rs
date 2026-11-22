@@ -1,3 +1,9 @@
+//! Dynamic loading and lifetime management for C ABI v3 plugins.
+//!
+//! Manifest and descriptor checks establish compatibility, not native memory
+//! safety. The public loading APIs are unsafe because plugin code executes with
+//! host process authority; accepted callbacks retain their library until every
+//! synchronous call and async operation has finished.
 use super::abi::{self, Bytes, Handle, HostV3, Status, ValueView};
 use super::entry_allowed;
 use super::{Effects, Engine, Error, ErrorKind, Permissions, Signature, Type};
@@ -44,6 +50,7 @@ impl Type {
         Ok(match name {
             "any" => Self::Any,
             "int" => Self::Int,
+            "uint" => Self::UInt,
             "str" => Self::Str,
             "bytes" => Self::Bytes,
             "handle" => Self::Handle,
@@ -270,6 +277,8 @@ impl PluginManifest {
                 "plugin library path must be relative to the manifest",
             ));
         }
+        // SAFETY: the public method's caller accepts the trusted-plugin contract;
+        // this wrapper changes only the manifest-relative path.
         unsafe {
             load(
                 engine,
@@ -304,6 +313,8 @@ impl PluginManifest {
                 "plugin library path must be a normalized path inside the package",
             ));
         }
+        // SAFETY: the caller accepted the trusted-plugin contract documented
+        // above; target selection only chooses the declared package library.
         unsafe { load(engine, &package_root.join(library), Some(&self.functions)) }
     }
 }
@@ -493,6 +504,10 @@ impl NativeAsyncFactory for PluginAsyncFactory {
         });
         let wake_pointer = (&*wake as *const WakeRegistration).cast_mut().cast();
         let mut operation = std::ptr::null_mut();
+        // SAFETY: this callback came from a descriptor accepted by the unsafe
+        // loader, and `state` retains the library. The frame, argument handles,
+        // and boxed wake registration stay live through `start`; ABI v3 forbids
+        // retaining the frame/handles and requires failed starts to clean up.
         let status = unsafe {
             (self.start)(
                 self.state.state,
@@ -537,6 +552,9 @@ impl NativeAsyncOperation for PluginAsyncOperation {
             remaining_bytes,
         };
         let mut result = 0;
+        // SAFETY: the accepted callback and its library remain alive through this
+        // operation's retained state. The poll frame/output are call-scoped, as
+        // required by ABI v3, and the operation itself is still owned here.
         let status = unsafe {
             (self.poll)(
                 self.state.state,
@@ -571,6 +589,9 @@ impl NativeAsyncOperation for PluginAsyncOperation {
             self.wake
                 .active
                 .store(false, std::sync::atomic::Ordering::Release);
+            // SAFETY: the descriptor supplied this callback under the trusted
+            // ABI contract; its operation state and library are still retained.
+            // The plugin must stop and join workers before `cancel` returns.
             unsafe { (self.cancel)(self.state.state, self.operation) };
         }
     }
@@ -581,6 +602,9 @@ impl Drop for PluginAsyncOperation {
         self.wake
             .active
             .store(false, std::sync::atomic::Ordering::Release);
+        // SAFETY: the descriptor supplied this callback under the trusted ABI
+        // contract. The operation and library remain alive through the call, and
+        // ABI v3 requires all workers to stop before destruction returns.
         unsafe { (self.destroy)(self.state.state, self.operation) };
     }
 }
@@ -588,6 +612,9 @@ impl Drop for LibraryState {
     fn drop(&mut self) {
         // The library field remains alive until after this destructor returns.
         if let Some(destroy) = self.destroy {
+            // SAFETY: this callback was loaded from the trusted descriptor, and
+            // `state` is the pointer returned by its matching `create` callback.
+            // `LibraryState` is released once, after its last callback reference.
             unsafe {
                 destroy(self.state);
             }
@@ -603,6 +630,7 @@ impl Engine {
     /// Same requirements as PluginManifest::load. Size/version checks detect
     /// compatibility mistakes; they cannot validate arbitrary native pointers.
     pub unsafe fn load_plugin(&mut self, path: &Path) -> Result<(), Error> {
+        // SAFETY: the caller supplies the trust guarantee required by this API.
         unsafe { load(self, path, None) }
     }
 }
@@ -617,7 +645,10 @@ enum PluginCallbacks {
     },
 }
 
-// The unsafe caller guarantees descriptor storage for the lifetime of library.
+// SAFETY: the caller must guarantee that `bytes` points to readable immutable
+// storage in the loaded library for the returned borrow's full lifetime. The
+// length is bounded here, but raw pointer validity can only come from the ABI
+// contract and the unsafe trust boundary in `load`.
 unsafe fn view<'a>(bytes: Bytes, limit: usize) -> Result<&'a [u8], Error> {
     if bytes.len > limit || (bytes.len != 0 && bytes.data.is_null()) {
         return Err(failure("invalid plugin byte view"));
@@ -629,6 +660,12 @@ unsafe fn view<'a>(bytes: Bytes, limit: usize) -> Result<&'a [u8], Error> {
     }
 }
 
+/// Parse a plugin descriptor and register its callbacks.
+///
+/// # Safety
+/// The caller must trust the library and all dependencies to obey C ABI v3.
+/// Descriptor pointers must reference immutable readable storage until unload;
+/// callbacks must obey thread, lifetime, panic, wakeup, and cleanup rules.
 unsafe fn load(
     engine: &mut Engine,
     path: &Path,
@@ -640,10 +677,19 @@ unsafe fn load(
     let path = path
         .canonicalize()
         .map_err(|error| failure(format!("cannot resolve plugin {}: {error}", path.display())))?;
+    // SAFETY: this function is reachable only through an unsafe public loader;
+    // its caller must trust the library because loading can execute initializers.
     let library = unsafe { libloading::Library::new(&path) }.map_err(|e| failure(e.to_string()))?;
+    // SAFETY: the caller guarantees this trusted library exports the ABI v3 entry
+    // with the declared C signature. The `Symbol` borrow keeps the library alive.
     let entry: libloading::Symbol<'_, unsafe extern "C" fn() -> *const abi::PluginV3> =
         unsafe { library.get(b"cog_plugin_v3\0") }.map_err(|e| failure(e.to_string()))?;
+    // SAFETY: ABI v3 defines the entrypoint as a callable C function returning
+    // descriptor storage that stays valid until this library is unloaded.
     let descriptor = unsafe { entry() };
+    // SAFETY: the unsafe caller promises descriptor and function-table storage
+    // remains readable and immutable until unload. The checks below validate
+    // declared sizes/counts, but cannot validate arbitrary native addresses.
     if descriptor.is_null()
         || unsafe { descriptor.cast::<u32>().read() } != size_of::<abi::PluginV3>() as u32
     {
@@ -752,7 +798,12 @@ unsafe fn load(
     });
     let mut state = state;
     if let Some(create) = descriptor.create {
-        let status = unsafe { create(&mut Rc::get_mut(&mut state).unwrap().state) };
+        let state = &mut Rc::get_mut(&mut state)
+            .expect("library state has not been shared before create")
+            .state;
+        // SAFETY: the callback was validated from the trusted descriptor, and
+        // this writable state slot belongs to the newly created LibraryState.
+        let status = unsafe { create(state) };
         if status != abi::OK {
             return Err(failure(format!("plugin initialization failed ({status})")));
         }
@@ -858,6 +909,9 @@ fn call(
             .map_err(|_| failure("native handle budget exceeded"))?;
     }
     let mut result = 0;
+    // SAFETY: `invoke` is a trusted descriptor callback whose library is retained
+    // by `state`. The host owns `frame`, handles, and output until it returns, and
+    // ABI v3 requires synchronous callbacks to use them only on this thread.
     let status = unsafe {
         invoke(
             state.state,
@@ -888,7 +942,9 @@ fn guarded(action: impl FnOnce() -> Result<(), Status>) -> Status {
         Err(_) => abi::PANIC,
     }
 }
-// A trusted caller may only use this pointer synchronously on the calling thread.
+// SAFETY: `context` is the active `Frame` pointer passed by the host to this
+// synchronous callback. The plugin contract forbids retaining it or using it on
+// another thread; callback entry points reject null before calling this helper.
 unsafe fn frame<'a>(context: *mut c_void) -> &'a mut Frame<'a, 'a, 'a> {
     unsafe { &mut *context.cast::<Frame<'a, 'a, 'a>>() }
 }
@@ -901,6 +957,8 @@ unsafe extern "C" fn inspect(
         if context.is_null() || output.is_null() {
             return Err(abi::INVALID);
         }
+        // SAFETY: HOST invokes this with the active host-owned call frame, which
+        // remains live until this synchronous callback returns.
         let value = unsafe { frame(context) }.get(handle)?;
         let mut view = ValueView::default();
         view.kind = match &value.0 {
@@ -942,6 +1000,8 @@ unsafe extern "C" fn inspect(
             VmValue::Error(_) => abi::ERROR_VALUE,
             _ => abi::OPAQUE_VALUE,
         };
+        // SAFETY: ABI v3 requires a writable output view for the duration of the
+        // callback; null is rejected above.
         unsafe {
             output.write(view);
         }
@@ -957,7 +1017,10 @@ unsafe extern "C" fn make(
         if context.is_null() || input.is_null() || output.is_null() {
             return Err(abi::INVALID);
         }
+        // SAFETY: HOST passes the active host-owned frame for this callback.
         let frame = unsafe { frame(context) };
+        // SAFETY: the trusted plugin supplies a readable `ValueView` that remains
+        // valid until this host callback returns; null was rejected above.
         let input = unsafe { &*input };
         let value = match input.kind {
             1 => Value::int(input.integer as i64),
@@ -972,6 +1035,8 @@ unsafe extern "C" fn make(
             5 => Value::nil(),
             2 => {
                 frame.charge(input.bytes.len)?;
+                // SAFETY: the plugin supplies this readable byte view for the
+                // duration of the callback, as required by ABI v3.
                 let bytes =
                     unsafe { view(input.bytes, isize::MAX as usize) }.map_err(|_| abi::INVALID)?;
                 Value::string(std::str::from_utf8(bytes).map_err(|_| abi::INVALID)?)
@@ -989,6 +1054,8 @@ unsafe extern "C" fn make(
                 let items = if input.len == 0 {
                     &[]
                 } else {
+                    // SAFETY: ABI v3 requires `items` to reference `len` readable
+                    // handles; the length and null case were checked above.
                     unsafe { std::slice::from_raw_parts(input.items, input.len) }
                 };
                 let mut values = Vec::new();
@@ -1001,6 +1068,8 @@ unsafe extern "C" fn make(
             _ => return Err(abi::TYPE_MISMATCH),
         };
         let handle = frame.push(value)?;
+        // SAFETY: ABI v3 requires a writable output handle for this callback;
+        // null was rejected above.
         unsafe {
             output.write(handle);
         }
@@ -1017,12 +1086,15 @@ unsafe extern "C" fn array_get(
         if context.is_null() || output.is_null() {
             return Err(abi::INVALID);
         }
+        // SAFETY: HOST passes the active host-owned frame for this callback.
         let frame = unsafe { frame(context) };
         let value = frame
             .get(array)?
             .array_get(index)
             .map_err(|_| abi::INVALID)?;
         let handle = frame.push(value)?;
+        // SAFETY: ABI v3 requires a writable output handle for this callback;
+        // null was rejected above.
         unsafe {
             output.write(handle);
         }
@@ -1039,6 +1111,7 @@ unsafe extern "C" fn array_set(
         if context.is_null() {
             return Err(abi::INVALID);
         }
+        // SAFETY: HOST passes the active host-owned frame for this callback.
         let frame = unsafe { frame(context) };
         frame
             .get(array)?
@@ -1051,7 +1124,10 @@ unsafe extern "C" fn write_output(context: *mut c_void, bytes: Bytes) -> Status 
         if context.is_null() {
             return Err(abi::INVALID);
         }
+        // SAFETY: HOST passes the active host-owned frame for this callback.
         let frame = unsafe { frame(context) };
+        // SAFETY: the plugin supplies readable bytes for this callback only;
+        // `view` checks null and the active buffer limit before creating a slice.
         let bytes = unsafe { view(bytes, frame.context.inner.limits.buffer_limit()) }
             .map_err(|_| abi::LIMIT)?;
         frame
@@ -1065,7 +1141,10 @@ unsafe extern "C" fn set_error(context: *mut c_void, bytes: Bytes) -> Status {
         if context.is_null() {
             return Err(abi::INVALID);
         }
+        // SAFETY: HOST passes the active host-owned frame for this callback.
         let frame = unsafe { frame(context) };
+        // SAFETY: the plugin supplies readable error bytes for this callback;
+        // `view` bounds the length before constructing the slice.
         let bytes = unsafe { view(bytes, 64 * 1024) }.map_err(|_| abi::LIMIT)?;
         frame.error = Some(
             std::str::from_utf8(bytes)
@@ -1080,6 +1159,9 @@ unsafe extern "C" fn wake(context: *mut c_void) -> Status {
         if context.is_null() {
             return Err(abi::INVALID);
         }
+        // SAFETY: the plugin receives this pointer only with `start`; the boxed
+        // registration is kept in the operation until cancel/destroy have joined
+        // its workers. Those callbacks must not wake after returning.
         let registration = unsafe { &*context.cast::<WakeRegistration>() };
         if !registration
             .active

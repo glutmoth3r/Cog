@@ -1,3 +1,8 @@
+//! Source ownership, spans, diagnostics, and mapped runtime locations.
+//!
+//! `SourceFile` keeps the original text alive through AST cloning and lowering so
+//! diagnostics can use byte ranges without rewriting source coordinates. Compiled
+//! artifacts retain only compact file/line/column source-map entries, not the text.
 use std::ops::Range;
 use std::rc::Rc;
 

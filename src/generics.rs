@@ -1,4 +1,8 @@
 //! Bounded monomorphization of generic functions after semantic inference.
+//!
+//! Each expansion round checks the current AST, uses call-site facts to discover
+//! specializations, and rechecks the expanded program. The work and instance caps
+//! bound compiler cost; the final check result is passed on to codegen.
 use crate::analysis::{self, CheckResult};
 use crate::ast::{
     Block, Expr, ForClause, FunctionDecl, Item, Program, Stmt, StringPart, TypeAnnotation, TypeKind,

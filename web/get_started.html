@@ -287,17 +287,17 @@ fn main() -&gt; nil {
 <div class="actions"><button class="run" type="button" disabled>Run</button><button class="reset" type="button">Reset</button><span class="run-status" role="status" aria-live="polite"></span></div>
 <div class="result" hidden><div class="output-group"><h3>Output</h3><pre class="output" tabindex="0"></pre></div><div class="diagnostic-group" hidden><h3>Diagnostics</h3><pre class="diagnostics" tabindex="0"></pre></div></div>
 <p class="exercise"><strong>Try it:</strong> Change the separator, then browse <a href="../docs/STANDARD_LIBRARY.md">the standard library reference</a> for filesystem, process, math, and collection APIs.</p></section>
-<section id="comptime" class="lesson"><h2>13. Compile-time evaluation</h2><p><code> const</code> evaluates a binding before runtime code is generated. A <code> fn</code> can compute reusable values; its call is evaluated during compilation and the result is materialized for the program. The function itself does not run in the VM.</p>
+<section id="comptime" class="lesson"><h2>13. Compile-time evaluation</h2><p><code>@comptime const</code> evaluates a binding before runtime code is generated. An <code>@comptime fn</code> can compute reusable values; its call is evaluated during compilation and the result is materialized for the program. The function itself does not run in the VM.</p>
 <label class="editor-label" for="code-comptime">Cog example</label><textarea class="source" id="code-comptime" rows="13" spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off">@!include("std")
 use io;
 
- const BASE: int = 20;
+@comptime const BASE: int = 20;
 
- fn twice(value: int) -&gt; int {
+@comptime fn twice(value: int) -&gt; int {
     value * 2
 }
 
- const ANSWER: int = twice(BASE) + 2;
+@comptime const ANSWER: int = twice(BASE) + 2;
 
 fn main() -&gt; nil {
     io::println(ANSWER)!!;
@@ -306,7 +306,7 @@ fn main() -&gt; nil {
 <div class="actions"><button class="run" type="button" disabled>Run</button><button class="reset" type="button">Reset</button><span class="run-status" role="status" aria-live="polite"></span></div>
 <div class="result" hidden><div class="output-group"><h3>Output</h3><pre class="output" tabindex="0"></pre></div><div class="diagnostic-group" hidden><h3>Diagnostics</h3><pre class="diagnostics" tabindex="0"></pre></div></div>
 <p class="exercise"><strong>Try it:</strong> Change <code>BASE</code> and observe the result. See <a href="../docs/LANGUAGE.md#compile-time-evaluation">the language reference</a> for supported comptime operations and current limits.</p></section>
-<section class="next"><h2>Next: modules and projects</h2><p>Use <code>cog init my-app</code> to create a project. Modules follow source filenames; <code>use</code> imports names and <code>public</code> exposes declarations to other modules.</p><p>Try the <a href="../examples/modules/README.md">modules example</a> and <a href="../examples/package_include/">package inclusion example</a>, then read the <a href="../docs/PROJECT_FORMATS.md">project guide</a>. The <a href="../docs/LANGUAGE.md">language reference</a> covers further details and current limitations.</p><p>This tutorial uses implemented syntax. Typed arrays, scalar and struct compile-time evaluation, type aliases, extension methods, inferred specialization of generic functions and structs, and statically dispatched traits are available. Closures and JIT remain future work; see the <a href="../examples/README.md">examples</a> and <a href="../docs/LANGUAGE.md#compile-time-evaluation">language reference</a>.</p></section>
+<section class="next"><h2>Next: modules and projects</h2><p>Use <code>cog init my-app</code> to create a project. Modules follow source filenames; <code>use</code> imports names and <code>public</code> exposes declarations to other modules.</p><p>Try the <a href="../examples/modules/README.md">modules example</a> and <a href="../examples/package_include/">package inclusion example</a>, then read the <a href="../docs/PROJECT_FORMATS.md">project guide</a>. The <a href="../docs/LANGUAGE.md">language reference</a> covers further details and current limitations.</p><p>This tutorial uses implemented syntax. Typed arrays, scalar and struct compile-time evaluation, type aliases, extension methods, inferred specialization of generic functions and structs, and statically dispatched traits are available. Cog also supports closures with explicit captures and an experimental, opt-in Cranelift JIT; see the <a href="../examples/README.md">examples</a>, <a href="../docs/LANGUAGE.md">language reference</a>, and <a href="../docs/JIT_DESIGN.md">JIT design</a>.</p></section>
 <footer>Cog is experimental. <a href="../ROADMAP.md">Roadmap</a> · <a href="README.md">Tutorial setup and tests</a></footer></main></div>
 <script>
 (() => {

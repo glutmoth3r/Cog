@@ -1292,3 +1292,267 @@ fn jit_enum_and_variant_type_tests_match_vm() {
 fn jit_error_variant_type_test_falls_back_to_vm_matching() {
     assert_jit_fallback_matches_vm(JIT_ERROR_VARIANT_FALLBACK_SOURCE, "error-variant", "6000\n");
 }
+
+#[test]
+fn jit_bridges_recursive_calls_and_lexical_cleanup() {
+    assert_jit_matches_vm(
+        r#"
+        @!include("std") use io; use err::Error;
+        var trace = 0;
+
+        @inline("never")
+        fn descend(depth: int) -> int {
+            trace += 1;
+            if depth == 0 { return 7; }
+            descend(depth - 1)
+        }
+
+        @inline("never")
+        fn step(index: int) -> int {
+            defer { trace += 10; }
+            const value = descend(3);
+            if index == 9999 { return (value / (index - 9999))!!; }
+            value
+        }
+
+        fn work(n: int) -> int {
+            var i = 0;
+            var total = 0;
+            while i < n {
+                try {
+                    total += step(i);
+                } catch(error) {
+                    when error is Error::DivisionByZero { total += 100; }
+                    else { error!!; }
+                }
+                i += 1;
+            }
+            total
+        }
+
+        fn main() {
+            io::println(work(10000));
+            io::println(trace);
+        }
+        "#,
+        "bridge-recursive-cleanup",
+        "70093\n140000\n",
+    );
+}
+
+#[test]
+fn jit_bridges_named_targets_and_nested_mutable_captures() {
+    assert_jit_matches_vm(
+        r#"
+        @!include("std") use io;
+        fn plain(x: int) -> int { x * 2 }
+
+        fn make() -> fn(int) -> int {
+            var total = 0;
+            const inner = fn[var total](x: int) -> int { total += 1; x + total };
+            const outer = fn[inner](x: int) -> int { (inner)(x) };
+            outer
+        }
+
+        fn work(n: int, first: fn(int) -> int, second: fn(int) -> int) -> int {
+            var callback = first;
+            var i = 0;
+            var sum = 0;
+            while i < n {
+                if i == 5000 { callback = second; }
+                sum += (callback)(i);
+                i += 1;
+            }
+            sum
+        }
+
+        fn main() { io::println(work(10000, make(), plain)); }
+        "#,
+        "bridge-switch-target",
+        "99995000\n",
+    );
+}
+
+#[test]
+fn jit_bridges_native_mutations_errors_and_retained_reference_results() {
+    use cog::sdk::{Engine, Limits, RunContext, Signature, Type, Value};
+    use std::{cell::Cell, rc::Rc};
+
+    let calls = Rc::new(Cell::new(0));
+    let native_calls = Rc::clone(&calls);
+    let mut engine = Engine::new();
+    engine
+        .register(
+            "host::step",
+            Signature::new(vec![Type::Array, Type::Int], Type::Array)
+                .with_mutating_parameters(vec![0]),
+            move |_, args| {
+                native_calls.set(native_calls.get() + 1);
+                let i = args[1].as_int()?;
+                args[0].array_set(0, Value::int(i))?;
+                if i == 9999 {
+                    args[0].array_get(10)
+                } else {
+                    Ok(args[0].clone())
+                }
+            },
+        )
+        .unwrap();
+    let program = engine
+        .compile(
+            "native-bridge.cog",
+            r#"
+            @!include("std") use io; use host; use err::Error;
+            fn work(n: int) -> int {
+                var array: int[] = [0];
+                const alias = array;
+                var i = 0;
+                var total = 0;
+                while i < n {
+                    try {
+                        const same = host::step(array, i);
+                        total += alias[0];
+                    } catch (error) {
+                        when error is Error { total += alias[0]; }
+                    }
+                    i += 1;
+                }
+                total
+            }
+            fn main() { io::println(work(10000)); }
+            "#,
+        )
+        .unwrap();
+    let program = engine.decode(&program.encode().unwrap()).unwrap();
+    let profile = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("jit-native-bridge-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&profile);
+    for jit in [false, true, true] {
+        calls.set(0);
+        let mut output = Vec::new();
+        program
+            .run_in(
+                &mut RunContext::new(&mut output)
+                    .with_jit(jit)
+                    .with_jit_profile_path(&profile),
+            )
+            .unwrap();
+        assert_eq!(calls.get(), 10000);
+        assert_eq!(output, b"49995000\n");
+    }
+    let data: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&profile).unwrap()).unwrap();
+    assert!(
+        data["functions"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|function| {
+                function["compile_ns"].as_u64().unwrap_or(0) > 0 && function["calibrated"] == true
+            })
+    );
+    std::fs::remove_file(&profile).unwrap();
+
+    for jit in [false, true] {
+        calls.set(0);
+        let mut output = Vec::new();
+        let result = program.run_in(
+            &mut RunContext::new(&mut output)
+                .with_jit(jit)
+                .with_jit_profile_path(&profile)
+                .with_limits(Limits {
+                    max_steps: Some(100),
+                    ..Limits::default()
+                }),
+        );
+        assert!(result.is_err());
+        assert!(!profile.exists());
+        assert!(calls.get() < 100);
+    }
+}
+
+#[test]
+fn jit_roots_bridged_aggregate_results_and_reference_captures_during_gc() {
+    assert_jit_matches_vm(
+        r#"
+        @!include("std") use io;
+
+        @inline("never")
+        fn pair(read: fn() -> int, i: int) -> int[] { [(read)(), i] }
+
+        fn work(n: int, read: fn() -> int) -> int {
+            var sum = 0;
+            var i = 0;
+            while i < n {
+                const values = pair(read, i);
+                sum += values[0] + values[1];
+                i += 1;
+            }
+            sum
+        }
+
+        fn main() {
+            var state: int[] = [7];
+            const read = fn[state]() -> int { state[0] };
+            io::println(work(10000, read));
+            state[0] = 11;
+            io::println(work(10000, read));
+        }
+        "#,
+        "bridge-gc",
+        "50065000\n50105000\n",
+    );
+}
+
+#[test]
+fn jit_bridge_does_not_replay_effects_on_terminal_failure() {
+    let artifact = project::compile_source(
+        "bridge-terminal.cog",
+        r#"
+        @!include("std") use io;
+        @inline("never")
+        fn step(i: int) -> int {
+            if i == 9999 { io::println(i); crash("terminal"); }
+            i
+        }
+        fn work(n: int) -> int {
+            var i = 0;
+            var sum = 0;
+            while i < n { sum += step(i); i += 1; }
+            sum
+        }
+        fn main() { io::println(work(10000)); }
+        "#,
+    )
+    .unwrap();
+    let artifact = cog::bytecode::decode(&cog::bytecode::encode(&artifact).unwrap()).unwrap();
+    let profile = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("jit-terminal-bridge-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&profile);
+    let run = |jit| {
+        let mut output = Vec::new();
+        let mut context = RuntimeContext::new(&mut output, VmCapabilities::default());
+        context.configure_jit(jit, Some(&profile), false);
+        let error = interpreter::run_with_context(&artifact, &mut context).unwrap_err();
+        let location = context.last_source_location().cloned();
+        drop(context);
+        (error.to_string(), location, output)
+    };
+    let vm = run(false);
+    assert_eq!(vm.2, b"9999\n");
+    assert_eq!(run(true), vm);
+    let data: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&profile).unwrap()).unwrap();
+    assert!(
+        data["functions"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|function| {
+                function["compile_ns"].as_u64().unwrap_or(0) > 0 && function["calibrated"] == true
+            })
+    );
+    std::fs::remove_file(&profile).unwrap();
+}

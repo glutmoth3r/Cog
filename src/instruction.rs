@@ -1,3 +1,8 @@
+//! Portable stack-machine instruction definitions.
+//!
+//! The backend emits these instructions; the bytecode codec and verifier inspect
+//! them, and both the interpreter and JIT consume them. Runtime semantics belong
+//! to the interpreter, so a new lowering must preserve its observable behavior.
 use crate::template::ArrayTemplate;
 use crate::value::{RuntimeType, Value};
 use std::rc::Rc;

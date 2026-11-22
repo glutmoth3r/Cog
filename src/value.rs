@@ -1,3 +1,9 @@
+//! Runtime values and their checked aggregate contracts.
+//!
+//! Primitive values are copied directly; shared aggregates, buffers, cells, and
+//! closures carry heap handles and preserve reference-like aliasing. Runtime type
+//! descriptors constrain typed aggregates, while `Error` values may remain stored
+//! at aggregate leaves until an observing operation consumes them.
 use crate::error::RuntimeError;
 use crate::heap::{HeapObject, HeapRef, ObjectKey};
 use num_bigint::BigInt;

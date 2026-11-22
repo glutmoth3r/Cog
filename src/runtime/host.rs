@@ -41,7 +41,7 @@ pub(crate) fn sleep_duration(
         Value::UInt(seconds) => Duration::from_secs(seconds),
         Value::Float(seconds) if seconds < 0.0 => return Err(RuntimeError::NegativeSleep(seconds)),
         Value::Float(seconds) => Duration::try_from_secs_f64(seconds).map_err(|_| invalid(op))?,
-        _ => unreachable!(),
+        _ => unreachable!("time::sleep signature validation requires a numeric value"),
     };
     #[cfg(windows)]
     if windows_timeout_millis(duration) >= u128::from(u32::MAX) {
@@ -199,7 +199,7 @@ fn run_with_cancellation(
         return Err(RuntimeError::PermissionDenied { op });
     }
     let Value::Array(arguments) = &args[1] else {
-        unreachable!()
+        unreachable!("process::run signature validation requires a string array")
     };
     let arguments = arguments
         .try_borrow()
@@ -416,6 +416,8 @@ fn write_process_input(
     #[cfg(unix)]
     {
         let fd = stdin.as_raw_fd();
+        // SAFETY: `stdin` owns this descriptor for the whole loop. These calls
+        // pass no pointers and only inspect/change flags on that live descriptor.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
             return Err(io::Error::last_os_error());

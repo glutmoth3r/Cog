@@ -1,4 +1,9 @@
-//! Versioned portable bytecode, distinct from the in-memory Value graph.
+//! Versioned portable bytecode, distinct from the in-memory `Value` graph.
+//!
+//! Encoding and decoding share one validator so compiler output and loaded
+//! artifacts face the same structural checks. The decoder bounds file sizes,
+//! allocations, constants, and type descriptors before constructing an executable
+//! program; live host pointers and managed runtime objects are never serialized.
 use crate::backend::{CallableSignature, CompiledProgram, SourceMapEntry};
 use crate::instruction::{Instruction, ValueType};
 use crate::runtime::{NativeImport, NativeType};
@@ -414,7 +419,11 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
     if r.take(4)? != MAGIC {
         return Err("invalid bytecode magic; expected a .cogb file".into());
     }
-    let version = u16::from_le_bytes(r.take(2)?.try_into().unwrap());
+    let version = u16::from_le_bytes(
+        r.take(2)?
+            .try_into()
+            .expect("Reader::take returned the requested width"),
+    );
     if version != VERSION {
         return Err(format!(
             "unsupported bytecode version {version}; expected {VERSION}"
@@ -433,7 +442,11 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
         .map_err(|_| "cannot allocate runtime import table")?;
     for _ in 0..import_count {
         let name = r.string()?;
-        let version = u16::from_le_bytes(r.take(2)?.try_into().unwrap());
+        let version = u16::from_le_bytes(
+            r.take(2)?
+                .try_into()
+                .expect("Reader::take returned the requested width"),
+        );
         let arity = r.index()?;
         if arity > 64 {
             return Err("invalid runtime import arity".into());
@@ -1084,6 +1097,8 @@ struct Reader<'a> {
 }
 impl<'a> Reader<'a> {
     fn take(&mut self, count: usize) -> Result<&'a [u8]> {
+        // Success means the returned slice has exactly `count` bytes; fixed-width
+        // conversions below rely on that check rather than file contents.
         let end = self
             .pos
             .checked_add(count)
@@ -1097,7 +1112,11 @@ impl<'a> Reader<'a> {
         Ok(self.take(1)?[0])
     }
     fn index(&mut self) -> Result<usize> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()) as usize)
+        Ok(u32::from_le_bytes(
+            self.take(4)?
+                .try_into()
+                .expect("Reader::take returned the requested width"),
+        ) as usize)
     }
     fn string_slice(&mut self) -> Result<&'a str> {
         let count = self.index()?;
@@ -1124,8 +1143,16 @@ impl<'a> Reader<'a> {
     fn value(&mut self) -> Result<Value> {
         self.budget.node(0)?;
         Ok(match self.byte()? {
-            0 => Value::Int(i64::from_le_bytes(self.take(8)?.try_into().unwrap())),
-            8 => Value::UInt(u64::from_le_bytes(self.take(8)?.try_into().unwrap())),
+            0 => Value::Int(i64::from_le_bytes(
+                self.take(8)?
+                    .try_into()
+                    .expect("Reader::take returned the requested width"),
+            )),
+            8 => Value::UInt(u64::from_le_bytes(
+                self.take(8)?
+                    .try_into()
+                    .expect("Reader::take returned the requested width"),
+            )),
             9 => {
                 let length = self.index()?;
                 self.budget.string(length)?;
@@ -1136,14 +1163,22 @@ impl<'a> Reader<'a> {
                 }
                 Value::BigInt(number)
             }
-            1 => Value::Float(f64::from_le_bytes(self.take(8)?.try_into().unwrap())),
+            1 => Value::Float(f64::from_le_bytes(
+                self.take(8)?
+                    .try_into()
+                    .expect("Reader::take returned the requested width"),
+            )),
             2 => Value::Bool(match self.byte()? {
                 0 => false,
                 1 => true,
                 _ => return Err("invalid bytecode boolean".into()),
             }),
             7 => {
-                let scalar = u32::from_le_bytes(self.take(4)?.try_into().unwrap());
+                let scalar = u32::from_le_bytes(
+                    self.take(4)?
+                        .try_into()
+                        .expect("Reader::take returned the requested width"),
+                );
                 Value::Char(char::from_u32(scalar).ok_or("invalid bytecode Unicode scalar")?)
             }
             3 => Value::Nil,

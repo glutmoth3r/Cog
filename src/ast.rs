@@ -1,3 +1,9 @@
+//! Source-level syntax shared by parsing, resolution, checking, and lowering.
+//!
+//! Located expression and statement nodes preserve source origins as the tree is
+//! cloned for module linking and specialization. This is compiler input, not a
+//! runtime representation; compiler-only nodes must be resolved or rejected
+//! before code generation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub items: Vec<Item>,

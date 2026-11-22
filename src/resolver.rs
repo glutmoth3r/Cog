@@ -1,4 +1,9 @@
-//! Resolve module/package paths and lexical imports once, before type checking.
+//! Resolve module/package paths, declarations, and lexical imports before checking.
+//!
+//! The resolver combines package-owned source modules, assigns compiler identities,
+//! and binds imports so semantic analysis and codegen do not repeat filesystem
+//! lookup. It does not load native plugin code; that remains an explicit runtime
+//! boundary.
 //! Bound declarations use unspellable internal names; source spans remain intact.
 use crate::ast::*;
 use crate::builtins::Builtin;
@@ -821,7 +826,7 @@ impl Resolver {
                 let generic = matches!(receiver.node(), Expr::Ident(name) if self.generic_symbols.contains(name));
                 if generic {
                     let Expr::Ident(symbol) = receiver.node() else {
-                        unreachable!()
+                        unreachable!("generic receiver was matched as an identifier")
                     };
                     let symbol = symbol.clone();
                     if !self.type_symbols.contains(&symbol) {

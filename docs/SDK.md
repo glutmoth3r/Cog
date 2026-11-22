@@ -149,7 +149,10 @@ program.run_in(&mut context)?;
 The experimental Cranelift JIT is opt-in with `RunContext::with_jit(true)`.
 `with_jit_profile_path` selects its advisory APE profile, and
 `with_jit_debug(true)` prints selection and fallback diagnostics. Configured
-runtime limits keep execution in the interpreter.
+runtime limits keep execution in the interpreter. A synchronous import called
+from compiled code uses the usual linked dispatch, including permission
+checks, native Errors, and callback-scoped handles. Programs retain their
+linked native library for the lifetime of the import.
 
 ## Independently built CLI plugins
 

@@ -85,10 +85,47 @@ fn separately_compiled_rust_plugin_uses_c_abi_and_contains_panics() {
     unsafe { engine.load_plugin(&output) }.unwrap();
     let program = engine.compile("plugin.cog", "@!include(\"std\") use io; use host; use err; fn main() { io::println(host::double(21)); try { host::fail(); } catch(e) { io::println(e.error_kind()); } }").unwrap();
     let program = engine.decode(&program.encode().unwrap()).unwrap();
+    let hot = engine
+        .compile(
+            "hot-plugin.cog",
+            r#"
+        @!include("std") use io; use host;
+        fn work(n: int) -> int {
+            var i = 0;
+            var total = 0;
+            while i < n { total += host::double(i); i += 1; }
+            total
+        }
+        fn main() { io::println(work(10000)); }
+    "#,
+        )
+        .unwrap();
+    let hot = engine.decode(&hot.encode().unwrap()).unwrap();
     drop(engine);
     let mut result = Vec::new();
     program.run(&mut result).unwrap();
     assert_eq!(result, b"42\nNativeFailure\n");
+    let profile = directory.0.join("jit-profile.json");
+    for jit in [false, true, true] {
+        let mut output = Vec::new();
+        hot.run_in(
+            &mut cog::sdk::RunContext::new(&mut output)
+                .with_jit(jit)
+                .with_jit_profile_path(&profile),
+        )
+        .unwrap();
+        assert_eq!(output, b"99990000\n");
+    }
+    let data: serde_json::Value = serde_json::from_slice(&std::fs::read(profile).unwrap()).unwrap();
+    assert!(
+        data["functions"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|function| {
+                function["compile_ns"].as_u64().unwrap_or(0) > 0 && function["calibrated"] == true
+            })
+    );
 }
 
 #[test]
@@ -123,6 +160,29 @@ fn plugin_manifests_are_strict_bounded_and_never_load_libraries() {
         })
         .unwrap();
     assert!(manifest.register_metadata(&mut duplicate).is_err());
+}
+
+#[test]
+fn native_manifests_accept_unsigned_integer_parameters_and_results() {
+    let function = r#"function "host::identity" result="uint" { param "uint"; }"#;
+    let external = PluginManifest::parse(&format!(
+        "plugin version=1 library=\"plugin.so\"\n{function}",
+    ))
+    .unwrap();
+    let package_source = format!(
+        r#"package "unsigned" version="1" {{
+    plugin version=1 library="plugin.so" {{
+        {function}
+    }}
+}}"#
+    );
+    let package =
+        cog::config::package_from_source(Path::new("package.kdl"), &package_source).unwrap();
+    for manifest in [&external, &package.plugins[0]] {
+        let functions = manifest.functions();
+        assert_eq!(functions[0].1.parameters, [Type::UInt]);
+        assert_eq!(functions[0].1.result, Type::UInt);
+    }
 }
 
 #[test]
@@ -333,7 +393,7 @@ fn c_plugin_validates_handles_and_pins_state_and_library_until_program_drops() {
     let mut engine = Engine::new();
     unsafe { engine.load_plugin(&library) }.unwrap();
     let source = format!(
-        "@!include(\"std\") use io; use host; use err; fn main() {{ host::probe({}); host::probe(-4); io::println(host::probe(1)); try {{ host::probe(-1); }} catch(e) {{ io::println(e.error_kind()); }} io::println(host::probe(-2)); try {{ host::probe(0); }} catch(e) {{ io::println(e.error_kind()); }} try {{ host::probe(-3); }} catch(e) {{ io::println(e.error_kind()); }} }}",
+        "@!include(\"std\") use io; use host; use err; fn main() {{ host::probe({}); host::probe(-4); io::println(host::probe(1)); try {{ host::probe(-1); }} catch(e) {{ io::println(e.error_kind()); }} io::println(host::probe(-2)); io::println(host::probe(18446744073709551616)); try {{ host::probe(0); }} catch(e) {{ io::println(e.error_kind()); }} try {{ host::probe(-3); }} catch(e) {{ io::println(e.error_kind()); }} }}",
         serde_json::to_string(marker.to_str().unwrap()).unwrap()
     );
     let program = engine
@@ -345,7 +405,7 @@ fn c_plugin_validates_handles_and_pins_state_and_library_until_program_drops() {
     program.run(&mut output).unwrap();
     assert_eq!(
         output,
-        b"1\nNativeFailure\n2\nNativeFailure\nNativeFailure\n"
+        b"1\nNativeFailure\n2\n18446744073709551616\nNativeFailure\nNativeFailure\n"
     );
     assert!(!marker.exists(), "program retains the library's state");
     drop(program);

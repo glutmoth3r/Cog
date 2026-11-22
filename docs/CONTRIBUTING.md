@@ -24,6 +24,43 @@ A guide to the source tree, local checks, and performance tools.
 | `web/` | Interactive tutorial and local TypeScript server |
 | `benches/`, `src/bin/bench_*.rs` | Performance tools |
 
+## Compilation and execution path
+
+For in-memory source, `project::compile_source` coordinates the pipeline. A
+filesystem project follows `project::prepare` → `Prepared::resolve` →
+`Loaded::compile`, retaining package and build-input context along the way.
+
+```text
+lexer/parser → resolver → comptime evaluation → generic specialization + semantic checks
+             → codegen → backend optimizer → bytecode verifier → .cogb / VM
+```
+
+`frontend` tokenizes and parses one source file and can return a partial AST for
+diagnostics. `resolver` joins package modules and binds names before checking.
+`project` evaluates compile-time declarations before runtime lowering.
+`generics::expand` asks `analysis` for type, effect, and call-site facts, then
+rechecks generated specializations; `codegen` consumes those facts to emit
+instructions. `backend::Emitter::finish` patches labels, runs the bounded optimizer,
+and validates its output. If optimized output fails validation, it checks and
+returns the original emitted program instead.
+
+`bytecode::encode` and `decode` both validate through `verifier`. The verifier
+rejects malformed control flow, frame layouts, call contracts, and invalid local
+uses, and tracks bounded value-flow facts. It is not a complete static type proof:
+the VM still checks dynamic values and produces the canonical runtime Errors.
+The interpreter defines observable execution behavior. The opt-in JIT may enter a
+verified synchronous loop at a supported empty-stack OSR point. Synchronous
+runtime helpers can return results to machine code. Unsupported operations and
+checked machine faults restore the corresponding VM instruction. A bridged
+operation that returns an Error resumes at its successor.
+See [runtime and bytecode](RUNTIME.md), [JIT design](JIT_DESIGN.md), and
+[async design](ASYNC_DESIGN.md) for their detailed contracts.
+
+Managed values use `heap::HeapRef` roots and the tracing collector in `heap`;
+host resources and context-scoped handles live in `runtime`. The async scheduler
+owns task outcomes and joins spawned children. SDK and C plugin ownership rules
+are documented in [SDK](SDK.md) and [async design](ASYNC_DESIGN.md).
+
 ## Validation
 
 ```sh
@@ -43,6 +80,11 @@ Feature regressions cover source compilation, bytecode round trips, VM execution
 error paths, and cleanup. Project tests cover discovery, manifests, dependencies,
 locks, caching, and CLI behavior. Assembler, loader, and runtime tests exercise the
 lower-level interfaces directly.
+
+For targeted investigation, start with [semantic contracts](../tests/semantic_contracts.rs),
+[bytecode security](../tests/bytecode_security.rs),
+[runtime behavior](../tests/runtime.rs),
+[project behavior](../tests/projects.rs), or [JIT equivalence](../tests/jit.rs).
 
 `tests/documentation.rs` compiles the standalone Cog examples in Markdown and HTML.
 `tests/examples.rs` runs the learning examples and interactive input/EOF cases,

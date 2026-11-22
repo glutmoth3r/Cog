@@ -25,7 +25,7 @@ infer `uint`; larger values infer `bigint`. The negative value
 `uint` or `bigint` type also gives integer literals their type in supported typed
 contexts.
 
-```cog
+```text
 const ordinary: int = 42;
 const contextual: uint = 42;
 const limit: uint = 18446744073709551615;
@@ -40,7 +40,7 @@ integer literals support digit separators.
 An expected `uint` type selects `uint` for small nonnegative literals in typed
 contexts:
 
-```cog
+```text
 fn repeat(count: uint) -> uint { return count + 1; }
 const next = repeat(4);
 ```
@@ -88,7 +88,7 @@ The implementation includes:
   including BigInt use as a `Map` key;
 - JSON parsing/stringification, where integer tokens map by range to `int`,
   `uint`, or `bigint` and serialize as exact JSON integers;
-- bytecode value/type tags in `.cogb` v15, with canonical signed little-endian
+- bytecode value/type tags in `.cogb`, with canonical signed little-endian
   BigInt constants and a distinct runtime type tag;
 - the native ABI, with an explicit unsigned 64-bit payload and type tag. C ABI v3
   uses a `uint64_t` integer field while preserving signed `int` through its bits.

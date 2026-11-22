@@ -553,6 +553,138 @@ fn closure_heap_and_global_stores_preserve_readonly_aliases() {
 }
 
 #[test]
+fn named_function_values_preserve_global_effects_through_indirect_calls() {
+    for invocation in [
+        "const callback: fn() -> nil = change; (callback)();",
+        "invoke(change);",
+        "const holder = Holder(change); (holder.callback)();",
+        "const callback = select(); (callback)();",
+    ] {
+        rejects(
+            &format!(
+                r#"
+                const protected = [10];
+                var shared = [1];
+                struct Holder {{ callback: fn() -> nil }}
+                fn change() -> nil {{ shared = protected; }}
+                fn invoke(callback: fn() -> nil) -> nil {{ (callback)(); }}
+                fn select() -> fn() -> nil {{ change }}
+                fn main() {{ {invocation} shared << 99; }}
+                "#
+            ),
+            "cannot mutate",
+        );
+    }
+    assert_eq!(
+        run(
+            "fn increment(value: int) -> int { value + 1 } fn main() { const callback: fn(int) -> int = increment; io::println((callback)(41)); }"
+        ),
+        "42\n"
+    );
+    assert_eq!(
+        run(
+            "const protected = [10]; var shared = [1]; fn change() -> nil { shared = protected; } fn noop() -> nil {} fn main() { const unused: fn() -> nil = change; const callback: fn() -> nil = noop; (callback)(); shared << 2; io::println(shared); }"
+        ),
+        "[1, 2]\n"
+    );
+    rejects(
+        "const protected = [10]; var shared = [1]; struct Holder { item: int[] } fn change(holder: Holder) -> nil { shared = holder.item; } fn main() { const callback: fn(Holder) -> nil = change; (callback)(Holder(protected)); shared << 99; }",
+        "cannot mutate",
+    );
+    rejects(
+        "const protected = [10]; var shared = [1]; struct Holder { item: int[] } fn change(holder: Holder) -> nil { shared = holder.item; } fn invoke(callback: fn(Holder) -> nil, holder: Holder) -> nil { (callback)(holder); } fn main() { invoke(change, Holder(protected)); shared << 99; }",
+        "cannot mutate",
+    );
+}
+
+#[test]
+fn immutable_function_values_can_replace_a_mutable_capture() {
+    assert_eq!(
+        run(r#"
+        fn first() -> int { 1 }
+        fn second() -> int { 2 }
+        fn main() {
+            var callback: fn() -> int = first;
+            const other: fn() -> int = second;
+            const replace = fn[var callback, other]() -> nil { callback = other; };
+            (replace)();
+            io::println((callback)());
+        }
+        "#),
+        "2\n"
+    );
+}
+
+#[test]
+fn closures_cannot_mutate_readonly_aliases_stored_after_creation() {
+    for body in [
+        r#"
+        var shared = [1];
+        fn main() {
+            const callback = fn[]() -> nil { shared << 99; };
+            const protected = [10];
+            shared = protected;
+            (callback)();
+        }
+        "#,
+        r#"
+        var shared = [1];
+        fn make() -> fn() -> nil {
+            const callback = fn[]() -> nil { shared << 99; };
+            callback
+        }
+        fn main() {
+            const callback = make();
+            const protected = [10];
+            shared = protected;
+            (callback)();
+        }
+        "#,
+        r#"
+        fn main() {
+            var holder = {item: [1]};
+            const callback = fn[var holder]() -> nil { holder.item << 99; };
+            const protected = [10];
+            holder.item = protected;
+            (callback)();
+        }
+        "#,
+        r#"
+        var shared = [1];
+        fn main() {
+            const protected = [10];
+            const callback = fn[protected]() -> nil { shared = protected; };
+            shared = [2];
+            (callback)();
+            shared << 99;
+        }
+        "#,
+        r#"
+        fn make(holder) -> fn() -> nil {
+            var current = holder;
+            const callback = fn[var current]() -> nil { current.item << 99; };
+            callback
+        }
+        fn main() {
+            var holder = {item: [1]};
+            const callback = make(holder);
+            const protected = [10];
+            holder.item = protected;
+            (callback)();
+        }
+        "#,
+    ] {
+        rejects(body, "read-only");
+    }
+    assert_eq!(
+        run(
+            "fn main() { var holder = {item: [1]}; const callback = fn[var holder]() -> nil { holder.item << 99; }; holder.item = [2]; (callback)(); io::println(holder.item); }"
+        ),
+        "[2, 99]\n"
+    );
+}
+
+#[test]
 fn terminal_helpers_and_infinite_loops_do_not_justify_unreachable_writes() {
     rejects(
         "fn stop() { crash(\"stop\"); } fn main() { var a = [1]; stop(); a << 2; }",

@@ -4,7 +4,8 @@
 //! weak object references, traces their Cog-value edges, and breaks unreachable
 //! graph cycles before the last strong references are released. Registry growth
 //! is fallible; allocation of the `Rc` payload still follows the host allocator's
-//! infallible API.
+//! infallible API. VM values, closures, task captures, and retained SDK `Value`s
+//! are roots; collection must preserve every object reachable from those roots.
 
 use std::any::Any;
 use std::cell::RefCell;

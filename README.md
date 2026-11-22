@@ -32,6 +32,10 @@ fn main() -> nil {
 
 Save this as `hello.cog`, then run `cog run hello.cog`.
 
+Use the [documentation index](docs/README.md) to find the [language reference](docs/LANGUAGE.md),
+[runtime and bytecode guide](docs/RUNTIME.md), [project formats](docs/PROJECT_FORMATS.md),
+[Rust SDK](docs/SDK.md), and [contributor guide](docs/CONTRIBUTING.md).
+
 ## Build and install
 
 You need Rust 1.95 or newer and Cargo. From this directory:
@@ -149,15 +153,6 @@ supported primitive and nested container types. Generic structs support inferred
 compile-time type parameters and applied type annotations. Nullable and Error flow
 facts refine supported branches and are conservatively invalidated by writes and
 calls.
-
-## Learn more
-
-- [Documentation index](docs/README.md) and [language reference](docs/LANGUAGE.md)
-- [Getting started](web/get_started.html), an interactive local tutorial; start it
-  with `node web/server.mts` (Node.js 24.12+)
-- [Examples](examples/README.md), from hello world to an interactive guessing game
-- [Roadmap](ROADMAP.md), current progress and future direction
-- [Contributing](docs/CONTRIBUTING.md), source layout and validation commands
 
 ## License
 

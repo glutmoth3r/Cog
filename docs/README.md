@@ -1,8 +1,11 @@
 # Cog documentation
 
-Cog is experimental. These pages describe the current compiler and VM unless a
-section explicitly says **planned**. Code examples marked as Cog are checked by
-the test suite; proposed syntax in the design contracts is marked as text.
+Cog is experimental. These pages describe the current compiler and VM; status
+labels distinguish implemented behavior from limitations, planned work, and open
+questions. Standalone fenced `cog` examples in the README and documentation are
+compiled and round-tripped by `tests/documentation.rs`. Fragments that need an external
+package are syntax-checked there and exercised by project tests. Proposed syntax
+in design contracts is shown as text.
 
 Start with the [repository README](../README.md), the
 [getting-started page](../web/get_started.html), or the [runnable examples](../examples/README.md).
@@ -16,9 +19,14 @@ Start with the [repository README](../README.md), the
 | [Runtime and bytecode](RUNTIME.md) | Compilation pipeline, artifacts, native ABI, and embedding boundaries |
 | [Numeric types](NUMERIC_TYPES.md) | Implemented `int`, `uint`, and `bigint` behavior; proposed decimal contract |
 | [Rust SDK and plugins](SDK.md) | Owned embedding API, native registration, C ABI v3 and plugin lifecycle |
-| [Semantic contracts](SEMANTIC_CONTRACTS.md) | Implemented invariants, accepted future specifications, and open decisions |
+| [Semantic contracts](SEMANTIC_CONTRACTS.md) | Implemented invariants, current limitations, planned work, and open decisions |
 | [Async design](ASYNC_DESIGN.md) | Task scheduling, async host/plugin APIs, limits, cancellation, and open ownership contracts |
 | [Contributing](CONTRIBUTING.md) | Source layout, validation, diagnostics, and performance tools |
+
+For implementation work, start with [contributing](CONTRIBUTING.md), then use
+[runtime and bytecode](RUNTIME.md) for artifact and execution boundaries. The
+[JIT design](JIT_DESIGN.md) and [async design](ASYNC_DESIGN.md) document their
+separate implementation contracts.
 
 The [roadmap](../ROADMAP.md) separates completed work, near-term priorities, and
 longer-term goals. Design sections identify which parts are implemented and which

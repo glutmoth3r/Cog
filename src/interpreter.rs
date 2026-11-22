@@ -1,3 +1,10 @@
+//! Cog's stack VM and cooperative async executor.
+//!
+//! This is the semantic authority for synchronous execution and task completion.
+//! The optional JIT enters at checked bytecode positions and returns here for
+//! unsupported operations, metered execution, and canonical runtime Error handling.
+//! Managed values are rooted in the Cog heap; host resources remain owned by the
+//! per-run [`crate::runtime::RuntimeContext`].
 use crate::error::RuntimeError;
 use crate::heap;
 use crate::heap::{HeapRef, TaskRootSet};
@@ -69,6 +76,20 @@ struct VmContinuation {
     callable_end: usize,
 }
 
+#[derive(Default)]
+struct BridgeScratch {
+    locals: Vec<Option<Value>>,
+    frames: Vec<CallFrame>,
+}
+
+struct BridgeEntry<'a> {
+    pc: usize,
+    stack: &'a mut Vec<Value>,
+    scratch: &'a mut BridgeScratch,
+    error_pc: &'a mut Option<usize>,
+    propagation_pending: &'a mut bool,
+}
+
 enum VmExecution {
     Complete(Result<Value, RuntimeError>),
     Suspended(VmContinuation),
@@ -82,6 +103,8 @@ pub(crate) struct VmExecutionPlan {
     needs_stdin: bool,
     needs_stdout: bool,
     has_async: bool,
+    observes_exclusivity: bool,
+    callable_halt: bool,
     jit: RefCell<JitPlanState>,
 }
 
@@ -97,6 +120,14 @@ impl VmExecutionPlan {
         let mut needs_stdin = false;
         let mut needs_stdout = false;
         let mut has_async = false;
+        let first_callable = artifact
+            .callables
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or(program.len());
+        let mut observes_exclusivity = false;
+        let mut callable_halt = false;
         for (pc, instruction) in program.iter().enumerate() {
             has_back_edge |= matches!(
                 instruction,
@@ -118,6 +149,8 @@ impl VmExecutionPlan {
                     | Instruction::AsyncIoWriteAll
                     | Instruction::AsyncIoFlush
             );
+            observes_exclusivity |= matches!(instruction, Instruction::Exclusive);
+            callable_halt |= pc >= first_callable && matches!(instruction, Instruction::Halt);
             has_async |= instruction_requires_scheduler(instruction, &artifact.imports);
         }
 
@@ -152,6 +185,8 @@ impl VmExecutionPlan {
             needs_stdin,
             needs_stdout,
             has_async,
+            observes_exclusivity,
+            callable_halt,
             jit: RefCell::new(JitPlanState::NotInitialized),
         }
     }
@@ -169,10 +204,15 @@ impl VmExecutionPlan {
         operand_base: usize,
         captures: &CaptureValues,
         propagation_pending: &mut bool,
-        context: &RuntimeContext<'_>,
-    ) -> Option<JitExit> {
+        context: &mut RuntimeContext<'_>,
+        owner: &Rc<()>,
+        scheduler: &mut AsyncScheduler,
+        globals: &mut Vec<Option<Value>>,
+        error_value_pc: &mut Option<usize>,
+        halt_error_pc: &mut Option<usize>,
+    ) -> Result<Option<JitExit>, RuntimeError> {
         if !context.jit_enabled || context.limits.any_active() {
-            return None;
+            return Ok(None);
         }
 
         let mut state = self.jit.borrow_mut();
@@ -188,9 +228,97 @@ impl VmExecutionPlan {
             };
         }
         let JitPlanState::Ready(jit) = &mut *state else {
-            return None;
+            return Ok(None);
         };
-        jit.try_osr(
+        let debug = context.jit_debug;
+        let mut scratch = BridgeScratch::default();
+        let mut fatal = None;
+        let mut bridge = |pc, operands: &mut Vec<Value>, mut pending| {
+            let mut error_pc = None;
+            let result = match artifact.instructions[pc] {
+                Instruction::CallNative(index) => {
+                    let result = call_sync_native(&artifact.imports[index], context, operands);
+                    if matches!(result, Ok(Value::Error(_))) {
+                        error_pc = Some(pc);
+                    }
+                    result
+                }
+                Instruction::Index => {
+                    let (object, key) = pop2(operands).expect("verified index operands");
+                    let value = index_value(object, key);
+                    if matches!(value, Value::Error(_)) {
+                        error_pc = Some(pc);
+                    }
+                    Ok(value)
+                }
+                Instruction::IndexSet => {
+                    let (object, key, value) = pop3(operands).expect("verified indexset operands");
+                    let value = index_set_value(object, key, value);
+                    if matches!(value, Value::Error(_)) {
+                        error_pc = Some(pc);
+                    }
+                    Ok(value)
+                }
+                Instruction::Len => {
+                    let value = length_value(operands.pop().expect("verified len operand"));
+                    if matches!(value, Value::Error(_)) {
+                        error_pc = Some(pc);
+                    }
+                    Ok(value)
+                }
+                _ if self.has_async => {
+                    return crate::jit::BridgeOutcome::Unsupported("async-program");
+                }
+                _ if self.observes_exclusivity => {
+                    return crate::jit::BridgeOutcome::Unsupported("observes-exclusivity");
+                }
+                _ if self.callable_halt => {
+                    return crate::jit::BridgeOutcome::Unsupported("callable-halt");
+                }
+                _ => {
+                    let entry = BridgeEntry {
+                        pc,
+                        stack: operands,
+                        scratch: &mut scratch,
+                        error_pc: &mut error_pc,
+                        propagation_pending: &mut pending,
+                    };
+                    match execute_vm(
+                        artifact,
+                        context,
+                        owner,
+                        self,
+                        scheduler,
+                        globals,
+                        &mut None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(entry),
+                    ) {
+                        VmExecution::Complete(result) => result,
+                        VmExecution::Suspended(_) => unreachable!("bridge is scheduler-free"),
+                    }
+                }
+            };
+            match result {
+                Ok(value) => {
+                    if let Some(origin) = error_pc {
+                        *error_value_pc = Some(origin);
+                    }
+                    crate::jit::BridgeOutcome::Returned {
+                        value,
+                        propagation_pending: pending,
+                    }
+                }
+                Err(error) => {
+                    fatal = Some((error, error_pc.unwrap_or(pc)));
+                    crate::jit::BridgeOutcome::Aborted
+                }
+            }
+        };
+        let exit = jit.try_osr(
             artifact,
             entry,
             target,
@@ -201,8 +329,19 @@ impl VmExecutionPlan {
             operand_base,
             captures,
             propagation_pending,
-            context.jit_debug,
-        )
+            debug,
+            &mut bridge,
+        );
+        if let Some((error, pc)) = fatal {
+            *halt_error_pc = Some(pc);
+            return Err(error);
+        }
+        if matches!(exit, Some(JitExit::InvalidCommittedFrame)) {
+            return Err(RuntimeError::InvalidArgument {
+                op: "JIT frame after runtime operation",
+            });
+        }
+        Ok(exit)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1722,6 +1861,7 @@ impl AsyncScheduler {
             Some(id),
             continuation,
             resume_outcome,
+            None,
         );
         let popped = self.active.pop();
         if popped != Some(id) {
@@ -2294,7 +2434,9 @@ impl AsyncScheduler {
         }
 
         let submission = match operation {
-            AsyncFileOperation::Open => unreachable!(),
+            AsyncFileOperation::Open => {
+                unreachable!("open is dispatched before the shared file-operation match")
+            }
             AsyncFileOperation::Read => {
                 let max_bytes = match &arguments[1] {
                     Value::Int(bytes) => usize::try_from(*bytes).ok(),
@@ -4278,6 +4420,7 @@ fn execute_top_level_vm(
         None,
         None,
         None,
+        None,
     ) {
         VmExecution::Complete(Ok(value)) => {
             if value.is_heap_managed()
@@ -4363,6 +4506,154 @@ fn prepare_stack_effect_cache(
     Some(cache)
 }
 
+fn call_sync_native(
+    import: &NativeImport,
+    context: &mut RuntimeContext<'_>,
+    arguments: &[Value],
+) -> Result<Value, RuntimeError> {
+    recover_native_result(import.call_from_vm(context, arguments))
+}
+
+fn recover_native_result(result: Result<Value, RuntimeError>) -> Result<Value, RuntimeError> {
+    match result {
+        Err(error) if error.is_recoverable() => Ok(Value::Error(Box::new(error))),
+        result => result,
+    }
+}
+
+fn length_value(value: Value) -> Value {
+    match value {
+        Value::Error(_) => value,
+        Value::Str(ref s) => Value::Int(s.chars().count() as i64),
+        Value::Array(ref arr) => match arr.try_borrow() {
+            Ok(items) => Value::Int(items.len() as i64),
+            Err(_) => Value::Error(Box::new(borrow_conflict("len"))),
+        },
+        _ => Value::Error(Box::new(RuntimeError::TypeMismatch { op: "len" })),
+    }
+}
+
+pub(crate) fn array_index(array: &ArrayValue, index: i64) -> Result<Value, RuntimeError> {
+    let items = array.try_borrow().map_err(|_| borrow_conflict("index"))?;
+    items
+        .get(usize::try_from(index).unwrap_or(usize::MAX))
+        .cloned()
+        .ok_or(RuntimeError::IndexOutOfBounds {
+            index,
+            len: items.len(),
+        })
+}
+
+pub(crate) fn array_index_set(
+    array: &ArrayValue,
+    index: i64,
+    value: Value,
+) -> Result<(), RuntimeError> {
+    let index = match usize::try_from(index) {
+        Ok(index) => index,
+        Err(_) => {
+            let len = array
+                .try_borrow()
+                .map_err(|_| borrow_conflict("indexset"))?
+                .len();
+            return Err(RuntimeError::IndexOutOfBounds { index, len });
+        }
+    };
+    array.try_set(index, value)
+}
+
+fn index_value(object: Value, key: Value) -> Value {
+    let key = match (&object, key) {
+        (Value::Record(_), Value::Int(index)) if index >= 0 => {
+            Value::Str(Rc::from(index.to_string()))
+        }
+        (_, key) => key,
+    };
+    // Type metadata is unspellable in source. This generic query
+    // lets lowered patterns inspect nominal identity without a
+    // match/enum instruction or a forgeable record field.
+    let result = match (&object, &key) {
+        (Value::Variant(tag, _), Value::TypeTag(_)) => Ok(Value::TypeTag(tag.clone())),
+        (Value::Error(err), Value::TypeTag(_)) => Ok(Value::TypeTag(err.tag())),
+        (_, Value::TypeTag(_)) => Ok(Value::Nil),
+        (Value::Error(err), Value::Str(name)) => {
+            err.field(name).map_or_else(|| missing_field(name), Ok)
+        }
+        (Value::Error(_), _) => Ok(object),
+        (_, Value::Error(_)) => Ok(key),
+        (Value::Array(arr), Value::Int(i)) => array_index(arr, *i),
+        (Value::Record(record), Value::Str(name)) => record
+            .try_get_field(name.as_ref())
+            .map_err(|_| borrow_conflict("index"))
+            .and_then(|value| value.map_or_else(|| missing_field(name), Ok)),
+        (Value::Variant(_, fields), Value::Str(name)) => fields
+            .get(name.as_ref())
+            .map_or_else(|| missing_field(name), |value| Ok(value.clone())),
+        _ => Err(RuntimeError::TypeMismatch { op: "index" }),
+    };
+    match result {
+        Ok(value) => value,
+        Err(error) => Value::Error(Box::new(error)),
+    }
+}
+
+fn index_set_value(array: Value, idx: Value, value: Value) -> Value {
+    let idx = match (&array, idx) {
+        (Value::Record(_), Value::Int(index)) if index >= 0 => {
+            Value::Str(Rc::from(index.to_string()))
+        }
+        (_, index) => index,
+    };
+    if let Value::Error(_) = array {
+        array
+    } else if let Value::Error(_) = idx {
+        idx
+    } else {
+        match (&array, &idx) {
+            (Value::Array(arr), Value::Int(i)) => match array_index_set(arr, *i, value) {
+                Ok(()) => array,
+                Err(error) => Value::Error(Box::new(error)),
+            },
+            (Value::Record(record), Value::Str(key)) => match record.try_get_field(key.as_ref()) {
+                Err(_) => Value::Error(Box::new(borrow_conflict("indexset"))),
+                Ok(current) => {
+                    let validation = match (&value, current.as_ref()) {
+                        (Value::Array(replacement), Some(Value::Array(template)))
+                            if record.is_nominal() =>
+                        {
+                            replacement.try_constrain_like(template)
+                        }
+                        (Value::Array(replacement), Some(Value::Array(template)))
+                            if replacement.needs_type_context() =>
+                        {
+                            replacement.try_constrain_from(template)
+                        }
+                        (Value::Array(replacement), _) if replacement.needs_type_context() => {
+                            Err(RuntimeError::TypeMismatch { op: "indexset" })
+                        }
+                        _ => Ok(()),
+                    };
+                    if let Err(error) = validation {
+                        let error = match error {
+                            RuntimeError::TypeMismatch { .. } => {
+                                RuntimeError::TypeMismatch { op: "indexset" }
+                            }
+                            error => error,
+                        };
+                        Value::Error(Box::new(error))
+                    } else {
+                        match record.try_set_field(key.as_ref(), value) {
+                            Ok(()) => array.clone(),
+                            Err(error) => Value::Error(Box::new(error)),
+                        }
+                    }
+                }
+            },
+            _ => Value::Error(Box::new(RuntimeError::TypeMismatch { op: "indexset" })),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_vm(
     artifact: &CompiledProgram,
@@ -4376,8 +4667,11 @@ fn execute_vm(
     async_task: Option<usize>,
     continuation: Option<VmContinuation>,
     resume_outcome: Option<Result<Value, RuntimeError>>,
+    mut bridge: Option<BridgeEntry<'_>>,
 ) -> VmExecution {
-    context.set_source_location(None);
+    if bridge.is_none() {
+        context.set_source_location(None);
+    }
     let program = &artifact.instructions;
     let start_entry = start.as_ref().map(|(entry, _)| *entry);
     let (
@@ -4414,18 +4708,30 @@ fn execute_vm(
             }));
         }
         None => {
-            let (pc, stack) = start.unwrap_or_else(|| (0, Vec::new()));
+            let (pc, stack, locals, frames) = if let Some(entry) = bridge.as_mut() {
+                (
+                    entry.pc,
+                    std::mem::take(entry.stack),
+                    std::mem::take(&mut entry.scratch.locals),
+                    std::mem::take(&mut entry.scratch.frames),
+                )
+            } else {
+                let (pc, stack) = start.unwrap_or_else(|| (0, Vec::new()));
+                (pc, stack, Vec::new(), Vec::new())
+            };
             (
                 pc,
                 stack,
-                Vec::new(),
+                locals,
                 0,
-                Vec::new(),
+                frames,
                 0,
                 CaptureValues::default(),
                 None,
                 None,
-                false,
+                bridge
+                    .as_ref()
+                    .is_some_and(|entry| *entry.propagation_pending),
                 start_entry.unwrap_or_else(|| execution_plan.callable_region_start(artifact, pc)),
                 execution_plan.next_callable_boundary(artifact, pc),
             )
@@ -4467,7 +4773,15 @@ fn execute_vm(
             });
         }
         while pc < program.len() {
-            scheduler.reap_abandoned_tasks();
+            if let Some(entry) = &bridge
+                && pc == entry.pc + 1
+                && call_stack.is_empty()
+            {
+                return stack.pop().ok_or(RuntimeError::StackUnderflow);
+            }
+            if bridge.is_none() {
+                scheduler.reap_abandoned_tasks();
+            }
             let heap_limit = context.limits.max_heap_objects;
             let collection_due = heap::collection_due();
             let heap_pressure = heap_limit.is_some_and(|limit| {
@@ -4915,13 +5229,7 @@ fn execute_vm(
                             import.call_from_vm(context, arguments)
                         };
                     stack.truncate(base);
-                    match result {
-                        Ok(value) => stack.push(value),
-                        Err(error) if error.is_recoverable() => {
-                            stack.push(Value::Error(Box::new(error)))
-                        }
-                        Err(error) => return Err(error),
-                    }
+                    stack.push(recover_native_result(result)?);
                 }
                 Instruction::Store(index) => {
                     let value = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
@@ -4967,7 +5275,8 @@ fn execute_vm(
                 }
                 Instruction::Jump(index) => {
                     let target = check_branch(program, pc, *index, callable_start, callable_end)?;
-                    if context.jit_enabled
+                    if bridge.is_none()
+                        && context.jit_enabled
                         && target <= pc
                         && let Some(exit) = execution_plan.try_jit_osr(
                             artifact,
@@ -4981,10 +5290,16 @@ fn execute_vm(
                             &captures,
                             &mut propagation_pending,
                             context,
-                        )
+                            owner,
+                            scheduler,
+                            globals,
+                            &mut error_value_pc,
+                            &mut halt_error_pc,
+                        )?
                     {
                         pc = match exit {
                             JitExit::Completed => pc,
+                            JitExit::InvalidCommittedFrame => unreachable!("validated JIT exit"),
                             JitExit::ResumeAt { pc } | JitExit::FaultAt { pc } => pc,
                         };
                         continue;
@@ -4998,7 +5313,8 @@ fn execute_vm(
                         Value::Bool(false) => {
                             let target =
                                 check_branch(program, pc, *index, callable_start, callable_end)?;
-                            if context.jit_enabled
+                            if bridge.is_none()
+                                && context.jit_enabled
                                 && target <= pc
                                 && let Some(exit) = execution_plan.try_jit_osr(
                                     artifact,
@@ -5012,10 +5328,18 @@ fn execute_vm(
                                     &captures,
                                     &mut propagation_pending,
                                     context,
-                                )
+                                    owner,
+                                    scheduler,
+                                    globals,
+                                    &mut error_value_pc,
+                                    &mut halt_error_pc,
+                                )?
                             {
                                 pc = match exit {
                                     JitExit::Completed => pc,
+                                    JitExit::InvalidCommittedFrame => {
+                                        unreachable!("validated JIT exit")
+                                    }
                                     JitExit::ResumeAt { pc } | JitExit::FaultAt { pc } => pc,
                                 };
                                 continue;
@@ -5037,7 +5361,8 @@ fn execute_vm(
                         Value::Bool(true) => {
                             let target =
                                 check_branch(program, pc, *index, callable_start, callable_end)?;
-                            if context.jit_enabled
+                            if bridge.is_none()
+                                && context.jit_enabled
                                 && target <= pc
                                 && let Some(exit) = execution_plan.try_jit_osr(
                                     artifact,
@@ -5051,10 +5376,18 @@ fn execute_vm(
                                     &captures,
                                     &mut propagation_pending,
                                     context,
-                                )
+                                    owner,
+                                    scheduler,
+                                    globals,
+                                    &mut error_value_pc,
+                                    &mut halt_error_pc,
+                                )?
                             {
                                 pc = match exit {
                                     JitExit::Completed => pc,
+                                    JitExit::InvalidCommittedFrame => {
+                                        unreachable!("validated JIT exit")
+                                    }
                                     JitExit::ResumeAt { pc } | JitExit::FaultAt { pc } => pc,
                                 };
                                 continue;
@@ -5089,16 +5422,7 @@ fn execute_vm(
                 }
                 Instruction::Len => {
                     let value = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
-                    let result = match value {
-                        Value::Error(_) => value,
-                        Value::Str(ref s) => Value::Int(s.chars().count() as i64),
-                        Value::Array(ref arr) => match arr.try_borrow() {
-                            Ok(items) => Value::Int(items.len() as i64),
-                            Err(_) => Value::Error(Box::new(borrow_conflict("len"))),
-                        },
-                        _ => Value::Error(Box::new(RuntimeError::TypeMismatch { op: "len" })),
-                    };
-                    stack.push(result);
+                    stack.push(length_value(value));
                 }
                 Instruction::Exclusive => {
                     let value = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
@@ -5373,7 +5697,7 @@ fn execute_vm(
                         Instruction::FsAppendTextAsync => AsyncFsOperation::AppendText,
                         Instruction::FsCopyAsync => AsyncFsOperation::Copy,
                         Instruction::FsRenameAsync => AsyncFsOperation::Rename,
-                        _ => unreachable!(),
+                        _ => unreachable!("outer match admits only filesystem async instructions"),
                     };
                     let arguments = take_stack_tail(&mut stack, operation.arity())?;
                     if let Some(Value::Error(error)) = arguments
@@ -5411,7 +5735,9 @@ fn execute_vm(
                         Instruction::AsyncIoWriteAll => AsyncFileOperation::WriteAll,
                         Instruction::AsyncIoFlush => AsyncFileOperation::Flush,
                         Instruction::AsyncIoSeek => AsyncFileOperation::Seek,
-                        _ => unreachable!(),
+                        _ => {
+                            unreachable!("outer match admits only managed-file async instructions")
+                        }
                     };
                     let arguments = take_stack_tail(&mut stack, operation.arity())?;
                     if let Some(Value::Error(error)) = arguments
@@ -5445,7 +5771,7 @@ fn execute_vm(
                         }
                         Instruction::ProcessRunInputTimeoutAsync => 4,
                         Instruction::ProcessRunInputTimeoutOutputLimitAsync => 5,
-                        _ => unreachable!(),
+                        _ => unreachable!("outer match admits only process-run async instructions"),
                     };
                     let arguments = take_stack_tail(&mut stack, arity)?;
                     if let Some(error) = arguments
@@ -5492,7 +5818,9 @@ fn execute_vm(
                                 let output_limit = arguments.next();
                                 (input, timeout, output_limit)
                             }
-                            _ => unreachable!(),
+                            _ => unreachable!(
+                                "process arity was selected from the matched instruction"
+                            ),
                         };
                         match scheduler.create_target(AsyncTaskTarget::ProcessRun {
                             program,
@@ -5547,7 +5875,7 @@ fn execute_vm(
                         Instruction::TcpWriteAsync => AsyncTcpOperation::Write,
                         Instruction::TcpWriteAllAsync => AsyncTcpOperation::WriteAll,
                         Instruction::TcpShutdownWriteAsync => AsyncTcpOperation::ShutdownWrite,
-                        _ => unreachable!(),
+                        _ => unreachable!("outer match admits only TCP async instructions"),
                     };
                     let arguments = take_stack_tail(&mut stack, operation.arity())?;
                     if let Some(Value::Error(error)) = arguments
@@ -5602,20 +5930,25 @@ fn execute_vm(
                         captures = CaptureValues::default();
                         bp = locals.len();
                         pc = check_jump(program, *index)?;
-                        if let Some(exit) = execution_plan.try_jit_call(
-                            artifact,
-                            callable_start,
-                            &mut pc,
-                            &mut locals,
-                            bp,
-                            &mut stack,
-                            operand_base,
-                            &captures,
-                            &mut propagation_pending,
-                            context,
-                        ) {
+                        if bridge.is_none()
+                            && let Some(exit) = execution_plan.try_jit_call(
+                                artifact,
+                                callable_start,
+                                &mut pc,
+                                &mut locals,
+                                bp,
+                                &mut stack,
+                                operand_base,
+                                &captures,
+                                &mut propagation_pending,
+                                context,
+                            )
+                        {
                             pc = match exit {
                                 JitExit::Completed => pc,
+                                JitExit::InvalidCommittedFrame => {
+                                    unreachable!("validated JIT exit")
+                                }
                                 JitExit::ResumeAt { pc } | JitExit::FaultAt { pc } => pc,
                             };
                         }
@@ -5835,136 +6168,11 @@ fn execute_vm(
                 }
                 Instruction::Index => {
                     let (object, key) = pop2(&mut stack)?;
-                    let key = match (&object, key) {
-                        (Value::Record(_), Value::Int(index)) if index >= 0 => {
-                            Value::Str(Rc::from(index.to_string()))
-                        }
-                        (_, key) => key,
-                    };
-                    // Type metadata is unspellable in source. This generic query
-                    // lets lowered patterns inspect nominal identity without a
-                    // match/enum instruction or a forgeable record field.
-                    let result = match (&object, &key) {
-                        (Value::Variant(tag, _), Value::TypeTag(_)) => {
-                            Ok(Value::TypeTag(tag.clone()))
-                        }
-                        (Value::Error(err), Value::TypeTag(_)) => Ok(Value::TypeTag(err.tag())),
-                        (_, Value::TypeTag(_)) => Ok(Value::Nil),
-                        (Value::Error(err), Value::Str(name)) => {
-                            err.field(name).map_or_else(|| missing_field(name), Ok)
-                        }
-                        (Value::Error(_), _) => Ok(object),
-                        (_, Value::Error(_)) => Ok(key),
-                        (Value::Array(arr), Value::Int(i)) => arr
-                            .try_borrow()
-                            .map_err(|_| borrow_conflict("index"))
-                            .and_then(|items| {
-                                items
-                                    .get(usize::try_from(*i).unwrap_or(usize::MAX))
-                                    .cloned()
-                                    .ok_or(RuntimeError::IndexOutOfBounds {
-                                        index: *i,
-                                        len: items.len(),
-                                    })
-                            }),
-                        (Value::Record(record), Value::Str(name)) => record
-                            .try_get_field(name.as_ref())
-                            .map_err(|_| borrow_conflict("index"))
-                            .and_then(|value| value.map_or_else(|| missing_field(name), Ok)),
-                        (Value::Variant(_, fields), Value::Str(name)) => fields
-                            .get(name.as_ref())
-                            .map_or_else(|| missing_field(name), |value| Ok(value.clone())),
-                        _ => Err(RuntimeError::TypeMismatch { op: "index" }),
-                    };
-                    stack.push(match result {
-                        Ok(value) => value,
-                        Err(error) => Value::Error(Box::new(error)),
-                    });
+                    stack.push(index_value(object, key));
                 }
                 Instruction::IndexSet => {
-                    let (array, idx, value) = pop3(&mut stack)?;
-                    let idx = match (&array, idx) {
-                        (Value::Record(_), Value::Int(index)) if index >= 0 => {
-                            Value::Str(Rc::from(index.to_string()))
-                        }
-                        (_, index) => index,
-                    };
-                    if let Value::Error(_) = array {
-                        stack.push(array);
-                    } else if let Value::Error(_) = idx {
-                        stack.push(idx);
-                    } else {
-                        match (&array, &idx) {
-                            (Value::Array(arr), Value::Int(i)) => match arr.try_borrow() {
-                                Err(_) => {
-                                    stack.push(Value::Error(Box::new(borrow_conflict("indexset"))))
-                                }
-                                Ok(items) => {
-                                    let len = items.len();
-                                    drop(items);
-                                    if *i < 0 || (*i as usize) >= len {
-                                        stack.push(Value::Error(Box::new(
-                                            RuntimeError::IndexOutOfBounds { index: *i, len },
-                                        )));
-                                    } else {
-                                        match arr.try_set(*i as usize, value) {
-                                            Ok(()) => stack.push(array.clone()),
-                                            Err(error) => stack.push(Value::Error(Box::new(error))),
-                                        }
-                                    }
-                                }
-                            },
-                            (Value::Record(record), Value::Str(key)) => {
-                                match record.try_get_field(key.as_ref()) {
-                                    Err(_) => stack
-                                        .push(Value::Error(Box::new(borrow_conflict("indexset")))),
-                                    Ok(current) => {
-                                        let validation = match (&value, current.as_ref()) {
-                                            (
-                                                Value::Array(replacement),
-                                                Some(Value::Array(template)),
-                                            ) if record.is_nominal() => {
-                                                replacement.try_constrain_like(template)
-                                            }
-                                            (
-                                                Value::Array(replacement),
-                                                Some(Value::Array(template)),
-                                            ) if replacement.needs_type_context() => {
-                                                replacement.try_constrain_from(template)
-                                            }
-                                            (Value::Array(replacement), _)
-                                                if replacement.needs_type_context() =>
-                                            {
-                                                Err(RuntimeError::TypeMismatch { op: "indexset" })
-                                            }
-                                            _ => Ok(()),
-                                        };
-                                        if let Err(error) = validation {
-                                            let error = match error {
-                                                RuntimeError::TypeMismatch { .. } => {
-                                                    RuntimeError::TypeMismatch { op: "indexset" }
-                                                }
-                                                error => error,
-                                            };
-                                            stack.push(Value::Error(Box::new(error)));
-                                        } else {
-                                            match record.try_set_field(key.as_ref(), value) {
-                                                Ok(()) => stack.push(array.clone()),
-                                                Err(error) => {
-                                                    stack.push(Value::Error(Box::new(error)))
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {
-                                stack.push(Value::Error(Box::new(RuntimeError::TypeMismatch {
-                                    op: "indexset",
-                                })));
-                            }
-                        }
-                    }
+                    let (object, key, value) = pop3(&mut stack)?;
+                    stack.push(index_set_value(object, key, value));
                 }
                 Instruction::MakeCell => {
                     let value = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
@@ -6216,6 +6424,22 @@ fn execute_vm(
         }
         Err(RuntimeError::MissingHalt)
     })();
+
+    if let Some(entry) = bridge {
+        *entry.error_pc = if result.is_err() {
+            Some(halt_error_pc.unwrap_or(pc))
+        } else {
+            error_value_pc
+        };
+        *entry.propagation_pending = propagation_pending;
+        stack.clear();
+        locals.clear();
+        call_stack.clear();
+        *entry.stack = stack;
+        entry.scratch.locals = locals;
+        entry.scratch.frames = call_stack;
+        return VmExecution::Complete(result);
+    }
 
     if suspended {
         return VmExecution::Suspended(VmContinuation {

@@ -1,3 +1,9 @@
+//! Lower checked, resolved AST into Cog stack instructions.
+//!
+//! Generic expansion and semantic analysis run before emission; this module uses
+//! their call-site, type, and effect facts rather than re-deriving language rules
+//! while writing instructions. The backend patches control-flow targets, optimizes
+//! compiler output, and verifies the result before returning it.
 use crate::ast::{
     BinOp, BindingPattern, Block, CallArgument, ClosureCapture, EnumVariant, Expr, FallbackKind,
     ForClause, FunctionDecl, InlineMode, Item, MatchPattern, Param, Program, Stmt, StringPart,
@@ -1536,6 +1542,8 @@ impl<'a> Codegen<'a> {
         } else {
             None
         };
+        // SAFETY: the cleanup queue is drained synchronously while the expanded
+        // program that owns every deferred AST block remains alive.
         let body = unsafe { cleanup.body.as_ref() };
         let result = self.compile_block_with_deferred(body, scopes, pending);
         if let Some(boundary) = boundary {

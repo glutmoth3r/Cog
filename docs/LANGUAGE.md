@@ -86,6 +86,10 @@ Scalar assignment copies a value. Array/record assignment shares an object witho
 moving or invalidating the original binding. A const alias observes changes through
 an existing mutable alias; creating it does not freeze the object globally.
 
+Unlike JavaScript `const`, Cog `const` also blocks mutation through that access
+path. Unlike Rust's borrow checker, Cog checks alias effects without lifetime-
+checked borrows; the analysis is conservative and can reject some safe programs.
+
 ## Function values and closures
 
 Cog supports function types, named function values, and synchronous closures.
@@ -127,10 +131,12 @@ results require annotations in this release. Named function values must have
 fully annotated parameters and result types; async, generic, and defaulted
 functions cannot be used as values. Indirect calls are positional and require an
 exact argument count. JIT can OSR into synchronous closure bodies with captures;
-captured values remain rooted, and unsupported operations and dynamic callback
-dispatch resume in the VM. Indirect calls do not yet carry mutation-effect types,
+captured values remain rooted. Eligible indirect calls use VM dispatch and
+can return to the same compiled loop. Unsupported operations resume in the VM. Indirect calls do not yet carry mutation-effect types,
 so reference arguments are treated as potentially mutated and reference-valued
-results are read-only. Use `.clone()` to obtain an independent writable copy
+results are read-only. Effects of possible named targets are also tracked; mutable
+captures and globals affected by closures may remain conservatively restricted
+after closure creation. Use `.clone()` to obtain an independent writable copy
 where the value supports cloning.
 Generic type parameters can be inferred through callback signatures such as
 `fn(T) -> U`, as used by `array::map`.
@@ -201,6 +207,9 @@ lexical handler or the binding root. Using `!!` directly at a comptime binding
 root is rejected because there is no enclosing comptime function to receive the
 propagation. An Error reaching the root without a handler is reported as a
 diagnostic.
+
+Unlike Rust `const fn`, an `@comptime fn` is compile-time-only and is omitted from
+the runtime artifact. A normal `fn` remains runtime-only even when its body is pure.
 The lazy `??` and `?!` operators are supported, including in compile-time functions;
 `!!` propagation bypasses them. Native calls, mutation statements, loops, array,
 tuple, and enum values, along with tuple destructuring, are not supported as

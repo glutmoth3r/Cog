@@ -1,4 +1,9 @@
-//! Filesystem discovery, local package resolution and build preparation.
+//! Filesystem discovery, local package resolution, and build orchestration.
+//!
+//! `Prepared` captures project/package inputs, `resolve` joins their source modules,
+//! and `Loaded::compile` evaluates compile-time declarations before semantic
+//! analysis and instruction emission. In-memory callers use the same later phases
+//! through `compile_source` without filesystem package discovery.
 use crate::ast::Program;
 use crate::diagnostic::{Diagnostic, SourceSpan};
 use crate::lockfile::{self, Lockfile};

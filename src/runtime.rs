@@ -1,5 +1,10 @@
-//! Native ABI and managed host resources. Portable artifacts contain identities
-//! and signatures; executable imports retain a resolved function pointer.
+//! Native dispatch, permissions, and per-run managed host resources.
+//!
+//! Portable artifacts contain symbolic import identities and signatures;
+//! executable imports retain a resolved function pointer. Resource handles name
+//! generation-checked slots owned by one `RuntimeContext`, not OS descriptors.
+//! Private resource access follows successful handle/permission validation, and
+//! native argument types are checked before builtin dispatch.
 use crate::error::RuntimeError;
 use crate::heap::HeapRef;
 use crate::value::{IteratorValue, Value};
@@ -1903,8 +1908,10 @@ impl<'a> RuntimeContext<'a> {
                 .flush(),
             Stream::File(file) => lock_file_stream(file).flush(),
             Stream::Tcp(_) => Ok(()),
-            Stream::TcpListener(_) => unreachable!(),
-            Stream::Stdin => unreachable!(),
+            Stream::TcpListener(_) => {
+                unreachable!("permission validation rejects non-writable listeners")
+            }
+            Stream::Stdin => unreachable!("permission validation rejects non-writable stdin"),
         };
         resource.dirty = false;
         result.map_err(write_error)?;
@@ -1972,21 +1979,21 @@ fn integer(value: &Value) -> i64 {
     if let Value::Int(n) = value {
         *n
     } else {
-        unreachable!()
+        unreachable!("native signature validation requires an int argument")
     }
 }
 fn string(value: &Value) -> &str {
     if let Value::Str(s) = value {
         s
     } else {
-        unreachable!()
+        unreachable!("native signature validation requires a string argument")
     }
 }
 fn buffer(value: &Value) -> &RefCell<Vec<u8>> {
     if let Value::Bytes(b) = value {
         b
     } else {
-        unreachable!()
+        unreachable!("native signature validation requires a bytes argument")
     }
 }
 fn bytes_borrow<'a>(
@@ -2009,7 +2016,7 @@ fn handle(value: &Value) -> &ResourceHandle {
     if let Value::Handle(h) = value {
         h
     } else {
-        unreachable!()
+        unreachable!("native signature validation requires a resource handle")
     }
 }
 fn invalid(op: &'static str) -> RuntimeError {
@@ -2269,8 +2276,8 @@ fn read_into(context: &mut RuntimeContext<'_>, args: &[Value]) -> Result<Value, 
                     io::ErrorKind::Unsupported,
                     "TCP listener does not support reading",
                 )),
-                Stream::File(_) => unreachable!(),
-                Stream::Stdout => unreachable!(),
+                Stream::File(_) => unreachable!("file reads use the file fast path above"),
+                Stream::Stdout => unreachable!("permission validation rejects unreadable stdout"),
             }
         };
         if !matches!(&result, Err(error) if error.kind() == io::ErrorKind::Interrupted) {
@@ -2309,7 +2316,7 @@ fn write_bytes(
             io::ErrorKind::Unsupported,
             "TCP listener does not support writing",
         )),
-        Stream::Stdin => unreachable!(),
+        Stream::Stdin => unreachable!("permission validation rejects non-writable stdin"),
     };
     let was_dirty = resource.dirty;
     // The caller has received this failure. Automatic cleanup must not retry

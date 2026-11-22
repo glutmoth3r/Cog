@@ -1,3 +1,8 @@
+//! Single-source lexing and recovering parsing.
+//!
+//! The frontend owns source text for diagnostics and returns a partial AST for
+//! error recovery. Callers may use that AST to find further diagnostics, but must
+//! not execute it when parsing reports errors; name and type resolution happen later.
 use crate::ast::Program;
 use crate::diagnostic::{Diagnostic, SourceFile};
 use crate::hlparser::{self, ParseOutput};

@@ -743,7 +743,9 @@ impl Serialize for JsonValue<'_> {
                     return Err(S::Error::custom(RESOURCE));
                 }
                 let text = value.to_str_radix(10);
-                // BigInt's radix formatter emits a canonical JSON integer token.
+                // SAFETY: base-10 BigInt formatting emits only an optional minus
+                // sign and decimal digits, with no leading plus or invalid zeros,
+                // so the string is a valid JSON integer token.
                 let number = unsafe { serde_json::value::RawValue::from_string_unchecked(text) };
                 number.serialize(serializer)
             }

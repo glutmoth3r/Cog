@@ -1278,13 +1278,18 @@ fn connect_tcp_address(
         target_os = "openbsd"
     )))]
     let socket_type = libc::SOCK_STREAM;
+    // SAFETY: the address family comes from a valid `SocketAddr`; the socket type
+    // and protocol are fixed libc constants, and this call passes no pointers.
     let raw_fd = unsafe { libc::socket(family, socket_type, libc::IPPROTO_TCP) };
     if raw_fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    // Safety: `socket` returned a new descriptor owned by this function.
+    // SAFETY: `socket` returned a fresh descriptor, and this function transfers
+    // its sole ownership into `OwnedFd` before any fallible setup can return.
     let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
     let raw_fd = fd.as_raw_fd();
+    // SAFETY: `fd` keeps `raw_fd` open through this setup; these calls use only
+    // scalar flags and pass no pointers to libc.
     let descriptor_flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFD) };
     if descriptor_flags < 0
         || unsafe { libc::fcntl(raw_fd, libc::F_SETFD, descriptor_flags | libc::FD_CLOEXEC) } < 0
@@ -1316,6 +1321,8 @@ fn connect_tcp_address(
                 },
                 sin_zero: [0; 8],
             };
+            // SAFETY: this C-layout address is initialized for IPv4 and remains
+            // live for the call; the pointer and length describe that exact value.
             unsafe {
                 libc::connect(
                     raw_fd,
@@ -1342,6 +1349,8 @@ fn connect_tcp_address(
                 },
                 sin6_scope_id: address.scope_id(),
             };
+            // SAFETY: this C-layout address is initialized for IPv6 and remains
+            // live for the call; the pointer and length describe that exact value.
             unsafe {
                 libc::connect(
                     raw_fd,
@@ -1389,6 +1398,8 @@ fn connect_tcp_address(
                 events: libc::POLLOUT,
                 revents: 0,
             };
+            // SAFETY: `descriptor` is one initialized `pollfd`, and the count is
+            // exactly one for the pointer passed to libc.
             let ready = unsafe { libc::poll(&mut descriptor, 1, poll_millis) };
             if ready == 0 {
                 continue;
@@ -1403,6 +1414,8 @@ fn connect_tcp_address(
 
             let mut socket_error: libc::c_int = 0;
             let mut length = std::mem::size_of_val(&socket_error) as libc::socklen_t;
+            // SAFETY: both output pointers refer to live local storage and `length`
+            // advertises the exact size of `socket_error`.
             let result = unsafe {
                 libc::getsockopt(
                     raw_fd,
@@ -1428,6 +1441,7 @@ fn connect_tcp_address(
             "TCP connection cancelled",
         ));
     }
+    // SAFETY: `fd` still owns the descriptor, and restoring flags uses no pointers.
     if unsafe { libc::fcntl(raw_fd, libc::F_SETFL, status_flags) } < 0 {
         return Err(io::Error::last_os_error());
     }

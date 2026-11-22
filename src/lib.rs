@@ -1,3 +1,11 @@
+//! Cog's compiler, portable bytecode, stack VM, and embedding interfaces.
+//!
+//! Source compilation is coordinated by [`project`]: parsing and resolution
+//! produce an AST, compile-time evaluation and semantic checking establish the
+//! facts used by [`codegen`], and [`backend`] emits validated instructions.
+//! [`interpreter`] is the runtime authority; the internal Cranelift JIT is an
+//! optional optimization that falls back to it. User-facing behavior and module
+//! boundaries are described in `docs/CONTRIBUTING.md` and `docs/RUNTIME.md`.
 pub mod analysis;
 mod arguments;
 pub mod ast;

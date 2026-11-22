@@ -21,6 +21,10 @@ UTF-8 source → recovering lexer/parser → module/name resolution → semantic
              → direct instruction emission → .cogb → validated loader/linker → VM
 ```
 
+For a contributor view of these phases, including where compile-time evaluation,
+specialization, optimization, and verification fit, see the
+[compilation path](CONTRIBUTING.md#compilation-and-execution-path).
+
 ## Executable artifacts
 
 One `.cogb` links the chosen entry point and imported module/package code. It runs
@@ -62,7 +66,9 @@ by identity and linked once. Host pointers and Rust enum layout are not serializ
 
 ABI v3 native tags are any=0, int=1, str=2, bytes=3, handle=4, nil=5, number=6,
 array=7, record=8, float=9, bool=10, strbuf=11, Error=12, char=13, and uint=14.
-ABI v3 has no BigInt payload; BigInt values cannot cross the native plugin boundary.
+ABI v3 exposes BigInt values as opaque handles through `Any`. A plugin can
+forward the handle within its call. The ABI has no BigInt payload for inspection
+or construction.
 These are runtime descriptors, not the available source annotation grammar. Array values
 carry recursive element type metadata, and runtime mutations enforce that
 invariant. The format limits
@@ -112,8 +118,11 @@ comparisons, `char` ordering, boolean equality, and boolean branches. Other
 mixed numeric operations, float remainder, and unsupported instructions return
 to the interpreter at their bytecode position. Primitive type tests are lowered
 when their runtime tag is represented directly. Strings, BigInts, Errors,
-aggregates, and other opaque values can remain rooted in locals across OSR; the
-JIT does not inspect their payloads. `ReturnPropagate` remains in the VM.
+aggregates, and other opaque values can remain rooted across OSR. The call bridge
+runs synchronous Cog and native calls through the current execution context and
+can resume machine execution with the returned result. It also covers indexing,
+indexed writes, and length using shared VM checks. Returned Errors resume at
+the following instruction so that VM observation and propagation run once.
 Runtime metering limits also force interpretation so native code cannot bypass
 step, stack, or object quotas.
 
@@ -125,21 +134,20 @@ as budget debt that later refills repay. Heat and active-window counters belong 
 the current run and reset after an idle gap; they are not loaded from the profile.
 The profile is advisory and keyed by bytecode, Cog ABI and format, Cranelift
 version, target triple, and CPU features. Invalid measurements, malformed JSON,
-and mismatched profiles are ignored. The CLI stores it under the project's
+mismatched profiles and profiles larger than 4 MiB are ignored. The CLI stores it under the project's
 `target/.cog-ape-v2.json`.
-The machine-code cache is limited to 128 functions and 16 MiB of executable
+The machine-code cache is limited to 512 functions and 64 MiB of executable
 memory per execution plan. This is an experimental optimization, not a sandbox
 or a guarantee that every eligible function will be compiled.
 
 `cargo run --locked --offline --release --bin bench_jit -- [iterations] [samples]`
-compares the same integer, unsigned integer, and float workloads through the VM
-and JIT. It separates the first JIT-enabled invocation from retained-plan runs,
-checks output equality, and stores temporary profiles only under
+compares the same scalar, call, callback, collection, and Mandelbrot workloads
+through the VM and JIT. It separates the first JIT-enabled invocation from
+retained-plan runs, checks output equality, and stores temporary profiles only under
 `target/jit-bench/`. Retained-plan timings measure adaptive JIT-enabled execution;
 the APE may still choose the interpreter for some or all of a sample. See
-[`JIT_DESIGN.md`](JIT_DESIGN.md) for one local release baseline, the V1 plan,
-and scope limits. The recorded scalar-loop results are host-specific and are not
-a general application speedup claim.
+[`JIT_DESIGN.md`](JIT_DESIGN.md) for execution contracts. The repository
+keeps host-specific measurements in its development evidence.
 
 ## Embedding
 
@@ -261,6 +269,7 @@ type constraints have dedicated instructions. Printing, conversions, formatting,
 time, entropy, and processes use native calls rather than dedicated opcodes.
 
 Source diagnostics retain file/line/column origins through frontend linking and
-recover independent errors. Current v25 artifacts carry validated serialized source
-maps. Public runtime APIs are listed in [standard library](STANDARD_LIBRARY.md);
+recover independent errors. The current artifact format carries validated
+serialized source maps. Public runtime APIs are listed in
+[standard library](STANDARD_LIBRARY.md);
 cleanup and error boundaries are defined in [errors](ERRORS.md).

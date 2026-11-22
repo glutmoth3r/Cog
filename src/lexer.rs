@@ -1,3 +1,6 @@
+//! Cog tokenization, including source spans and the shared budget for nested
+//! interpolation. The lexer reports invalid tokens without deciding whether the
+//! resulting syntax is semantically valid; [`crate::hlparser`] handles that phase.
 pub use crate::string_literals::{InterpolationToken, InterpolationTokenPart};
 use logos::Logos;
 use num_bigint::BigInt;

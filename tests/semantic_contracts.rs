@@ -174,6 +174,108 @@ fn deferred_async_global_rebinding_retains_const_aliases() {
 }
 
 #[test]
+fn deferred_async_global_mutation_rejects_rebinding_through_helpers() {
+    rejects_semantically(
+        r#"
+        var shared = [1];
+        @async fn change() -> nil { shared << 99; }
+        fn replace(value: int[]) -> nil { shared = value; }
+        fn forward(value: int[]) -> nil { replace(value); }
+        @async fn main() {
+            const protected = [10];
+            const pending = change();
+            forward(protected);
+            await pending;
+            io::println(protected);
+        }
+        "#,
+        &["read-only"],
+    );
+}
+
+#[test]
+fn helper_cannot_hide_deferred_global_mutation_and_rebinding() {
+    rejects_semantically(
+        r#"
+        var shared = [1];
+        @async fn change() -> nil { shared << 99; }
+        fn replace(value: int[]) -> nil { shared = value; }
+        fn setup(value: int[]) -> Task[nil] {
+            const pending = change();
+            replace(value);
+            pending
+        }
+        @async fn main() {
+            const protected = [10];
+            const pending = setup(protected);
+            await pending;
+            io::println(protected);
+        }
+        "#,
+        &["read-only"],
+    );
+}
+
+#[test]
+fn helper_cannot_hide_deferred_heap_stores() {
+    rejects_semantically(
+        r#"
+        @async fn save(holder, value: int[]) -> nil { holder.item = value; }
+        fn start(holder, value: int[]) -> Task[nil] { save(holder, value) }
+        @async fn main() {
+            const protected = [10];
+            var holder = {item: [1]};
+            const pending = start(holder, protected);
+            holder.item = [2];
+            await pending;
+            holder.item << 99;
+        }
+        "#,
+        &["read-only"],
+    );
+}
+
+#[test]
+fn named_callback_cannot_rebind_a_global_used_by_a_pending_task() {
+    rejects_semantically(
+        r#"
+        var shared = [1];
+        const protected = [10];
+        @async fn change() -> nil { shared << 99; }
+        fn install() -> nil { shared = protected; }
+        @async fn main() {
+            const pending = change();
+            const callback: fn() -> nil = install;
+            (callback)();
+            await pending;
+        }
+        "#,
+        &["read-only"],
+    );
+}
+
+#[test]
+fn unrelated_async_mutation_does_not_block_global_rebinding() {
+    output(
+        r#"
+        var shared = [1];
+        @async fn change(value: int[]) -> nil { value << 99; }
+        fn replace(value: int[]) -> nil { shared = value; }
+        @async fn main() {
+            const protected = [10];
+            var work = [1];
+            const pending = change(work);
+            replace(protected);
+            await pending;
+            io::println(shared);
+            io::println(work);
+        }
+        "#,
+        "[10]\n[1, 99]\n",
+    );
+}
+
+#[test]
 fn deferred_async_method_mutation_cannot_reach_a_later_const_alias() {
     rejects_semantically(
         r#"

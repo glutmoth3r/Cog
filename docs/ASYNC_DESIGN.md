@@ -11,7 +11,7 @@ An `@async fn name(args...) -> T` declaration keeps `T` as the function body's
 result type. Calling it creates a cold `Task[T]`; its body does not run until the
 task is started or awaited.
 
-```cog
+```text
 @async fn load() -> Data {
     // The body starts when this task is awaited or spawned.
     fetch_data()
@@ -33,7 +33,7 @@ It is the explicit way to run independent tasks concurrently. A queued task star
 when the executor reaches an `await` or joins the spawning scope. Discarding a cold
 `Task` does not run its body. A diagnostic for discarded task results remains open.
 
-```cog
+```text
 @async fn main() -> nil {
     const data_task = spawn(load_data());
     const cookie_task = spawn(load_cookie());
@@ -143,7 +143,7 @@ entry point. `process::run_sync` is the blocking process-capture operation.
 In this example, both tasks start before either result is awaited, so the file read
 can overlap the timer:
 
-```cog
+```text
 use async::fs;
 use async::time;
 

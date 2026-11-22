@@ -1,3 +1,8 @@
+//! Parser for the diagnostic assembly language accepted by `--allow-asm`.
+//!
+//! This is separate from the source lexer/parser and does not participate in
+//! ordinary Cog compilation. It produces the same instruction representation so
+//! hand-written fixtures can exercise the VM and bytecode verifier.
 use crate::error::ParseError;
 use crate::instruction::Instruction;
 use crate::template::{ArrayItem, ArrayTemplate};

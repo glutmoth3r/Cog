@@ -1,5 +1,7 @@
-//! Semantic checking is independent of instruction emission. Poison represents
-//! invalid source, not a runtime error value, and suppresses derivative errors.
+//! Semantic checking is independent of instruction emission. It produces the
+//! type, effect, flow, and call-site facts consumed by specialization and codegen.
+//! Poison represents invalid source, not a runtime Error value, and suppresses
+//! derivative diagnostics during recovery.
 use crate::ast::*;
 use crate::builtins::Builtin;
 use crate::diagnostic::{Diagnostic, DiagnosticSuggestion, SourceSpan};
@@ -9,7 +11,7 @@ const CLONE_TRAIT: &str = "$core::clone::Clone";
 const MAX_TRAIT_COHERENCE_WORK: usize = 1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum Type {
+pub(crate) enum Type {
     Primitive(VarType, bool),
     Nil,
     Never,
@@ -31,7 +33,7 @@ enum Type {
     Poison,
 }
 
-fn type_compatible(expected: &Type, actual: &Type) -> bool {
+pub(crate) fn type_compatible(expected: &Type, actual: &Type) -> bool {
     match (expected, actual) {
         (Type::Dynamic, _) | (_, Type::Poison | Type::ErrorValue | Type::Never) => true,
         (Type::Primitive(a, nullable), Type::Primitive(b, actual_nullable)) => {
@@ -5315,6 +5317,10 @@ impl<'a> Checker<'a> {
                     }
                     return Type::Poison;
                 };
+                self.access_facts.indirect_signatures.insert(
+                    crate::mutability::expr_id(expr),
+                    Type::Function(parameters.clone(), result.clone()),
+                );
                 if arguments.len() != parameters.len() {
                     self.error(
                         "E1005",
@@ -5448,7 +5454,7 @@ impl<'a> Checker<'a> {
                         );
                         return Type::Poison;
                     }
-                    return Type::Function(
+                    let callable = Type::Function(
                         function
                             .params
                             .iter()
@@ -5466,6 +5472,13 @@ impl<'a> Checker<'a> {
                                 .map_or(Type::Dynamic, |ty| self.annotation_type(ty)),
                         ),
                     );
+                    self.access_facts
+                        .function_values
+                        .insert(function_name.clone(), callable.clone());
+                    self.access_facts
+                        .function_value_sites
+                        .insert(crate::mutability::expr_id(expr), function_name);
+                    return callable;
                 }
                 self.error("E1002", format!("undefined variable `{name}`"), expr.span());
                 Type::Poison
@@ -7054,7 +7067,9 @@ impl<'a> Checker<'a> {
                     }
                     let expected = match parameter {
                         N::Any => continue,
-                        N::Number => unreachable!(),
+                        N::Number => {
+                            unreachable!("number arguments use the numeric-union check above")
+                        }
                         N::Int => Type::concrete(VarType::Int),
                         N::UInt => Type::concrete(VarType::UInt),
                         N::Float => Type::concrete(VarType::Float),

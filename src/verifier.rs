@@ -1,5 +1,8 @@
 //! Bounded verification of frame shape, value flow, callable contracts, and local initialization.
-//! Dynamic and Error-dependent value checks remain interpreter responsibilities.
+//!
+//! This is a structural and partial value-flow check, not a complete static type
+//! proof. It protects bytecode loading and compiler output with bounded analysis;
+//! dynamic and Error-dependent checks remain interpreter responsibilities.
 use crate::backend::{CallableSignature, CompiledProgram};
 use crate::bytecode::LIMIT;
 use crate::instruction::Instruction;
@@ -1560,9 +1563,17 @@ fn native_result_flow(
     let categories = match import.result_contract() {
         NativeResultContract::Declared => None,
         NativeResultContract::OptionalString => Some(TYPE_STR | TYPE_NIL),
-        NativeResultContract::Json => {
-            Some(TYPE_NIL | TYPE_BOOL | TYPE_INT | TYPE_FLOAT | TYPE_STR | TYPE_ARRAY | TYPE_RECORD)
-        }
+        NativeResultContract::Json => Some(
+            TYPE_NIL
+                | TYPE_BOOL
+                | TYPE_INT
+                | TYPE_UINT
+                | TYPE_BIGINT
+                | TYPE_FLOAT
+                | TYPE_STR
+                | TYPE_ARRAY
+                | TYPE_RECORD,
+        ),
         NativeResultContract::Iterator => Some(TYPE_OTHER),
         NativeResultContract::Error => return FlowValue::ERROR,
         NativeResultContract::StructuralClone => Some(
@@ -1571,6 +1582,7 @@ fn native_result_flow(
                     | TYPE_UINT
                     | TYPE_FLOAT
                     | TYPE_BOOL
+                    | TYPE_CHAR
                     | TYPE_NIL
                     | TYPE_STR
                     | TYPE_ARRAY
@@ -2344,6 +2356,38 @@ fn truncate_record_shapes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_any_summaries_cover_runtime_numeric_and_character_results() {
+        use crate::runtime::{NativeImport, RuntimeContext, VmCapabilities};
+
+        let mut output = Vec::new();
+        let mut context = RuntimeContext::new(&mut output, VmCapabilities::default());
+        for (name, argument, normal_type) in [
+            (
+                "json::parse",
+                Value::Str("9223372036854775808".into()),
+                TYPE_UINT,
+            ),
+            (
+                "json::parse",
+                Value::Str("18446744073709551616".into()),
+                TYPE_BIGINT,
+            ),
+            (
+                "json::parse",
+                Value::Str("-9223372036854775809".into()),
+                TYPE_BIGINT,
+            ),
+            ("$vm::structural_clone", Value::Char('Ω'), TYPE_CHAR),
+        ] {
+            let import = NativeImport::named(name).unwrap();
+            let summary = native_result_flow(&import, value_flow(&argument, None));
+            let result = import.call(&mut context, &[argument]).unwrap();
+            assert_eq!(value_flow(&result, None).normal_types, normal_type);
+            assert_eq!(summary.normal_types & normal_type, normal_type, "{name}");
+        }
+    }
 
     #[test]
     fn static_call_contracts_overapproximate_runtime_acceptance() {

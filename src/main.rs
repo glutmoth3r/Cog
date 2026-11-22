@@ -1,3 +1,8 @@
+//! Command-line orchestration for checking, building, packaging, and running Cog.
+//!
+//! Project discovery and bytecode validation happen before execution. Native
+//! plugins are loaded only on run paths and are treated as trusted process code;
+//! command presentation is kept in `cli_output`.
 use cog::backend::CompiledProgram;
 use cog::runtime::{RuntimeContext, VmCapabilities};
 use cog::{build, bytecode, config, frontend, interpreter, parser, project};
@@ -570,8 +575,9 @@ fn command_with_plugins(
         }
         for (package_root, manifest) in &prepared.plugins {
             if mode == Mode::Run {
-                // Running a package loads its declared trusted native code with
-                // the same process authority as the Cog host.
+                // SAFETY: the selected package plugin runs only because the user
+                // requested `run`, and its library must be trusted native code.
+                // Descriptor checks establish ABI compatibility, not memory safety.
                 unsafe {
                     manifest.load_for_target(&mut engine, package_root, host_plugin_target()?)
                 }
@@ -586,8 +592,9 @@ fn command_with_plugins(
     for path in &options.plugins {
         let manifest = PluginManifest::read(path).map_err(|error| error.to_string())?;
         if mode == Mode::Run {
-            // --plugin is explicit user authorization to execute this trusted
-            // native library with process authority. Check/build never load it.
+            // SAFETY: `--plugin` is explicit authorization to execute this trusted
+            // native library with process authority. Check/build never load it;
+            // descriptor validation cannot make an untrusted library safe.
             unsafe { manifest.load(&mut engine, path.parent().unwrap_or(Path::new("."))) }
                 .map_err(|error| error.to_string())?;
         } else {
@@ -726,10 +733,21 @@ fn command_with_application(target: &Path, options: Options, color: &Color) -> R
     };
     // Load only after archive and bytecode validation has completed.
     for (root, manifest) in manifests {
-        unsafe { manifest.load_for_target(&mut engine, &root, host_target.unwrap()) }
-            .map_err(|error| error.to_string())?;
+        // SAFETY: invoking the application explicitly requests its declared native
+        // plugin. The selected library must be trusted; package digests do not
+        // authenticate publishers and ABI checks do not prove pointer validity.
+        unsafe {
+            manifest.load_for_target(
+                &mut engine,
+                &root,
+                host_target.expect("plugin target is set when manifests are present"),
+            )
+        }
+        .map_err(|error| error.to_string())?;
     }
     for (root, manifest) in external {
+        // SAFETY: this manifest was explicitly supplied for the requested run;
+        // its library must obey the trusted C ABI v3 contract.
         unsafe { manifest.load(&mut engine, &root) }.map_err(|error| error.to_string())?;
     }
     let program = engine

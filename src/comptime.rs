@@ -1,4 +1,8 @@
 //! Compile-time evaluation for constant values and compile-time-only functions.
+//!
+//! This phase runs after name resolution and before runtime semantic checking and
+//! codegen. It may materialize only the implemented compile-time value forms;
+//! forbidden runtime effects and evaluator budget exhaustion become diagnostics.
 use crate::ast::{
     BinOp, BindingPattern, Block, CallArgument, Expr, FallbackKind, ForClause, FunctionDecl, Item,
     MatchPattern, Program, Stmt, StructField, TypeAnnotation, TypeKind, UnOp,

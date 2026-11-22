@@ -1,5 +1,8 @@
-// Recoverable runtime failures travel as Value::Error. Invalid VM state and
-// explicit crash terminate execution; compiler diagnostics live in diagnostic.rs.
+//! Runtime failure categories shared by the VM and native host layer.
+//!
+//! Recoverable program failures travel as `Value::Error`; invalid VM state and
+//! explicit `crash` terminate execution. Source/compiler diagnostics live in
+//! [`crate::diagnostic`] and do not become catchable Cog errors.
 pub(crate) const ERROR_TYPE: &str = "$core::err::Error";
 
 #[derive(Debug, Clone)]
