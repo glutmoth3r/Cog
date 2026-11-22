@@ -24,6 +24,11 @@ fn cog_fixtures_match_across_vm_and_retained_jit() {
             "[0, 1, 2, 3, 4]\n",
         ),
         (
+            "set-benchmark.cog",
+            include_str!("../benchmarks/stdlib/set.cog"),
+            "112000\n",
+        ),
+        (
             "word_inventory.cog",
             include_str!("../examples/word_inventory.cog"),
             "apple: 3\npear: 2\nplum: 1\n",
@@ -38,6 +43,7 @@ fn cog_fixtures_match_across_vm_and_retained_jit() {
             let mut output = Vec::new();
             {
                 let mut context = RunContext::new(&mut output).with_jit(jit);
+                context.set_process_arguments(Vec::new());
                 program
                     .run_in(&mut context)
                     .unwrap_or_else(|e| panic!("{name}: {e}"));

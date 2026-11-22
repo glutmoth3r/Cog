@@ -32,7 +32,7 @@ for workload in blocks callable; do
     fi
 done
 
-for stdlib_example in examples/breadth_first.cog tests/fixtures/stdlib_v2_binary.cog; do
+for stdlib_example in examples/breadth_first.cog tests/fixtures/stdlib_v2_binary.cog benchmarks/stdlib/set.cog; do
     name=$(basename "$stdlib_example" .cog)
     cp "$stdlib_example" "$out/$name.cog"
     "$cli" build --native "$out/$name.cog" -o "$out/$name"

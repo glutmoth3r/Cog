@@ -351,7 +351,12 @@ extend[T: type + Hashable] Set[T] {
     }
 
     public fn symmetric_difference(self, other: Self) -> Self {
-        var result = self.difference(other)!!;
+        var result = Set[T](items: Map::new[T, bool]());
+        for slot in self.items.slots {
+            if slot.live && find_slot(other.items, slot.key, slot.hash)!! < 0 {
+                insert_new(result.items, slot.key, true, slot.hash)!!;
+            }
+        }
         for slot in other.items.slots {
             if slot.live && find_slot(self.items, slot.key, slot.hash)!! < 0 {
                 insert_new(result.items, slot.key, true, slot.hash)!!;
