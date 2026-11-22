@@ -1,0 +1,21 @@
+@!include("std")
+use collections from std;
+use io;
+use str as text;
+
+fn main() -> nil {
+    const report = "apple pear apple\r\npear plum\napple";
+    var counts = collections::Map::new[str, int]();
+    for line in text::lines(report)!! {
+        for token in text::split(text::trim(line)!!, " ")!! {
+            const word = (token as str)!!;
+            if word != "" {
+                const count = counts.get_or(word, 0)!!;
+                counts.set(word, count + 1)!!;
+            }
+        }
+    }
+    for entry in counts.entries()!! {
+        io::println($"{entry.0}: {entry.1}")!!;
+    }
+}

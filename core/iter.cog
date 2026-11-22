@@ -7,3 +7,41 @@ public trait Iterator[Item: type] {
 public trait IntoIterator[Iter: type, Item: type] {
     fn into_iter(self) -> Iter;
 }
+
+use err::Error;
+
+public struct Range {
+    private start: int,
+    private end: int
+}
+
+public struct RangeCursor {
+    private next_value: int,
+    private end: int,
+    private has_current: bool = false
+}
+
+public fn range(start: int, end: int) -> Range {
+    start!!;
+    end!!;
+    Range(start: start, end: end)
+}
+
+extend Range with IntoIterator[RangeCursor, int] {
+    fn into_iter(self) -> RangeCursor {
+        RangeCursor(next_value: self.start, end: self.end)
+    }
+}
+
+extend RangeCursor with Iterator[int] {
+    fn next(mut self) -> bool {
+        self.has_current = self.next_value < self.end;
+        if self.has_current { self.next_value += 1; }
+        self.has_current
+    }
+
+    fn current(self) -> int {
+        if !self.has_current { return Error::InvalidArgument("RangeCursor::current"); }
+        self.next_value - 1
+    }
+}

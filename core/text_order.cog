@@ -1,0 +1,20 @@
+use bytes;
+
+// Compare Unicode strings by their UTF-8 byte order, which preserves scalar
+// value order for valid UTF-8. Return -1, 0, or 1.
+public fn compare(left: str, right: str) -> int {
+    const left_bytes = bytes::from_str(left)!!;
+    const right_bytes = bytes::from_str(right)!!;
+    const left_length = bytes::len(left_bytes)!!;
+    const right_length = bytes::len(right_bytes)!!;
+    const common = if left_length < right_length { left_length } else { right_length };
+    for index in 0..common {
+        const left_byte = bytes::get(left_bytes, index)!!;
+        const right_byte = bytes::get(right_bytes, index)!!;
+        if left_byte < right_byte { return -1; }
+        if left_byte > right_byte { return 1; }
+    }
+    if left_length < right_length { return -1; }
+    if left_length > right_length { return 1; }
+    0
+}

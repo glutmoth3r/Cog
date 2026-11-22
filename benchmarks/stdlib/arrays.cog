@@ -1,0 +1,19 @@
+@!include("std")
+use array;
+use io;
+
+fn twice(x: int) -> int { x * 2 }
+fn selected(x: int) -> bool { x % 6 == 0 }
+fn add(sum: int, x: int) -> int { sum + x }
+
+fn work(n: int) -> int {
+    var data: int[] = [];
+    for i in 0..n { data << i; }
+    const mapped = array::map(data, twice)!!;
+    const filtered = array::filter(data, selected)!!;
+    var checksum = mapped.len();
+    for item in filtered { checksum = add(checksum, item); }
+    checksum
+}
+
+fn main() { io::println(work(12000)!!)!!; }

@@ -32,6 +32,17 @@ for workload in blocks callable; do
     fi
 done
 
+for stdlib_example in examples/breadth_first.cog tests/fixtures/stdlib_v2_binary.cog; do
+    name=$(basename "$stdlib_example" .cog)
+    cp "$stdlib_example" "$out/$name.cog"
+    "$cli" build --native "$out/$name.cog" -o "$out/$name"
+    "$cli" run "$out/$name.cog" > "$out/vm"
+    "$cli" run --jit "$out/$name.cog" > "$out/jit"
+    env -u COG_NATIVE_RUNTIME PATH=/nonexistent "$out/$name" > "$out/aot"
+    cmp "$out/vm" "$out/jit"
+    cmp "$out/vm" "$out/aot"
+done
+
 cp examples/native/optimizer-error.cog "$out"
 "$cli" build --native "$out/optimizer-error.cog" -o "$out/optimizer-error"
 "$cli" run "$out/optimizer-error.cog" > "$out/vm"

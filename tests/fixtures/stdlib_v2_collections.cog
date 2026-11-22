@@ -1,0 +1,140 @@
+@!include("std")
+use collections;
+use err::Error;
+use io;
+use ord::Ord;
+use sort;
+@comptime const OptionalInt: type = int?;
+
+var hashes = 0;
+var reject_comparison = false;
+struct Key { id: int }
+
+extend Key with collections::Hashable {
+    fn hash_code(self) -> int {
+        hashes += 1;
+        if self.id < 0 { return Error::MissingField("hash"); }
+        -1
+    }
+    fn equals(self, other: Key) -> bool { self.id == other.id }
+}
+
+extend Key with Ord {
+    fn compare(self, other: Key) -> int {
+        if reject_comparison || self.id == 99 { return Error::Unordered(); }
+        self.id - other.id
+    }
+}
+
+fn require(ok: bool, label: str) {
+    if !ok { crash(label); }
+}
+
+fn sets() {
+    var a = collections::Set::from([4, 2, 1, 2])!!;
+    const b = collections::Set::from([3, 2, 4, 6])!!;
+    require(!a.insert(1)!!, "set duplicate");
+    require(a.len() == 3, "set length");
+    io::println(a.union(b)!!.to_array()!!)!!;
+    io::println(a.intersection(b)!!.to_array()!!)!!;
+    io::println(a.difference(b)!!.to_array()!!)!!;
+    io::println(a.symmetric_difference(b)!!.to_array()!!)!!;
+    require(!a.subset(b)!! && !a.disjoint(b)!!, "set relations");
+    require(a.intersection(b)!!.subset(a)!!, "intersection subset");
+    require(a.difference(b)!!.disjoint(b)!!, "difference disjoint");
+    a.remove(2)!!;
+    require(a.insert(2)!!, "set reinsertion");
+    io::println(a.to_array()!!)!!;
+    const alias = a;
+    a.clear()!!;
+    require(alias.is_empty(), "set alias clear");
+
+    const left = collections::Set::from([Key(1), Key(2)])!!;
+    const right = collections::Set::from([Key(2), Key(3)])!!;
+    const prior = hashes;
+    require(left.union(right)!!.len() == 3, "colliding union");
+    require(left.intersection(right)!!.len() == 1, "colliding intersection");
+    require(hashes == prior, "set rehashed stored keys");
+    when left.contains(Key(-1)) is Error::MissingField(field) {
+        require(field == "hash", "hash error payload");
+    } else { crash("lost hash error"); }
+
+    var map = collections::Map::new[Key, OptionalInt]();
+    require(map.get_or_insert(Key(4), nil)!! == nil, "map insert nil");
+    require(map.get_or_insert(Key(4), 10)!! == nil, "map existing nil");
+    require(hashes == prior + 3, "map repeated hash lookup");
+    const incoming = collections::Map::from([(Key(4), 5), (Key(2), 6)])!!;
+    var values = collections::Map::new[Key, int]();
+    values.set(Key(4), 9)!!;
+    values.merge(incoming)!!;
+    require(values.keys()!![0]!!.id == 4 && values.get(Key(4))!! == 5, "ordered merge");
+    const same = values;
+    values.merge(same)!!;
+    require(values.len() == 2, "merge alias");
+}
+
+fn queues() {
+    var nullable = collections::Queue::new[OptionalInt]();
+    nullable.push(nil)!!;
+    require(!nullable.is_empty() && nullable.pop()!! == nil, "queued nil");
+    when nullable.pop() is Error::InvalidArgument {} else { crash("empty queue"); }
+
+    var q = collections::Queue::new[int]();
+    var reference: int[] = [];
+    var head = 0;
+    var rng = 17;
+    for index in 0..1000 {
+        rng = (rng * 97 + 11) % 251;
+        if q.is_empty() || rng % 5 > 1 {
+            q.push(index)!!;
+            reference << index;
+        } else {
+            require(q.peek()!! == reference[head]!!, "queue peek");
+            require(q.pop()!! == reference[head]!!, "queue order");
+            head += 1;
+        }
+        require(q.len() == reference.len() - head, "queue length");
+    }
+    while !q.is_empty() {
+        require(q.pop()!! == reference[head]!!, "queue drain");
+        head += 1;
+    }
+    require(head == reference.len(), "queue lost entries");
+
+    var deque = collections::Deque::from([1, 2, 3])!!;
+    deque.push_front(0)!!;
+    deque.push_back(4)!!;
+    require(deque.peek_front()!! == 0 && deque.peek_back()!! == 4, "deque peek");
+    require(deque.pop_front()!! == 0, "deque front");
+    require(deque.pop_back()!! == 4, "deque back");
+    require(deque.pop_front()!! == 1, "deque front order");
+    require(deque.pop_back()!! == 3, "deque back order");
+    require(deque.pop_back()!! == 2 && deque.is_empty(), "deque drain");
+}
+
+fn heaps() {
+    var data: int[] = [];
+    for i in 0..200 { data << (i * 23 % 71); }
+    var heap = collections::PriorityQueue::from(data)!!;
+    const sorted = sort::sorted(data)!!;
+    for expected in sorted {
+        require(heap.pop()!! == expected, "heap differs from sorted reference");
+    }
+    require(heap.is_empty(), "heap drain");
+
+    var custom = collections::PriorityQueue::from([Key(4), Key(1), Key(5), Key(2)])!!;
+    when custom.push(Key(99)) is Error::Unordered {} else { crash("heap push comparison error"); }
+    require(custom.len() == 4 && custom.peek()!!.id == 1, "failed push modified heap");
+    reject_comparison = true;
+    when custom.pop() is Error::Unordered {} else { crash("heap pop comparison error"); }
+    reject_comparison = false;
+    require(custom.len() == 4 && custom.peek()!!.id == 1, "failed pop modified heap");
+    for wanted in [1, 2, 4, 5] { require(custom.pop()!!.id == wanted, "heap contents after error"); }
+}
+
+fn main() {
+    sets()!!;
+    queues()!!;
+    heaps()!!;
+    io::println("collections ok")!!;
+}

@@ -56,3 +56,8 @@ public fn upper_bound[T: type + Ord](items: T[], target: T) -> int {
 
     low
 }
+
+// The half-open interval containing exactly the matching elements.
+public fn equal_range[T: type + Ord](items: T[], target: T) -> (int, int) {
+    (lower_bound(items, target)!!, upper_bound(items, target)!!)
+}

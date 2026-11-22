@@ -1,0 +1,85 @@
+// Integer fields over existing byte buffers. Reads avoid slicing or copying.
+use bytes;
+use err::Error;
+
+fn check_range(data, offset: int, width: int, operation: str) -> nil {
+    offset!!;
+    const size = bytes::len(data)!!;
+    if offset < 0 || offset > size || width > size - offset {
+        return Error::InvalidArgument(operation);
+    }
+    nil
+}
+
+fn read_word(data, offset: int, little: bool) -> uint {
+    check_range(data, offset, 8, "binary::read_u64")!!;
+    var value: uint = 0;
+    for step in 0..8 {
+        const index = if little { 7 - step } else { step };
+        const byte = bytes::get(data, offset + index)!!;
+        value = value * 256 + (byte as uint)!!;
+    }
+    value
+}
+
+public fn read_u64_le(data, offset: int) -> uint { read_word(data, offset, true) }
+public fn read_u64_be(data, offset: int) -> uint { read_word(data, offset, false) }
+
+fn write_word(data, offset: int, value: uint, little: bool) -> nil {
+    value!!;
+    check_range(data, offset, 8, "binary::write_u64")!!;
+    var rest: uint = value;
+    for step in 0..8 {
+        const index = if little { step } else { 7 - step };
+        const byte = ((rest % 256) as int)!!;
+        bytes::set(data, offset + index, byte)!!;
+        rest /= 256;
+    }
+    nil
+}
+
+public fn write_u64_le(data, offset: int, value: uint) -> nil {
+    write_word(data, offset, value, true)
+}
+public fn write_u64_be(data, offset: int, value: uint) -> nil {
+    write_word(data, offset, value, false)
+}
+
+public fn encode_varuint(value: uint) {
+    value!!;
+    var rest: uint = value;
+    var width = 1;
+    while rest >= 128 { rest /= 128; width += 1; }
+    var data = bytes::new(width)!!;
+    rest = value;
+    for i in 0..width {
+        var byte = ((rest % 128) as int)!!;
+        rest /= 128;
+        if rest != 0 { byte += 128; }
+        bytes::set(data, i, byte)!!;
+    }
+    data
+}
+
+public fn read_varuint(data, offset: int) -> (uint, int) {
+    const size = bytes::len(data)!!;
+    offset!!;
+    if offset < 0 || offset > size { return Error::InvalidArgument("binary::read_varuint"); }
+    var position = offset;
+    var scale: uint = 1;
+    var value: uint = 0;
+    for group in 0..10 {
+        if position >= size { return Error::ParseFailure("varuint", "uint"); }
+        const byte = bytes::get(data, position)!!;
+        position += 1;
+        const digit = ((byte % 128) as uint)!!;
+        if group == 9 && (digit > 1 || byte >= 128) { return Error::Overflow(); }
+        value += digit * scale;
+        if byte < 128 {
+            if group > 0 && digit == 0 { return Error::ParseFailure("varuint", "uint"); }
+            return (value, position);
+        }
+        scale *= 128;
+    }
+    Error::Overflow()
+}

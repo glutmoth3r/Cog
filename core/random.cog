@@ -1,3 +1,4 @@
+use array_storage;
 use err::Error;
 use entropy;
 use bytes;
@@ -69,4 +70,67 @@ fn range_bound(value) {
 
 public fn boolean() {
     return next()!! >= MODULUS / 2;
+}
+
+// Independent deterministic streams. This is the same non-cryptographic LCG
+// as the default generator, without an entropy dependency.
+public struct Seeded {
+    private state: int
+}
+
+extend Seeded {
+    public fn new(seed: int) -> Self {
+        var normalized = seed!! % MODULUS;
+        if normalized < 0 { normalized += MODULUS; }
+        Seeded(state: normalized)
+    }
+
+    public fn next(mut self) -> int {
+        self.state = (self.state * 1103515245 + 12345) % MODULUS;
+        self.state
+    }
+
+    public fn range(mut self, lo: int, hi: int) -> int {
+        lo!!;
+        hi!!;
+        if hi <= lo { return Error::InvalidArgument("Seeded::range"); }
+        const width = (hi - lo)!!;
+        if width > MODULUS { return Error::InvalidArgument("Seeded::range"); }
+        const limit = MODULUS - MODULUS % width;
+        var sample = self.next()!!;
+        while sample >= limit { sample = self.next()!!; }
+        lo + sample % width
+    }
+}
+
+public fn choose[T: type](rng: Seeded, items: T[]) -> T {
+    if items.len() == 0 { return Error::InvalidArgument("random::choose"); }
+    items[rng.range(0, items.len())!!]
+}
+
+public fn shuffle[T: type](rng: Seeded, items: T[]) -> nil {
+    if items.len() > MODULUS { return Error::InvalidArgument("random::shuffle"); }
+    var end = items.len();
+    while end > 1 {
+        items.swap(end - 1, rng.range(0, end)!!)!!;
+        end -= 1;
+    }
+    nil
+}
+
+public fn sample[T: type](rng: Seeded, items: T[], count: int) -> T[] {
+    count!!;
+    if count < 0 || count > items.len() || items.len() > MODULUS {
+        return Error::InvalidArgument("random::sample");
+    }
+    var result: T[] = [];
+    if count == 0 { return result; }
+    var pool: T[] = [];
+    for item in items { (pool << item)!!; }
+    for index in 0..count {
+        const selected = rng.range(index, pool.len())!!;
+        pool.swap(index, selected)!!;
+        (result << pool[index]!!)!!;
+    }
+    result
 }

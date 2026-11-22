@@ -1,0 +1,24 @@
+@!include("std")
+use collections from std;
+use io;
+
+fn visit(edges: int[][], start: int) -> int[] {
+    var tasks = collections::Queue::new[int]();
+    var visited = collections::Set::new[int]();
+    var order: int[] = [];
+    tasks.push(start)!!;
+    visited.insert(start)!!;
+    while !tasks.is_empty() {
+        const node = tasks.pop()!!;
+        (order << node)!!;
+        for neighbor in edges[node]!! {
+            if visited.insert(neighbor)!! { tasks.push(neighbor)!!; }
+        }
+    }
+    order
+}
+
+fn main() {
+    const edges = [[1, 2], [2, 3], [0, 4], [4], []];
+    io::println(visit(edges, 0)!!)!!;
+}

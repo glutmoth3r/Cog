@@ -1,4 +1,6 @@
 // Array utilities preserve element references and never mutate their inputs.
+use array_storage;
+use collections::{Hashable, Map, Set};
 use eq::Eq;
 use err::Error;
 use ord::Ord;
@@ -65,25 +67,6 @@ public fn fold[T: type, U: type](
         result = (combine)(result, item)!!;
     }
     result
-}
-
-extend[T: type] T[] {
-    // Swaps two existing elements after validating both indices and reads.
-    public fn swap(mut self, left: int, right: int) -> nil {
-        const length = self.len();
-        if left < 0 || left >= length {
-            return Error::IndexOutOfBounds(left, length);
-        }
-        if right < 0 || right >= length {
-            return Error::IndexOutOfBounds(right, length);
-        }
-        if left == right { return nil; }
-        const left_value = self[left]!!;
-        const right_value = self[right]!!;
-        self[left] = right_value;
-        self[right] = left_value;
-        nil
-    }
 }
 
 // A statically typed equality search. Unlike index_of, this requires an Eq
@@ -153,5 +136,167 @@ public fn concat(left, right) {
     for index in 0..right_length { result << right[index]!!; }
     const compatible = left.empty_like()!! + right.empty_like()!!;
     compatible!!;
+    result
+}
+
+// Predicates visit elements in order and short-circuit once the answer is known.
+public fn any[T: type](items: T[], predicate: fn(T) -> bool) -> bool {
+    for item in items {
+        if (predicate)(item)!! { return true; }
+    }
+    false
+}
+
+public fn all[T: type](items: T[], predicate: fn(T) -> bool) -> bool {
+    for item in items {
+        if !(predicate)(item)!! { return false; }
+    }
+    true
+}
+
+public fn find_index[T: type](items: T[], predicate: fn(T) -> bool) -> int? {
+    var index = 0;
+    for item in items {
+        if (predicate)(item)!! { return index; }
+        index += 1;
+    }
+    nil
+}
+
+public fn find[T: type](items: T[], predicate: fn(T) -> bool) -> T {
+    for item in items {
+        if (predicate)(item)!! { return item; }
+    }
+    Error::MissingKey()
+}
+
+public fn count_if[T: type](items: T[], predicate: fn(T) -> bool) -> int {
+    var count = 0;
+    for item in items {
+        if (predicate)(item)!! { count += 1; }
+    }
+    count
+}
+
+fn copy_range[T: type](items: T[], start: int, end: int) -> T[] {
+    var result: T[] = [];
+    for index in start..end { (result << items[index]!!)!!; }
+    result
+}
+
+public fn take[T: type](items: T[], count: int) -> T[] {
+    if count < 0 { return Error::InvalidArgument("array::take"); }
+    const end = if count < items.len() { count } else { items.len() };
+    copy_range(items, 0, end)
+}
+
+public fn drop[T: type](items: T[], count: int) -> T[] {
+    if count < 0 { return Error::InvalidArgument("array::drop"); }
+    const start = if count < items.len() { count } else { items.len() };
+    copy_range(items, start, items.len())
+}
+
+public fn partition[T: type](items: T[], predicate: fn(T) -> bool) -> (T[], T[]) {
+    var selected: T[] = [];
+    var rejected: T[] = [];
+    for item in items {
+        if (predicate)(item)!! { (selected << item)!!; }
+        else { (rejected << item)!!; }
+    }
+    (selected, rejected)
+}
+
+public fn flatten[T: type](items: T[][]) -> T[] {
+    var result: T[] = [];
+    for part in items {
+        for item in part { (result << item)!!; }
+    }
+    result
+}
+
+public fn flat_map[T: type, U: type](items: T[], transform: fn(T) -> U[]) -> U[] {
+    var result: U[] = [];
+    for item in items {
+        const part = (transform)(item)!!;
+        for mapped in part { (result << mapped)!!; }
+    }
+    result
+}
+
+public fn zip[T: type, U: type](left: T[], right: U[]) -> (T, U)[] {
+    var result: (T, U)[] = [];
+    const end = if left.len() < right.len() { left.len() } else { right.len() };
+    for index in 0..end { (result << (left[index]!!, right[index]!!))!!; }
+    result
+}
+
+public fn enumerate[T: type](items: T[]) -> (int, T)[] {
+    var result: (int, T)[] = [];
+    for index in 0..items.len() { (result << (index, items[index]!!))!!; }
+    result
+}
+
+public fn chunks[T: type](items: T[], size: int) -> T[][] {
+    if size <= 0 { return Error::InvalidArgument("array::chunks"); }
+    var result: T[][] = [];
+    var start = 0;
+    while start < items.len() {
+        const remaining = items.len() - start;
+        const count = if size < remaining { size } else { remaining };
+        const end = start + count;
+        (result << copy_range(items, start, end)!!)!!;
+        start = end;
+    }
+    result
+}
+
+public fn windows[T: type](items: T[], size: int) -> T[][] {
+    if size <= 0 { return Error::InvalidArgument("array::windows"); }
+    var result: T[][] = [];
+    if size > items.len() { return result; }
+    for start in 0..(items.len() - size + 1) {
+        (result << copy_range(items, start, start + size)!!)!!;
+    }
+    result
+}
+
+public fn dedup[T: type + Eq[T]](items: T[]) -> T[] {
+    var result: T[] = [];
+    for index in 0..items.len() {
+        const item = items[index]!!;
+        if result.len() == 0 || !item.equals(result[result.len() - 1]!!)!! {
+            (result << item)!!;
+        }
+    }
+    result
+}
+
+public fn scan[T: type, U: type](items: T[], initial: U, combine: fn(U, T) -> U) -> U[] {
+    var result: U[] = [];
+    var accumulator = initial;
+    for item in items {
+        accumulator = (combine)(accumulator, item)!!;
+        (result << accumulator)!!;
+    }
+    result
+}
+
+// Deduplicates by Hashable while retaining the first representative of each key.
+public fn unique[T: type + Hashable](items: T[]) -> T[] {
+    var seen = Set::new[T]();
+    var result: T[] = [];
+    for item in items {
+        if seen.insert(item)!! { (result << item)!!; }
+    }
+    result
+}
+
+public fn group_by[T: type, K: type + Hashable](items: T[], key: fn(T) -> K) -> Map[K, T[]] {
+    var result = Map::new[K, T[]]();
+    for item in items {
+        var empty: T[] = [];
+        var group = result.get_or_insert((key)(item)!!, empty)!!;
+        (group << item)!!;
+    }
     result
 }

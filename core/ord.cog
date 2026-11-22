@@ -1,5 +1,5 @@
 // Ordering operations for generic sorting, selection, and search.
-use str;
+use text_order;
 use err::Error;
 
 public trait Ord {
@@ -57,6 +57,6 @@ extend float with Ord {
 
 extend str with Ord {
     fn compare(self, other: str) -> int {
-        str::compare(self, other)!!
+        text_order::compare(self, other)!!
     }
 }

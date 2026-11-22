@@ -1,0 +1,16 @@
+@!include("std")
+use collections;
+use io;
+
+fn work(n: int) -> int {
+    var map = collections::Map::new[int, int]();
+    var result = 0;
+    for i in 0..(n * 5) {
+        const key = i % n;
+        if !map.contains(key)!! { map.set(key, key * 3)!!; }
+        result += map.get(key)!!;
+    }
+    result + map.len()
+}
+
+fn main() { io::println(work(2000)!!)!!; }

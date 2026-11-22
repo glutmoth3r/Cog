@@ -12,6 +12,8 @@ os.chdir(ROOT)
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("profile", type=Path)
 parser.add_argument("--only", nargs="+", metavar="WORKLOAD")
+parser.add_argument("--source", action="append", type=Path, help="measure a Cog file instead")
+parser.add_argument("--arg", action="append", default=[], help="pass an argument to the program")
 parser.add_argument("--reference", type=Path, metavar="RESULTS",
                     help="require each checksum to match a previous run")
 args = parser.parse_args()
@@ -60,15 +62,19 @@ workloads += [Path(f"examples/native/{name}.cog") for name in
               ("numeric", "pipeline", "closures", "bytes", "bigint")]
 with tempfile.TemporaryDirectory(prefix="optimizer-", dir="target") as tmp:
     out = Path(tmp).resolve()
-    mandelbrot = (ROOT / "src/bin/bench_jit.rs").read_text().split("fn mandelbrot_render_source", 1)[1]
-    mandelbrot = mandelbrot.split('r#"', 1)[1].split('"#', 1)[0]
-    mandelbrot_path = out / "mandelbrot.cog"
-    mandelbrot_path.write_text(mandelbrot)
-    large = out / "large.cog"
-    declarations = "\n".join(f'fn f{i}(x: int) -> int {{ (x + {i}) % 997 }}' for i in range(1000))
-    large.write_text('@!include("std")\nuse io;\n' + declarations
-                     + '\nfn main() { io::println(f999(7)!!)!!; }\n')
-    for workload in workloads + [mandelbrot_path, large]:
+    if args.source:
+        workloads = args.source
+    else:
+        mandelbrot = (ROOT / "src/bin/bench_jit.rs").read_text().split("fn mandelbrot_render_source", 1)[1]
+        mandelbrot = mandelbrot.split('r#"', 1)[1].split('"#', 1)[0]
+        mandelbrot_path = out / "mandelbrot.cog"
+        mandelbrot_path.write_text(mandelbrot)
+        large = out / "large.cog"
+        declarations = "\n".join(f'fn f{i}(x: int) -> int {{ (x + {i}) % 997 }}' for i in range(1000))
+        large.write_text('@!include("std")\nuse io;\n' + declarations
+                         + '\nfn main() { io::println(f999(7)!!)!!; }\n')
+        workloads.extend([mandelbrot_path, large])
+    for workload in workloads:
         if args.only and workload.stem not in args.only:
             continue
         workspace = out / workload.stem
@@ -79,13 +85,13 @@ with tempfile.TemporaryDirectory(prefix="optimizer-", dir="target") as tmp:
         native = workspace / workload.stem
         compile_ms = compile_bytecode(cli, source, bytecode)
         build_ms, _, build_log = measure(cli, "build", "--native", source, "-o", native, samples=3)
-        expected = run(cli, "run", bytecode)[0]
-        assert run(cli, "run", "--jit", bytecode)[0] == expected
+        expected = run(cli, "run", bytecode, "--", *args.arg)[0]
+        assert run(cli, "run", "--jit", bytecode, "--", *args.arg)[0] == expected
         if args.reference:
             assert reference[workload.stem] == repr(expected), workload.stem
-        aot_ms, _, _ = measure(native, expected=expected)
+        aot_ms, _, _ = measure(native, *args.arg, expected=expected)
         print(f"{workload.stem} compile_ms={compile_ms:.3f} bytecode_bytes={bytecode.stat().st_size} "
               f"aot_build_ms={build_ms:.3f} aot_run_ms={aot_ms:.3f} "
               f"exe_bytes={native.stat().st_size} checksum={expected!r}", flush=True)
         print(build_log.decode().strip(), flush=True)
-        print(run(profile / "examples/bench_native", source)[0].decode().strip(), flush=True)
+        print(run(profile / "examples/bench_native", source, *args.arg)[0].decode().strip(), flush=True)

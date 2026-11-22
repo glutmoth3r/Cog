@@ -2,6 +2,7 @@
 use err::Error;
 use clone::Clone;
 use hash;
+use ord::Ord;
 
 public trait Hashable {
     fn hash_code(self) -> int;
@@ -61,7 +62,7 @@ fn bucket_index(hash_code: int, capacity: int) -> int {
 
 fn empty_buckets(capacity: int) -> int[] {
     var buckets: int[] = [];
-    for _ in 0..capacity { buckets << -1; }
+    for _ in 0..capacity { (buckets << -1)!!; }
     buckets
 }
 
@@ -79,24 +80,45 @@ fn find_slot[K: type + Hashable, V: type](items: Map[K, V], key: K, hash_code: i
 }
 
 fn rebuild[K: type + Hashable, V: type](items: Map[K, V], capacity: int) {
-    var buckets = empty_buckets(capacity);
+    var buckets = empty_buckets(capacity)!!;
     var slots: Slot[K, V][] = [];
     for old in items.slots {
         if old.live {
             const bucket = bucket_index(old.hash, capacity);
-            slots << Slot(
+            (slots << Slot(
                 key: old.key,
                 value: old.value,
                 hash: old.hash,
                 next: buckets[bucket]!!,
                 live: true
-            );
+            ))!!;
             buckets[bucket] = slots.len() - 1;
         }
     }
     items.slots = slots;
     items.buckets = buckets;
     items.deleted = 0;
+}
+
+fn insert_new[K: type + Hashable, V: type](items: Map[K, V], key: K, value: V, hash_code: int) {
+    if items.length + 1 > items.buckets.len() - items.buckets.len() / 4 {
+        var next_capacity = items.buckets.len() * 2;
+        if next_capacity == 0 { next_capacity = 8; }
+        rebuild(items, next_capacity)!!;
+    } else if items.deleted > items.slots.len() / 2 {
+        rebuild(items, items.buckets.len())!!;
+    }
+
+    const bucket = bucket_index(hash_code, items.buckets.len());
+    (items.slots << Slot(
+        key: key,
+        value: value,
+        hash: hash_code,
+        next: items.buckets[bucket]!!,
+        live: true
+    ))!!;
+    items.buckets[bucket] = items.slots.len() - 1;
+    items.length += 1;
 }
 
 extend[K: type + Hashable, V: type] Map[K, V] {
@@ -134,24 +156,7 @@ extend[K: type + Hashable, V: type] Map[K, V] {
             return false;
         }
 
-        if self.length + 1 > self.buckets.len() - self.buckets.len() / 4 {
-            var next_capacity = self.buckets.len() * 2;
-            if next_capacity == 0 { next_capacity = 8; }
-            rebuild(self, next_capacity);
-        } else if self.deleted > self.slots.len() / 2 {
-            rebuild(self, self.buckets.len());
-        }
-
-        const bucket = bucket_index(hash_code, self.buckets.len());
-        self.slots << Slot(
-            key: key,
-            value: value,
-            hash: hash_code,
-            next: self.buckets[bucket]!!,
-            live: true
-        );
-        self.buckets[bucket] = self.slots.len() - 1;
-        self.length += 1;
+        insert_new(self, key, value, hash_code)!!;
         true
     }
 
@@ -167,6 +172,20 @@ extend[K: type + Hashable, V: type] Map[K, V] {
         const index = find_slot(self, key, key.hash_code()!!);
         if index < 0 { return default; }
         self.slots[index]!!.value
+    }
+
+    public fn get_or_insert(mut self, key: K, default: V) -> V {
+        const hash_code = key.hash_code()!!;
+        const index = find_slot(self, key, hash_code)!!;
+        if index >= 0 { return self.slots[index]!!.value; }
+        insert_new(self, key, default, hash_code)!!;
+        default
+    }
+
+    public fn merge(mut self, other: Self) -> nil {
+        const entries = other.entries()!!;
+        for entry in entries { self.set(entry.0, entry.1)!!; }
+        nil
     }
 
     // Unlinks in expected O(1), then compacts once tombstones exceed half the slots.
@@ -212,8 +231,8 @@ extend[K: type + Hashable, V: type] Map[K, V] {
     }
 
     public fn clear(mut self) {
+        self.buckets = empty_buckets(self.buckets.len())!!;
         self.slots = [];
-        self.buckets = empty_buckets(self.buckets.len());
         self.length = 0;
         self.deleted = 0;
     }
@@ -221,7 +240,7 @@ extend[K: type + Hashable, V: type] Map[K, V] {
     public fn entries(self) -> (K, V)[] {
         var result: (K, V)[] = [];
         for slot in self.slots {
-            if slot.live { result << (slot.key, slot.value); }
+            if slot.live { (result << (slot.key, slot.value))!!; }
         }
         result
     }
@@ -229,7 +248,7 @@ extend[K: type + Hashable, V: type] Map[K, V] {
     public fn keys(self) -> K[] {
         var result: K[] = [];
         for slot in self.slots {
-            if slot.live { result << slot.key; }
+            if slot.live { (result << slot.key)!!; }
         }
         result
     }
@@ -237,7 +256,7 @@ extend[K: type + Hashable, V: type] Map[K, V] {
     public fn values(self) -> V[] {
         var result: V[] = [];
         for slot in self.slots {
-            if slot.live { result << slot.value; }
+            if slot.live { (result << slot.value)!!; }
         }
         result
     }
@@ -266,5 +285,284 @@ extend[K: type + Hashable + Clone, V: type + Clone] Map[K, V] with Clone {
             }
         }
         copied
+    }
+}
+
+public struct Set[T: type + Hashable] {
+    private items: Map[T, bool]
+}
+
+extend[T: type + Hashable] Set[T] {
+    public fn new() -> Self { Set[T](items: Map::new[T, bool]()) }
+
+    public fn from(values: T[]) -> Self {
+        var result = Set[T](items: Map::new[T, bool]());
+        for value in values { result.insert(value)!!; }
+        result
+    }
+
+    public fn len(self) -> int { self.items.len() }
+    public fn is_empty(self) -> bool { self.items.is_empty() }
+    public fn contains(self, value: T) -> bool { self.items.contains(value) }
+    public fn insert(mut self, value: T) -> bool {
+        const hash_code = value.hash_code()!!;
+        if find_slot(self.items, value, hash_code)!! >= 0 { return false; }
+        insert_new(self.items, value, true, hash_code)!!;
+        true
+    }
+    public fn remove(mut self, value: T) -> nil {
+        self.items.remove(value)!!;
+        nil
+    }
+    public fn clear(mut self) -> nil { self.items.clear()!!; nil }
+    public fn to_array(self) -> T[] { self.items.keys() }
+
+    public fn union(self, other: Self) -> Self {
+        var result = Set[T](items: Map::new[T, bool]());
+        for slot in self.items.slots {
+            if slot.live { insert_new(result.items, slot.key, true, slot.hash)!!; }
+        }
+        for slot in other.items.slots {
+            if slot.live && find_slot(result.items, slot.key, slot.hash)!! < 0 {
+                insert_new(result.items, slot.key, true, slot.hash)!!;
+            }
+        }
+        result
+    }
+
+    public fn intersection(self, other: Self) -> Self {
+        var result = Set[T](items: Map::new[T, bool]());
+        for slot in self.items.slots {
+            if slot.live && find_slot(other.items, slot.key, slot.hash)!! >= 0 {
+                insert_new(result.items, slot.key, true, slot.hash)!!;
+            }
+        }
+        result
+    }
+
+    public fn difference(self, other: Self) -> Self {
+        var result = Set[T](items: Map::new[T, bool]());
+        for slot in self.items.slots {
+            if slot.live && find_slot(other.items, slot.key, slot.hash)!! < 0 {
+                insert_new(result.items, slot.key, true, slot.hash)!!;
+            }
+        }
+        result
+    }
+
+    public fn symmetric_difference(self, other: Self) -> Self {
+        var result = self.difference(other)!!;
+        for slot in other.items.slots {
+            if slot.live && find_slot(self.items, slot.key, slot.hash)!! < 0 {
+                insert_new(result.items, slot.key, true, slot.hash)!!;
+            }
+        }
+        result
+    }
+
+    public fn subset(self, other: Self) -> bool {
+        if self.len() > other.len() { return false; }
+        for slot in self.items.slots {
+            if slot.live && find_slot(other.items, slot.key, slot.hash)!! < 0 { return false; }
+        }
+        true
+    }
+
+    public fn disjoint(self, other: Self) -> bool {
+        if self.len() > other.len() { return other.disjoint(self); }
+        for slot in self.items.slots {
+            if slot.live && find_slot(other.items, slot.key, slot.hash)!! >= 0 { return false; }
+        }
+        true
+    }
+}
+
+public struct Queue[T: type] {
+    private slots: T[][] = [],
+    private empty: T[] = [],
+    private head: int = 0,
+    private length: int = 0
+}
+
+// Allocate and fill the new ring before publishing it to shared aliases.
+fn reserve_queue[T: type](queue: Queue[T]) {
+    if queue.length == queue.slots.len() {
+        var slots: T[][] = [];
+        for index in 0..queue.length {
+            (slots << queue.slots[(queue.head + index) % queue.length]!!)!!;
+        }
+        const extra = if queue.length == 0 { 8 } else { queue.length };
+        for _ in 0..extra { (slots << queue.empty)!!; }
+        queue.slots = slots;
+        queue.head = 0;
+    }
+}
+
+extend[T: type] Queue[T] {
+    public fn new() -> Self { Queue[T]() }
+
+    public fn from(values: T[]) -> Self {
+        var result = Queue[T]();
+        for index in 0..values.len() { result.push(values[index])!!; }
+        result
+    }
+
+    public fn len(self) -> int { self.length }
+    public fn is_empty(self) -> bool { self.length == 0 }
+
+    public fn push(mut self, value: T) -> nil {
+        reserve_queue(self)!!;
+        const tail = (self.head + self.length) % self.slots.len();
+        const entry: T[] = [value];
+        entry!!;
+        try { self.slots[tail] = entry; }
+        catch (error) { return error; }
+        self.length += 1;
+        nil
+    }
+
+    public fn peek(self) -> T {
+        if self.length == 0 { return Error::InvalidArgument("Queue::peek"); }
+        self.slots[self.head]!![0]
+    }
+
+    public fn pop(mut self) -> T {
+        if self.length == 0 { return Error::InvalidArgument("Queue::pop"); }
+        const entry = self.slots[self.head]!!;
+        try { self.slots[self.head] = self.empty; }
+        catch (error) { return error; }
+        self.head = (self.head + 1) % self.slots.len();
+        self.length -= 1;
+        entry[0]
+    }
+
+    public fn clear(mut self) -> nil {
+        self.slots = [];
+        self.head = 0;
+        self.length = 0;
+        nil
+    }
+}
+
+fn remove_back[T: type](queue: Queue[T]) -> T {
+    if queue.length == 0 { return Error::InvalidArgument("Deque::pop_back"); }
+    const back = (queue.head + queue.length - 1) % queue.slots.len();
+    const entry = queue.slots[back]!!;
+    try { queue.slots[back] = queue.empty; }
+    catch (error) { return error; }
+    queue.length -= 1;
+    entry[0]
+}
+
+public struct Deque[T: type] {
+    private queue: Queue[T]
+}
+
+extend[T: type] Deque[T] {
+    public fn new() -> Self { Deque[T](queue: Queue::new[T]()) }
+
+    public fn from(values: T[]) -> Self { Deque[T](queue: Queue::from(values)!!) }
+
+    public fn len(self) -> int { self.queue.len() }
+    public fn is_empty(self) -> bool { self.queue.is_empty() }
+    public fn push_back(mut self, value: T) -> nil { self.queue.push(value) }
+    public fn pop_front(mut self) -> T { self.queue.pop() }
+    public fn pop_back(mut self) -> T { remove_back(self.queue) }
+    public fn peek_front(self) -> T { self.queue.peek() }
+    public fn clear(mut self) -> nil { self.queue.clear() }
+
+    public fn peek_back(self) -> T {
+        if self.queue.length == 0 { return Error::InvalidArgument("Deque::peek_back"); }
+        const back = (self.queue.head + self.queue.length - 1) % self.queue.slots.len();
+        self.queue.slots[back]!![0]
+    }
+
+    public fn push_front(mut self, value: T) -> nil {
+        reserve_queue(self.queue)!!;
+        const capacity = self.queue.slots.len();
+        const head = if self.queue.head == 0 { capacity - 1 } else { self.queue.head - 1 };
+        const entry: T[] = [value];
+        entry!!;
+        try { self.queue.slots[head] = entry; }
+        catch (error) { return error; }
+        self.queue.head = head;
+        self.queue.length += 1;
+        nil
+    }
+}
+
+public struct PriorityQueue[T: type + Ord] {
+    private queue: Queue[T]
+}
+
+extend[T: type + Ord] PriorityQueue[T] {
+    public fn new() -> Self { PriorityQueue[T](queue: Queue::new[T]()) }
+
+    public fn from(values: T[]) -> Self {
+        var result = PriorityQueue[T](queue: Queue::new[T]());
+        for value in values { result.push(value)!!; }
+        result
+    }
+
+    public fn len(self) -> int { self.queue.length }
+    public fn is_empty(self) -> bool { self.queue.length == 0 }
+
+    public fn peek(self) -> T {
+        if self.queue.length == 0 { return Error::InvalidArgument("PriorityQueue::peek"); }
+        self.queue.peek()
+    }
+
+    public fn push(mut self, value: T) -> nil {
+        value!!;
+        const end = self.queue.length;
+        var hole = end;
+        // Compare before changing the heap. The second pass only moves entries.
+        while hole > 0 {
+            const parent = (hole - 1) / 2;
+            const candidate = self.queue.slots[parent]!![0]!!;
+            if value.compare(candidate)!! >= 0 { break; }
+            hole = parent;
+        }
+        self.queue.push(value)!!;
+        const entry = self.queue.slots[end]!!;
+        var index = end;
+        while index > hole {
+            const parent = (index - 1) / 2;
+            self.queue.slots[index] = self.queue.slots[parent]!!;
+            index = parent;
+        }
+        self.queue.slots[hole] = entry;
+        nil
+    }
+
+    public fn pop(mut self) -> T {
+        if self.queue.length == 0 { return Error::InvalidArgument("PriorityQueue::pop"); }
+        if self.queue.length == 1 { return remove_back(self.queue); }
+        const end = self.queue.length - 1;
+        const root = self.queue.slots[0]!!;
+        const last = self.queue.slots[end]!!;
+        const value = last[0]!!;
+        var hole = 0;
+        while hole < end / 2 {
+            var child = hole * 2 + 1;
+            if child + 1 < end {
+                const left = self.queue.slots[child]!![0]!!;
+                const right = self.queue.slots[child + 1]!![0]!!;
+                if right.compare(left)!! < 0 { child += 1; }
+            }
+            const candidate = self.queue.slots[child]!![0]!!;
+            if value.compare(candidate)!! <= 0 { break; }
+            hole = child;
+        }
+        remove_back(self.queue)!!;
+        var entry = last;
+        while hole > 0 {
+            const displaced = self.queue.slots[hole]!!;
+            self.queue.slots[hole] = entry;
+            entry = displaced;
+            hole = (hole - 1) / 2;
+        }
+        self.queue.slots[0] = entry;
+        root[0]
     }
 }

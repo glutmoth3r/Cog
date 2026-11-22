@@ -213,3 +213,41 @@ public fn log2(x) {
 public fn log10(x) {
     return ln(x)!! * LOG10_E;
 }
+
+public fn clamp(value, low, high) {
+    value!!;
+    low!!;
+    high!!;
+    number(value, "math::clamp")!!;
+    number(low, "math::clamp")!!;
+    number(high, "math::clamp")!!;
+    if value != value || low != low || high != high { return Error::Unordered(); }
+    if low > high { return Error::InvalidArgument("math::clamp"); }
+    if value < low { return low; }
+    if value > high { return high; }
+    value
+}
+
+// Work with nonpositive magnitudes to represent even the minimum int.
+public fn gcd(left: int, right: int) -> int {
+    left!!;
+    right!!;
+    var a = if left <= 0 { left } else { -left };
+    var b = if right <= 0 { right } else { -right };
+    while b != 0 {
+        if b == -1 { return 1; }
+        const remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    -a
+}
+
+public fn lcm(left: int, right: int) -> int {
+    left!!;
+    right!!;
+    if left == 0 || right == 0 { return 0; }
+    const multiple = ((left / gcd(left, right)!!) * right)!!;
+    if multiple < 0 { return -multiple; }
+    multiple
+}

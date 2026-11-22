@@ -1,0 +1,15 @@
+@!include("std")
+use collections;
+use io;
+
+fn work(n: int) -> int {
+    var map = collections::Map::new[int, int]();
+    var result = 0;
+    for i in 0..(n * 5) {
+        const key = i % n;
+        result += map.get_or_insert(key, key * 3)!!;
+    }
+    result + map.len()
+}
+
+fn main() { io::println(work(2000)!!)!!; }

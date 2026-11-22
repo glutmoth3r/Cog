@@ -1,0 +1,20 @@
+use err::Error;
+
+extend[T: type] T[] {
+    // Swaps two existing elements after validating both indices and reads.
+    public fn swap(mut self, left: int, right: int) -> nil {
+        const length = self.len();
+        if left < 0 || left >= length {
+            return Error::IndexOutOfBounds(left, length);
+        }
+        if right < 0 || right >= length {
+            return Error::IndexOutOfBounds(right, length);
+        }
+        if left == right { return nil; }
+        const left_value = self[left]!!;
+        const right_value = self[right]!!;
+        self[left] = right_value;
+        self[right] = left_value;
+        nil
+    }
+}
