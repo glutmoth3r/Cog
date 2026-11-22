@@ -18,6 +18,26 @@ printf '497969313\n[Ω]\n' | cmp - "$out/aot"
 grep -Eq '\[aot\] function=.*status=0 backedges=999999' "$out/trace"
 grep -Eq 'compiled=999999 .*aggregate=1999998' "$out/trace"
 
+for workload in blocks callable; do
+    cp "benchmarks/optimizer/$workload.cog" "$out"
+    "$cli" build --native "$out/$workload.cog" -o "$out/$workload"
+    "$cli" run "$out/$workload.cog" > "$out/vm"
+    "$cli" run --jit "$out/$workload.cog" > "$out/jit"
+    COG_AOT_TRACE=1 "$out/$workload" > "$out/aot" 2> "$out/trace"
+    cmp "$out/vm" "$out/jit"
+    cmp "$out/vm" "$out/aot"
+    grep -Eq '\[aot\] function=.*status=0 backedges=199999' "$out/trace"
+done
+
+cp examples/native/optimizer-error.cog "$out"
+"$cli" build --native "$out/optimizer-error.cog" -o "$out/optimizer-error"
+"$cli" run "$out/optimizer-error.cog" > "$out/vm"
+"$cli" run --jit "$out/optimizer-error.cog" > "$out/jit"
+env -u COG_NATIVE_RUNTIME PATH=/nonexistent "$out/optimizer-error" > "$out/aot"
+cmp "$out/vm" "$out/jit"
+cmp "$out/vm" "$out/aot"
+printf 'Overflow\n150014997\n' | cmp - "$out/aot"
+
 "$cli" build --native "$out/error.cog" -o "$out/error"
 if "$cli" run --color never "$out/error.cog" -- > "$out/vm" 2> "$out/vm-error"; then
     exit 1

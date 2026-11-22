@@ -6,7 +6,8 @@
 //! violates an invariant.
 //!
 //! The pass propagates scalar constants through local slots and operand-stack
-//! values, simplifies branches whose condition is known, and removes blocks
+//! values, specializes calls to proven named targets, simplifies known branches,
+//! and removes blocks
 //! made unreachable by those branches. Local slots with disjoint CFG liveness
 //! share frame storage. Potentially failing operations are only folded when
 //! the existing comptime evaluator proves that they succeed.
@@ -27,16 +28,17 @@ const MAX_SLOT_FLOW_OPERATIONS: usize = 4_000_000;
 const MAX_SLOT_INTERFERENCE_OPERATIONS: usize = 2_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Scalar {
+enum Fact {
     Int(i64),
     UInt(u64),
     Float(u64),
     Bool(bool),
     Char(char),
     Nil,
+    Function(usize),
 }
 
-impl Scalar {
+impl Fact {
     fn from_value(value: &Value) -> Option<Self> {
         Some(match value {
             Value::Int(value) => Self::Int(*value),
@@ -45,6 +47,7 @@ impl Scalar {
             Value::Bool(value) => Self::Bool(*value),
             Value::Char(value) => Self::Char(*value),
             Value::Nil => Self::Nil,
+            Value::Function(entry) => Self::Function(*entry),
             _ => return None,
         })
     }
@@ -57,18 +60,20 @@ impl Scalar {
             Self::Bool(value) => Value::Bool(value),
             Self::Char(value) => Value::Char(value),
             Self::Nil => Value::Nil,
+            Self::Function(entry) => Value::Function(entry),
         }
     }
 
-    fn expression(self) -> Expr {
-        match self {
+    fn expression(self) -> Option<Expr> {
+        Some(match self {
             Self::Int(value) => Expr::Int(value),
             Self::UInt(value) => Expr::UInt(value),
             Self::Float(value) => Expr::Float(f64::from_bits(value)),
             Self::Bool(value) => Expr::Bool(value),
             Self::Char(value) => Expr::Char(value),
             Self::Nil => Expr::Nil,
-        }
+            Self::Function(_) => return None,
+        })
     }
 
     fn is_type(self, ty: &ValueType) -> bool {
@@ -87,8 +92,8 @@ impl Scalar {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct State {
     stack_height: usize,
-    stack_values: HashMap<usize, Scalar>,
-    locals: HashMap<usize, Scalar>,
+    stack_values: HashMap<usize, Fact>,
+    locals: HashMap<usize, Fact>,
 }
 
 impl State {
@@ -100,7 +105,7 @@ impl State {
         }
     }
 
-    fn push(&mut self, value: Option<Scalar>) -> Result<(), ()> {
+    fn push(&mut self, value: Option<Fact>) -> Result<(), ()> {
         let slot = self.stack_height;
         self.stack_height = self.stack_height.checked_add(1).ok_or(())?;
         if let Some(value) = value {
@@ -112,19 +117,19 @@ impl State {
         Ok(())
     }
 
-    fn pop(&mut self) -> Result<Option<Scalar>, ()> {
+    fn pop(&mut self) -> Result<Option<Fact>, ()> {
         let slot = self.stack_height.checked_sub(1).ok_or(())?;
         self.stack_height = slot;
         Ok(self.stack_values.remove(&slot))
     }
 
-    fn peek(&self) -> Option<Scalar> {
+    fn peek(&self) -> Option<Fact> {
         self.stack_height
             .checked_sub(1)
             .and_then(|slot| self.stack_values.get(&slot).copied())
     }
 
-    fn store_local(&mut self, slot: usize, value: Option<Scalar>) {
+    fn store_local(&mut self, slot: usize, value: Option<Fact>) {
         let Some(value) = value else {
             self.locals.remove(&slot);
             return;
@@ -171,9 +176,11 @@ struct BasicBlock {
 
 struct RegionFacts {
     reachable: Vec<bool>,
-    load_constants: HashMap<usize, Scalar>,
+    load_constants: HashMap<usize, Fact>,
     redundant_stores: BTreeSet<usize>,
     branch_taken: HashMap<usize, bool>,
+    direct_calls: HashMap<usize, (usize, bool)>,
+    discarded_loads: BTreeSet<usize>,
 }
 
 impl RegionFacts {
@@ -183,6 +190,8 @@ impl RegionFacts {
             load_constants: HashMap::new(),
             redundant_stores: BTreeSet::new(),
             branch_taken: HashMap::new(),
+            direct_calls: HashMap::new(),
+            discarded_loads: BTreeSet::new(),
         }
     }
 }
@@ -209,6 +218,7 @@ pub(crate) fn optimize(program: &CompiledProgram) -> CompiledProgram {
     let mut old_to_new = vec![None; instruction_count + 1];
     let mut source_map = Vec::new();
     let mut source_index = 0;
+    let trace = std::env::var_os("COG_OPT_TRACE").is_some();
 
     for window in boundaries.windows(2) {
         let start = window[0];
@@ -219,6 +229,16 @@ pub(crate) fn optimize(program: &CompiledProgram) -> CompiledProgram {
         let facts = analyze_region(program, start, end)
             .unwrap_or_else(|| RegionFacts::conservative(end - start));
 
+        if trace && !facts.direct_calls.is_empty() {
+            let name = program
+                .functions
+                .get(&start)
+                .map_or("<entry>", String::as_str);
+            eprintln!(
+                "[optimizer] {name} direct_calls={}",
+                facts.direct_calls.len()
+            );
+        }
         for (pc, old_pc) in old_to_new.iter_mut().enumerate().take(end).skip(start) {
             if !facts.reachable[pc - start] {
                 continue;
@@ -226,11 +246,30 @@ pub(crate) fn optimize(program: &CompiledProgram) -> CompiledProgram {
             *old_pc = Some(rewritten.len());
             let location = source_location(program, pc, &mut source_index);
             match &program.instructions[pc] {
-                Instruction::Load(slot) if facts.load_constants.contains_key(&pc) => {
+                Instruction::Load(_) if facts.discarded_loads.contains(&pc) => {}
+                Instruction::Load(_) if facts.load_constants.contains_key(&pc) => {
                     push_instruction(
                         &mut rewritten,
                         &mut source_map,
                         Instruction::Push(facts.load_constants[&pc].value()),
+                        location,
+                    );
+                }
+                Instruction::CallValue(arity)
+                    if let Some(&(entry, folded_load)) = facts.direct_calls.get(&pc) =>
+                {
+                    if !folded_load {
+                        push_instruction(
+                            &mut rewritten,
+                            &mut source_map,
+                            Instruction::Pop,
+                            location.clone(),
+                        );
+                    }
+                    push_instruction(
+                        &mut rewritten,
+                        &mut source_map,
+                        Instruction::Call(entry, *arity),
                         location,
                     );
                 }
@@ -656,6 +695,8 @@ fn analyze_region(program: &CompiledProgram, start: usize, end: usize) -> Option
         load_constants: HashMap::new(),
         redundant_stores: BTreeSet::new(),
         branch_taken: HashMap::new(),
+        direct_calls: HashMap::new(),
+        discarded_loads: BTreeSet::new(),
     };
     for (index, block) in blocks.iter().enumerate() {
         let Some(mut state) = incoming[index].clone() else {
@@ -665,12 +706,31 @@ fn analyze_region(program: &CompiledProgram, start: usize, end: usize) -> Option
             facts.reachable[pc - start] = true;
             match &program.instructions[pc] {
                 Instruction::Load(slot) => {
-                    if let Some(value) = state.locals.get(slot).copied() {
+                    if let Some(value) = state.locals.get(slot).copied()
+                        && !matches!(value, Fact::Function(_))
+                    {
                         facts.load_constants.insert(pc, value);
                     }
                 }
+                Instruction::CallValue(arity)
+                    if let Some(Fact::Function(entry)) = state.peek()
+                        && program.callables.get(&entry).is_some_and(|signature| {
+                            !signature.asynchronous
+                                && signature.captures == 0
+                                && signature.parameters == *arity
+                        }) =>
+                {
+                    // An immediately preceding load in this block only feeds this call.
+                    let folded_load = pc > block.start
+                        && matches!(program.instructions[pc - 1], Instruction::Load(_));
+                    if folded_load {
+                        facts.discarded_loads.insert(pc - 1);
+                    }
+                    facts.direct_calls.insert(pc, (entry, folded_load));
+                }
                 Instruction::Store(slot)
-                    if state.peek().is_some()
+                    if !matches!(state.peek(), Some(Fact::Function(_)))
+                        && state.peek().is_some()
                         && state.peek() == state.locals.get(slot).copied() =>
                 {
                     facts.redundant_stores.insert(pc);
@@ -758,7 +818,7 @@ fn execute(
     imports: &[crate::runtime::NativeImport],
 ) -> Result<Option<bool>, ()> {
     match instruction {
-        Instruction::Push(value) => state.push(Scalar::from_value(value))?,
+        Instruction::Push(value) => state.push(Fact::from_value(value))?,
         Instruction::Load(slot) => state.push(state.locals.get(slot).copied())?,
         Instruction::Store(slot) => {
             let value = state.pop()?;
@@ -784,16 +844,20 @@ fn execute(
             let folded = value.and_then(|value| {
                 crate::comptime::fold_scalar_expression(&Expr::Unary(
                     UnOp::Not,
-                    Box::new(value.expression()),
+                    Box::new(value.expression()?),
                 ))
                 .as_ref()
-                .and_then(Scalar::from_value)
+                .and_then(Fact::from_value)
             });
             state.push(folded)?;
         }
         Instruction::IsType(ty) => {
             let value = state.pop()?;
-            state.push(value.map(|value| Scalar::Bool(value.is_type(ty))))?;
+            state.push(
+                value
+                    .filter(|value| !matches!(value, Fact::Function(_)))
+                    .map(|value| Fact::Bool(value.is_type(ty))),
+            )?;
         }
         Instruction::Add
         | Instruction::Sub
@@ -820,7 +884,7 @@ fn execute(
             let condition = state.pop()?;
             return Ok(condition
                 .and_then(|value| match value {
-                    Scalar::Bool(value) => Some(value),
+                    Fact::Bool(value) => Some(value),
                     _ => None,
                 })
                 .map(|value| match instruction {
@@ -842,7 +906,7 @@ fn execute(
     Ok(None)
 }
 
-fn fold_binary(instruction: &Instruction, left: Scalar, right: Scalar) -> Option<Scalar> {
+fn fold_binary(instruction: &Instruction, left: Fact, right: Fact) -> Option<Fact> {
     let op = match instruction {
         Instruction::Add => BinOp::Add,
         Instruction::Sub => BinOp::Sub,
@@ -862,12 +926,12 @@ fn fold_binary(instruction: &Instruction, left: Scalar, right: Scalar) -> Option
     };
     let expression = Expr::Binary(
         op,
-        Box::new(left.expression()),
-        Box::new(right.expression()),
+        Box::new(left.expression()?),
+        Box::new(right.expression()?),
     );
     crate::comptime::fold_scalar_expression(&expression)
         .as_ref()
-        .and_then(Scalar::from_value)
+        .and_then(Fact::from_value)
 }
 
 fn source_location(

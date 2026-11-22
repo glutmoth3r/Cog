@@ -1,0 +1,16 @@
+@!include("std")
+use io;
+
+fn run() -> int {
+    var checksum = 0;
+    for y in 0..400 {
+        for x in 0..400 {
+            checksum += (x * 23 + y * 17) % 991;
+        }
+    }
+    checksum
+}
+
+fn main() {
+    io::println(run()!!)!!;
+}
