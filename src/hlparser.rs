@@ -76,6 +76,7 @@ struct Parser<'a> {
     offset: usize,
     line_offset: usize,
     type_parameters: Vec<HashSet<String>>,
+    capture_enabled: bool,
     depth: usize,
     limits: crate::limits::CompilerLimits,
 }
@@ -85,6 +86,7 @@ struct DeclarationAttributes {
     comptime: bool,
     public: bool,
     asynchronous: bool,
+    propagate: bool,
     inline: InlineMode,
 }
 
@@ -98,6 +100,7 @@ impl<'a> Parser<'a> {
             offset: 0,
             line_offset: 0,
             type_parameters: Vec::new(),
+            capture_enabled: false,
             depth: 0,
             limits: crate::limits::CompilerLimits::default(),
         }
@@ -297,6 +300,7 @@ impl<'a> Parser<'a> {
                     ..
                 } => {
                     let mut parser = Parser::new(tokens, self.source.clone());
+                    parser.capture_enabled = self.capture_enabled;
                     parser.depth = self.depth;
                     parser.limits = self.limits;
                     parser.offset = offset;
@@ -581,6 +585,9 @@ impl<'a> Parser<'a> {
         {
             return Err(self.err("`@async` applies only to function declarations"));
         }
+        if attributes.propagate && !matches!(self.peek(), Some(Token::Fn) | Some(Token::Public)) {
+            return Err(self.err("`@propagate` applies only to function declarations"));
+        }
 
         let visibility = if attributes.public {
             Visibility::Public
@@ -589,12 +596,7 @@ impl<'a> Parser<'a> {
         };
         match self.peek() {
             Some(Token::Fn) | Some(Token::Public) => {
-                self.parse_function_item_with_attributes(
-                    attributes.comptime,
-                    attributes.public,
-                    attributes.asynchronous,
-                    attributes.inline,
-                )
+                self.parse_function_item_with_attributes(attributes)
             }
             Some(Token::Struct) if !attributes.comptime => {
                 let (name, type_params, fields) = self.parse_struct_decl()?;
@@ -683,6 +685,7 @@ impl<'a> Parser<'a> {
                     "comptime" => &mut attributes.comptime,
                     "public" => &mut attributes.public,
                     "async" => &mut attributes.asynchronous,
+                    "propagate" => &mut attributes.propagate,
                     _ => return Err(self.err(format!("unknown declaration attribute `@{name}`"))),
                 };
                 if self.peek() == Some(&Token::LParen) {
@@ -703,6 +706,9 @@ impl<'a> Parser<'a> {
         }
         if attributes.comptime && attributes.asynchronous {
             return Err(self.err("`@async` and `@comptime` cannot be combined"));
+        }
+        if attributes.comptime && attributes.propagate {
+            return Err(self.err("`@propagate` is not supported on `@comptime` functions"));
         }
         Ok(attributes)
     }
@@ -1088,6 +1094,9 @@ impl<'a> Parser<'a> {
                 if attributes.inline != InlineMode::Auto {
                     return Err(self.err("`@inline` applies only to function definitions"));
                 }
+                if attributes.propagate {
+                    return Err(self.err("`@propagate` cannot be applied to a trait signature"));
+                }
                 if attributes.public {
                     return Err(
                         self.err("trait method visibility is inherited from the trait declaration")
@@ -1235,21 +1244,20 @@ impl<'a> Parser<'a> {
         {
             return Err(self.err("`@async` applies only to function declarations"));
         }
-        self.parse_function_with_attributes(
-            attributes.comptime,
-            attributes.public,
-            attributes.asynchronous,
-            attributes.inline,
-        )
+        self.parse_function_with_attributes(attributes)
     }
 
     fn parse_function_with_attributes(
         &mut self,
-        attribute_comptime: bool,
-        attribute_public: bool,
-        asynchronous: bool,
-        inline: InlineMode,
+        attributes: DeclarationAttributes,
     ) -> Result<(FunctionDecl, bool), HlParseError> {
+        let DeclarationAttributes {
+            comptime: attribute_comptime,
+            public: attribute_public,
+            asynchronous,
+            propagate,
+            inline,
+        } = attributes;
         if attribute_comptime && inline != InlineMode::Auto {
             return Err(self.err("`@inline` applies only to runtime function declarations"));
         }
@@ -1285,7 +1293,10 @@ impl<'a> Parser<'a> {
             } else {
                 (None, None)
             };
-            let body = self.parse_block()?;
+            let previous = std::mem::replace(&mut self.capture_enabled, propagate);
+            let body = self.parse_block();
+            self.capture_enabled = previous;
+            let body = body?;
             if comptime && !type_params.is_empty() {
                 return Err(self.err("generic `@comptime fn` declarations are not supported"));
             }
@@ -1298,6 +1309,7 @@ impl<'a> Parser<'a> {
                     visibility,
                     comptime,
                     asynchronous,
+                    propagate,
                     inline,
                     type_params,
                     params,
@@ -1311,18 +1323,14 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_function_item(&mut self) -> Result<Item, HlParseError> {
-        self.parse_function_item_with_attributes(false, false, false, InlineMode::Auto)
+        self.parse_function_item_with_attributes(DeclarationAttributes::default())
     }
 
     fn parse_function_item_with_attributes(
         &mut self,
-        comptime: bool,
-        public: bool,
-        asynchronous: bool,
-        inline: InlineMode,
+        attributes: DeclarationAttributes,
     ) -> Result<Item, HlParseError> {
-        let (function, mutating_receiver) =
-            self.parse_function_with_attributes(comptime, public, asynchronous, inline)?;
+        let (function, mutating_receiver) = self.parse_function_with_attributes(attributes)?;
         if mutating_receiver {
             return Err(self.err("`mut self` is only valid on extension methods"));
         }
@@ -2626,7 +2634,7 @@ impl<'a> Parser<'a> {
     fn parse_primary(&mut self) -> Result<Expr, HlParseError> {
         let start = self.pos;
         let expr = self.parse_primary_inner()?;
-        let expr = self.parse_postfix(expr)?;
+        let expr = self.parse_postfix(expr, start)?;
         Ok(match self.location(start) {
             Some(span) => Expr::Located(span, Box::new(expr)),
             None => expr,
@@ -2690,11 +2698,11 @@ impl<'a> Parser<'a> {
             }
             Some(Token::LBrace) => {
                 let expr = self.parse_record_literal()?;
-                self.parse_postfix(expr)
+                Ok(expr)
             }
             Some(Token::LBracket) => {
                 let expr = self.parse_array_literal()?;
-                self.parse_postfix(expr)
+                Ok(expr)
             }
             Some(Token::LParen) => {
                 self.advance();
@@ -2706,11 +2714,22 @@ impl<'a> Parser<'a> {
                         items.push(self.parse_expr()?);
                     }
                     self.expect(&Token::RParen)?;
-                    self.parse_postfix(Expr::Tuple(items))
+                    Ok(Expr::Tuple(items))
                 } else {
                     self.expect(&Token::RParen)?;
-                    self.parse_postfix(inner)
+                    Ok(inner)
                 }
+            }
+            Some(Token::Ident(name))
+                if self.capture_enabled
+                    && name == "capture"
+                    && self
+                        .tokens
+                        .get(self.pos + 1)
+                        .is_some_and(|t| t.token == Token::LBrace) =>
+            {
+                self.advance();
+                Ok(Expr::Capture(self.parse_block()?))
             }
             Some(Token::Ident(name)) => {
                 self.advance();
@@ -2761,12 +2780,14 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let body = self.parse_block()?;
+        let previous = std::mem::replace(&mut self.capture_enabled, false);
+        let body = self.parse_block();
+        self.capture_enabled = previous;
         Ok(Expr::Closure {
             captures,
             params,
             result_type,
-            body,
+            body: body?,
         })
     }
 
@@ -2821,10 +2842,10 @@ impl<'a> Parser<'a> {
             Expr::Ident(name)
         };
 
-        self.parse_postfix(expr)
+        Ok(expr)
     }
 
-    fn parse_postfix(&mut self, mut expr: Expr) -> Result<Expr, HlParseError> {
+    fn parse_postfix(&mut self, mut expr: Expr, start: usize) -> Result<Expr, HlParseError> {
         loop {
             // Keep prefix ! parsing unchanged. Only adjacent postfix bangs
             // form propagation; `value! !` is not a compound operator.
@@ -2836,6 +2857,11 @@ impl<'a> Parser<'a> {
                     next.token == Token::Bang && self.tokens[self.pos].span.end == next.span.start
                 })
             {
+                if expr.span().is_none()
+                    && let Some(span) = self.location(start)
+                {
+                    expr = Expr::Located(span, Box::new(expr));
+                }
                 self.advance();
                 self.advance();
                 expr = Expr::Propagate(Box::new(expr));

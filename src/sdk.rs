@@ -447,6 +447,10 @@ impl<'a> RunContext<'a> {
     pub fn last_source_location(&self) -> Option<&crate::diagnostic::SourceLocation> {
         self.inner.last_source_location()
     }
+    /// Structured runtime failure from the most recent program execution.
+    pub fn last_runtime_diagnostic(&self) -> Option<&crate::error::RuntimeDiagnostic> {
+        self.inner.last_runtime_diagnostic()
+    }
     pub fn with_permissions(mut self, permissions: Permissions) -> Self {
         self.inner.capabilities = permissions.runtime();
         self
@@ -787,6 +791,7 @@ impl Program {
         self.run_in(&mut RunContext::new(output))
     }
     pub fn run_in(&self, context: &mut RunContext<'_>) -> Result<(), Error> {
+        context.inner.clear_runtime_diagnostic();
         entry_allowed()?;
         if let Some(import) = self.inner.imports.iter().find(|import| !import.is_linked()) {
             return Err(Error::at(

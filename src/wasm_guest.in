@@ -1,0 +1,365 @@
+#![allow(dead_code, unused_assignments, unused_mut, unused_variables)]
+
+use std::cmp::Ordering;
+use std::io::Write;
+use std::rc::Rc;
+
+#[derive(Clone)]
+enum V {
+    Nil,
+    Int(i64),
+    UInt(u64),
+    Bool(bool),
+    Char(char),
+    Str(Rc<str>),
+    Tag(Rc<str>),
+    Args(Rc<[Rc<str>]>),
+    Bytes(Rc<[u8]>),
+    Stdout,
+    Error(Fault),
+}
+
+#[derive(Clone)]
+struct Fault {
+    kind: &'static str,
+    pc: usize,
+    detail: Detail,
+}
+
+#[derive(Clone)]
+enum Detail {
+    None,
+    Operation(&'static str),
+    Index(i64, usize),
+    ParseFailure,
+    IoWrite(Rc<str>),
+    Missing(Rc<str>),
+}
+
+impl Fault {
+    fn new(kind: &'static str, pc: usize) -> Self {
+        Self {
+            kind,
+            pc,
+            detail: Detail::None,
+        }
+    }
+    fn value(kind: &'static str, pc: usize, detail: Detail) -> V {
+        V::Error(Self { kind, pc, detail })
+    }
+    fn tag(&self) -> String {
+        format!("$core::err::Error::{}", self.kind)
+    }
+    fn field(&self, field: &str) -> Option<V> {
+        match (&self.detail, field) {
+            (Detail::Operation(op), "op") => Some(V::Str((*op).into())),
+            (Detail::Index(index, _), "index") => Some(V::Int(*index)),
+            (Detail::Index(_, len), "len") => Some(V::Int(*len as i64)),
+            (Detail::ParseFailure, "from") => Some(V::Str("OS argument".into())),
+            (Detail::ParseFailure, "to") => Some(V::Str("str".into())),
+            (Detail::IoWrite(message), "message") => Some(V::Str(message.clone())),
+            (Detail::Missing(field), "field") => Some(V::Str(field.clone())),
+            _ => None,
+        }
+    }
+    fn message(&self) -> String {
+        match (&self.detail, self.kind) {
+            (_, "Overflow") => "integer arithmetic overflow".into(),
+            (_, "DivisionByZero") => "division by zero".into(),
+            (Detail::Operation(op), "TypeMismatch") => format!("type mismatch in `{op}`"),
+            (Detail::Operation(op), "InvalidArgument") => format!("invalid argument in `{op}`"),
+            (Detail::Index(index, len), _) => format!("index {index} out of bounds (length {len})"),
+            (Detail::IoWrite(message), _) => format!("failed to write output: {message}"),
+            (Detail::ParseFailure, _) => "cannot parse OS argument as str".into(),
+            (Detail::Missing(field), _) => format!("missing field `{field}`"),
+            _ => self.kind.into(),
+        }
+    }
+}
+
+type Run = Result<(V, bool), Fault>;
+
+struct State {
+    globals: [Option<V>; GLOBAL_SLOTS],
+}
+
+fn main() {
+    let mut state = State {
+        globals: std::array::from_fn(|_| None),
+    };
+    if let Err(error) = f_0(&mut state, 0, []) {
+        eprintln!(
+            "Error::{}: {}\nOrigin: {}",
+            error.kind,
+            error.message(),
+            site(error.pc)
+        );
+        std::process::exit(1);
+    }
+}
+
+fn take(value: &mut V) -> V {
+    std::mem::replace(value, V::Nil)
+}
+
+fn type_mismatch(pc: usize, op: &'static str) -> V {
+    Fault::value("TypeMismatch", pc, Detail::Operation(op))
+}
+
+fn condition(value: V, pc: usize) -> Result<bool, Fault> {
+    match value {
+        V::Bool(value) => Ok(value),
+        V::Error(error) => Err(error),
+        _ => Err(Fault::new("TypeMismatch", pc)),
+    }
+}
+
+fn unary_not(value: V, pc: usize) -> V {
+    match value {
+        V::Bool(value) => V::Bool(!value),
+        V::Error(_) => value,
+        _ => type_mismatch(pc, "not"),
+    }
+}
+
+fn logic(
+    a: V,
+    b: V,
+    operation: impl FnOnce(bool, bool) -> bool,
+    pc: usize,
+    name: &'static str,
+) -> V {
+    match (a, b) {
+        (error @ V::Error(_), _) | (_, error @ V::Error(_)) => error,
+        (V::Bool(a), V::Bool(b)) => V::Bool(operation(a, b)),
+        _ => type_mismatch(pc, name),
+    }
+}
+
+macro_rules! arithmetic {
+    ($name:ident, $method:ident, $op:literal, $division:literal) => {
+        fn $name(a: V, b: V, pc: usize) -> V {
+            let overflow = || V::Error(Fault::new("Overflow", pc));
+            match (a, b) {
+                (error @ V::Error(_), _) | (_, error @ V::Error(_)) => error,
+                (V::Int(_), V::Int(0)) | (V::UInt(_), V::UInt(0)) if $division => {
+                    V::Error(Fault::new("DivisionByZero", pc))
+                }
+                (V::Int(a), V::Int(b)) => a.$method(b).map_or_else(overflow, V::Int),
+                (V::UInt(a), V::UInt(b)) => a.$method(b).map_or_else(overflow, V::UInt),
+                _ => type_mismatch(pc, $op),
+            }
+        }
+    };
+}
+arithmetic!(add_number, checked_add, "add", false);
+arithmetic!(sub, checked_sub, "sub", false);
+arithmetic!(mul, checked_mul, "mul", false);
+arithmetic!(div, checked_div, "div", true);
+arithmetic!(rem, checked_rem, "mod", true);
+
+fn add(a: V, b: V, pc: usize) -> V {
+    let args = match (a, b) {
+        (error @ V::Error(_), _) | (_, error @ V::Error(_)) => return error,
+        (V::Str(a), V::Str(b)) => return V::Str((a.to_string() + &b).into()),
+        (V::Args(a), V::Args(b)) => a.iter().chain(b.iter()).cloned().collect::<Vec<_>>(),
+        (V::Args(a), V::Str(b)) => a.iter().cloned().chain([b]).collect(),
+        (V::Str(a), V::Args(b)) => [a].into_iter().chain(b.iter().cloned()).collect(),
+        (V::Args(_), _) | (_, V::Args(_)) => return type_mismatch(pc, "array_concat"),
+        (a, b) => return add_number(a, b, pc),
+    };
+    V::Args(args.into())
+}
+
+enum Order {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl Order {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Eq => "eq",
+            Self::Ne => "ne",
+            Self::Lt => "lt",
+            Self::Le => "le",
+            Self::Gt => "gt",
+            Self::Ge => "ge",
+        }
+    }
+}
+
+fn compare(a: V, b: V, operation: Order, pc: usize) -> V {
+    let equality = matches!(operation, Order::Eq | Order::Ne);
+    let order = match (a, b) {
+        (error @ V::Error(_), _) | (_, error @ V::Error(_)) => return error,
+        (V::Int(a), V::Int(b)) => a.cmp(&b),
+        (V::UInt(a), V::UInt(b)) => a.cmp(&b),
+        (V::Int(a), V::UInt(b)) => i128::from(a).cmp(&i128::from(b)),
+        (V::UInt(a), V::Int(b)) => i128::from(a).cmp(&i128::from(b)),
+        (V::Char(a), V::Char(b)) => a.cmp(&b),
+        (V::Bool(a), V::Bool(b)) if equality => a.cmp(&b),
+        (V::Str(a), V::Str(b)) | (V::Tag(a), V::Tag(b)) if equality => a.cmp(&b),
+        (V::Nil, V::Nil) if equality => Ordering::Equal,
+        (a, b) if equality && std::mem::discriminant(&a) != std::mem::discriminant(&b) => {
+            Ordering::Less
+        }
+        _ => return type_mismatch(pc, operation.name()),
+    };
+    V::Bool(match operation {
+        Order::Eq => order.is_eq(),
+        Order::Ne => order.is_ne(),
+        Order::Lt => order.is_lt(),
+        Order::Le => order.is_le(),
+        Order::Gt => order.is_gt(),
+        Order::Ge => order.is_ge(),
+    })
+}
+
+fn length(value: V, pc: usize) -> V {
+    match value {
+        V::Str(text) => V::Int(text.chars().count() as i64),
+        V::Args(args) => V::Int(args.len() as i64),
+        V::Error(_) => value,
+        _ => type_mismatch(pc, "len"),
+    }
+}
+
+fn index(value: V, key: V, pc: usize) -> V {
+    match (value, key) {
+        (V::Error(error), V::Tag(_)) => V::Tag(error.tag().into()),
+        (_, V::Tag(_)) => V::Nil,
+        (V::Error(error), V::Str(field)) => error
+            .field(&field)
+            .unwrap_or_else(|| Fault::value("MissingField", pc, Detail::Missing(field))),
+        (error @ V::Error(_), _) | (_, error @ V::Error(_)) => error,
+        (V::Args(args), V::Int(index)) => usize::try_from(index)
+            .ok()
+            .and_then(|index| args.get(index))
+            .map_or_else(
+                || Fault::value("IndexOutOfBounds", pc, Detail::Index(index, args.len())),
+                |s| V::Str(s.clone()),
+            ),
+        _ => type_mismatch(pc, "index"),
+    }
+}
+
+fn native<const N: usize>(operation: fn([V; N], usize) -> V, pc: usize, arguments: [V; N]) -> V {
+    operation(arguments, pc)
+}
+
+fn process_args(_: [V; 0], pc: usize) -> V {
+    let mut args = Vec::new();
+    for argument in std::env::args_os().skip(1) {
+        let Some(text) = argument.to_str() else {
+            return Fault::value("ParseFailure", pc, Detail::ParseFailure);
+        };
+        args.push(Rc::from(text));
+    }
+    V::Args(args.into())
+}
+
+fn stdout(_: [V; 0], _: usize) -> V {
+    V::Stdout
+}
+
+fn check_native(
+    value: V,
+    predicate: impl FnOnce(&V) -> bool,
+    pc: usize,
+    op: &'static str,
+) -> Result<V, V> {
+    if matches!(value, V::Error(_)) {
+        Err(value)
+    } else if predicate(&value) {
+        Ok(value)
+    } else {
+        Err(type_mismatch(pc, op))
+    }
+}
+
+fn to_bytes([value]: [V; 1], pc: usize) -> V {
+    match value {
+        V::Str(text) => V::Bytes(Rc::from(text.as_bytes())),
+        V::Error(_) => value,
+        _ => type_mismatch(pc, "bytes::from_str"),
+    }
+}
+
+fn render_text(value: V) -> String {
+    match value {
+        V::Int(value) => value.to_string(),
+        V::UInt(value) => value.to_string(),
+        V::Bool(value) => value.to_string(),
+        V::Char(value) => value.to_string(),
+        V::Nil => "nil".into(),
+        V::Str(value) | V::Tag(value) => value.to_string(),
+        V::Bytes(value) => format!("<bytes:{}>", value.len()),
+        V::Args(values) => format!("[{}]", values.join(", ")),
+        V::Stdout => "<resource>".into(),
+        V::Error(error) => format!("Error: {}", error.message()),
+    }
+}
+
+fn render([value]: [V; 1], _: usize) -> V {
+    V::Bytes(render_text(value).into_bytes().into())
+}
+
+fn bytes_len([value]: [V; 1], pc: usize) -> V {
+    match value {
+        V::Bytes(bytes) => V::Int(bytes.len() as i64),
+        V::Error(_) => value,
+        _ => type_mismatch(pc, "bytes::len"),
+    }
+}
+
+fn io_result(result: std::io::Result<()>, pc: usize) -> V {
+    result.map_or_else(
+        |error| {
+            Fault::value(
+                "IoWriteFailed",
+                pc,
+                Detail::IoWrite(error.to_string().into()),
+            )
+        },
+        |()| V::Nil,
+    )
+}
+
+fn write_all([handle, bytes, offset, count]: [V; 4], pc: usize) -> V {
+    for (value, valid) in [
+        (&handle, matches!(handle, V::Stdout)),
+        (&bytes, matches!(bytes, V::Bytes(_))),
+        (&offset, matches!(offset, V::Int(_))),
+        (&count, matches!(count, V::Int(_))),
+    ] {
+        if let V::Error(_) = value {
+            return value.clone();
+        }
+        if !valid {
+            return type_mismatch(pc, "io::write_all");
+        }
+    }
+    let (V::Bytes(bytes), V::Int(offset), V::Int(count)) = (bytes, offset, count) else {
+        unreachable!()
+    };
+    let range = usize::try_from(offset)
+        .ok()
+        .zip(usize::try_from(count).ok())
+        .and_then(|(offset, count)| bytes.get(offset..offset.checked_add(count)?));
+    match range {
+        Some(bytes) => io_result(std::io::stdout().lock().write_all(bytes), pc),
+        None => Fault::value("InvalidArgument", pc, Detail::Operation("bytes range")),
+    }
+}
+
+fn flush([handle]: [V; 1], pc: usize) -> V {
+    match check_native(handle, |value| matches!(value, V::Stdout), pc, "io::flush") {
+        Ok(_) => io_result(std::io::stdout().lock().flush(), pc),
+        Err(error) => error,
+    }
+}

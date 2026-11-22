@@ -1497,6 +1497,7 @@ pub struct RuntimeContext<'a> {
     identity: Rc<()>,
     process_arguments: Option<Vec<OsString>>,
     last_source_location: Option<crate::diagnostic::SourceLocation>,
+    last_runtime_diagnostic: Option<crate::error::RuntimeDiagnostic>,
     pub(crate) jit_enabled: bool,
     pub(crate) jit_debug: bool,
     pub(crate) jit_profile_path: Option<PathBuf>,
@@ -1545,6 +1546,7 @@ impl<'a> RuntimeContext<'a> {
             identity: Rc::new(()),
             process_arguments: None,
             last_source_location: None,
+            last_runtime_diagnostic: None,
             jit_enabled: false,
             jit_debug: false,
             jit_profile_path: None,
@@ -1594,6 +1596,20 @@ impl<'a> RuntimeContext<'a> {
     /// source-map metadata. Catchable errors handled by Cog are not recorded.
     pub fn last_source_location(&self) -> Option<&crate::diagnostic::SourceLocation> {
         self.last_source_location.as_ref()
+    }
+
+    /// The last execution's failure, with Cog trace records when available.
+    pub fn last_runtime_diagnostic(&self) -> Option<&crate::error::RuntimeDiagnostic> {
+        self.last_runtime_diagnostic.as_ref()
+    }
+
+    pub(crate) fn clear_runtime_diagnostic(&mut self) {
+        self.last_runtime_diagnostic = None;
+        self.last_source_location = None;
+    }
+
+    pub(crate) fn record_runtime_diagnostic(&mut self, error: &RuntimeError) {
+        self.last_runtime_diagnostic = Some(crate::error::RuntimeDiagnostic::new(error));
     }
 
     pub(crate) fn set_source_location(

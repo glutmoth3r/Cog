@@ -212,6 +212,8 @@ pub struct FunctionDecl {
     pub comptime: bool,
     /// Runtime task-producing callable declared with `@async`.
     pub asynchronous: bool,
+    /// Observe unhandled errors at statement boundaries in this function.
+    pub propagate: bool,
     /// Inlining preference supplied with `@inline` or `@inline("never")`.
     pub inline: InlineMode,
     pub type_params: Vec<TypeParameter>,
@@ -621,6 +623,8 @@ pub enum Expr {
         fallback: Box<Expr>,
     },
     Block(Block),
+    /// Preserve the block result at the closest implicit observation boundary.
+    Capture(Block),
     Match {
         value: Box<Expr>,
         arms: Vec<MatchArm>,

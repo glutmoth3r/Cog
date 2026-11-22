@@ -6171,7 +6171,7 @@ impl<'a> Checker<'a> {
                     _ => Type::Dynamic,
                 }
             }
-            Expr::Block(block) => self.block(block),
+            Expr::Block(block) | Expr::Capture(block) => self.block(block),
             Expr::Match {
                 value,
                 arms,

@@ -999,7 +999,7 @@ impl Resolver {
             Expr::Unary(_, x) | Expr::Cast(x, _) | Expr::Propagate(x) => {
                 self.expr(x, owner, scopes, location)
             }
-            Expr::Block(body) => self.block(body, owner, scopes, location),
+            Expr::Block(body) | Expr::Capture(body) => self.block(body, owner, scopes, location),
             Expr::Match { value, arms, .. } => {
                 self.expr(value, owner, scopes, location.clone());
                 for arm in arms {

@@ -1537,8 +1537,12 @@ fn jit_bridge_does_not_replay_effects_on_terminal_failure() {
         context.configure_jit(jit, Some(&profile), false);
         let error = interpreter::run_with_context(&artifact, &mut context).unwrap_err();
         let location = context.last_source_location().cloned();
+        let diagnostic = context.last_runtime_diagnostic().cloned().unwrap();
+        assert_eq!(diagnostic.kind, "Crashed");
+        let origin = &diagnostic.provenance.as_ref().unwrap().origin;
+        assert!(origin.function.as_ref().unwrap().ends_with("step"));
         drop(context);
-        (error.to_string(), location, output)
+        (error.to_string(), location, output, diagnostic)
     };
     let vm = run(false);
     assert_eq!(vm.2, b"9999\n");

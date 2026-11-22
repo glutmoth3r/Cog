@@ -5,7 +5,7 @@
 //! unsupported operations, metered execution, and canonical runtime Error handling.
 //! Managed values are rooted in the Cog heap; host resources remain owned by the
 //! per-run [`crate::runtime::RuntimeContext`].
-use crate::error::RuntimeError;
+use crate::error::{ErrorProvenance, ErrorTraceFrame, MAX_ERROR_TRACE_FRAMES, RuntimeError};
 use crate::heap;
 use crate::heap::{HeapRef, TaskRootSet};
 use crate::instruction::Instruction;
@@ -61,6 +61,50 @@ impl CaptureValues {
 
 type CallFrame = (usize, usize, CaptureValues, usize, usize, usize);
 
+fn trace_frame(artifact: &CompiledProgram, entry: usize, pc: usize) -> ErrorTraceFrame {
+    ErrorTraceFrame {
+        instruction: pc,
+        function: artifact.functions.get(&entry).cloned(),
+        location: artifact.source_location(pc).cloned(),
+        native_operation: match artifact.instructions.get(pc) {
+            Some(Instruction::CallNative(index)) => artifact
+                .imports
+                .get(*index)
+                .map(|import| import.name().to_owned()),
+            _ => None,
+        },
+    }
+}
+
+#[cold]
+fn trace_error(
+    error: &mut RuntimeError,
+    artifact: &CompiledProgram,
+    entry: usize,
+    pc: usize,
+    frames: &[CallFrame],
+    bridge_callers: &[CallFrame],
+) {
+    if artifact.source_map.is_empty() || error.provenance().is_some() {
+        return;
+    }
+    let mut callers = frames
+        .iter()
+        .rev()
+        .chain(bridge_callers.iter().rev())
+        .filter_map(|(return_pc, _, _, _, entry, _)| {
+            let pc = return_pc.checked_sub(1)?;
+            Some(trace_frame(artifact, *entry, pc))
+        });
+    error.attach_provenance(ErrorProvenance {
+        origin: trace_frame(artifact, entry, pc),
+        callers: callers.by_ref().take(MAX_ERROR_TRACE_FRAMES).collect(),
+        propagation: Vec::new(),
+        observation: None,
+        truncated: callers.next().is_some(),
+    });
+}
+
 struct VmContinuation {
     pc: usize,
     stack: Vec<Value>,
@@ -88,6 +132,7 @@ struct BridgeEntry<'a> {
     scratch: &'a mut BridgeScratch,
     error_pc: &'a mut Option<usize>,
     propagation_pending: &'a mut bool,
+    callers: &'a [CallFrame],
 }
 
 enum VmExecution {
@@ -210,6 +255,7 @@ impl VmExecutionPlan {
         globals: &mut Vec<Option<Value>>,
         error_value_pc: &mut Option<usize>,
         halt_error_pc: &mut Option<usize>,
+        callers: &[CallFrame],
     ) -> Result<Option<JitExit>, RuntimeError> {
         if !context.jit_enabled || context.limits.any_active() {
             return Ok(None);
@@ -282,6 +328,7 @@ impl VmExecutionPlan {
                         scratch: &mut scratch,
                         error_pc: &mut error_pc,
                         propagation_pending: &mut pending,
+                        callers,
                     };
                     match execute_vm(
                         artifact,
@@ -303,7 +350,10 @@ impl VmExecutionPlan {
                 }
             };
             match result {
-                Ok(value) => {
+                Ok(mut value) => {
+                    if let Value::Error(error) = &mut value {
+                        trace_error(error, artifact, entry, pc, callers, &[]);
+                    }
                     if let Some(origin) = error_pc {
                         *error_value_pc = Some(origin);
                     }
@@ -4410,15 +4460,20 @@ fn run_with_execution_plan(
     execution_plan: &VmExecutionPlan,
     scheduler_plan: Option<Rc<VmExecutionPlan>>,
 ) -> Result<(), RuntimeError> {
+    context.clear_runtime_diagnostic();
     let _heap_object_limit = heap::limit_object_allocations(context.limits.max_heap_objects);
     let result = execute(artifact, context, owner, execution_plan, scheduler_plan);
     let cleanup = context.finish();
-    match (result, cleanup) {
+    let result = match (result, cleanup) {
         (Err(primary), Err(secondary)) if primary.is_recoverable() => {
             Err(primary.with_suppressed(secondary))
         }
         (result, cleanup) => result.and(cleanup),
-    }
+    };
+    result.map_err(|error| {
+        context.record_runtime_diagnostic(&error);
+        error.without_provenance()
+    })
 }
 
 fn execute(
@@ -4795,8 +4850,9 @@ fn execute_vm(
             )
         }
     };
+    let bridge_callers = bridge.as_ref().map_or(&[][..], |entry| entry.callers);
     let mut suspended = false;
-    let result = (|| -> Result<Value, RuntimeError> {
+    let mut result = (|| -> Result<Value, RuntimeError> {
         if let Some(outcome) = resume_outcome {
             let value = await_outcome(outcome)?;
             if matches!(&value, Value::Error(_)) {
@@ -4918,7 +4974,11 @@ fn execute_vm(
                 Instruction::Halt => {
                     if let Some(Value::Error(error)) = stack[operand_base..].last() {
                         halt_error_pc = Some(error_value_pc.unwrap_or(pc));
-                        return Err((**error).clone());
+                        let mut error = (**error).clone();
+                        if error.provenance().is_some() {
+                            error.record_observation(trace_frame(artifact, callable_start, pc));
+                        }
+                        return Err(error);
                     }
                     return Ok(stack[operand_base..].last().cloned().unwrap_or(Value::Nil));
                 }
@@ -5367,6 +5427,7 @@ fn execute_vm(
                             globals,
                             &mut error_value_pc,
                             &mut halt_error_pc,
+                            &call_stack,
                         )?
                     {
                         pc = match exit {
@@ -5405,6 +5466,7 @@ fn execute_vm(
                                     globals,
                                     &mut error_value_pc,
                                     &mut halt_error_pc,
+                                    &call_stack,
                                 )?
                             {
                                 pc = match exit {
@@ -5453,6 +5515,7 @@ fn execute_vm(
                                     globals,
                                     &mut error_value_pc,
                                     &mut halt_error_pc,
+                                    &call_stack,
                                 )?
                             {
                                 pc = match exit {
@@ -6033,7 +6096,7 @@ fn execute_vm(
                         return Err(RuntimeError::StackUnderflow);
                     }
                     let result = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
-                    let result = execution_plan
+                    let mut result = execution_plan
                         .callable_signature(artifact, callable_start)
                         .and_then(|signature| signature.result_type.as_ref())
                         .filter(|expected| !matches_runtime_type(expected, &result))
@@ -6045,7 +6108,27 @@ fn execute_vm(
                             op: "propagate non-error return",
                         });
                     }
-                    if matches!(result, Value::Error(_)) {
+                    if let Value::Error(error) = &mut result {
+                        trace_error(
+                            error,
+                            artifact,
+                            callable_start,
+                            pc,
+                            &call_stack,
+                            bridge_callers,
+                        );
+                        if error.provenance().is_some() {
+                            if propagates {
+                                error.record_propagation(trace_frame(artifact, callable_start, pc));
+                            }
+                            if let Some((return_pc, _, _, _, entry, _)) = call_stack.last() {
+                                error.record_propagation(trace_frame(
+                                    artifact,
+                                    *entry,
+                                    return_pc - 1,
+                                ));
+                            }
+                        }
                         error_value_pc = Some(pc);
                     }
                     if call_stack.is_empty() {
@@ -6482,11 +6565,18 @@ fn execute_vm(
             }
             if produced != 0 {
                 let output_start = stack.len().saturating_sub(produced);
-                if stack[output_start..]
-                    .iter()
-                    .any(|value| matches!(value, Value::Error(_)))
-                {
-                    error_value_pc = Some(pc);
+                for value in &mut stack[output_start..] {
+                    if let Value::Error(error) = value {
+                        trace_error(
+                            error,
+                            artifact,
+                            callable_start,
+                            pc,
+                            &call_stack,
+                            bridge_callers,
+                        );
+                        error_value_pc = Some(pc);
+                    }
                 }
             }
             if callable_end < program.len() && pc + 1 == callable_end {
@@ -6496,6 +6586,17 @@ fn execute_vm(
         }
         Err(RuntimeError::MissingHalt)
     })();
+
+    if let Err(error) = &mut result {
+        trace_error(
+            error,
+            artifact,
+            callable_start,
+            halt_error_pc.unwrap_or(pc),
+            &call_stack,
+            bridge_callers,
+        );
+    }
 
     if let Some(entry) = bridge {
         *entry.error_pc = if result.is_err() {
@@ -6531,12 +6632,19 @@ fn execute_vm(
     }
 
     let source_pc = result.as_ref().err().map(|_| halt_error_pc.unwrap_or(pc));
-    let source_location = source_pc.and_then(|instruction| {
-        artifact
-            .source_location(instruction)
-            .or_else(|| artifact.source_location_before(instruction))
-            .cloned()
-    });
+    let source_location = result
+        .as_ref()
+        .err()
+        .and_then(RuntimeError::provenance)
+        .and_then(|trace| trace.origin.location.clone())
+        .or_else(|| {
+            source_pc.and_then(|instruction| {
+                artifact
+                    .source_location(instruction)
+                    .or_else(|| artifact.source_location_before(instruction))
+                    .cloned()
+            })
+        });
     context.set_source_location(source_location);
 
     // Keep the VM's roots alive until the collector has detached all edges in

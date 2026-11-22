@@ -353,7 +353,7 @@ fn measure_with_pending_limit<'a>(
                         }
                     }
                 }
-                Expr::Block(block) => pending.push(Node::Block(block)),
+                Expr::Block(block) | Expr::Capture(block) => pending.push(Node::Block(block)),
                 Expr::Try {
                     body, catch_block, ..
                 } => {

@@ -50,8 +50,11 @@ fn untrusted_instructions(instruction_count: usize, encoded: &[u8]) -> Vec<u8> {
     let seed = CompiledProgram::new((0..instruction_count).map(|_| I::Halt).collect());
     let mut bytes = bytecode::encode(&seed).expect("valid seed artifact should encode");
     let instruction_start = 20; // Fixed header with empty import and callable tables.
-    let source_map_start = bytes.len() - 4;
-    bytes.splice(instruction_start..source_map_start, encoded.iter().copied());
+    let diagnostic_tables_start = bytes.len() - 8;
+    bytes.splice(
+        instruction_start..diagnostic_tables_start,
+        encoded.iter().copied(),
+    );
     bytes
 }
 
@@ -121,7 +124,7 @@ fn typed_aggregate_metadata_is_bounded_canonical_and_versioned() {
     assert!(
         bytecode::decode(&legacy)
             .unwrap_err()
-            .contains("unsupported bytecode version 10; expected 38")
+            .contains("unsupported bytecode version 10; expected 39")
     );
 }
 

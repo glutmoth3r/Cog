@@ -130,7 +130,7 @@ pub struct SourceSpan {
 }
 
 /// Source coordinates that remain useful after the source text is discarded.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SourceLocation {
     pub file: String,
     pub line: usize,

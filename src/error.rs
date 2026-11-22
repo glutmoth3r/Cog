@@ -3,7 +3,156 @@
 //! Recoverable program failures travel as `Value::Error`; invalid VM state and
 //! explicit `crash` terminate execution. Source/compiler diagnostics live in
 //! [`crate::diagnostic`] and do not become catchable Cog errors.
+use crate::diagnostic::SourceLocation;
+use std::rc::Rc;
+
 pub(crate) const ERROR_TYPE: &str = "$core::err::Error";
+
+pub(crate) const MAX_ERROR_TRACE_FRAMES: usize = 24;
+
+/// One Cog instruction in a diagnostic trace. Unmapped instructions keep their
+/// bytecode address without borrowing a coordinate from a different operation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ErrorTraceFrame {
+    pub instruction: usize,
+    pub function: Option<String>,
+    pub location: Option<SourceLocation>,
+    pub native_operation: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ErrorProvenance {
+    pub origin: ErrorTraceFrame,
+    /// Innermost caller first.
+    pub callers: Vec<ErrorTraceFrame>,
+    pub propagation: Vec<ErrorTraceFrame>,
+    pub observation: Option<ErrorTraceFrame>,
+    pub truncated: bool,
+}
+
+/// A host-facing snapshot that owns no Cog heap values.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RuntimeDiagnostic {
+    pub kind: String,
+    pub message: String,
+    pub provenance: Option<ErrorProvenance>,
+    pub suppressed: Vec<RuntimeDiagnostic>,
+    pub suppressed_truncated: bool,
+    pub unhandled_error: bool,
+}
+
+impl RuntimeDiagnostic {
+    pub(crate) fn new(error: &RuntimeError) -> Self {
+        let mut remaining = MAX_ERROR_TRACE_FRAMES;
+        Self::snapshot(error, &mut remaining, 0)
+    }
+
+    fn snapshot(error: &RuntimeError, remaining: &mut usize, depth: usize) -> Self {
+        let mut suppressed = Vec::new();
+        for secondary in error.suppressed() {
+            if *remaining == 0 || depth >= 4 {
+                break;
+            }
+            *remaining -= 1;
+            suppressed.push(Self::snapshot(secondary, remaining, depth + 1));
+        }
+        Self {
+            kind: error.kind().into(),
+            message: error.to_string(),
+            provenance: error.provenance().map(|trace| (**trace).clone()),
+            suppressed_truncated: suppressed.len() < error.suppressed().len(),
+            suppressed,
+            unhandled_error: error.is_recoverable()
+                && error
+                    .provenance()
+                    .is_some_and(|trace| trace.observation.is_some()),
+        }
+    }
+
+    /// Render the same structured records exposed to embedders.
+    pub fn render(&self, fallback: Option<&SourceLocation>) -> String {
+        use std::fmt::Write as _;
+        let location = self
+            .provenance
+            .as_ref()
+            .and_then(|trace| trace.origin.location.as_ref())
+            .or(fallback);
+        let mut output = if let Some(location) = location {
+            format!(
+                "runtime error at {}:{}:{}: {}",
+                location.file.escape_debug(),
+                location.line,
+                location.column,
+                self.message
+            )
+        } else {
+            format!("runtime error: {}", self.message)
+        };
+        self.write_trace(&mut output, 0);
+        if self.unhandled_error {
+            let _ = write!(output, "\nUnhandled Error reached the program entry point.");
+        }
+        output
+    }
+
+    fn write_trace(&self, output: &mut String, depth: usize) {
+        use std::fmt::Write as _;
+        let indent = "  ".repeat(depth);
+        if let Some(trace) = &self.provenance {
+            let mut frame = |label, frame: &ErrorTraceFrame| {
+                let _ = write!(output, "\n{indent}  {label} {frame}");
+            };
+            frame("origin:", &trace.origin);
+            for caller in &trace.callers {
+                frame("called from", caller);
+            }
+            for site in &trace.propagation {
+                frame("propagated through", site);
+            }
+            if let Some(site) = &trace.observation {
+                frame("observed at", site);
+            }
+            if trace.truncated {
+                let _ = write!(output, "\n{indent}  … trace truncated");
+            }
+        }
+        for secondary in &self.suppressed {
+            let _ = write!(
+                output,
+                "\n{indent}  suppressed {}: {}",
+                secondary.kind.escape_debug(),
+                secondary.message,
+            );
+            secondary.write_trace(output, depth + 1);
+        }
+        if self.suppressed_truncated {
+            let _ = write!(output, "\n{indent}  … suppressed diagnostics truncated");
+        }
+    }
+}
+
+impl std::fmt::Display for ErrorTraceFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(function) = &self.function {
+            write!(f, "{} at ", function.escape_debug())?;
+        }
+        if let Some(location) = &self.location {
+            write!(
+                f,
+                "{}:{}:{}",
+                location.file.escape_debug(),
+                location.line,
+                location.column
+            )?;
+        } else {
+            write!(f, "instruction {}", self.instruction)?;
+        }
+        if let Some(operation) = &self.native_operation {
+            write!(f, " (native {})", operation.escape_debug())?;
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum RuntimeError {
@@ -76,6 +225,10 @@ pub enum RuntimeError {
         primary: Box<RuntimeError>,
         suppressed: Vec<RuntimeError>,
     },
+    WithProvenance {
+        error: Box<RuntimeError>,
+        provenance: Rc<ErrorProvenance>,
+    },
     Crashed {
         context: Option<std::rc::Rc<str>>,
         value: crate::value::Value,
@@ -86,6 +239,7 @@ impl RuntimeError {
     pub fn primary(&self) -> &Self {
         match self {
             Self::WithSuppressed { primary, .. } => primary.primary(),
+            Self::WithProvenance { error, .. } => error.primary(),
             error => error,
         }
     }
@@ -93,12 +247,17 @@ impl RuntimeError {
     pub fn suppressed(&self) -> &[RuntimeError] {
         match self {
             Self::WithSuppressed { suppressed, .. } => suppressed,
+            Self::WithProvenance { error, .. } => error.suppressed(),
             _ => &[],
         }
     }
 
     pub fn with_suppressed(self, secondary: RuntimeError) -> Self {
         match self {
+            Self::WithProvenance { error, provenance } => Self::WithProvenance {
+                error: Box::new(error.with_suppressed(secondary)),
+                provenance,
+            },
             Self::WithSuppressed {
                 primary,
                 mut suppressed,
@@ -113,6 +272,60 @@ impl RuntimeError {
                 primary: Box::new(primary),
                 suppressed: vec![secondary],
             },
+        }
+    }
+
+    pub fn provenance(&self) -> Option<&Rc<ErrorProvenance>> {
+        match self {
+            Self::WithProvenance { provenance, .. } => Some(provenance),
+            Self::WithSuppressed { primary, .. } => primary.provenance(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn attach_provenance(&mut self, provenance: ErrorProvenance) {
+        let error = std::mem::replace(self, Self::MissingHalt);
+        *self = Self::WithProvenance {
+            error: Box::new(error),
+            provenance: Rc::new(provenance),
+        };
+    }
+
+    fn provenance_mut(&mut self) -> Option<&mut ErrorProvenance> {
+        match self {
+            Self::WithProvenance { provenance, .. } => Some(Rc::make_mut(provenance)),
+            Self::WithSuppressed { primary, .. } => primary.provenance_mut(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn record_propagation(&mut self, frame: ErrorTraceFrame) {
+        if let Some(provenance) = self.provenance_mut() {
+            if provenance.propagation.len() < MAX_ERROR_TRACE_FRAMES {
+                provenance.propagation.push(frame);
+            } else {
+                provenance.truncated = true;
+            }
+        }
+    }
+
+    pub(crate) fn record_observation(&mut self, frame: ErrorTraceFrame) {
+        if let Some(provenance) = self.provenance_mut() {
+            provenance.observation = Some(frame);
+        }
+    }
+
+    pub(crate) fn without_provenance(self) -> Self {
+        match self {
+            Self::WithProvenance { error, .. } => error.without_provenance(),
+            Self::WithSuppressed {
+                primary,
+                suppressed,
+            } => Self::WithSuppressed {
+                primary: Box::new(primary.without_provenance()),
+                suppressed,
+            },
+            error => error,
         }
     }
 
@@ -177,6 +390,7 @@ impl RuntimeError {
             Self::Unordered => "Unordered",
             Self::LanguageError { tag, .. } => tag.rsplit("::").next().unwrap_or(tag),
             Self::WithSuppressed { primary, .. } => primary.kind(),
+            Self::WithProvenance { error, .. } => error.kind(),
             Self::Crashed { .. } => "Crashed",
         }
     }
@@ -184,6 +398,7 @@ impl RuntimeError {
     pub fn tag(&self) -> std::rc::Rc<str> {
         match self {
             Self::WithSuppressed { primary, .. } => primary.tag(),
+            Self::WithProvenance { error, .. } => error.tag(),
             Self::LanguageError { tag, .. } => tag.clone(),
             _ => format!("{ERROR_TYPE}::{}", self.kind()).into(),
         }
@@ -194,6 +409,7 @@ impl RuntimeError {
         let text = |s: &str| Value::Str(std::rc::Rc::from(s));
         Some(match (self, name) {
             (Self::WithSuppressed { primary, .. }, name) => return primary.field(name),
+            (Self::WithProvenance { error, .. }, name) => return error.field(name),
             (Self::TypeMismatch { op } | Self::PermissionDenied { op }, "op") => text(op),
             (Self::InvalidArgument { op } | Self::IoFailure { op, .. }, "op") => text(op),
             (Self::IoFailure { message, .. }, "message") => text(message),
@@ -222,6 +438,7 @@ impl std::fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RuntimeError::WithSuppressed { primary, .. } => primary.fmt(f),
+            RuntimeError::WithProvenance { error, .. } => error.fmt(f),
             RuntimeError::StackUnderflow => write!(f, "stack underflow"),
             RuntimeError::CallStackUnderflow => {
                 write!(f, "call stack underflow (return without call)")

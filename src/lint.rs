@@ -492,7 +492,7 @@ impl Linter {
                 self.block(body, report);
                 self.pop_scope();
             }
-            Expr::Block(block) => self.block(block, report),
+            Expr::Block(block) | Expr::Capture(block) => self.block(block, report),
             Expr::Match { value, arms, .. } => {
                 self.expr(value, report);
                 for arm in arms {

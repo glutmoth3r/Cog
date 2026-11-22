@@ -1,0 +1,27 @@
+@!include("std")
+use io;
+use err::Error;
+
+@propagate
+fn scale(divisor: int) -> int {
+    const quotient = 84 / divisor;
+    quotient + 3
+}
+
+@propagate
+fn cleanup(divisor: int) -> int {
+    defer { io::println("cleanup"); }
+    const value = scale(divisor);
+    io::println("after scale");
+    value
+}
+
+@propagate
+fn main() -> nil {
+    io::println(scale(2));
+    const error = capture { cleanup(0) };
+    when error is Error::DivisionByZero {
+        io::println("captured");
+    };
+    io::println(error ?! 7);
+}

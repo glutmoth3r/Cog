@@ -82,6 +82,16 @@ cmp "$out/vm" "$out/jit"
 cmp "$out/vm" "$out/aot"
 printf 'Overflow\n150014997\n' | cmp - "$out/aot"
 
+cp examples/native/error-semantics-v2.cog "$out"
+"$cli" build --native "$out/error-semantics-v2.cog" -o "$out/error-semantics-v2"
+"$cli" run "$out/error-semantics-v2.cog" > "$out/vm"
+"$cli" run --jit "$out/error-semantics-v2.cog" > "$out/jit"
+env -u COG_NATIVE_RUNTIME PATH=/nonexistent COG_AOT_TRACE=1 "$out/error-semantics-v2" > "$out/aot" 2> "$out/trace"
+cmp "$out/vm" "$out/jit"
+cmp "$out/vm" "$out/aot"
+printf '45\ncleanup\ncaptured\n7\n' | cmp - "$out/aot"
+grep -Eq '\[aot\] call function=[0-9]+ status=0' "$out/trace"
+
 "$cli" build --native "$out/error.cog" -o "$out/error"
 if "$cli" run --color never "$out/error.cog" -- > "$out/vm" 2> "$out/vm-error"; then
     exit 1
@@ -90,7 +100,9 @@ if "$out/error" > "$out/aot" 2> "$out/aot-error"; then
     exit 1
 fi
 cmp "$out/vm" "$out/aot"
-diff -u <(grep -Ei 'runtime error.*division by zero' "$out/vm-error" | sed "s/^error: //") "$out/aot-error"
+diff -u <(sed -n '/^error: runtime error/,$p' "$out/vm-error" | sed '1s/^error: //') "$out/aot-error"
+grep -Eq 'origin: .*work at .*error\.cog:[0-9]+:[0-9]+' "$out/aot-error"
+grep -Eq 'called from .*main at .*error\.cog:[0-9]+:[0-9]+' "$out/aot-error"
 
 "$cli" build --native "$out/cleanup.cog" -o "$out/cleanup"
 "$cli" run "$out/cleanup.cog" > "$out/vm"

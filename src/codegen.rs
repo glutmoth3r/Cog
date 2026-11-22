@@ -97,7 +97,7 @@ fn mutable_capture_names(block: &Block) -> HashSet<String> {
                 visit_expr(value, names);
                 visit_expr(fallback, names);
             }
-            Expr::Block(body) => visit_block(body, names),
+            Expr::Block(body) | Expr::Capture(body) => visit_block(body, names),
             Expr::Match { value, arms, .. } => {
                 visit_expr(value, names);
                 for arm in arms {
@@ -262,6 +262,7 @@ fn collect_inline_functions(program: &Program) -> HashMap<String, InlineFunction
             if function.inline == InlineMode::Never
                 || function.comptime
                 || function.asynchronous
+                || function.propagate
                 || !function.type_params.is_empty()
                 || function.params.len() > MAX_INLINE_PARAMETERS
                 || function.params.iter().any(|parameter| {
@@ -848,6 +849,7 @@ struct Codegen<'a> {
     function_result_type: Option<crate::ast::TypeAnnotation>,
     in_function: bool,
     in_async: bool,
+    implicit_propagation: bool,
 }
 
 pub fn compile(program: &Program) -> Result<CompiledProgram, CodegenError> {
@@ -1145,6 +1147,7 @@ fn compile_with_modules_and_names(
         function_result_type: None,
         in_function: false,
         in_async: false,
+        implicit_propagation: false,
     };
 
     // The resolver orders global declarations by initialization dependencies.
@@ -1361,7 +1364,9 @@ impl<'a> Codegen<'a> {
         self.inline_nodes_remaining = MAX_INLINE_NODES_PER_FUNCTION;
         self.current_function = Some(f.name.clone());
         let saved_async = self.in_async;
+        let saved_propagation = self.implicit_propagation;
         self.in_async = f.asynchronous;
+        self.implicit_propagation = f.propagate;
         let mut scopes = Scopes::new();
         scopes.cell_names = mutable_capture_names(&f.body);
         scopes
@@ -1416,6 +1421,7 @@ impl<'a> Codegen<'a> {
         self.function_result_type = None;
         self.in_function = false;
         self.in_async = saved_async;
+        self.implicit_propagation = saved_propagation;
         Ok(())
     }
 
@@ -1663,6 +1669,9 @@ impl<'a> Codegen<'a> {
                     self.compile_expr_typed_array(e, &expected, scopes)?;
                 } else {
                     self.compile_expr(e, scopes)?;
+                }
+                if self.error_handler.is_some() {
+                    self.observe_binding_result(e, scopes)?;
                 }
                 self.compile_return(scopes, deferred)?;
             }
@@ -2136,6 +2145,7 @@ impl<'a> Codegen<'a> {
                 } else {
                     self.compile_expr(value, scopes)?;
                 }
+                self.observe_binding_result(value, scopes)?;
             }
             let slot = scopes.define(name);
             if is_const {
@@ -2158,6 +2168,7 @@ impl<'a> Codegen<'a> {
         } else {
             self.compile_expr(value, scopes)?;
         }
+        self.observe_binding_result(value, scopes)?;
         let value_slot = scopes.reserve_slot();
         self.out.emit(Instruction::Store(value_slot));
         let bindings = allocate_pattern_slots(pattern, scopes);
@@ -2478,12 +2489,13 @@ impl<'a> Codegen<'a> {
                         self.out.emit(Instruction::Load(slot));
                         self.compile_expr(value, scopes)?;
                         self.out.emit(Instruction::CellSet);
-                        self.guard_error(scopes)?;
+                        self.observe_statement_error(scopes)?;
                         self.out.emit(Instruction::Pop);
                     } else {
                         self.compile_expr(value, scopes)?;
                         self.out.emit(Instruction::Load(slot));
                         self.out.emit(Instruction::ConstrainArrayFrom);
+                        self.observe_binding_result(value, scopes)?;
                         self.out.emit(Instruction::Store(slot));
                     }
                     return Ok(());
@@ -2497,7 +2509,7 @@ impl<'a> Codegen<'a> {
                     self.out.emit(Instruction::LoadCapture(index));
                     self.compile_expr(value, scopes)?;
                     self.out.emit(Instruction::CellSet);
-                    self.guard_error(scopes)?;
+                    self.observe_statement_error(scopes)?;
                     self.out.emit(Instruction::Pop);
                     return Ok(());
                 }
@@ -2515,6 +2527,7 @@ impl<'a> Codegen<'a> {
                     let idx = self.global_indices[&candidate];
                     self.out.emit(Instruction::LoadGlobal(idx));
                     self.out.emit(Instruction::ConstrainArrayFrom);
+                    self.observe_binding_result(value, scopes)?;
                     self.out.emit(Instruction::StoreGlobal(idx));
                     return Ok(());
                 }
@@ -2527,7 +2540,7 @@ impl<'a> Codegen<'a> {
                 self.compile_expr(idx, scopes)?;
                 self.compile_expr(value, scopes)?;
                 self.out.emit(Instruction::IndexSet);
-                self.guard_error(scopes)?;
+                self.observe_statement_error(scopes)?;
                 self.out.emit(Instruction::Pop);
                 Ok(())
             }
@@ -2606,6 +2619,9 @@ impl<'a> Codegen<'a> {
         // available for generic extension methods such as Map.get().
         self.compile_expr(&target, scopes)?;
         self.compile_binary_rhs(op, value, scopes)?;
+        if self.implicit_propagation && matches!(target.node(), Expr::Index(..)) {
+            self.propagate_control_error(scopes)?;
+        }
 
         let result_name = format!("$compound_result{}", scopes.next_slot);
         let result_slot = scopes.define(&result_name);
@@ -2840,7 +2856,9 @@ impl<'a> Codegen<'a> {
             self.apply_use_decl(decl, &mut context)?;
         }
         context.next_slot = caller.next_slot;
+        let implicit_propagation = std::mem::replace(&mut self.implicit_propagation, false);
         let result = self.compile_expr(value, &mut context);
+        self.implicit_propagation = implicit_propagation;
         caller.next_slot = context.next_slot;
         self.current_module = previous;
         self.current_function = previous_function;
@@ -3433,6 +3451,7 @@ impl<'a> Codegen<'a> {
         // callee must reach the caller's handler only as the call result.
         let saved_error_handler = self.error_handler.take();
         let saved_cleanup_boundary = self.cleanup_boundary.take();
+        let implicit_propagation = std::mem::replace(&mut self.implicit_propagation, false);
         let result = (|| {
             let mut deferred = self.active_defers.clone();
             for binding in &function.bindings {
@@ -3442,6 +3461,7 @@ impl<'a> Codegen<'a> {
         })();
         self.cleanup_boundary = saved_cleanup_boundary;
         self.error_handler = saved_error_handler;
+        self.implicit_propagation = implicit_propagation;
         scopes.pop();
         result?;
         Ok(true)
@@ -3759,6 +3779,28 @@ impl<'a> Codegen<'a> {
         self.error_handler = saved;
         self.out.jump(Instruction::Jump(0), label);
         self.out.bind(ok);
+        Ok(())
+    }
+
+    fn observe_statement_error(&mut self, scopes: &mut Scopes) -> Result<(), CodegenError> {
+        if self.implicit_propagation {
+            self.propagate_control_error(scopes)
+        } else {
+            self.guard_error(scopes)
+        }
+    }
+
+    fn observe_binding_result(
+        &mut self,
+        expression: &Expr,
+        scopes: &mut Scopes,
+    ) -> Result<(), CodegenError> {
+        if self.implicit_propagation && !matches!(expression.node(), Expr::Capture(_)) {
+            let saved_source = self.out.enter_source(expression.span());
+            let result = self.propagate_control_error(scopes);
+            self.out.leave_source(saved_source);
+            result?;
+        }
         Ok(())
     }
 
@@ -4265,7 +4307,7 @@ impl<'a> Codegen<'a> {
                     crate::runtime::NativeImport::named(name).expect("conversion import"),
                 );
             }
-            Expr::Block(block) => {
+            Expr::Block(block) | Expr::Capture(block) => {
                 self.compile_block_as_expr(block, scopes)?;
             }
             Expr::Match { value, arms, .. } => {
@@ -4431,6 +4473,7 @@ impl<'a> Codegen<'a> {
             } => self.compile_try(body, catch_name, catch_block, scopes, false)?,
             _ => {
                 self.compile_expr(expr, scopes)?;
+                self.observe_binding_result(expr, scopes)?;
                 self.out.emit(Instruction::Pop);
             }
         }
@@ -4532,6 +4575,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
+                    propagate: false,
                     inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
@@ -4548,6 +4592,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
+                    propagate: false,
                     inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
@@ -4573,6 +4618,7 @@ mod tests {
                 owner: None,
                 comptime: false,
                 asynchronous: false,
+                propagate: false,
                 inline: InlineMode::Auto,
                 type_params: vec![],
                 result_type: None,
@@ -4598,6 +4644,7 @@ mod tests {
                 owner: None,
                 comptime: false,
                 asynchronous: false,
+                propagate: false,
                 inline: InlineMode::Auto,
                 type_params: vec![],
                 result_type: None,
@@ -4634,6 +4681,7 @@ mod tests {
                 owner: None,
                 comptime: false,
                 asynchronous: false,
+                propagate: false,
                 inline: InlineMode::Auto,
                 type_params: vec![],
                 result_type: None,
@@ -4671,6 +4719,7 @@ mod tests {
                 owner: None,
                 comptime: false,
                 asynchronous: false,
+                propagate: false,
                 inline: InlineMode::Auto,
                 type_params: vec![],
                 result_type: None,
@@ -4698,6 +4747,7 @@ mod tests {
                 owner: None,
                 comptime: false,
                 asynchronous: false,
+                propagate: false,
                 inline: InlineMode::Auto,
                 type_params: vec![],
                 result_type: None,
@@ -4726,6 +4776,7 @@ mod tests {
                 owner: None,
                 comptime: false,
                 asynchronous: false,
+                propagate: false,
                 inline: InlineMode::Auto,
                 type_params: vec![],
                 result_type: None,
@@ -4775,6 +4826,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
+                    propagate: false,
                     inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
@@ -4814,6 +4866,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
+                    propagate: false,
                     inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
@@ -4857,6 +4910,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
+                    propagate: false,
                     inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
@@ -4876,6 +4930,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
+                    propagate: false,
                     inline: InlineMode::Never,
                     type_params: vec![],
                     result_type: None,
@@ -4916,6 +4971,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
+                    propagate: false,
                     inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
@@ -4985,6 +5041,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
+                    propagate: false,
                     inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
@@ -5031,6 +5088,7 @@ mod tests {
                 owner: None,
                 comptime: false,
                 asynchronous: false,
+                propagate: false,
                 inline: InlineMode::Auto,
                 type_params: vec![],
                 result_type: None,
@@ -5074,6 +5132,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
+                    propagate: false,
                     inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
@@ -5109,6 +5168,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
+                    propagate: false,
                     inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
@@ -5140,6 +5200,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
+                    propagate: false,
                     inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
@@ -5169,6 +5230,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
+                    propagate: false,
                     inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
@@ -5198,6 +5260,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
+                    propagate: false,
                     inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
@@ -5219,6 +5282,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
+                    propagate: false,
                     inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
@@ -5248,6 +5312,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
+                    propagate: false,
                     inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
@@ -5277,6 +5342,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
+                    propagate: false,
                     inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
@@ -5324,6 +5390,7 @@ mod tests {
                 owner: None,
                 comptime: false,
                 asynchronous: false,
+                propagate: false,
                 inline: InlineMode::Auto,
                 type_params: vec![],
                 result_type: None,
@@ -5373,6 +5440,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
+                    propagate: false,
                     inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
@@ -5394,6 +5462,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
+                    propagate: false,
                     inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
@@ -5423,6 +5492,7 @@ mod tests {
                 owner: None,
                 comptime: false,
                 asynchronous: false,
+                propagate: false,
                 inline: InlineMode::Auto,
                 type_params: vec![],
                 result_type: None,
@@ -5447,6 +5517,7 @@ mod tests {
                 owner: None,
                 comptime: false,
                 asynchronous: false,
+                propagate: false,
                 inline: InlineMode::Auto,
                 type_params: vec![],
                 result_type: None,
@@ -5503,6 +5574,7 @@ mod tests {
                 owner: None,
                 comptime: false,
                 asynchronous: false,
+                propagate: false,
                 inline: InlineMode::Auto,
                 type_params: vec![],
                 result_type: None,
@@ -5536,6 +5608,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
+                    propagate: false,
                     inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
@@ -5555,6 +5628,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
+                    propagate: false,
                     inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
@@ -5593,6 +5667,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
+                    propagate: false,
                     inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
@@ -5612,6 +5687,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
+                    propagate: false,
                     inline: InlineMode::Never,
                     type_params: vec![],
                     result_type: None,
@@ -5676,6 +5752,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
+                    propagate: false,
                     inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
@@ -5723,6 +5800,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
+                    propagate: false,
                     inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
@@ -5827,6 +5905,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
+                    propagate: false,
                     inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,
@@ -5870,6 +5949,7 @@ mod tests {
                     owner: None,
                     comptime: false,
                     asynchronous: false,
+                    propagate: false,
                     inline: InlineMode::Auto,
                     type_params: vec![],
                     result_type: None,

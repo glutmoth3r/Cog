@@ -529,14 +529,11 @@ fn run(bytes: &[u8], entries: &[LinkedEntry], bindings: &[LinkedImport]) -> Resu
         &Rc::new(()),
         &plan,
     )
-    .map_err(|error| match context.last_source_location() {
-        Some(location) => format!(
-            "runtime error at {}:{}:{}: {error}",
-            location.file.escape_debug(),
-            location.line,
-            location.column
-        ),
-        None => format!("runtime error: {error}"),
+    .map_err(|error| {
+        context.last_runtime_diagnostic().map_or_else(
+            || format!("runtime error: {error}"),
+            |diagnostic| diagnostic.render(context.last_source_location()),
+        )
     })
 }
 

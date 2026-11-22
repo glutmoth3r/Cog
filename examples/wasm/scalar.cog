@@ -1,0 +1,16 @@
+@!include("std")
+use io;
+
+@inline("never")
+fn advance(i: int) -> int { (i * 3 + 1) % 1009 }
+
+fn main(args: str[]) -> nil {
+    var i = 0;
+    var sum = 0;
+    while i < 100000 {
+        sum += advance(i);
+        i += 1;
+    }
+    if args.len() > 0 { io::println(args[0])!!; }
+    io::println(sum)!!;
+}

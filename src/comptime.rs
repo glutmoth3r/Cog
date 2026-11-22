@@ -333,6 +333,7 @@ impl ComptimeValue {
             }
             RuntimeError::IoFailure { message, .. } => message.len(),
             RuntimeError::ProcessFailed { command, .. } => command.len(),
+            RuntimeError::WithProvenance { error, .. } => Self::error_clone_cost(error, depth + 1),
             RuntimeError::WithSuppressed {
                 primary,
                 suppressed,
@@ -1311,7 +1312,7 @@ fn rewrite_expr(
                 diagnostics,
             );
         }
-        Expr::Block(block) => rewrite_block(
+        Expr::Block(block) | Expr::Capture(block) => rewrite_block(
             block,
             values,
             globals,
@@ -1828,7 +1829,7 @@ fn eval_expr(
             }
             Ok(ComptimeValue::Nil)
         }
-        Expr::Block(block) => {
+        Expr::Block(block) | Expr::Capture(block) => {
             let mut values = context.budget.clone_values(values)?;
             match eval_comptime_block(block, &mut values, context, depth + 1, call_depth)? {
                 BlockExit::Return(value) | BlockExit::Tail(value) => Ok(value),
@@ -2185,7 +2186,7 @@ fn substitute_program_types(program: &mut Program, aliases: &HashMap<String, Typ
                 expr(value, aliases);
                 expr(fallback, aliases);
             }
-            Expr::Block(body) => block(body, aliases),
+            Expr::Block(body) | Expr::Capture(body) => block(body, aliases),
             Expr::Match { value, arms, .. } => {
                 expr(value, aliases);
                 for arm in arms {
@@ -2533,7 +2534,7 @@ fn eval_comptime_statement_expr(
                 eval_comptime_statement_expr(selected, values, context, depth + 1, call_depth)
             })
         }
-        Expr::Block(block) => {
+        Expr::Block(block) | Expr::Capture(block) => {
             let mut values = context.budget.clone_values(values)?;
             match eval_comptime_block(block, &mut values, context, depth + 1, call_depth)? {
                 BlockExit::Return(value) => Ok(Some(value)),

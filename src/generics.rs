@@ -461,7 +461,7 @@ fn substitute_expr(expr: &mut Expr, arguments: &std::collections::HashMap<String
             substitute_expr(value, arguments);
             substitute_expr(fallback, arguments);
         }
-        Expr::Block(block) => substitute_block(block, arguments),
+        Expr::Block(block) | Expr::Capture(block) => substitute_block(block, arguments),
         Expr::Match { value, arms, .. } => {
             substitute_expr(value, arguments);
             for arm in arms {

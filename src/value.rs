@@ -1884,6 +1884,9 @@ impl Value {
                         })?;
                     values.push(value);
                 }
+                RuntimeError::WithProvenance { error, .. } => {
+                    errors.push(error);
+                }
                 RuntimeError::WithSuppressed {
                     primary,
                     suppressed,

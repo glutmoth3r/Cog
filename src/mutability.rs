@@ -1741,7 +1741,7 @@ impl<'a> Pass<'a> {
                 self.call(expr, name, args)
             }
             Expr::AssociatedCall { args, .. } => self.call(expr, "", args),
-            Expr::Block(block) => self.block(block),
+            Expr::Block(block) | Expr::Capture(block) => self.block(block),
             Expr::If {
                 cond,
                 then_branch,

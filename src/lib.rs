@@ -47,3 +47,4 @@ pub mod sdk;
 pub mod template;
 pub mod value;
 mod verifier;
+pub mod wasm;

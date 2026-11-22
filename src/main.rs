@@ -178,6 +178,15 @@ fn command(color: &mut Color) -> Result<(), String> {
         return Err("expected a command or a source/bytecode path".into());
     }
     let action = action.as_deref().unwrap_or("run");
+    let wasi = action == "build" && options.target.as_deref() == Some("wasm32-wasip1");
+    if wasi {
+        options.target = None;
+        if options.native || options.init_library || options.restricted {
+            return Err(
+                "WASI builds cannot be combined with --native, --lib or --restricted".into(),
+            );
+        }
+    }
     if options.native && action != "build" {
         return Err("--native is only valid with `build`".into());
     }
@@ -352,6 +361,38 @@ fn command(color: &mut Color) -> Result<(), String> {
     let package_has_plugins = prepared
         .as_ref()
         .is_some_and(|prepared| !prepared.plugins.is_empty());
+    if wasi {
+        if package_has_plugins || !options.plugins.is_empty() {
+            return Err("WASI builds do not support plugin imports".into());
+        }
+        let name = prepared
+            .as_ref()
+            .map(|p| p.artifact_name.as_str())
+            .or_else(|| target.file_stem().and_then(OsStr::to_str))
+            .unwrap_or("main");
+        let destination = options.output.clone().unwrap_or_else(|| {
+            let root = if target.is_dir() {
+                target
+            } else {
+                target.parent().unwrap_or(Path::new("."))
+            };
+            root.join("target").join(format!("{name}.wasm"))
+        });
+        let lock_update = prepared.as_ref().and_then(|p| p.lock_update.clone());
+        let (compiled, _, _, warnings) =
+            prepare(target, Mode::Check, &options, bytecode_input, prepared)?;
+        let compiled = compiled.ok_or("WASI builds require an application entry point")?;
+        if !warnings.is_empty() {
+            color.warning(&frontend::render(&warnings));
+        }
+        if options.debug {
+            println!("bytecode\n{}", compiled.disassemble());
+        }
+        cog::wasm::build_executable(&compiled, &destination)?;
+        project::write_lock(lock_update)?;
+        color.status("linked", &destination, started.elapsed());
+        return Ok(());
+    }
     if options.native || native_library {
         if package_has_plugins || !options.plugins.is_empty() {
             return Err("AOT builds do not support plugin imports yet".into());
@@ -468,7 +509,13 @@ fn command(color: &mut Color) -> Result<(), String> {
                     .ok_or("internal error: run has no compiled program")?,
                 &mut context,
             )
-            .map_err(|error| format_runtime_error(&error, context.last_source_location()))
+            .map_err(|error| {
+                format_runtime_error(
+                    &error,
+                    context.last_source_location(),
+                    context.last_runtime_diagnostic(),
+                )
+            })
         }
         Mode::Build => {
             color.status(
@@ -519,14 +566,23 @@ fn eval_expression(expression: &str, options: &Options, color: &Color) -> Result
     };
     let mut stdout = std::io::stdout();
     let mut context = RuntimeContext::new(&mut stdout, capabilities);
-    interpreter::run_with_context(&compiled, &mut context)
-        .map_err(|error| format_runtime_error(&error, context.last_source_location()))
+    interpreter::run_with_context(&compiled, &mut context).map_err(|error| {
+        format_runtime_error(
+            &error,
+            context.last_source_location(),
+            context.last_runtime_diagnostic(),
+        )
+    })
 }
 
 fn format_runtime_error(
     error: &impl std::fmt::Display,
     location: Option<&cog::diagnostic::SourceLocation>,
+    diagnostic: Option<&cog::error::RuntimeDiagnostic>,
 ) -> String {
+    if let Some(diagnostic) = diagnostic {
+        return diagnostic.render(location);
+    }
     if let Some(location) = location {
         format!(
             "runtime error at {}:{}:{}: {error}",
@@ -634,6 +690,7 @@ fn print_usage() {
     eprintln!("       cog build <file.cog|project> [-o output]");
     eprintln!("       cog run [file.cog|project]  (reuse or build .cogb, then execute it)");
     eprintln!("       cog run <file.cogb>  (no source files or compilation required)");
+    eprintln!("       cog build --target wasm32-wasip1 <file.cog|project> [-o artifact.wasm]");
     eprintln!("       cog build --native <file.cog|project> [-o executable]");
     eprintln!("       cog build --lib <file.cog|project> --export <function> [-o library.so]");
     eprintln!("       --c-import <module::name=symbol:i64|f64> --c-link <object.o|archive.a>");
@@ -792,9 +849,13 @@ fn command_with_plugins(
                 );
             }
             context.set_process_arguments(options.program_args);
-            program
-                .run_in(&mut context)
-                .map_err(|error| format_runtime_error(&error, context.last_source_location()))
+            program.run_in(&mut context).map_err(|error| {
+                format_runtime_error(
+                    &error,
+                    context.last_source_location(),
+                    context.last_runtime_diagnostic(),
+                )
+            })
         }
     }
 }
@@ -870,9 +931,13 @@ fn command_with_application(target: &Path, options: Options, color: &Color) -> R
         context = context.with_jit_profile_path(jit_profile_path(target));
     }
     context.set_process_arguments(options.program_args);
-    program
-        .run_in(&mut context)
-        .map_err(|error| format_runtime_error(&error, context.last_source_location()))
+    program.run_in(&mut context).map_err(|error| {
+        format_runtime_error(
+            &error,
+            context.last_source_location(),
+            context.last_runtime_diagnostic(),
+        )
+    })
 }
 
 fn jit_profile_path(target: &Path) -> PathBuf {

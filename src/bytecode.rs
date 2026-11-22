@@ -12,7 +12,8 @@ use crate::value::{RuntimeType, Value};
 use std::rc::Rc;
 
 const MAGIC: &[u8; 4] = b"COG\0";
-pub(crate) const VERSION: u16 = 38;
+pub(crate) const VERSION: u16 = 39;
+const VERSION_WITHOUT_FUNCTION_NAMES: u16 = 38;
 pub(crate) const LIMIT: usize = crate::value::MAX_RUNTIME_TYPE_NODES;
 const MAX_DEPTH: usize = crate::value::MAX_RUNTIME_TYPE_DEPTH;
 pub const MAX_FILE_BYTES: usize = 128 * 1024 * 1024;
@@ -393,6 +394,11 @@ pub fn encode(program: &CompiledProgram) -> Result<Vec<u8>> {
             }
         }
     }
+    w.index(program.functions.len())?;
+    for (entry, name) in &program.functions {
+        w.index(*entry)?;
+        w.string(name)?;
+    }
     w.index(program.source_map.len())?;
     for entry in &program.source_map {
         w.index(entry.start)?;
@@ -424,7 +430,7 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
             .try_into()
             .expect("Reader::take returned the requested width"),
     );
-    if version != VERSION {
+    if !matches!(version, VERSION | VERSION_WITHOUT_FUNCTION_NAMES) {
         return Err(format!(
             "unsupported bytecode version {version}; expected {VERSION}"
         ));
@@ -695,6 +701,23 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
         };
         program.push(instruction);
     }
+    let mut functions = std::collections::BTreeMap::new();
+    if version == VERSION {
+        let function_count = r.index()?;
+        if function_count > callables.len() {
+            return Err("invalid diagnostic function name count".into());
+        }
+        let mut previous = None;
+        for _ in 0..function_count {
+            let entry = r.index()?;
+            if previous.is_some_and(|previous| previous >= entry) || !callables.contains_key(&entry)
+            {
+                return Err("invalid or noncanonical diagnostic function name entry".into());
+            }
+            functions.insert(entry, r.owned_string()?);
+            previous = Some(entry);
+        }
+    }
     let source_map_count = r.index()?;
     if source_map_count > count {
         return Err("invalid source map entry count".into());
@@ -720,9 +743,9 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
     let program = CompiledProgram {
         instructions: program,
         imports,
+        functions,
         callables,
         source_map,
-        ..CompiledProgram::default()
     };
     validate(&program)?;
     Ok(program)
@@ -769,6 +792,12 @@ pub fn validate(artifact: &CompiledProgram) -> Result<()> {
             validate_runtime_type(ty, 0)?;
             budget.runtime_type(ty, 0)?;
         }
+    }
+    for (entry, name) in &artifact.functions {
+        if name.is_empty() || !artifact.callables.contains_key(entry) {
+            return Err("invalid diagnostic function name entry".into());
+        }
+        budget.string(name.len())?;
     }
     let program = &artifact.instructions;
     if program.is_empty() || program.len() > LIMIT {

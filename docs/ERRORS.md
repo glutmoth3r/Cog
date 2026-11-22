@@ -16,8 +16,9 @@ operation or `!!` applies the documented handling rule.
 The CLI reports the source file, line, and column for terminal runtime errors
 when the bytecode contains source maps. This applies to source projects,
 `.cogb` files, and installed `.cogpkg` applications. Embedders can read the same
-coordinate with `RunContext::last_source_location`; handled Error values do not
-set it.
+coordinate with `RunContext::last_source_location`. See
+[Diagnostics](DIAGNOSTICS.md) for origins, call paths, propagation, and
+structured access to suppressed failures.
 
 Compiler warnings are non-fatal. For example, `while false` and literal
 ascending ranges with no iterations report that their loop bodies never run.

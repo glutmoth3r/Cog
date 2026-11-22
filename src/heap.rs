@@ -580,6 +580,9 @@ fn add_task_value_edges(
             continue;
         };
         match error {
+            RuntimeError::WithProvenance { error, .. } => {
+                errors.push(error);
+            }
             RuntimeError::WithSuppressed {
                 primary,
                 suppressed,
