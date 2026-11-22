@@ -1,5 +1,5 @@
 // In-place sorting for values that implement Ord.
-use array;
+use array_storage;
 use clone::Clone;
 use clone::value;
 use ord::Ord;

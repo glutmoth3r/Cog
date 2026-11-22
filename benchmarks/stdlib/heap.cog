@@ -1,0 +1,16 @@
+@!include("std")
+use collections;
+use io;
+
+fn work(n: int) -> int {
+    var heap = collections::PriorityQueue::new[int]();
+    for i in 0..n { heap.push((i * 997) % n)!!; }
+    var sum = 0;
+    while !heap.is_empty() { sum = (sum * 31 + heap.pop()!!) % 1000000007; }
+    sum
+}
+
+fn main(args: str[]) {
+    const n = if args.len() == 0 { 2000 } else { (args[0]!! as int)!! };
+    io::println(work(n)!!)!!;
+}

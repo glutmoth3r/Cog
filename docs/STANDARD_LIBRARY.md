@@ -40,7 +40,10 @@ statically dispatched, and Errors they return use ordinary propagation and
 target concrete types; generic target
 implementations and iteration through a generic trait bound are not supported.
 See [user-defined collection iteration](LANGUAGE.md#user-defined-collection-iteration)
-for a complete example.
+for a complete example. `iter::range(start, end)` provides a concrete
+`Range` and `RangeCursor` for half-open ascending integer ranges.
+An inverted range is empty. The cursor has no current element before the
+first successful `next()` or after exhaustion.
 
 Source modules in `core/` and native functions share the resolver. The tables below
 describe successful results, not additional source annotation syntax. Native calls
@@ -137,6 +140,23 @@ fn main() -> nil {
 A prompt printed to stdout is separate from the input returned by `io::read_line`. Use
 `str::trim(io::read_line()) as int` to accept whitespace around a number.
 
+### Text search and slices
+
+`str::find(text, pattern)` and `str::rfind(text, pattern)` return a
+zero-based Unicode scalar index or nil. The empty pattern matches at zero
+for find and at the scalar length for rfind. Reverse search includes
+overlapping matches. `count` counts nonoverlapping matches.
+`split_once` and `rsplit_once` return the portions on either side of
+the first or last separator, or MissingKey when absent. Count and split
+reject empty patterns. Matching compares exact UTF-8 sequences without
+normalization and uses linear-time search.
+
+`lines` splits on LF, dropping CR only when directly before LF. It keeps
+interior blank lines and omits the empty field after a final newline.
+`repeat` accepts a nonnegative count, checks output size, and builds one
+output buffer. `remove_prefix` and `remove_suffix` remove a single exact
+affix when present. An empty or absent affix leaves the text unchanged.
+
 ## Arrays
 
 | Call | Successful result / behavior |
@@ -210,9 +230,34 @@ fn main() -> nil {
 }
 ```
 
+### Typed array algorithms
+
+| Call | Successful result |
+| --- | --- |
+| `any(items, pred)`, `all(items, pred)` | Short-circuit boolean tests. On an empty input, any is false and all is true |
+| `find(items, pred)`, `find_index(items, pred)` | First element or zero-based index. A missing element returns `Error::MissingKey` from find and nil from find_index |
+| `count_if(items, pred)` | Number of true predicate results |
+| `take(items, n)`, `drop(items, n)` | Fresh prefix or suffix. Counts greater than length are clamped. Negative counts return InvalidArgument |
+| `partition(items, pred)` | Tuple of two fresh arrays, accepted items followed by rejected items |
+| `flatten(items)`, `flat_map(items, transform)` | Concatenate nested arrays or callback results in order |
+| `zip(left, right)`, `enumerate(items)` | Fresh arrays of pairs. Zip stops at the shorter input, enumerate starts at zero |
+| `chunks(items, size)` | Consecutive fresh arrays including a shorter last chunk when needed |
+| `windows(items, size)` | Overlapping complete windows with stride one, each with its own outer storage |
+| `dedup(items)`, `unique(items)` | Keep the first of adjacent equal elements using `Eq[T]`, or the first of every equal key using `Hashable` |
+| `group_by(items, key)` | `Map[K, T[]]` with keys ordered by first occurrence and stable item order within each group |
+| `scan(items, seed, combine)` | Each post-step accumulator in left-to-right order. The seed itself is omitted |
+
+These functions are in `array`. Chunk and window sizes must be positive.
+An oversized window produces an empty array. All returned outer arrays
+are independent and retain their element types, including empty results.
+Shared elements and accumulators keep their ordinary aliases. Callback
+calls run once per visited element and stop at the first propagated Error.
+A successful find may return a stored nil. These calls share the
+reference access rules for map, filter, and fold above.
+
 ## Collections
 
-`collections` exposes one insertion-ordered hash table, `Map[K, V]`. Its
+`collections::Map[K, V]` is an insertion-ordered hash table. Its
 empty constructor is `Map::new[K, V]()`. `Map::from(entries)` builds one from an
 array of `(key, value)` tuples and infers both types from that array. Duplicate keys
 follow `set` semantics: the last value wins and the first insertion position stays.
@@ -251,6 +296,8 @@ stable across processes and must not be persisted.
 | `.contains(key)` | Tests key presence, including when the stored value is nil |
 | `.get(key)` | Returns the value or `Error::MissingKey` |
 | `.get_or(key, default)` | Returns the value or the default after one lookup |
+| `.get_or_insert(key, default)` | Returns the existing value, including nil, or inserts and returns the eager default. One hash lookup |
+| `.merge(other)` | Applies the source snapshot in source insertion order. Existing destination positions stay fixed |
 | `.set(key, value)` | Inserts or replaces; returns true only for a new key |
 | `.remove(key)` | Removes and returns the value, or `Error::MissingKey` |
 | `.clear()` | Removes all entries while retaining bucket capacity |
@@ -261,8 +308,9 @@ declare a comptime alias such as `@comptime const MaybeInt: type = int?;`, then 
 `Map::new[str, MaybeInt]()` and store `nil` under a key. `get` returns nil for that
 present key and `Error::MissingKey` for an absent key.
 
-`set`, `remove`, and `clear` declare `mut self`, so they require a mutable
-`var` binding. Updating a key preserves its original position; removing a key
+`set`, `remove`, `clear`, `get_or_insert`, and `merge` require a
+writable receiver. If a merge encounters an Error, entries it applied
+before that Error stay applied. Updating a key preserves its original position; removing a key
 and inserting it again places it at the end. Removal unlinks a bucket entry and
 uses tombstones in the ordered slot array. The array is compacted during resize
 or after tombstones exceed half its slots, preserving the order of live entries.
@@ -288,6 +336,49 @@ fn main() -> nil {
     io::println(scores.get("Ada"))!!;
 }
 ```
+
+### Set
+
+Use `Set::new[T]()` or `Set::from(values)`. Elements implement
+`Hashable`. The set uses the same hashing and equality contract as Map.
+Insertion returns true only for a new key and keeps the first representative
+of an equal key. Removal returns nil on success or `Error::MissingKey`.
+Use `contains`, `len`, `is_empty`, `clear`, and `to_array` for queries,
+reset, and an insertion-ordered snapshot.
+
+`union`, `intersection`, `difference`, and `symmetric_difference`
+return independent sets. Union takes the receiver's order and appends
+new keys from the argument. Intersection and difference keep receiver
+order. Symmetric difference lists receiver-only entries, then
+argument-only entries. `subset` and `disjoint` return booleans.
+Algebra reuses the stored hashes and propagates equality errors.
+Basic operations are expected amortized O(1) and algebra is expected
+linear in the number of visited slots with well-distributed hashes.
+
+### Queues
+
+| Type | Operations |
+| --- | --- |
+| `Queue[T]` | `new`, `from`, `push` at the back, `peek` and `pop` at the front, `len`, `is_empty`, `clear` |
+| `Deque[T]` | `new`, `from`, `push_front`, `push_back`, `pop_front`, `pop_back`, `peek_front`, `peek_back`, `len`, `is_empty`, `clear` |
+| `PriorityQueue[T]` | `new`, `from`, `push`, `pop`, `peek`, `len`, `is_empty` |
+
+Queue and Deque use a geometrically growing ring. Inserts are amortized
+O(1), reads and removal are O(1), and removal clears the extracted slot
+immediately. Capacity stays allocated until clear. Popping or peeking an
+empty structure returns InvalidArgument. A queue with nilable elements
+can return nil as a successful element.
+
+PriorityQueue removes the least element under `Ord`. Inserts and removals
+take O(log n) comparisons, peek is O(1), and from uses n inserts.
+Equal elements have unspecified ordering. Comparisons finish before the
+heap is changed, so a comparison Error leaves its contents intact.
+A custom comparator must keep stored priorities stable and avoid mutating
+the same heap during comparison.
+
+These types share storage through assignment. See the
+[breadth-first traversal](../examples/breadth_first.cog) and
+[word inventory](../examples/word_inventory.cog) for complete examples.
 
 ## JSON
 
@@ -344,11 +435,11 @@ fn main() -> nil {
 
 | Module | Public API |
 | --- | --- |
-| `math` | `abs`, `min`, `max`, `floor`, `ceil`, `round`, `pow`, `sqrt`, `ln`, `log2`, `log10` |
+| `math` | `abs`, `min`, `max`, `floor`, `ceil`, `round`, `pow`, `sqrt`, `ln`, `log2`, `log10`, `clamp`, `gcd`, `lcm` |
 | `math` constants | `PI`, `E`, `TAU`, `SQRT_2`, `SQRT_3`, `LN_2`, `LN_10`, `LOG2_E`, `LOG10_E`, `DEG_TO_RAD`, `RAD_TO_DEG` |
 | `sort` | `quick`, `stable`, `sorted`, `is_sorted`; `insertion`, `selection`, and `bubble` remain educational algorithms |
-| `search` | `binary`, `lower_bound`, `upper_bound`; inferred comptime type `T` must implement `Ord` |
-| `random` | `next()`, `range(lo, hi)`, `range_uint(lo, hi)`, `boolean()` |
+| `search` | `binary`, `lower_bound`, `upper_bound`, `equal_range`; inferred comptime type `T` must implement `Ord` |
+| `random` | `next()`, `range(lo, hi)`, `range_uint(lo, hi)`, `boolean()`, `Seeded`, `choose`, `shuffle`, `sample` |
 | `entropy` | `bytes(count)`, bytes from OS entropy |
 
 All sorting functions require elements implementing `Ord { compare(self, other: Self) -> int }`.
@@ -376,7 +467,7 @@ The `search` functions require an array sorted in ascending order according to
 are duplicated, it may return any matching index. `lower_bound` returns the first
 index whose element is greater than or equal to the target, and `upper_bound`
 returns the first index whose element is greater than the target. Both bounds can
-equal the array length when no element meets the condition. Empty arrays return
+equal the array length when no element meets the condition. `equal_range` returns both bounds as a half-open interval. Empty arrays return
 `-1` from `binary` and `0` from both bound functions. These functions do not mutate
 the input.
 
@@ -420,6 +511,26 @@ sampling discards the incomplete remainder interval to avoid modulo bias. Bounds
 are checked before requesting entropy. Entropy failures remain recoverable Error.
 This generator is not cryptographic. Seed/partition/recursive helpers are private.
 
+### Numeric utilities and seeded random streams
+
+`math::clamp(value, low, high)` keeps the type of the selected numeric
+operand and uses the language's exact mixed-type comparison. Reversed
+bounds return InvalidArgument and NaN returns Unordered.
+`math::gcd(a, b)` and `math::lcm(a, b)` operate on signed int and
+return nonnegative results, or Overflow when the answer cannot fit an
+int. GCD of two zeros and LCM with either operand zero return zero.
+
+`random::Seeded::new(seed)` creates an independent deterministic stream,
+normalizing a signed int seed modulo 2³¹. `next()` and
+`range(low, high)` mutate the stream. Range uses rejection sampling and
+accepts widths up to 2³¹. With a writable stream, `random::choose`
+selects an element, `shuffle` permutes a writable array in place, and
+`sample` returns a fresh array drawn by index without replacement.
+Equal values at different indices may appear more than once in a sample.
+Choose rejects empty arrays and sample rejects counts outside
+`0..=items.len()`. This generator is intended for reproducibility.
+Use `entropy::bytes` for OS entropy.
+
 ## Byte buffers
 
 | Call | Successful result |
@@ -440,6 +551,20 @@ Copy, slice, and concat allocate independent storage and obey the runtime buffer
 limit; concat accepts aliases, including the same buffer for both arguments.
 Invalid byte values, negative/out-of-bounds ranges, and invalid UTF-8 produce Error.
 `len(str)` counts Unicode scalars; use `bytes::len(bytes::from_str(text))` for bytes.
+
+### Binary integers
+
+`binary::read_u64_le`, `read_u64_be`, `write_u64_le`, and
+`write_u64_be` work on eight bytes at an explicit zero-based byte offset.
+They read or write a `uint`. Writes require a mutable buffer and validate
+the entire range before any byte changes. Invalid ranges return
+InvalidArgument.
+
+`binary::encode_varuint(value)` allocates a byte buffer containing canonical
+unsigned LEB128. `read_varuint(buffer, offset)` returns a
+`(value, next_offset)` pair without copying the buffer. It reports
+ParseFailure for truncated or overlong encodings and Overflow if the
+encoding would exceed 64 bits. Existing runtime buffer limits apply.
 
 ## ASCII and hexadecimal text
 

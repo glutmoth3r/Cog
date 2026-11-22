@@ -1,0 +1,16 @@
+@!include("std")
+use collections;
+use io;
+
+fn work(n: int) -> int {
+    var queue = collections::Queue::new[int]();
+    for i in 0..n { queue.push(i)!!; }
+    var sum = 0;
+    while !queue.is_empty() { sum += queue.pop()!!; }
+    sum
+}
+
+fn main(args: str[]) {
+    const n = if args.len() == 0 { 2000 } else { (args[0]!! as int)!! };
+    io::println(work(n)!!)!!;
+}

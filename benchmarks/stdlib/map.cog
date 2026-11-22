@@ -1,0 +1,14 @@
+@!include("std")
+use collections;
+use io;
+
+fn work(n: int) -> int {
+    var data = collections::Map::new[int, int]();
+    for i in 0..n { data.set(i, i * 3)!!; }
+    var sum = 0;
+    for i in 0..n { sum += data.get(i)!!; }
+    for i in 0..n { sum -= data.remove(i)!! / 3; }
+    sum + data.len()
+}
+
+fn main() { io::println(work(4000)!!)!!; }

@@ -1,7 +1,7 @@
 // String operations implemented in Cog over the existing UTF-8 byte API.
 use bytes;
-use array;
 use fmt;
+use text_order;
 use err::Error;
 
 // Unicode White_Space, expressed as complete UTF-8 sequences. All whitespace
@@ -179,23 +179,8 @@ public fn replace(text: str, pattern: str, replacement: str) -> str {
     bytes::to_str(result, 0, result_length)
 }
 
-// Compare Unicode strings by their UTF-8 byte order, which preserves scalar
-// value order for valid UTF-8. Return -1, 0, or 1.
 public fn compare(left: str, right: str) -> int {
-    const left_bytes = bytes::from_str(left)!!;
-    const right_bytes = bytes::from_str(right)!!;
-    const left_length = bytes::len(left_bytes)!!;
-    const right_length = bytes::len(right_bytes)!!;
-    const common = if left_length < right_length { left_length } else { right_length };
-    for index in 0..common {
-        const left_byte = bytes::get(left_bytes, index)!!;
-        const right_byte = bytes::get(right_bytes, index)!!;
-        if left_byte < right_byte { return -1; }
-        if left_byte > right_byte { return 1; }
-    }
-    if left_length < right_length { return -1; }
-    if left_length > right_length { return 1; }
-    0
+    text_order::compare(left, right)
 }
 
 // Exact, non-overlapping separators. Preserve leading/trailing empty fields.
@@ -225,14 +210,166 @@ public fn split(text: str, separator: str) {
 
 public fn join(parts, separator: str = "") -> str {
     // Validate even an empty input without mutating the caller's array.
-    array::is_empty(parts)!!;
+    parts!!;
+    when parts is str { return Error::TypeMismatch("array::is_empty"); }
+    const length = len(parts)!!;
     separator!!;
     var result = str::builder()!!;
-    for index in 0..len(parts) {
+    for index in 0..length {
         const part = parts[index]!!;
         when part is str {} else { return Error::TypeMismatch("str::join"); }
         if index > 0 { fmt::write(result, "{}", separator)!!; }
         fmt::write(result, "{}", part)!!;
     }
     str::build(result)
+}
+
+// Knuth-Morris-Pratt over valid UTF-8. A complete nonempty pattern starts
+// and ends at scalar boundaries. Byte offsets stay private to this module.
+fn match_offsets(data, needle, first_only: bool, non_overlapping: bool) -> (int, int) {
+    const size = bytes::len(needle)!!;
+    const length = bytes::len(data)!!;
+    if size > length { return (-1, 0); }
+    var prefix: int[] = [0];
+    var matched = 0;
+    for i in 1..size {
+        const symbol = bytes::get(needle, i)!!;
+        while matched > 0 && symbol != bytes::get(needle, matched)!! {
+            matched = prefix[matched - 1]!!;
+        }
+        if symbol == bytes::get(needle, matched)!! { matched += 1; }
+        (prefix << matched)!!;
+    }
+
+    var last = -1;
+    var count = 0;
+    matched = 0;
+    for i in 0..length {
+        const symbol = bytes::get(data, i)!!;
+        while matched > 0 && symbol != bytes::get(needle, matched)!! {
+            matched = prefix[matched - 1]!!;
+        }
+        if symbol == bytes::get(needle, matched)!! { matched += 1; }
+        if matched == size {
+            last = i + 1 - size;
+            count += 1;
+            if first_only { return (last, count); }
+            matched = if non_overlapping { 0 } else { prefix[matched - 1]!! };
+        }
+    }
+    (last, count)
+}
+
+fn scalar_offset(data, position: int) -> int? {
+    if position < 0 { return nil; }
+    var offset = 0;
+    for i in 0..position {
+        const byte = bytes::get(data, i)!!;
+        if byte < 128 || byte >= 192 { offset += 1; }
+    }
+    offset
+}
+
+public fn find(text: str, pattern: str) -> int? {
+    text!!;
+    pattern!!;
+    if pattern == "" { return 0; }
+    const data = bytes::from_str(text)!!;
+    const needle = bytes::from_str(pattern)!!;
+    scalar_offset(data, match_offsets(data, needle, true, false)!!.0)!!
+}
+
+public fn rfind(text: str, pattern: str) -> int? {
+    text!!;
+    pattern!!;
+    if pattern == "" { return len(text); }
+    const data = bytes::from_str(text)!!;
+    const needle = bytes::from_str(pattern)!!;
+    scalar_offset(data, match_offsets(data, needle, false, false)!!.0)!!
+}
+
+public fn count(text: str, pattern: str) -> int {
+    text!!;
+    pattern!!;
+    if pattern == "" { return Error::InvalidArgument("str::count"); }
+    const data = bytes::from_str(text)!!;
+    const needle = bytes::from_str(pattern)!!;
+    match_offsets(data, needle, false, true)!!.1
+}
+
+fn split_pair(text: str, separator: str, first_only: bool) -> (str, str) {
+    text!!;
+    separator!!;
+    if separator == "" { return Error::InvalidArgument("str::split_once"); }
+    const data = bytes::from_str(text)!!;
+    const needle = bytes::from_str(separator)!!;
+    const middle = match_offsets(data, needle, first_only, false)!!.0;
+    if middle < 0 { return Error::MissingKey(); }
+    const right = middle + bytes::len(needle)!!;
+    (bytes::to_str(data, 0, middle)!!, bytes::to_str(data, right, bytes::len(data)!! - right)!!)
+}
+
+public fn split_once(text: str, separator: str) -> (str, str) {
+    split_pair(text, separator, true)
+}
+
+public fn rsplit_once(text: str, separator: str) -> (str, str) {
+    split_pair(text, separator, false)
+}
+
+public fn lines(text: str) -> str[] {
+    const data = bytes::from_str(text)!!;
+    const length = bytes::len(data)!!;
+    var result: str[] = [];
+    var start = 0;
+    for i in 0..length {
+        if bytes::get(data, i)!! == 10 {
+            const end = if i > start && bytes::get(data, i - 1)!! == 13 { i - 1 } else { i };
+            (result << bytes::to_str(data, start, end - start)!!)!!;
+            start = i + 1;
+        }
+    }
+    if start < length { (result << bytes::to_str(data, start, length - start)!!)!!; }
+    result
+}
+
+public fn repeat(text: str, count: int) -> str {
+    text!!;
+    count!!;
+    if count < 0 { return Error::InvalidArgument("str::repeat"); }
+    if count == 0 || text == "" { return ""; }
+    const data = bytes::from_str(text)!!;
+    const width = bytes::len(data)!!;
+    const length = (width * count)!!;
+    var result = bytes::new(length)!!;
+    var offset = 0;
+    for _ in 0..count {
+        for i in 0..width {
+            bytes::set(result, offset, bytes::get(data, i)!!)!!;
+            offset += 1;
+        }
+    }
+    bytes::to_str(result, 0, length)
+}
+
+fn remove_affix(text: str, pattern: str, prefix: bool) -> str {
+    text!!;
+    pattern!!;
+    if pattern == "" { return text; }
+    const data = bytes::from_str(text)!!;
+    const needle = bytes::from_str(pattern)!!;
+    const width = bytes::len(needle)!!;
+    const remaining = bytes::len(data)!! - width;
+    if remaining < 0 { return text; }
+    const offset = if prefix { 0 } else { remaining };
+    if !bytes_match(data, offset, needle, width)!! { return text; }
+    bytes::to_str(data, if prefix { width } else { 0 }, remaining)
+}
+
+public fn remove_prefix(text: str, prefix: str) -> str {
+    remove_affix(text, prefix, true)
+}
+
+public fn remove_suffix(text: str, suffix: str) -> str {
+    remove_affix(text, suffix, false)
 }

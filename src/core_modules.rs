@@ -1,8 +1,10 @@
 //! Embedded standard-library sources consumed by the common module resolver.
 pub(crate) const SOURCES: &[(&str, &str)] = &[
     ("array", include_str!("../core/array.cog")),
+    ("array_storage", include_str!("../core/array_storage.cog")),
     ("ascii", include_str!("../core/ascii.cog")),
     ("base64", include_str!("../core/base64.cog")),
+    ("binary", include_str!("../core/binary.cog")),
     ("clone", include_str!("../core/clone.cog")),
     ("collections", include_str!("../core/collections.cog")),
     ("eq", include_str!("../core/eq.cog")),
@@ -16,4 +18,5 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
     ("search", include_str!("../core/search.cog")),
     ("sort", include_str!("../core/sort.cog")),
     ("str", include_str!("../core/str.cog")),
+    ("text_order", include_str!("../core/text_order.cog")),
 ];

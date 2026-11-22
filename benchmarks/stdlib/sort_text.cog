@@ -1,0 +1,23 @@
+@!include("std")
+use bytes;
+use hex;
+use io;
+use sort;
+use str;
+
+fn work(n: int) -> int {
+    var values: int[] = [];
+    for i in 0..n { values << ((i * 997) % n); }
+    sort::quick(values)!!;
+    const text = "  é:apple:pear  ";
+    var checksum = 0;
+    for i in 0..n {
+        const cleaned = str::trim(text)!!;
+        const parts = str::split(cleaned, ":")!!;
+        const payload = hex::encode(bytes::from_str(parts[1]!!)!!)!!;
+        checksum += values[i]!! + len(payload);
+    }
+    checksum
+}
+
+fn main() { io::println(work(1500)!!)!!; }

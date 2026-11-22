@@ -1,0 +1,21 @@
+@!include("std")
+use collections;
+use io;
+
+fn work(n: int) -> int {
+    var left = collections::Set::new[int]();
+    var right = collections::Set::new[int]();
+    for i in 0..n {
+        left.insert(i)!!;
+        right.insert(i * 2)!!;
+    }
+    const combined = left.union(right)!!;
+    const shared = left.intersection(right)!!;
+    const different = left.symmetric_difference(right)!!;
+    combined.len() * 31 + shared.len() * 17 + different.len()
+}
+
+fn main(args: str[]) {
+    const n = if args.len() == 0 { 2000 } else { (args[0]!! as int)!! };
+    io::println(work(n)!!)!!;
+}

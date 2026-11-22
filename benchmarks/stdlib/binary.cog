@@ -1,0 +1,22 @@
+@!include("std")
+use binary;
+use bytes;
+use io;
+
+fn work(n: int) -> uint {
+    var data = bytes::new(8)!!;
+    var result: uint = 0;
+    for i in 0..n {
+        const expected = ((i as uint)!! * 65537 + 129)!!;
+        binary::write_u64_be(data, 0, expected)!!;
+        const value = binary::read_u64_be(data, 0)!!;
+        const encoded = binary::encode_varuint(value)!!;
+        result += binary::read_varuint(encoded, 0)!!.0;
+    }
+    result
+}
+
+fn main(args: str[]) {
+    const n = if args.len() == 0 { 2000 } else { (args[0]!! as int)!! };
+    io::println(work(n)!!)!!;
+}

@@ -1,0 +1,38 @@
+@!include("std")
+use binary;
+use bytes;
+use err::Error;
+use hex;
+use io;
+
+fn require(ok: bool, label: str) {
+    if !ok { crash(label); }
+}
+
+fn main() {
+    var data = bytes::new(16)!!;
+    binary::write_u64_le(data, 0, 258)!!;
+    binary::write_u64_be(data, 8, 258)!!;
+    const original = "02010000000000000000000000000102";
+    require(hex::encode(data)!! == original, "endian layout");
+    require(binary::read_u64_le(data, 0)!! == 258, "little-endian read");
+    require(binary::read_u64_be(data, 8)!! == 258, "big-endian read");
+    when binary::write_u64_le(data, 9, 0) is Error::InvalidArgument {}
+    else { crash("out-of-bounds write"); }
+    require(hex::encode(data)!! == original, "partial write on invalid range");
+
+    const values: uint[] = [0, 1, 127, 128, 255, 16383, 16384, 4294967296, 18446744073709551615];
+    for value in values {
+        const encoded = binary::encode_varuint(value)!!;
+        const wire = bytes::concat(hex::decode("ae")!!, encoded)!!;
+        const result = binary::read_varuint(wire, 1)!!;
+        require(result.0 == value && result.1 == bytes::len(wire)!!, "varuint round trip");
+    }
+    when binary::read_varuint(hex::decode("8000")!!, 0) is Error::ParseFailure {}
+    else { crash("noncanonical varuint"); }
+    when binary::read_varuint(hex::decode("80")!!, 0) is Error::ParseFailure {}
+    else { crash("truncated varuint"); }
+    when binary::read_varuint(hex::decode("ffffffffffffffffff02")!!, 0) is Error::Overflow {}
+    else { crash("overflowing varuint"); }
+    io::println("binary ok")!!;
+}

@@ -1,0 +1,120 @@
+@!include("std")
+use array;
+use err::Error;
+use io;
+use iter;
+use math;
+use random;
+use search;
+use str;
+
+fn require(ok: bool, label: str) {
+    if !ok { crash(label); }
+}
+
+fn even(value: int) -> bool { value % 2 == 0 }
+fn parity(value: int) -> int { value % 2 }
+fn pair(value: int) -> int[] { [value, -value] }
+fn add(left: int, right: int) -> int { left + right }
+fn nil_value(value: int?) -> bool { value == nil }
+
+fn arrays() {
+    var values = [1, 2, 2];
+    values << 3;
+    var visits = 0;
+    const observed = fn[var visits](value: int) -> bool {
+        visits += 1;
+        value == 2
+    };
+    require(array::any(values, observed)!! && visits == 2, "any visits");
+    require(!array::all(values, observed)!! && visits == 3, "all visits");
+    require(array::find_index(values, even)!! == 1, "find index");
+    require(array::find(values, even)!! == 2, "find element");
+    require(array::count_if(values, even)!! == 2, "count");
+    const parts = array::partition(values, even)!!;
+    require(parts.0.len() == 2 && parts.1[1]!! == 3, "partition");
+    require(array::take(values, 99)!!.len() == values.len(), "take clamp");
+    require(array::drop(values, 99)!!.len() == 0, "drop clamp");
+    when array::take(values, -1) is Error::InvalidArgument {} else { crash("negative take"); }
+    const zipped = array::zip(values, ["a", "b"])!!;
+    require(zipped.len() == 2 && zipped[1]!!.1 == "b", "zip limits");
+    require(array::enumerate(values)!![3]!!.0 == 3, "enumerate");
+    require(array::chunks(values, 3)!![1]!!.len() == 1, "short chunk");
+    require(array::windows(values, 2)!![2]!![1]!! == 3, "overlapping windows");
+    require(array::windows(values, 99)!!.len() == 0, "no windows");
+    require(array::dedup([1, 2, 2, 1])!!.len() == 3, "adjacent dedup");
+    const equal = search::equal_range([1, 2, 2, 3], 2)!!;
+    require(equal.0 == 1 && equal.1 == 3, "equal range");
+    require(array::unique([1, 2, 2, 1])!!.len() == 2, "global dedup");
+    require(array::unique([1 as bigint, 1 as bigint, 2 as bigint])!!.len() == 2, "bigint dedup");
+    require(array::flat_map(values, pair)!![7]!! == -3, "flat map");
+    require(array::flatten([[1, 2], [3]])!!.len() == 3, "flatten");
+    require(array::scan(values, 0, add)!![3]!! == 8, "scan accumulation");
+    const grouped = array::group_by(values, parity)!!;
+    require(grouped.keys()!![0]!! == 1, "group order");
+    require(grouped.get(1)!![1]!! == 3, "group element order");
+
+    var maybe: int?[] = [];
+    maybe << nil;
+    require(array::find(maybe, nil_value)!! == nil, "find present nil");
+    var failures = [2, 4];
+    failures[1] = Error::MissingField("leaf");
+    require(array::any(failures, even)!!, "skipped error leaf");
+    when array::count_if(failures, even) is Error::MissingField(field) {
+        require(field == "leaf", "error leaf payload");
+    } else { crash("lost error leaf"); }
+
+    var children = [[1, 2], [3]];
+    var copied = array::take(children, 1)!!;
+    copied << [4];
+    children[0]!![0] = 7;
+    require(copied.len() == 2 && children.len() == 2 && copied[0]!![0]!! == 7,
+            "shallow copy alias");
+}
+
+fn utilities() {
+    require(str::find("é🙂ré🙂", "🙂")!! == 1, "scalar offset");
+    require(str::rfind("é🙂ré🙂", "🙂")!! == 4, "reverse scalar offset");
+    require(str::rfind("aaaa", "aaa")!! == 1, "overlapping search");
+    require(str::count("aaaaa", "aa")!! == 2, "nonoverlapping count");
+    require(str::find("🙂", "")!! == 0 && str::rfind("🙂", "")!! == 1, "empty needle");
+    require(str::find("é", "e")!! == nil, "no normalization");
+    require(str::split_once("a::é::🦀", "::")!!.1 == "é::🦀", "first separator");
+    require(str::rsplit_once("a::é::🦀", "::")!!.0 == "a::é", "last separator");
+    const lines = str::lines("é\r\n\n🦀\n")!!;
+    require(lines.len() == 3 && lines[1]!! == "" && lines[2]!! == "🦀", "lines");
+    require(str::lines("").len() == 0 && str::lines("x\r")!![0]!! == "x\r", "terminal lines");
+    require(str::repeat("é🦀", 2)!! == "é🦀é🦀", "unicode repetition");
+    require(str::remove_prefix("é🦀é", "é")!! == "🦀é", "prefix");
+    require(str::remove_suffix("é🦀é", "é")!! == "é🦀", "suffix");
+
+    require(math::gcd(-84, 30)!! == 6 && math::lcm(-21, 6)!! == 42, "gcd and lcm");
+    require(math::gcd(-9223372036854775807 - 1, 3)!! == 1, "minimum int gcd");
+    when math::gcd(-9223372036854775807 - 1, 0) is Error::Overflow {}
+    else { crash("gcd overflow"); }
+    require(math::clamp(20, 2, 10)!! == 10, "clamp");
+
+    var a = random::Seeded::new(-1)!!;
+    var b = random::Seeded::new(-1)!!;
+    for _ in 0..50 { require(a.next()!! == b.next()!!, "seeded stream"); }
+    for _ in 0..70 {
+        const value = a.range(-12, 17)!!;
+        require(value >= -12 && value < 17, "bounded stream");
+    }
+    const sampled = random::sample(a, [0, 1, 2, 3, 4], 4)!!;
+    require(array::unique(sampled)!!.len() == 4, "unique sample indices");
+    var shuffled = [0, 1, 2, 3, 4];
+    random::shuffle(a, shuffled)!!;
+    require(array::unique(shuffled)!!.len() == 5, "shuffle permutation");
+    const selected = random::choose(b, shuffled)!!;
+    require(selected >= 0 && selected < 5, "random choice");
+    var sum = 0;
+    for value in iter::range(-5, 6)!! { sum += value; }
+    require(sum == 0, "concrete range iterator");
+}
+
+fn main() {
+    arrays()!!;
+    utilities()!!;
+    io::println("algorithms ok")!!;
+}
