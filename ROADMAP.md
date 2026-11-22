@@ -45,7 +45,8 @@ remaining release acceptance gates, and the next language goals. See the [langua
 - A tutorial and CI/fuzz infrastructure. Short fuzz smoke runs and local Linux
   validation have been recorded; sustained fuzz campaigns remain outstanding.
   The CI workflow is configured for Linux x86_64, Windows x86_64, and macOS
-  arm64 on Rust 1.95 and stable; current-revision results are still required.
+  arm64 on Rust 1.95 and stable; all six platform/toolchain jobs and the
+  tutorial passed for the early Beta candidate. Sustained campaigns remain.
 - A Rust SDK for embedding and native registration, plus CLI plugins across a
   versioned C ABI v3 with call-scoped handles, async task callbacks and retained
   library lifetimes.
@@ -167,7 +168,9 @@ thread-safe scheduler wakeups. Detach and async closures remain future work.
 
 Version `0.1.0-beta.1` marks **early Beta**. The local audit verified the
 implemented Beta contracts and Linux x86_64 packaging and installation on
-Rust 1.95 and stable. Full release acceptance still requires the four
-sustained fuzz campaigns and current-candidate Windows x86_64 and macOS arm64
-results on both toolchains. The earlier platform CI applies to its recorded
-revision. Detailed audit evidence lives in the repository's development records.
+Rust 1.95 and stable. CI run
+[45030017021](https://github.com/glutmoth3r/cog-lang/actions/runs/45030017021)
+then passed Linux x86_64, Windows x86_64 and macOS arm64 on both Rust 1.95 and
+stable, along with the tutorial. Full release acceptance still requires the
+four sustained fuzz campaigns. Detailed audit evidence lives in the
+repository's development records.
