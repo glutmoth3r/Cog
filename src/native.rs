@@ -517,7 +517,8 @@ fn run(bytes: &[u8], entries: &[LinkedEntry], bindings: &[LinkedImport]) -> Resu
         .iter()
         .map(|entry| (entry.pc, entry.function))
         .collect();
-    let plan = crate::interpreter::prepare_aot_plan(&artifact, &entries)?;
+    let plan =
+        crate::interpreter::prepare_aot_plan(&artifact, &entries, aot_jit_fallback_enabled())?;
     let mut stdout = std::io::stdout();
     let mut context = RuntimeContext::new(&mut stdout, VmCapabilities::default());
     context.set_process_arguments(std::env::args_os().skip(1).collect());
@@ -537,6 +538,10 @@ fn run(bytes: &[u8], entries: &[LinkedEntry], bindings: &[LinkedImport]) -> Resu
         ),
         None => format!("runtime error: {error}"),
     })
+}
+
+fn aot_jit_fallback_enabled() -> bool {
+    std::env::var_os("COG_AOT_JIT").is_some_and(|value| value == std::ffi::OsStr::new("1"))
 }
 
 fn library_glue(length: usize, count: usize, exports: &[Export]) -> (String, String) {
@@ -614,7 +619,9 @@ unsafe extern "C" fn cog_aot_open_v2(
             .iter()
             .map(|entry| (entry.pc, entry.function))
             .collect();
-        let plan = crate::interpreter::prepare_aot_plan(&artifact, &entries).ok()?;
+        let plan =
+            crate::interpreter::prepare_aot_plan(&artifact, &entries, aot_jit_fallback_enabled())
+                .ok()?;
         Some(Box::into_raw(Box::new(LibraryContext {
             image: bytes,
             thread: std::thread::current().id(),

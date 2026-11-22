@@ -18,6 +18,36 @@ printf '497969313\n[Ω]\n' | cmp - "$out/aot"
 grep -Eq '\[aot\] function=.*status=0 backedges=999999' "$out/trace"
 grep -Eq 'compiled=999999 .*aggregate=1999998' "$out/trace"
 
+# The ELF AOT table is capped at 512 entries. Keep a hot direct callee beyond
+# that table so the opt-in runtime JIT must compile and use its VM fallback.
+{
+    printf '@!include("std")\nuse io;\n'
+    for index in $(seq 0 512); do
+        printf '@inline("never")\nfn filler_%03d(value: int) -> int { value + 1 }\n' "$index"
+    done
+    cat <<'COG'
+@inline("never")
+fn vm_fallback(value: int) -> int { value + 2 }
+
+fn main() -> nil {
+    var index = 0;
+    var total = 0;
+    while index < 6000 {
+        total = total + (vm_fallback(index)!!);
+        index += 1;
+    }
+    io::println(total)!!;
+}
+COG
+} > "$out/hybrid-jit.cog"
+"$cli" build --native "$out/hybrid-jit.cog" -o "$out/hybrid-jit"
+"$cli" run "$out/hybrid-jit.cog" > "$out/vm"
+COG_AOT_JIT=1 COG_AOT_TRACE=1 "$out/hybrid-jit" > "$out/aot-jit" 2> "$out/trace"
+cmp "$out/vm" "$out/aot-jit"
+printf '18009000\n' | cmp - "$out/aot-jit"
+grep -Eq '\[jit\] call-compile function=.* machine_code_bytes=' "$out/trace"
+grep -Eq '\[jit\] bridge function=.*compiled=[1-9][0-9]* cog=' "$out/trace"
+
 for workload in blocks callable; do
     cp "benchmarks/optimizer/$workload.cog" "$out"
     "$cli" build --native "$out/$workload.cog" -o "$out/$workload"

@@ -52,4 +52,30 @@ the VM. Cog rejects a native build with zero eligible machine functions.
 Windows and macOS artifact production is pending. The private machine
 frame and table ABI can change between Cog builds.
 
+### Optional runtime JIT for AOT fallbacks
+
+By default, an AOT executable uses its embedded machine code and resumes in
+the embedded VM when it reaches bytecode without an AOT entry. To let the
+runtime JIT compile hot eligible functions that were not embedded, set
+`COG_AOT_JIT=1` before starting the executable:
+
+```sh
+COG_AOT_JIT=1 ./target/my-app arg1 arg2
+```
+
+The adaptive compiler is initialized at startup. Existing AOT entries remain
+in use; the JIT profiles bridged direct Cog calls and compiles eligible missing
+callees for later native slices. AOT loops yield to the VM periodically while
+this option is enabled so the runtime can collect those call profiles. The
+JIT uses the existing code size and function budgets. Its profiles are local
+to that process and are not persisted.
+
+This does not make bytecode outside the shared JIT/AOT lowering eligible for
+native compilation. Async functions, oversized functions and unsupported
+operations still use the VM. A command-line `--jit` after the executable name
+is a Cog program argument, not a runtime option. For a shared library, set
+`COG_AOT_JIT=1` before calling `cog_native_open()`; the setting is captured
+when that runtime context is created. `COG_AOT_TRACE=1` shows JIT compilation
+and bridge decisions.
+
 See [C interoperation](FFI.md) for shared libraries and C imports.

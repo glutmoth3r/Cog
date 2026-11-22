@@ -479,9 +479,14 @@ pub(crate) fn run_aot_export(
 pub(crate) fn prepare_aot_plan(
     artifact: &CompiledProgram,
     entries: &[(usize, crate::jit::JitEntry)],
+    enable_jit_fallback: bool,
 ) -> Result<Rc<VmExecutionPlan>, String> {
     let plan = VmExecutionPlan::new(artifact);
-    *plan.jit.borrow_mut() = JitPlanState::Ready(Box::new(JitState::from_aot(artifact, entries)?));
+    *plan.jit.borrow_mut() = JitPlanState::Ready(Box::new(JitState::from_aot(
+        artifact,
+        entries,
+        enable_jit_fallback,
+    )?));
     Ok(Rc::new(plan))
 }
 
@@ -6640,6 +6645,48 @@ mod tests {
             &format!("@!include(\"std\") use io; use err::Error; {source}"),
         )
         .unwrap()
+    }
+
+    unsafe extern "C" fn unused_aot_entry(_: *mut crate::jit::JitFrame) -> i32 {
+        0
+    }
+
+    #[test]
+    fn aot_fallback_jits_a_hot_bridged_callee_and_resumes_native_execution() {
+        let program = compile(
+            r#"
+@inline("never")
+fn baked(value: int) -> int { value + 1 }
+@inline("never")
+fn fallback(value: int) -> int { value + 2 }
+fn main() -> nil {
+    var index = 0;
+    var total = 0;
+    while index < 6000 {
+        total = total + (fallback(index)!!);
+        index += 1;
+    }
+    io::println(total)!!;
+}
+"#,
+        );
+        let baked_entry = program
+            .functions
+            .iter()
+            .find_map(|(&entry, name)| name.ends_with("baked").then_some(entry))
+            .expect("test AOT function has a bytecode entry");
+        let plan = prepare_aot_plan(&program, &[(baked_entry, unused_aot_entry)], true).unwrap();
+        let mut output = Vec::new();
+        let mut context = RuntimeContext::new(&mut output, VmCapabilities::default());
+        context.configure_jit(true, None, false);
+        run_with_callable_owner_and_plan(&program, &mut context, &Rc::new(()), &plan).unwrap();
+        drop(context);
+
+        assert_eq!(output, b"18009000\n");
+        let JitPlanState::Ready(jit) = &*plan.jit.borrow() else {
+            panic!("AOT plan should retain its execution state");
+        };
+        assert!(jit.compiled_function_count() >= 2);
     }
 
     #[test]

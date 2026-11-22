@@ -24,7 +24,7 @@ use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
 use num_traits::{ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::mem::{offset_of, size_of, transmute};
@@ -205,6 +205,8 @@ struct JitExecutionContext<'a, 'bridge> {
     artifact: &'a CompiledProgram,
     variant_tags: &'a VariantTags,
     callables: HashMap<usize, JitCallable<'a>>,
+    profile_fallback_calls: bool,
+    deferred_calls: BTreeMap<usize, u64>,
     call_frame: Option<Box<JitCallFrame>>,
     bridge: Option<&'a mut RuntimeBridge<'bridge>>,
     arguments: Vec<Value>,
@@ -540,6 +542,7 @@ pub(crate) struct JitState {
     plans: BTreeMap<usize, Arc<FunctionPlan>>,
     variant_tags: VariantTags,
     candidates: BTreeMap<usize, Candidate>,
+    aot_entries: BTreeSet<usize>,
     compiler: Option<JitCompiler>,
     coefficients: Coefficients,
     profile_key: String,
@@ -588,6 +591,7 @@ impl JitState {
             plans,
             variant_tags,
             candidates,
+            aot_entries: BTreeSet::new(),
             compiler: Some(compiler),
             coefficients,
             profile_key,
@@ -601,33 +605,56 @@ impl JitState {
     pub(crate) fn from_aot(
         artifact: &CompiledProgram,
         entries: &[(usize, JitEntry)],
+        enable_jit_fallback: bool,
     ) -> Result<Self, String> {
         let plans = analyze_program(artifact);
         let mut candidates = BTreeMap::new();
+        let compiler = if enable_jit_fallback {
+            for entry in plans.keys() {
+                candidates.insert(*entry, Candidate::new(FunctionProfile::default()));
+            }
+            Some(JitCompiler::new()?.0)
+        } else {
+            None
+        };
+        let mut aot_entries = BTreeSet::new();
         for &(entry, function) in entries {
-            if !plans.contains_key(&entry) || candidates.contains_key(&entry) {
+            if !plans.contains_key(&entry) || !aot_entries.insert(entry) {
                 return Err("invalid AOT entry table".into());
             }
-            let mut candidate = Candidate::new(FunctionProfile::default());
+            let candidate = candidates
+                .entry(entry)
+                .or_insert_with(|| Candidate::new(FunctionProfile::default()));
             candidate.compiled = Some(CompiledFunction {
                 entry: function,
                 probe_pending: false,
                 call_compiled: true,
             });
-            candidates.insert(entry, candidate);
         }
         Ok(Self {
             plans,
             variant_tags: VariantTags::from_program(artifact),
             candidates,
-            compiler: None,
+            aot_entries,
+            compiler,
             coefficients: Coefficients::seeded(),
             profile_key: String::new(),
             profile_path: None,
             bootstrap_probes: 0,
-            compile_tokens_ns: 0,
+            compile_tokens_ns: if enable_jit_fallback {
+                TOKEN_CAPACITY_NS as i64
+            } else {
+                0
+            },
             token_refill_at: Instant::now(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn compiled_function_count(&self) -> usize {
+        self.compiler
+            .as_ref()
+            .map_or(0, |compiler| compiler.functions)
     }
 
     pub(crate) fn contains(&self, entry: usize, target: usize) -> bool {
@@ -672,7 +699,7 @@ impl JitState {
             }
             return None;
         }
-        let aot = self.compiler.is_none();
+        let aot = self.aot_entries.contains(&entry);
         if aot {
             let candidate = self.candidates.get_mut(&entry)?;
             if candidate.disabled {
@@ -705,6 +732,7 @@ impl JitState {
                 let call_profiled = compiled.call_compiled
                     && candidate.profile.total_calls >= HOT_CALL_THRESHOLD
                     && candidate.profile.total_calls >= candidate.retry_after_calls;
+                let aot = self.aot_entries.contains(&candidate_entry);
                 if !plan.callable_from_jit
                     || compiled.probe_pending
                     || candidate.disabled
@@ -740,6 +768,8 @@ impl JitState {
             artifact,
             variant_tags: &self.variant_tags,
             callables,
+            profile_fallback_calls: !self.aot_entries.is_empty() && self.compiler.is_some(),
+            deferred_calls: BTreeMap::new(),
             call_frame: None,
             bridge: Some(bridge),
             arguments: Vec::new(),
@@ -781,7 +811,11 @@ impl JitState {
             pc: target as u64,
             stack_len: remaining as u64,
             propagation_pending: u64::from(*propagation_pending),
-            backedge_budget: if probe_pending { WINDOW_BACKEDGES } else { 0 },
+            backedge_budget: if probe_pending || (aot && self.compiler.is_some()) {
+                WINDOW_BACKEDGES
+            } else {
+                0
+            },
             backedge_count: 0,
             exit_reason: REASON_NORMAL,
         };
@@ -824,6 +858,7 @@ impl JitState {
             return Some(JitExit::InvalidCommittedFrame);
         }
         let committed = runtime.committed;
+        let deferred_calls = std::mem::take(&mut runtime.deferred_calls);
         drop(runtime);
         let exit = match decode_exit(&plan, artifact, &frame, status) {
             Ok(exit) => exit,
@@ -935,6 +970,7 @@ impl JitState {
                 );
             }
         }
+        self.compile_deferred_calls(entry, artifact, deferred_calls, debug);
         Some(exit)
     }
 
@@ -973,7 +1009,7 @@ impl JitState {
             return None;
         }
 
-        let aot = self.compiler.is_none();
+        let aot = self.aot_entries.contains(&entry);
         if aot {
             let candidate = self.candidates.get_mut(&entry)?;
             if candidate.disabled {
@@ -981,7 +1017,7 @@ impl JitState {
             }
             candidate.profile.total_calls = candidate.profile.total_calls.saturating_add(1);
         } else {
-            self.prepare_jit_call(entry, &plan, artifact, debug)?;
+            self.prepare_jit_call(entry, &plan, artifact, debug, 1)?;
         }
 
         let entry_function = {
@@ -996,6 +1032,8 @@ impl JitState {
             artifact,
             variant_tags: &self.variant_tags,
             callables: HashMap::new(),
+            profile_fallback_calls: false,
+            deferred_calls: BTreeMap::new(),
             call_frame: None,
             bridge: None,
             arguments: Vec::new(),
@@ -1249,18 +1287,68 @@ impl JitState {
         Some(())
     }
 
+    fn compile_deferred_calls(
+        &mut self,
+        caller: usize,
+        artifact: &CompiledProgram,
+        calls: BTreeMap<usize, u64>,
+        debug: bool,
+    ) {
+        if self.compiler.is_none() {
+            return;
+        }
+        for (entry, count) in calls {
+            let Some(plan) = self.plans.get(&entry).cloned() else {
+                continue;
+            };
+            let Some(signature) = artifact.callables.get(&entry) else {
+                continue;
+            };
+            if !plan.callable_from_jit
+                || signature.asynchronous
+                || signature.captures != 0
+                || self.aot_entries.contains(&entry)
+            {
+                continue;
+            }
+            let should_compile = if let Some(candidate) = self.candidates.get_mut(&entry) {
+                candidate.profile.total_calls = candidate.profile.total_calls.saturating_add(count);
+                candidate.compiled.is_none() && !candidate.disabled
+            } else {
+                false
+            };
+            if should_compile {
+                self.prepare_jit_call(entry, &plan, artifact, debug, 0);
+                if self
+                    .candidates
+                    .get(&entry)
+                    .is_some_and(|candidate| candidate.compiled.is_some())
+                    && !self.aot_entries.contains(&caller)
+                    && let Some(candidate) = self.candidates.get_mut(&caller)
+                {
+                    candidate.profile.calibrated = false;
+                    if let Some(compiled) = candidate.compiled.as_mut() {
+                        compiled.probe_pending = true;
+                    }
+                }
+            }
+        }
+    }
+
     fn prepare_jit_call(
         &mut self,
         entry: usize,
         plan: &FunctionPlan,
         artifact: &CompiledProgram,
         debug: bool,
+        observed_calls: u64,
     ) -> Option<()> {
         let now = Instant::now();
         self.refill_tokens(now);
         {
             let candidate = self.candidates.get_mut(&entry)?;
-            candidate.profile.total_calls = candidate.profile.total_calls.saturating_add(1);
+            candidate.profile.total_calls =
+                candidate.profile.total_calls.saturating_add(observed_calls);
             if debug
                 && (candidate.profile.total_calls == 1
                     || candidate.profile.total_calls % HOT_CALL_THRESHOLD == 0)
@@ -2811,10 +2899,32 @@ unsafe extern "C" fn jit_direct_call(
             }
             true
         } else {
+            record_deferred_direct_call(frame, pc, target);
             jit_runtime_bridge_inner(frame, pc as usize, depth as usize, arity as usize)
         }
     }))
     .unwrap_or(false) as i32
+}
+
+unsafe fn record_deferred_direct_call(frame: *mut JitFrame, pc: u64, target: u64) {
+    let Some(frame) = (unsafe { frame.as_ref() }) else {
+        return;
+    };
+    if frame.runtime_context.is_null() {
+        return;
+    }
+    let (Ok(pc), Ok(target)) = (usize::try_from(pc), usize::try_from(target)) else {
+        return;
+    };
+    let context = unsafe { &mut *frame.runtime_context.cast::<JitExecutionContext<'_, '_>>() };
+    if !context.profile_fallback_calls {
+        return;
+    }
+    if matches!(context.artifact.instructions.get(pc), Some(Instruction::Call(actual, _)) if *actual == target)
+    {
+        let calls = context.deferred_calls.entry(target).or_default();
+        *calls = calls.saturating_add(1);
+    }
 }
 
 // SAFETY: Only a function emitted from a verified plan calls this helper. The
@@ -6664,6 +6774,46 @@ fn emit_conditional_jump(
 mod tests {
     use super::*;
 
+    unsafe extern "C" fn unused_aot_entry(_: *mut JitFrame) -> i32 {
+        0
+    }
+
+    #[test]
+    fn aot_jit_fallback_keeps_linked_entries_and_candidates_for_vm_functions() {
+        let artifact = crate::project::compile_source(
+            "native-jit-fallback.cog",
+            r#"
+@!include("std")
+@inline("never")
+fn baked(value: int) -> int { value + 1 }
+@inline("never")
+fn fallback(value: int) -> int { value + 2 }
+fn main() -> nil {}
+"#,
+        )
+        .unwrap();
+        let entry = |name: &str| {
+            artifact
+                .functions
+                .iter()
+                .find_map(|(&entry, function)| (function == name).then_some(entry))
+                .expect("test function has a bytecode entry")
+        };
+        let baked = entry("baked");
+        let fallback = entry("fallback");
+
+        let state = JitState::from_aot(&artifact, &[(baked, unused_aot_entry)], true).unwrap();
+        assert!(state.compiler.is_some());
+        assert!(state.aot_entries.contains(&baked));
+        assert!(state.candidates[&baked].compiled.is_some());
+        assert!(state.candidates[&fallback].compiled.is_none());
+
+        let vm_only = JitState::from_aot(&artifact, &[(baked, unused_aot_entry)], false).unwrap();
+        assert!(vm_only.compiler.is_none());
+        assert_eq!(vm_only.candidates.len(), 1);
+        assert!(vm_only.aot_entries.contains(&baked));
+    }
+
     #[test]
     fn jit_bytecode_blocks_coalesce_linear_instructions() {
         let artifact = CompiledProgram {
@@ -6898,6 +7048,7 @@ mod tests {
             plans: BTreeMap::from([(entry, Arc::new(plan)), (stale_entry, Arc::new(stale_plan))]),
             variant_tags: VariantTags::default(),
             candidates,
+            aot_entries: BTreeSet::new(),
             compiler: Some(compiler),
             coefficients: Coefficients::seeded(),
             profile_key: String::new(),
@@ -6972,6 +7123,7 @@ mod tests {
             plans: BTreeMap::from([(entry, Arc::new(plan))]),
             variant_tags: VariantTags::default(),
             candidates,
+            aot_entries: BTreeSet::new(),
             compiler: Some(compiler),
             coefficients: Coefficients::seeded(),
             profile_key: String::new(),
