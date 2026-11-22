@@ -1,0 +1,17 @@
+@!include("std")
+use io;
+
+fn work() -> bigint {
+    const step = 18446744073709551616 as bigint;
+    var result = 0 as bigint;
+    var i: int = 0;
+    while i < 100000 {
+        result += step;
+        i += 1;
+    }
+    result
+}
+
+fn main() {
+    io::println(work()!!)!!;
+}

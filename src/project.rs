@@ -942,10 +942,21 @@ pub fn compile_with_inputs(
 /// Check a library package without generating executable bytecode.
 pub fn check_with_inputs_and_warnings(
     program: Program,
-    mut diagnostics: Vec<Diagnostic>,
+    diagnostics: Vec<Diagnostic>,
     names: &BTreeMap<String, String>,
     inputs: &crate::build_inputs::BuildInputs,
 ) -> Result<Vec<Diagnostic>, String> {
+    compile_library_with_inputs_and_warnings(program, diagnostics, names, inputs)
+        .map(|(_, warnings)| warnings)
+}
+
+/// Compile a library and retain callable metadata for native artifact emission.
+pub fn compile_library_with_inputs_and_warnings(
+    program: Program,
+    mut diagnostics: Vec<Diagnostic>,
+    names: &BTreeMap<String, String>,
+    inputs: &crate::build_inputs::BuildInputs,
+) -> Result<(crate::backend::CompiledProgram, Vec<Diagnostic>), String> {
     inputs.begin();
     let mut program = program;
     if let Err(message) = crate::ast_budget::program(&program) {
@@ -984,8 +995,14 @@ pub fn check_with_inputs_and_warnings(
         ));
         return Err(render(diagnostics));
     }
-    crate::codegen::compile_library(&program, names).map_err(|error| render(error.diagnostics))?;
-    Ok(crate::lint::check_with_names(&program, names))
+    let mut compiled = crate::codegen::compile_library(&program, names)
+        .map_err(|error| render(error.diagnostics))?;
+    for name in compiled.functions.values_mut() {
+        if let Some(original) = names.get(name) {
+            *name = original.clone();
+        }
+    }
+    Ok((compiled, crate::lint::check_with_names(&program, names)))
 }
 
 pub fn compile_with_inputs_and_warnings(

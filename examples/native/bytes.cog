@@ -1,0 +1,20 @@
+@!include("std")
+use io;
+use bytes from std;
+
+fn work() -> int {
+    var buffer = bytes::new(4096)!!;
+    var i: int = 0;
+    var sum: int = 0;
+    while i < 500000 {
+        const index = i % 4096;
+        bytes::set(buffer, index, i % 256)!!;
+        sum += bytes::get(buffer, index)!!;
+        i += 1;
+    }
+    sum
+}
+
+fn main() {
+    io::println(work()!!)!!;
+}

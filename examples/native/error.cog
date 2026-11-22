@@ -1,0 +1,16 @@
+@!include("std")
+use io;
+
+fn work(n: int) -> int {
+    var i: int = 0;
+    var total: int = 0;
+    while i < n {
+        total += 12 / (20 - i)!!;
+        i += 1;
+    }
+    total
+}
+
+fn main() {
+    io::println(work(23)!!)!!;
+}

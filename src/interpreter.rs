@@ -432,6 +432,59 @@ impl VmExecutionPlan {
     }
 }
 
+pub(crate) fn run_aot_export(
+    artifact: &CompiledProgram,
+    plan: &VmExecutionPlan,
+    owner: &Rc<()>,
+    entry: usize,
+    arguments: Vec<Value>,
+) -> Result<Value, RuntimeError> {
+    let mut stdout = std::io::stdout();
+    let mut context = RuntimeContext::new(&mut stdout, VmCapabilities::default());
+    context.configure_jit(true, None, std::env::var_os("COG_AOT_TRACE").is_some());
+    if plan.has_async {
+        return Err(RuntimeError::InvalidArgument {
+            op: "async native export",
+        });
+    }
+    let mut scheduler = AsyncScheduler::new(None, None, None);
+    let execution = execute_vm(
+        artifact,
+        &mut context,
+        owner,
+        plan,
+        &mut scheduler,
+        &mut Vec::new(),
+        &mut None,
+        Some((entry, arguments)),
+        None,
+        None,
+        None,
+        None,
+    );
+    let cleanup = context.finish();
+    match (execution, cleanup) {
+        (VmExecution::Complete(Err(primary)), Err(secondary)) if primary.is_recoverable() => {
+            Err(primary.with_suppressed(secondary))
+        }
+        (VmExecution::Complete(result), cleanup) => {
+            result.and_then(|value| cleanup.map(|()| value))
+        }
+        (VmExecution::Suspended(_), _) => Err(RuntimeError::InvalidArgument {
+            op: "synchronous native export suspended",
+        }),
+    }
+}
+
+pub(crate) fn prepare_aot_plan(
+    artifact: &CompiledProgram,
+    entries: &[(usize, crate::jit::JitEntry)],
+) -> Result<Rc<VmExecutionPlan>, String> {
+    let plan = VmExecutionPlan::new(artifact);
+    *plan.jit.borrow_mut() = JitPlanState::Ready(Box::new(JitState::from_aot(artifact, entries)?));
+    Ok(Rc::new(plan))
+}
+
 pub(crate) fn prepare_execution_plan(artifact: &CompiledProgram) -> Rc<VmExecutionPlan> {
     Rc::new(VmExecutionPlan::new(artifact))
 }
@@ -4755,13 +4808,27 @@ fn execute_vm(
             let signature = execution_plan
                 .callable_signature(artifact, entry)
                 .ok_or(RuntimeError::InvalidCall(entry))?;
-            if !signature.asynchronous
+            if signature.asynchronous != async_task.is_some()
                 || signature.captures != 0
                 || !call_arguments_match(signature, &stack)
             {
                 return Err(RuntimeError::InvalidCall(entry));
             }
             check_jump(program, entry)?;
+            if async_task.is_none() {
+                execution_plan.try_jit_call(
+                    artifact,
+                    entry,
+                    &mut pc,
+                    &mut locals,
+                    bp,
+                    &mut stack,
+                    operand_base,
+                    &captures,
+                    &mut propagation_pending,
+                    context,
+                );
+            }
         }
         if context
             .limits
@@ -5977,7 +6044,7 @@ fn execute_vm(
                         error_value_pc = Some(pc);
                     }
                     if call_stack.is_empty() {
-                        if async_task.is_some() {
+                        if async_task.is_some() || start_entry.is_some() {
                             if propagates {
                                 let Value::Error(error) = result else {
                                     unreachable!("propagated return was checked above")

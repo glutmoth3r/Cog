@@ -1,0 +1,16 @@
+@!include("std")
+use io;
+
+fn run() -> int {
+    var i: int = 0;
+    var sum: int = 0;
+    while i < 5000000 {
+        sum += (i * 3) % 97;
+        i += 1;
+    }
+    sum
+}
+
+fn main() {
+    io::println(run()!!)!!;
+}

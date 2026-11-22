@@ -739,9 +739,15 @@ impl Engine {
         .map_err(|error| Error::at(ErrorKind::Compilation, error))
     }
     pub fn decode(&self, bytes: &[u8]) -> Result<Program, Error> {
+        self.decode_compiled(bytes).map(Program::new)
+    }
+
+    pub(crate) fn decode_compiled(
+        &self,
+        bytes: &[u8],
+    ) -> Result<crate::backend::CompiledProgram, Error> {
         entry_allowed()?;
         crate::runtime::with_registry(self.registry.clone(), || crate::bytecode::decode(bytes))
-            .map(Program::new)
             .map_err(|error| Error::at(ErrorKind::Bytecode, error))
     }
 }
@@ -761,6 +767,10 @@ impl Program {
             callable_owner: Rc::new(()),
             execution_plan,
         }
+    }
+
+    pub(crate) fn into_compiled(self) -> crate::backend::CompiledProgram {
+        self.inner
     }
 
     pub fn disassemble(&self) -> String {

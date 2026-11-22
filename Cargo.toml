@@ -47,6 +47,7 @@ cranelift-frontend = "=0.135.2"
 cranelift-jit = "=0.135.2"
 cranelift-module = "=0.135.2"
 cranelift-native = "=0.135.2"
+cranelift-object = "=0.135.2"
 logos = "0.16.1"
 kdl = { version = "6.7.1", default-features = false, features = ["span"] }
 serde = { version = "1.0.229", features = ["derive"] }

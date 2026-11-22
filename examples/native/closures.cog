@@ -1,0 +1,21 @@
+@!include("std")
+use io;
+
+fn work() -> int {
+    var captured = 0;
+    const callback = fn[var captured](i: int) -> int {
+        captured += 1;
+        (i + captured) % 991
+    };
+    var i: int = 0;
+    var sum: int = 0;
+    while i < 100000 {
+        sum += (callback)(i)!!;
+        i += 1;
+    }
+    sum
+}
+
+fn main() {
+    io::println(work()!!)!!;
+}

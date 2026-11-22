@@ -1,0 +1,9 @@
+@public
+fn add(a: int, b: int) -> int {
+    a + b
+}
+
+@public
+fn divide(a: int, b: int) -> int {
+    a / b
+}

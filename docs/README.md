@@ -17,6 +17,9 @@ Start with the [repository README](../README.md), the
 | [Standard library](STANDARD_LIBRARY.md) | Generic array search and sorting, cloning, text, ASCII, hex, Base64, bytes, streams, time, and processes |
 | [Projects and configuration](PROJECT_FORMATS.md) | Modules, KDL manifests, dependencies, lockfiles, targets, and caching |
 | [Runtime and bytecode](RUNTIME.md) | Compilation pipeline, artifacts, native ABI, and embedding boundaries |
+| [Native compilation](NATIVE_COMPILATION.md) | Linux AOT artifacts and shared execution with the JIT |
+| [C interoperation](FFI.md) | Scalar imports, generated headers, and shared library calls |
+| [Foreign memory](FOREIGN_MEMORY.md) | Context lifetime and managed value boundaries |
 | [Numeric types](NUMERIC_TYPES.md) | Implemented `int`, `uint`, and `bigint` behavior; proposed decimal contract |
 | [Rust SDK and plugins](SDK.md) | Owned embedding API, native registration, C ABI v3 and plugin lifecycle |
 | [Semantic contracts](SEMANTIC_CONTRACTS.md) | Implemented invariants, current limitations, planned work, and open decisions |

@@ -1,0 +1,24 @@
+@!include("std")
+use io;
+use process;
+
+@inline("never")
+fn step(value: int) -> int {
+    (value * 7 + 3) % 997
+}
+
+fn main() -> nil {
+    const arguments = process::args()!!;
+    var values: int[] = [2, 3, 5, 7];
+    var i: int = 0;
+    var sum: int = 0;
+    while i < 1000000 {
+        const index = i % 4;
+        const value = step(values[index]!! + i)!!;
+        values[index] = value;
+        sum = sum + value;
+        i = i + 1;
+    }
+    io::println(sum)!!;
+    io::println(arguments)!!;
+}

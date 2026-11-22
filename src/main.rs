@@ -30,6 +30,10 @@ enum Mode {
 struct Options {
     debug: bool,
     jit: bool,
+    native: bool,
+    exports: Vec<String>,
+    c_imports: Vec<String>,
+    c_objects: Vec<PathBuf>,
     allow_asm: bool,
     restricted: bool,
     target: Option<String>,
@@ -96,6 +100,7 @@ fn command(color: &mut Color) -> Result<(), String> {
         match arg.as_str() {
             "--debug" | "-v" => options.debug = true,
             "--jit" => options.jit = true,
+            "--native" => options.native = true,
             "--allow-asm" => options.allow_asm = true,
             "--restricted" => options.restricted = true,
             "--target" => options.target = Some(required_cli_arg(&mut args, "--target")?),
@@ -104,6 +109,17 @@ fn command(color: &mut Color) -> Result<(), String> {
                 .push(required_cli_arg(&mut args, "--use")?),
             "--locked" => options.locked = true,
             "--lib" => options.init_library = true,
+            "--export" => options
+                .exports
+                .push(required_cli_arg(&mut args, "--export")?),
+            "--c-import" => options
+                .c_imports
+                .push(required_cli_arg(&mut args, "--c-import")?),
+            "--c-link" => options.c_objects.push(
+                args.next()
+                    .ok_or("--c-link requires an object or archive path")?
+                    .into(),
+            ),
             "--plugin" => options.plugins.push(
                 args.next()
                     .ok_or("--plugin requires a KDL manifest path")?
@@ -162,6 +178,9 @@ fn command(color: &mut Color) -> Result<(), String> {
         return Err("expected a command or a source/bytecode path".into());
     }
     let action = action.as_deref().unwrap_or("run");
+    if options.native && action != "build" {
+        return Err("--native is only valid with `build`".into());
+    }
     if options.jit && action != "run" {
         return Err("--jit is only valid with `run`".into());
     }
@@ -174,8 +193,26 @@ fn command(color: &mut Color) -> Result<(), String> {
     if options.install_path.is_some() && action != "install" {
         return Err("--path is only valid with `install`".into());
     }
-    if options.init_library && action != "init" {
-        return Err("--lib is only valid with `init`".into());
+    if options.init_library && !matches!(action, "init" | "build") {
+        return Err("--lib is only valid with `init` or `build`".into());
+    }
+    let native_library = action == "build" && options.init_library;
+    if native_library && options.native {
+        return Err("choose either `build --native` or `build --lib`".into());
+    }
+    if (native_library || options.native) && options.restricted {
+        return Err("--restricted is only available when running through the CLI".into());
+    }
+    if !options.c_imports.is_empty() || !options.c_objects.is_empty() {
+        if !options.native {
+            return Err("C imports require an unrestricted `build --native` executable".into());
+        }
+        if options.c_imports.is_empty() {
+            return Err("--c-link requires an explicit --c-import".into());
+        }
+    }
+    if !options.exports.is_empty() && !native_library {
+        return Err("--export is only valid with `build --lib`".into());
     }
     if !options.use_modules.is_empty() && action != "eval" {
         return Err("--use is only valid with `eval`".into());
@@ -315,6 +352,71 @@ fn command(color: &mut Color) -> Result<(), String> {
     let package_has_plugins = prepared
         .as_ref()
         .is_some_and(|prepared| !prepared.plugins.is_empty());
+    if options.native || native_library {
+        if package_has_plugins || !options.plugins.is_empty() {
+            return Err("AOT builds do not support plugin imports yet".into());
+        }
+        let name = prepared
+            .as_ref()
+            .map(|p| p.artifact_name.as_str())
+            .or_else(|| target.file_stem().and_then(OsStr::to_str))
+            .unwrap_or("main");
+        let destination = options.output.clone().unwrap_or_else(|| {
+            let base = if target.is_dir() {
+                target
+            } else {
+                target.parent().unwrap_or(Path::new("."))
+            };
+            let file = if native_library {
+                format!("lib{name}.so")
+            } else {
+                name.to_owned()
+            };
+            base.join("target").join(file)
+        });
+        let lock_update = prepared.as_ref().and_then(|p| p.lock_update.clone());
+        let (report, warnings) = if !options.c_imports.is_empty() {
+            cog::native::build_executable_with_c_imports(
+                prepared.ok_or("C imports require Cog source or an application project")?,
+                &destination,
+                &options.c_imports,
+                &options.c_objects,
+            )?
+        } else if native_library {
+            let loaded = prepared
+                .ok_or("native library builds require a Cog source or library project")?
+                .resolve();
+            let (compiled, warnings) = project::compile_library_with_inputs_and_warnings(
+                loaded.program,
+                loaded.diagnostics,
+                &loaded.names,
+                &loaded.build_inputs,
+            )?;
+            (
+                cog::native::build_library(&compiled, &destination, &options.exports)?,
+                warnings,
+            )
+        } else {
+            let (compiled, _, _, warnings) =
+                prepare(target, Mode::Check, &options, bytecode_input, prepared)?;
+            let compiled =
+                compiled.ok_or("AOT executable builds require an application entry point")?;
+            (
+                cog::native::build_executable(&compiled, &destination)?,
+                warnings,
+            )
+        };
+        if !warnings.is_empty() {
+            color.warning(&frontend::render(&warnings));
+        }
+        project::write_lock(lock_update)?;
+        color.status("linked", &destination, started.elapsed());
+        eprintln!(
+            "AOT: {} functions, {} machine code bytes, {:?} code generation",
+            report.functions, report.code_bytes, report.codegen_time
+        );
+        return Ok(());
+    }
     if !options.plugins.is_empty() || package_has_plugins {
         return command_with_plugins(target, mode, options, color, prepared);
     }
@@ -532,6 +634,9 @@ fn print_usage() {
     eprintln!("       cog build <file.cog|project> [-o output]");
     eprintln!("       cog run [file.cog|project]  (reuse or build .cogb, then execute it)");
     eprintln!("       cog run <file.cogb>  (no source files or compilation required)");
+    eprintln!("       cog build --native <file.cog|project> [-o executable]");
+    eprintln!("       cog build --lib <file.cog|project> --export <function> [-o library.so]");
+    eprintln!("       --c-import <module::name=symbol:i64|f64> --c-link <object.o|archive.a>");
     eprintln!("       --jit  enable experimental adaptive Cranelift JIT (run only)");
     eprintln!("       cog init [--lib] <directory>");
     eprintln!("       eval compiles and runs one expression; --debug prints its bytecode");

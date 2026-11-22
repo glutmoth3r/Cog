@@ -1,0 +1,40 @@
+@!include("std")
+use io;
+use err::Error;
+
+var trace = 0;
+
+@inline("never")
+fn descend(depth: int) -> int {
+    trace += 1;
+    if depth == 0 { return 7; }
+    descend(depth - 1)
+}
+
+@inline("never")
+fn step(index: int) -> int {
+    defer { trace += 10; }
+    const value = descend(3)!!;
+    if index == 9999 { return (value / (index - 9999))!!; }
+    value
+}
+
+fn work() -> int {
+    var i = 0;
+    var total = 0;
+    while i < 10000 {
+        try {
+            total += step(i);
+        } catch(error) {
+            when error is Error::DivisionByZero { total += 100; }
+            else { error!!; }
+        }
+        i += 1;
+    }
+    total
+}
+
+fn main() {
+    io::println(work()!!)!!;
+    io::println(trace)!!;
+}
