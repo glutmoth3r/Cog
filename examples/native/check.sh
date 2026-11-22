@@ -27,6 +27,9 @@ for workload in blocks callable; do
     cmp "$out/vm" "$out/jit"
     cmp "$out/vm" "$out/aot"
     grep -Eq '\[aot\] function=.*status=0 backedges=199999' "$out/trace"
+    if [[ "$workload" == callable ]]; then
+        grep -Eq '\[jit\] bridge .*compiled=199999 cog=0 ' "$out/trace"
+    fi
 done
 
 cp examples/native/optimizer-error.cog "$out"

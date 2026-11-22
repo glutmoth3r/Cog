@@ -12,8 +12,16 @@ os.chdir(ROOT)
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("profile", type=Path)
 parser.add_argument("--only", nargs="+", metavar="WORKLOAD")
+parser.add_argument("--reference", type=Path, metavar="RESULTS",
+                    help="require each checksum to match a previous run")
 args = parser.parse_args()
 profile = args.profile.resolve()
+reference = {}
+if args.reference:
+    for line in args.reference.read_text().splitlines():
+        fields, separator, checksum = line.partition(" checksum=")
+        if separator:
+            reference[fields.split()[0]] = checksum
 env = dict(os.environ, COG_NATIVE_RUNTIME=str(profile / "libcog.a"))
 env.pop("COG_AOT_TRACE", None)
 
@@ -25,13 +33,25 @@ def run(*command):
     return result.stdout, result.stderr
 
 
-def measure(*command, samples=5):
+def measure(*command, samples=5, expected=None):
     elapsed = []
     for _ in range(samples):
         start = time.perf_counter()
         output, diagnostics = run(*command)
         elapsed.append((time.perf_counter() - start) * 1000)
+        if expected is not None:
+            assert output == expected, command
     return statistics.median(elapsed), output, diagnostics
+
+
+def compile_bytecode(cli, source, bytecode):
+    elapsed = []
+    for _ in range(5):
+        bytecode.unlink(missing_ok=True)
+        start = time.perf_counter()
+        run(cli, "build", source, "-o", bytecode)
+        elapsed.append((time.perf_counter() - start) * 1000)
+    return statistics.median(elapsed)
 
 
 cli = profile / "cog"
@@ -57,21 +77,13 @@ with tempfile.TemporaryDirectory(prefix="optimizer-", dir="target") as tmp:
         source.write_bytes(workload.read_bytes())
         bytecode = source.with_suffix(".cogb")
         native = workspace / workload.stem
-        def compile_bytecode():
-            elapsed = []
-            for _ in range(5):
-                bytecode.unlink(missing_ok=True)
-                start = time.perf_counter()
-                run(cli, "build", source, "-o", bytecode)
-                elapsed.append((time.perf_counter() - start) * 1000)
-            return statistics.median(elapsed)
-
-        compile_ms = compile_bytecode()
+        compile_ms = compile_bytecode(cli, source, bytecode)
         build_ms, _, build_log = measure(cli, "build", "--native", source, "-o", native, samples=3)
         expected = run(cli, "run", bytecode)[0]
         assert run(cli, "run", "--jit", bytecode)[0] == expected
-        aot_ms, actual, _ = measure(native)
-        assert actual == expected
+        if args.reference:
+            assert reference[workload.stem] == repr(expected), workload.stem
+        aot_ms, _, _ = measure(native, expected=expected)
         print(f"{workload.stem} compile_ms={compile_ms:.3f} bytecode_bytes={bytecode.stat().st_size} "
               f"aot_build_ms={build_ms:.3f} aot_run_ms={aot_ms:.3f} "
               f"exe_bytes={native.stat().st_size} checksum={expected!r}", flush=True)
