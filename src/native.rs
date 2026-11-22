@@ -234,22 +234,7 @@ fn link(
     {
         return Err("AOT builds do not support external imports yet".into());
     }
-    let runtime = std::env::var_os("COG_NATIVE_RUNTIME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            Some(
-                std::env::current_exe()
-                    .ok()?
-                    .with_file_name("libcog_native.a"),
-            )
-        })
-        .ok_or("set COG_NATIVE_RUNTIME to the matching Cog runtime archive")?;
-    if !runtime.is_file() {
-        return Err(format!(
-            "Cog AOT runtime archive missing at {}. Set COG_NATIVE_RUNTIME to the matching archive",
-            runtime.display()
-        ));
-    }
+    let runtime = find_runtime_archive(destination)?;
 
     let runtime = runtime.canonicalize().map_err(|error| error.to_string())?;
     let started = Instant::now();
@@ -353,6 +338,61 @@ fn link(
         code_bytes,
         codegen_time,
     })
+}
+
+fn find_runtime_archive(destination: &Path) -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os("COG_NATIVE_RUNTIME") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return path.canonicalize().map_err(|error| error.to_string());
+        }
+        return Err(format!(
+            "COG_NATIVE_RUNTIME does not name a runtime archive: {}",
+            path.display()
+        ));
+    }
+
+    let executable = std::env::current_exe().ok();
+    let cwd = std::env::current_dir().ok();
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let triple = "x86_64-unknown-linux-gnu";
+    let mut candidates = Vec::new();
+    if let Some(executable) = executable {
+        candidates.push(executable.with_file_name("libcog_native.a"));
+        if let Some(target_directory) = executable.parent().and_then(Path::parent) {
+            candidates.push(target_directory.join("libcog.a"));
+        }
+    }
+    if let Some(target_directory) = std::env::var_os("CARGO_TARGET_DIR") {
+        let target_directory = PathBuf::from(target_directory);
+        candidates.push(target_directory.join(triple).join(profile).join("libcog.a"));
+        candidates.push(target_directory.join(profile).join("libcog.a"));
+    }
+    if let Some(cwd) = cwd {
+        candidates.push(
+            cwd.join("target")
+                .join(triple)
+                .join(profile)
+                .join("libcog.a"),
+        );
+        candidates.push(cwd.join("target").join(profile).join("libcog.a"));
+    }
+    if let Some(parent) = destination.parent() {
+        candidates.push(parent.join("libcog_native.a"));
+    }
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            format!(
+                "Cog AOT runtime archive not found. Build it from the same Cog checkout with `cargo rustc --release --locked --target x86_64-unknown-linux-gnu --lib --crate-type staticlib`, then retry. You can also set COG_NATIVE_RUNTIME to its path."
+            )
+        })
+        .and_then(|path| path.canonicalize().map_err(|error| error.to_string()))
 }
 
 struct BuildDirectory(PathBuf);

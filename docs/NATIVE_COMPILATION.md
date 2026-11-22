@@ -2,13 +2,14 @@
 
 Cog can compile executables and shared libraries on Linux x86_64 GNU. Native
 builds need a C compiler driver and a Cog runtime archive built from the same
-source revision. Build both with the same Cargo toolchain and target:
+source revision. The CLI locates the archive beside itself or in the current
+project's Cargo target directory. Build both with the same Cargo toolchain and
+target:
 
 ```sh
 cargo build --locked --release --target x86_64-unknown-linux-gnu --bin cog
 cargo rustc --locked --release --target x86_64-unknown-linux-gnu --lib --crate-type staticlib
 native_profile=target/x86_64-unknown-linux-gnu/release
-export COG_NATIVE_RUNTIME="$PWD/$native_profile/libcog.a"
 "$native_profile/cog" build --native examples/native/pipeline.cog -o target/pipeline
 target/pipeline Ω
 ```
@@ -16,8 +17,8 @@ target/pipeline Ω
 The executable links Cog runtime code statically. It needs the target's
 system libraries at launch. The archive and compiler are build inputs. Set
 `CC` to a compatible driver executable or leave it unset to use `cc`.
-When `COG_NATIVE_RUNTIME` is unset, Cog checks for `libcog_native.a` next to
-the CLI.
+Set `COG_NATIVE_RUNTIME` when the archive lives elsewhere. An explicit value
+must point to an existing archive.
 
 ## Compilation and execution
 

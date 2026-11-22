@@ -4,7 +4,6 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 profile=target/x86_64-unknown-linux-gnu/release
 cli=${COG_NATIVE_CLI:-$profile/cog}
-export COG_NATIVE_RUNTIME=${COG_NATIVE_RUNTIME:-$profile/libcog.a}
 cc=${CC:-cc}
 mkdir -p target
 out=$(mktemp -d "$PWD/target/native-check.XXXXXXXX")
