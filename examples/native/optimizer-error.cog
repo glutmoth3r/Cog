@@ -1,0 +1,30 @@
+@!include("std")
+use io;
+
+fn step(x: int) -> int {
+    if x >= 0 {
+        const shifted = x + 2;
+        shifted * 3
+    } else {
+        const shifted = x - 2;
+        shifted * 5
+    }
+}
+
+fn work() {
+    var total = 0;
+    defer { io::println(total)!!; }
+    for i in 0..10000 {
+        const operand = if i == 9999 { 9223372036854775807 } else { i };
+        try {
+            const value = step(operand);
+            total += value;
+        } catch (error) {
+            io::println(error.error_kind())!!;
+        }
+    }
+}
+
+fn main() {
+    work()!!;
+}

@@ -1,0 +1,15 @@
+@!include("std")
+use io;
+
+fn run() -> int {
+    var checksum = 0;
+    for i in 0..100000 {
+        const pair = [i % 31, i % 13];
+        checksum += pair[0]!! * pair[1]!!;
+    }
+    checksum
+}
+
+fn main() {
+    io::println(run()!!)!!;
+}

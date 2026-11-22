@@ -1,0 +1,25 @@
+@!include("std")
+use io;
+
+fn step(x: int) -> int {
+    if x % 2 == 0 {
+        const shifted = x * 7 + 3;
+        shifted % 997
+    } else {
+        const shifted = x * 3 + 9;
+        shifted % 997
+    }
+}
+
+@inline("never")
+fn run() -> int {
+    var checksum = 0;
+    for i in 0..200000 {
+        checksum += step(i)!!;
+    }
+    checksum
+}
+
+fn main() {
+    io::println(run()!!)!!;
+}

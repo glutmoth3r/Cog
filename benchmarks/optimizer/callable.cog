@@ -1,0 +1,21 @@
+@!include("std")
+use io;
+
+@inline("never")
+fn step(x: int) -> int {
+    (x * 7 + 3) % 997
+}
+
+@inline("never")
+fn run() -> int {
+    const callback = step;
+    var checksum = 0;
+    for i in 0..200000 {
+        checksum += (callback)(i)!!;
+    }
+    checksum
+}
+
+fn main() {
+    io::println(run()!!)!!;
+}

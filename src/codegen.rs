@@ -20,6 +20,7 @@ const MAX_INLINE_BODY_NODES: usize = 32;
 const MAX_INLINE_NODES_PER_FUNCTION: usize = 256;
 const MAX_INLINE_PARAMETERS: usize = 8;
 const AUTO_INLINE_BODY_NODES: usize = 8;
+const LOOP_INLINE_BODY_NODES: usize = 30;
 
 #[derive(Clone, Copy)]
 enum DeclaredCall {
@@ -392,6 +393,35 @@ fn is_inlineable_body(expr: &Expr, parameters: &[String], nodes: &mut usize) -> 
         ) => {
             is_inlineable_body(left, parameters, nodes)
                 && is_inlineable_body(right, parameters, nodes)
+        }
+        Expr::Block(block) => {
+            let mut names = parameters.to_vec();
+            for statement in &block.stmts {
+                let Stmt::Const {
+                    pattern: BindingPattern::Name(name),
+                    ty,
+                    value,
+                } = statement.node()
+                else {
+                    return false;
+                };
+                if names.contains(name)
+                    || ty
+                        .as_ref()
+                        .is_some_and(|ty| !is_inline_scalar_type(ty) && !is_nil_type(ty))
+                {
+                    return false;
+                }
+                *nodes += 1;
+                if !is_inlineable_body(value, &names, nodes) {
+                    return false;
+                }
+                names.push(name.clone());
+            }
+            block
+                .tail
+                .as_ref()
+                .is_some_and(|tail| is_inlineable_body(tail, &names, nodes))
         }
         Expr::If {
             cond,
@@ -793,6 +823,7 @@ struct Codegen<'a> {
     bigint_literals: &'a std::collections::HashSet<usize>,
     inline_functions: HashMap<String, InlineFunction<'a>>,
     inline_nodes_remaining: usize,
+    trace_optimizer: bool,
     closures: Vec<ClosureDef>,
     next_closure: usize,
     current_function: Option<String>,
@@ -1090,6 +1121,7 @@ fn compile_with_modules_and_names(
         bigint_literals: &checked.bigint_literals,
         inline_functions,
         inline_nodes_remaining: MAX_INLINE_NODES_PER_FUNCTION,
+        trace_optimizer: std::env::var_os("COG_OPT_TRACE").is_some(),
         closures: Vec::new(),
         next_closure: 0,
         current_function: None,
@@ -3363,14 +3395,28 @@ impl<'a> Codegen<'a> {
         let Some(function) = self.inline_functions.get(name).cloned() else {
             return Ok(false);
         };
+        let auto_limit = if self.loop_end_stack.is_empty() {
+            AUTO_INLINE_BODY_NODES
+        } else {
+            LOOP_INLINE_BODY_NODES
+        };
         if function.mode == InlineMode::Never
-            || (function.mode == InlineMode::Auto && function.nodes > AUTO_INLINE_BODY_NODES)
+            || (function.mode == InlineMode::Auto && function.nodes > auto_limit)
             || function.nodes > self.inline_nodes_remaining
             || arguments.len() != function.parameters.len()
         {
             return Ok(false);
         }
 
+        if self.trace_optimizer {
+            let caller = self.current_function.as_deref().unwrap_or("<entry>");
+            eprintln!(
+                "[optimizer] {caller} inline={name} nodes={}",
+                function.nodes
+            );
+        }
+        // Reserve the budget before lowering arguments that can inline calls of their own.
+        self.inline_nodes_remaining -= function.nodes;
         let mut slots = Vec::with_capacity(arguments.len());
         for (argument, parameter) in arguments.iter().zip(&function.parameters) {
             self.compile_call_argument(argument, parameter.ty.as_ref(), scopes)?;
@@ -3379,7 +3425,6 @@ impl<'a> Codegen<'a> {
             slots.push(slot);
         }
 
-        self.inline_nodes_remaining -= function.nodes;
         scopes.push();
         for (parameter, slot) in function.parameters.iter().zip(slots) {
             scopes.bind_slot(&parameter.name, slot);
