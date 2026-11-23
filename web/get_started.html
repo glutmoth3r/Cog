@@ -343,6 +343,7 @@ fn main() -&gt; nil {
         const output = lesson.querySelector('.output');
         let running = false;
         let lastOutput = null;
+        let generation = 0;
         const check = document.createElement('details');
         check.className = 'check';
         check.hidden = true;
@@ -354,13 +355,17 @@ fn main() -&gt; nil {
         const showVerdict = (state, text) => { verdict.hidden = false; verdict.dataset.state = state; verdict.textContent = text; };
         const runCheck = async () => {
             if (lastOutput === null || checkRun.disabled) return;
+            const mine = generation;
+            const actual = lastOutput;
             checkRun.disabled = true;
             showVerdict('pending', 'Checking in WebAssembly…');
             try {
                 const { check: compare, run: runWasi } = await loadChecker();
-                const same = await compare(runWasi, expected.value, lastOutput);
+                const same = await compare(runWasi, expected.value, actual);
+                if (mine !== generation) return;
                 showVerdict(same ? 'match' : 'mismatch', same ? 'Match: the actual output equals the expected output exactly, including whitespace and the final newline.' : 'Mismatch: the actual output differs from the expected output. Whitespace and the final newline count.');
             } catch (error) {
+                if (mine !== generation) return;
                 showVerdict('error', error.name === 'TimeoutError' || error.name === 'AbortError' ? 'The WASM checker timed out.' : (error.message || 'The WASM checker failed.') + (location.protocol === 'file:' ? ' Open the tutorial through node web/server.mts.' : ''));
             } finally {
                 checkRun.disabled = false;
@@ -377,6 +382,7 @@ fn main() -&gt; nil {
             diagnostics.textContent = '';
             diagnosticGroup.hidden = true;
             lastOutput = null;
+            generation += 1;
             check.hidden = true;
             verdict.hidden = true;
             try {
@@ -404,7 +410,7 @@ fn main() -&gt; nil {
         };
         run.addEventListener('click', execute);
         editor.addEventListener('keydown', event => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); execute(); } });
-        reset.addEventListener('click', () => { editor.value = editor.defaultValue; if (input) input.value = input.defaultValue; result.hidden = true; check.hidden = true; lastOutput = null; status.textContent = ''; editor.focus(); });
+        reset.addEventListener('click', () => { editor.value = editor.defaultValue; if (input) input.value = input.defaultValue; result.hidden = true; check.hidden = true; lastOutput = null; generation += 1; status.textContent = ''; editor.focus(); });
     });
     document.querySelectorAll('aside a').forEach(link => link.addEventListener('click', () => {
         document.querySelectorAll('aside a').forEach(item => item.removeAttribute('aria-current'));

@@ -136,6 +136,11 @@ test("the fixed WASM checker is served with the WASM MIME type and nothing else 
     assert.equal((await fetch(origin + "/api/tutorial-checker.wasm", { method: "POST" })).status, 405);
 });
 
+test("the checker endpoint rejects cross-site fetches", async () => {
+    const response = await fetch(origin + "/api/tutorial-checker.wasm", { headers: { "Sec-Fetch-Site": "cross-site" } });
+    assert.equal(response.status, 403);
+});
+
 test("browser modules are served as JavaScript and wasi files stay inside web", async () => {
     for (const name of ["wasi.mjs", "wasi-worker.mjs", "wasi-browser.mjs"]) {
         const response = await fetch(`${origin}/web/${name}`);
@@ -206,4 +211,22 @@ test("a real Chromium Worker runs the WASM checker", { skip: process.env.COG_CHR
         chromium.kill("SIGKILL");
         await rm(profile, { recursive: true, force: true });
     }
+});
+
+test("the WASI host links guests that import clocks or unknown WASI functions", async () => {
+    // Hand-assembled module: _start calls clock_time_get and an unimplemented import.
+    const text = (value: string) => [value.length, ...new TextEncoder().encode(value)];
+    const wasi = text("wasi_snapshot_preview1");
+    const section = (id: number, body: number[]) => [id, body.length, ...body];
+    const bytes = new Uint8Array([
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        ...section(1, [3, 0x60, 3, 0x7f, 0x7e, 0x7f, 1, 0x7f, 0x60, 0, 1, 0x7f, 0x60, 0, 0]),
+        ...section(2, [2, ...wasi, ...text("clock_time_get"), 0, 0, ...wasi, ...text("fd_unknown"), 0, 1]),
+        ...section(3, [1, 2]),
+        ...section(5, [1, 0, 1]),
+        ...section(7, [2, ...text("memory"), 2, 0, ...text("_start"), 0, 2]),
+        ...section(10, [1, 14, 0, 0x41, 0, 0x42, 0, 0x41, 8, 0x10, 0, 0x1a, 0x10, 1, 0x1a, 0x0b]),
+    ]);
+    const result = await runWasi(await WebAssembly.compile(bytes), []);
+    assert.equal(result.exitCode, 0);
 });

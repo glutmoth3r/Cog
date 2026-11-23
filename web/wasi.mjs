@@ -1,6 +1,8 @@
 const MAX_ARGUMENT_BYTES = 256 * 1024;
 const MAX_OUTPUT_BYTES = 128 * 1024;
 const EBADF = 8;
+const EINVAL = 28;
+const ENOSYS = 52;
 
 class WasiExit {
     constructor(code) {
@@ -87,8 +89,33 @@ export async function runWasi(module, args) {
         proc_exit(code) {
             throw new WasiExit(code >>> 0);
         },
+        // Newer Rust toolchains may import these even when the program does not use them.
+        clock_time_get(id, _precision, result) {
+            if (id > 1) return EINVAL;
+            const nanoseconds = id === 0
+                ? BigInt(Date.now()) * 1000000n
+                : BigInt(Math.round(performance.now() * 1000000));
+            new DataView(memory.buffer).setBigUint64(result >>> 0, nanoseconds, true);
+            return 0;
+        },
+        random_get(buffer, size) {
+            const bytes = new Uint8Array(memory.buffer, buffer >>> 0, size >>> 0);
+            for (let offset = 0; offset < bytes.length; offset += 65536) {
+                crypto.getRandomValues(bytes.subarray(offset, offset + 65536));
+            }
+            return 0;
+        },
+        sched_yield() {
+            return 0;
+        },
     };
 
+    // Any other import the guest declares reports "not implemented" instead of failing to link.
+    for (const { module: namespace, name, kind } of WebAssembly.Module.imports(module)) {
+        if (namespace === "wasi_snapshot_preview1" && kind === "function" && !(name in preview1)) {
+            preview1[name] = () => ENOSYS;
+        }
+    }
     const instance = await WebAssembly.instantiate(module, { wasi_snapshot_preview1: preview1 });
     memory = instance.exports.memory;
     const start = instance.exports._start;

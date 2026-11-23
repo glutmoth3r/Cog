@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 type Result = { ok: boolean; stdout: string; diagnostics: string; phase: string };
-type Options = { compiler: string; timeoutMs?: number; outputLimit?: number };
+type Options = { compiler: string; timeoutMs?: number; outputLimit?: number; prewarm?: boolean };
 
 // Cargo reports the executable path, including any configured target triple.
 export async function buildCompiler(): Promise<string> {
@@ -40,7 +40,7 @@ async function validateCompiler(compiler: string): Promise<void> {
 }
 
 // Builds the fixed tutorial checker. Only web/tutorial_logic.cog is ever compiled for the browser.
-async function buildChecker(compiler: string): Promise<Buffer> {
+async function buildChecker(compiler: string, children: Set<ReturnType<typeof spawn>>): Promise<Buffer> {
     const directory = await mkdtemp(join(tmpdir(), "cog-checker-"));
     try {
         const artifact = join(directory, "checker.wasm");
@@ -48,9 +48,15 @@ async function buildChecker(compiler: string): Promise<Buffer> {
         let stderr = "";
         child.stderr.setEncoding("utf8").on("data", text => { stderr += text; });
         child.stdout.resume();
+        children.add(child);
         const timer = setTimeout(() => child.kill("SIGKILL"), 120000);
-        const [code] = await once(child, "close");
-        clearTimeout(timer);
+        let code: number | null;
+        try {
+            [code] = await once(child, "close");
+        } finally {
+            clearTimeout(timer);
+            children.delete(child);
+        }
         if (code !== 0) throw new Error(stderr.trim() || "The WASI build failed.");
         return await readFile(artifact);
     } finally {
@@ -58,10 +64,19 @@ async function buildChecker(compiler: string): Promise<Buffer> {
     }
 }
 
-export function createTutorialServer({ compiler, timeoutMs = 5000, outputLimit = 128 * 1024 }: Options) {
+export function createTutorialServer({ compiler, timeoutMs = 5000, outputLimit = 128 * 1024, prewarm = false }: Options) {
     let active = 0;
     const children = new Set<ReturnType<typeof spawn>>();
     let checker: Promise<Buffer> | undefined;
+    let checkerFailedAt = 0;
+    const startChecker = () => {
+        checker = buildChecker(compiler, children);
+        checker.catch(error => {
+            checker = undefined;
+            checkerFailedAt = Date.now();
+            console.error("Tutorial checker build failed:", error instanceof Error ? error.message : error);
+        });
+    };
     const server = createServer(async (request, response) => {
         const json = (status: number, value: unknown) => {
             response.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
@@ -73,14 +88,14 @@ export function createTutorialServer({ compiler, timeoutMs = 5000, outputLimit =
         const path = new URL(request.url ?? "/", `http://${request.headers.host}`).pathname;
         if (request.method === "GET" && path === "/api/status") { json(200, { ready: true }); return; }
         if (request.method === "GET" && path === "/api/tutorial-checker.wasm") {
-            checker ??= buildChecker(compiler);
+            if (request.headers["sec-fetch-site"] === "cross-site") { json(403, { error: "Load the checker from the local tutorial page." }); return; }
+            if (!checker && Date.now() - checkerFailedAt >= 30000) startChecker();
             try {
+                if (!checker) throw new Error("cooldown");
                 const artifact = await checker;
                 response.writeHead(200, { "Content-Type": "application/wasm", "Content-Length": artifact.length, "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store" });
                 response.end(artifact);
             } catch (error) {
-                checker = undefined;
-                console.error("Tutorial checker build failed:", error instanceof Error ? error.message : error);
                 json(503, { error: "The WASM checker is unavailable. Install the wasm32-wasip1 Rust target (rustup target add wasm32-wasip1) and retry." });
             }
             return;
@@ -162,6 +177,7 @@ export function createTutorialServer({ compiler, timeoutMs = 5000, outputLimit =
         } catch { json(404, { error: "Not found." }); }
     });
     server.requestTimeout = 10000;
+    if (prewarm) server.on("listening", () => startChecker());
     server.on("close", () => { for (const child of children) child.kill("SIGKILL"); });
     return server;
 }
@@ -170,7 +186,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     try {
         const compiler = process.env.COG_BIN ? resolve(process.env.COG_BIN) : await buildCompiler();
         await validateCompiler(compiler);
-        const server = createTutorialServer({ compiler });
+        const server = createTutorialServer({ compiler, prewarm: true });
         server.listen(Number(process.env.PORT ?? 4173), "127.0.0.1");
         await once(server, "listening");
         console.log(`Cog tutorial: http://127.0.0.1:${(server.address() as { port: number }).port}/web/get_started.html`);

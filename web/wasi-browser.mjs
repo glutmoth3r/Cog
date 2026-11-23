@@ -2,7 +2,7 @@ export function createWasiRunner(url) {
     let compiled;
     return async args => {
         compiled ??= WebAssembly.compileStreaming(
-            fetch(url, { signal: AbortSignal.timeout(5000) }).then(response => {
+            fetch(url, { signal: AbortSignal.timeout(130000) }).then(response => {
                 if (!response.ok) {
                     throw new Error("Could not load the tutorial's WASM checker.");
                 }
