@@ -39,9 +39,29 @@ async function validateCompiler(compiler: string): Promise<void> {
     }
 }
 
+// Builds the fixed tutorial checker. Only web/tutorial_logic.cog is ever compiled for the browser.
+async function buildChecker(compiler: string): Promise<Buffer> {
+    const directory = await mkdtemp(join(tmpdir(), "cog-checker-"));
+    try {
+        const artifact = join(directory, "checker.wasm");
+        const child = spawn(compiler, ["build", "--target", "wasm32-wasip1", join("web", "tutorial_logic.cog"), "-o", artifact, "--color", "never"], { cwd: root });
+        let stderr = "";
+        child.stderr.setEncoding("utf8").on("data", text => { stderr += text; });
+        child.stdout.resume();
+        const timer = setTimeout(() => child.kill("SIGKILL"), 120000);
+        const [code] = await once(child, "close");
+        clearTimeout(timer);
+        if (code !== 0) throw new Error(stderr.trim() || "The WASI build failed.");
+        return await readFile(artifact);
+    } finally {
+        await rm(directory, { recursive: true, force: true }).catch(() => {});
+    }
+}
+
 export function createTutorialServer({ compiler, timeoutMs = 5000, outputLimit = 128 * 1024 }: Options) {
     let active = 0;
     const children = new Set<ReturnType<typeof spawn>>();
+    let checker: Promise<Buffer> | undefined;
     const server = createServer(async (request, response) => {
         const json = (status: number, value: unknown) => {
             response.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
@@ -52,6 +72,19 @@ export function createTutorialServer({ compiler, timeoutMs = 5000, outputLimit =
         if (!hosts.includes(request.headers.host ?? "")) { json(403, { error: "Invalid host." }); return; }
         const path = new URL(request.url ?? "/", `http://${request.headers.host}`).pathname;
         if (request.method === "GET" && path === "/api/status") { json(200, { ready: true }); return; }
+        if (request.method === "GET" && path === "/api/tutorial-checker.wasm") {
+            checker ??= buildChecker(compiler);
+            try {
+                const artifact = await checker;
+                response.writeHead(200, { "Content-Type": "application/wasm", "Content-Length": artifact.length, "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store" });
+                response.end(artifact);
+            } catch (error) {
+                checker = undefined;
+                console.error("Tutorial checker build failed:", error instanceof Error ? error.message : error);
+                json(503, { error: "The WASM checker is unavailable. Install the wasm32-wasip1 Rust target (rustup target add wasm32-wasip1) and retry." });
+            }
+            return;
+        }
         if (request.method === "POST" && path === "/api/run") {
             if (request.headers.origin !== `http://${request.headers.host}` || request.headers["content-type"] !== "application/json") {
                 json(403, { error: "Run examples from the local tutorial page." }); return;
@@ -120,10 +153,11 @@ export function createTutorialServer({ compiler, timeoutMs = 5000, outputLimit =
         try {
             const file = resolve(root, "." + decodeURIComponent(path));
             const publicFile = ["README.md", "ROADMAP.md", "LICENSE", "LICENSE-MPL-2.0", "LICENSE-APACHE-2.0"].some(name => file === join(root, name));
-            const document = ["docs", "examples", "web"].some(name => file.startsWith(join(root, name) + sep)) && [".md", ".html", ".cog", ".kdl"].includes(extname(file));
+            const document = ["docs", "examples", "web"].some(name => file.startsWith(join(root, name) + sep)) && ([".md", ".html", ".cog", ".kdl"].includes(extname(file)) || (extname(file) === ".mjs" && dirname(file) === join(root, "web")));
             if (!publicFile && !document) { json(404, { error: "Not found." }); return; }
             const content = await readFile(file);
-            response.writeHead(200, { "Content-Type": extname(file) === ".html" ? "text/html; charset=utf-8" : "text/plain; charset=utf-8", "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store" });
+            const types: Record<string, string> = { ".html": "text/html; charset=utf-8", ".mjs": "text/javascript; charset=utf-8" };
+            response.writeHead(200, { "Content-Type": types[extname(file)] ?? "text/plain; charset=utf-8", "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store" });
             response.end(content);
         } catch { json(404, { error: "Not found." }); }
     });

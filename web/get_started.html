@@ -44,6 +44,10 @@ button:focus-visible,a:focus-visible,summary:focus-visible { outline:2px solid #
 .result pre { background:#f1f5f0; border-radius:7px; padding:12px 14px; min-height:42px; max-height:300px; }
 .diagnostic-group pre { background:#fff3ed; color:#80331e; }
 .exercise { margin:16px 0 0; }
+.check { margin:12px 0; }
+.check textarea { min-height:3.5em; }
+.check-verdict { font-size:14px; margin:8px 0 0; padding:8px 12px; border-radius:7px; background:#edf3ee; }
+.check-verdict[data-state="mismatch"],.check-verdict[data-state="error"] { background:#fff3ed; color:#80331e; }
 footer { color:var(--muted); font-size:13px; padding:5px 0 25px; }
 @media(max-width:760px) { .layout { grid-template-columns:1fr; margin:20px auto; gap:18px; padding:0 14px; } aside { position:static; } aside nav { display:flex; overflow:auto; gap:6px; padding-bottom:6px; } aside a { white-space:nowrap; background:#edf2ec; } .setup,.lesson,.next { padding:17px; } header { padding:13px 17px; } textarea { font-size:13px; } }
 </style></head>
@@ -63,7 +67,7 @@ footer { color:var(--muted); font-size:13px; padding:5px 0 25px; }
 <a href="#stdlib">12. Standard library</a>
 <a href="#comptime">13. Comptime</a></nav></aside>
 <main><h1>Get started with Cog</h1><p>Work through these small programs to learn the basics. Edit an example and choose Run, or press Ctrl+Enter / Command+Enter in its editor.</p>
-<div class="setup"><h2>Run this tutorial locally</h2><p>Requires Rust 1.95 or newer, Cargo, and Node.js 24.12 or newer. From the Cog repository:</p><pre><code>node web/server.mts</code></pre><p>The server builds Cog and prints a local URL. Open that URL to run examples with the actual compiler and VM. No npm installation is needed. If Cargo dependencies are not cached, run <code>cargo build --locked --bin cog</code> first.</p><p>For a standalone program: save the source as <code>main.cog</code>, then run <code>cargo run --locked --bin cog -- run main.cog</code>.</p></div>
+<div class="setup"><h2>Run this tutorial locally</h2><p>Requires Rust 1.95 or newer, Cargo, and Node.js 24.12 or newer. From the Cog repository:</p><pre><code>node web/server.mts</code></pre><p>The server builds Cog and prints a local URL. Open that URL to run examples with the actual compiler and VM. No npm installation is needed. If Cargo dependencies are not cached, run <code>cargo build --locked --bin cog</code> first.</p><p>The optional output check runs a precompiled Cog checker as WebAssembly in your browser. It needs <code>rustup target add wasm32-wasip1</code> on the machine running the server. The browser does not compile your Cog code; examples still run on the local VM.</p><p>For a standalone program: save the source as <code>main.cog</code>, then run <code>cargo run --locked --bin cog -- run main.cog</code>.</p></div>
 <div id="connection" role="status" aria-live="polite">Start the local server to run examples. You can still read and edit them here.</div>
 <section id="hello" class="lesson"><h2>1. A first program</h2><p>Import io to print text. Execution starts in main. The postfix !! passes a successful result through and returns an Error if printing fails.</p>
 <label class="editor-label" for="code-hello">Cog example</label><textarea class="source" id="code-hello" rows="6" spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off">@!include("std")
@@ -311,6 +315,10 @@ fn main() -&gt; nil {
 <script>
 (() => {
     let connected = false;
+    // Expected output for each unmodified lesson, used to pre-fill the WASM checker.
+    const expectedOutputs = {"hello": "Hello, Cog!\n", "bindings": "Cog: 3\n", "types": "42\n", "functions": "Cog: 1\nCog: 3\n", "control": "2\n1\nsum=10, large\n", "arrays": "[0, 9, 2, 3]\n4\n", "strings": "Plain: {name}\nHello, Ada! 2 + 3 = 5\n{Cog}\n", "patterns": "Move to 2\nmoving\n", "errors": "3\n7\nParseFailure\nDone.\n", "generics": "42\nCog\n3\n", "error-values": "right operand ran\nthe left Error survived the operation\n7\nthe selected array element is an Error\n", "stdlib": "Cog tools\nred / green / blue\n3\n", "comptime": "42\n"};
+    let checkerModule;
+    const loadChecker = () => checkerModule ??= import('./wasi-browser.mjs').then(module => ({ check: module.checkOutput, run: module.createWasiRunner('/api/tutorial-checker.wasm') })).catch(error => { checkerModule = undefined; throw error; });
     const lessons = [...document.querySelectorAll('.lesson')];
     const connection = document.getElementById('connection');
     const connect = async () => {
@@ -334,6 +342,31 @@ fn main() -&gt; nil {
         const diagnosticGroup = lesson.querySelector('.diagnostic-group');
         const output = lesson.querySelector('.output');
         let running = false;
+        let lastOutput = null;
+        const check = document.createElement('details');
+        check.className = 'check';
+        check.hidden = true;
+        check.innerHTML = '<summary>Check output with the WASM checker</summary><label>Expected output</label><textarea class="expected" rows="3" spellcheck="false"></textarea><div class="actions"><button class="check-run" type="button">Check</button></div><div class="check-verdict" role="status" aria-live="polite" hidden></div>';
+        lesson.querySelector('.result').after(check);
+        const expected = check.querySelector('.expected');
+        const checkRun = check.querySelector('.check-run');
+        const verdict = check.querySelector('.check-verdict');
+        const showVerdict = (state, text) => { verdict.hidden = false; verdict.dataset.state = state; verdict.textContent = text; };
+        const runCheck = async () => {
+            if (lastOutput === null || checkRun.disabled) return;
+            checkRun.disabled = true;
+            showVerdict('pending', 'Checking in WebAssembly…');
+            try {
+                const { check: compare, run: runWasi } = await loadChecker();
+                const same = await compare(runWasi, expected.value, lastOutput);
+                showVerdict(same ? 'match' : 'mismatch', same ? 'Match: the actual output equals the expected output exactly, including whitespace and the final newline.' : 'Mismatch: the actual output differs from the expected output. Whitespace and the final newline count.');
+            } catch (error) {
+                showVerdict('error', error.name === 'TimeoutError' || error.name === 'AbortError' ? 'The WASM checker timed out.' : (error.message || 'The WASM checker failed.') + (location.protocol === 'file:' ? ' Open the tutorial through node web/server.mts.' : ''));
+            } finally {
+                checkRun.disabled = false;
+            }
+        };
+        checkRun.addEventListener('click', runCheck);
         const execute = async () => {
             if (!connected || running) return;
             running = true;
@@ -343,6 +376,9 @@ fn main() -&gt; nil {
             output.textContent = '';
             diagnostics.textContent = '';
             diagnosticGroup.hidden = true;
+            lastOutput = null;
+            check.hidden = true;
+            verdict.hidden = true;
             try {
                 const response = await fetch('/api/run', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({source:editor.value,input:input?.value ?? ''}) });
                 const value = await response.json();
@@ -350,6 +386,11 @@ fn main() -&gt; nil {
                 output.textContent = value.stdout || (value.ok ? 'Program finished without output.' : 'No output.');
                 diagnostics.textContent = value.diagnostics;
                 diagnosticGroup.hidden = !value.diagnostics;
+                if (value.ok) {
+                    lastOutput = value.stdout;
+                    expected.value = expectedOutputs[lesson.id] ?? '';
+                    check.hidden = false;
+                }
                 status.textContent = value.ok ? 'Finished' : value.phase === 'compile' ? 'Compilation failed' : 'Execution failed';
             } catch (error) {
                 status.textContent = 'Could not run';
@@ -363,7 +404,7 @@ fn main() -&gt; nil {
         };
         run.addEventListener('click', execute);
         editor.addEventListener('keydown', event => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); execute(); } });
-        reset.addEventListener('click', () => { editor.value = editor.defaultValue; if (input) input.value = input.defaultValue; result.hidden = true; status.textContent = ''; editor.focus(); });
+        reset.addEventListener('click', () => { editor.value = editor.defaultValue; if (input) input.value = input.defaultValue; result.hidden = true; check.hidden = true; lastOutput = null; status.textContent = ''; editor.focus(); });
     });
     document.querySelectorAll('aside a').forEach(link => link.addEventListener('click', () => {
         document.querySelectorAll('aside a').forEach(item => item.removeAttribute('aria-current'));

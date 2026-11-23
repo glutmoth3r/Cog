@@ -21,6 +21,29 @@ and stdout, deny other runtime host effects, and have time/output limits. This i
 a local learning tool, not a service for hosting untrusted code. CLI runtime limits
 do not impose a total VM memory quota.
 
+## WASM output checker
+
+After a successful run, each lesson offers "Check output with the WASM checker".
+The example still runs through the VM path above. The page then passes the expected
+and actual output to `web/tutorial_logic.cog`, a Cog program compiled to a
+`wasm32-wasip1` command. The comparison (exact, including Unicode, whitespace, and
+the final newline) executes in WebAssembly inside a module Worker; JavaScript only
+handles the DOM, the Worker, and moving strings.
+
+`GET /api/tutorial-checker.wasm` serves that one artifact (`application/wasm`). The
+server builds it on first request with `cog build --target wasm32-wasip1`, which needs
+`rustup target add wasm32-wasip1`; without it the endpoint returns 503 and the page
+shows an error. The server also serves `web/*.mjs` as JavaScript. It exposes no
+other build output. Limits: 96 KiB per text, no NUL characters, 5 s per fetch and per
+Worker run; violations produce an error message instead of a verdict.
+
+This does **not** compile arbitrary Cog source in the browser. The browser runs a
+precompiled checker; compiling and running lesson code still needs the local server.
+
+Optional real-browser check: `COG_CHROMIUM=/usr/bin/chromium node --test web/server.test.mts`
+drives Chromium over the DevTools protocol and runs the checker in a Worker. It is skipped
+by default and not required in CI.
+
 The HTML remains readable when opened directly or without JavaScript; execution
 requires the local server. Language documentation is in [docs/](../docs/README.md).
 

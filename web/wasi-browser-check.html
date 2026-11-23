@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>WASI checker browser check</title></head>
+<body><pre id="result">running</pre>
+<script type="module">
+import { createWasiRunner, checkOutput } from "./wasi-browser.mjs";
+const run = createWasiRunner("/api/tutorial-checker.wasm");
+const cases = [["hello\n", "hello\n"], ["hello\n", "hello"], ["Καλημέρα 🦀\n", "Καλημέρα 🦀\n"], [" hi", "hi"], ["", ""]];
+const result = { verdicts: [], error: null };
+try {
+    for (const [expected, actual] of cases) result.verdicts.push(await checkOutput(run, expected, actual));
+} catch (error) {
+    result.error = String(error.message ?? error);
+}
+document.getElementById("result").textContent = JSON.stringify(result);
+</script></body></html>

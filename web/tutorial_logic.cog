@@ -1,0 +1,19 @@
+@!include("std")
+use io;
+
+// Compare complete output, including whitespace and the final newline.
+fn main(args: str[]) -> nil {
+    if args.len() != 3 {
+        io::println("invalid-request")!!;
+        return nil;
+    }
+    if args[0] != "check" {
+        io::println("invalid-request")!!;
+        return nil;
+    }
+    if args[1] == args[2] {
+        io::println("match")!!;
+    } else {
+        io::println("mismatch")!!;
+    }
+}

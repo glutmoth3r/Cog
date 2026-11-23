@@ -103,12 +103,13 @@ jobs:
       RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install stable --profile minimal
+      - run: rustup toolchain install stable --profile minimal --target wasm32-wasip1
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
       - run: cargo fetch --locked
       - run: node --test web/server.test.mts
+      - run: cargo test --locked -j 2 --test tutorial_logic -- --include-ignored
   wasi:
     runs-on: ubuntu-latest
     env:

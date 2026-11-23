@@ -42,6 +42,16 @@ not carry the VM's full diagnostics and its own compact values do not require
 Cog's tracing GC. The WASI command target is separate from running the Cog
 compiler and VM in browser WebAssembly.
 
+## Tutorial checker in the browser
+
+`web/tutorial_logic.cog` is built as a WASI command and served by the local tutorial
+server as `/api/tutorial-checker.wasm`. A small Preview 1 host in `web/wasi.mjs`
+runs it in a browser Worker and compares two output strings. This runs a
+precompiled program; the browser does not compile Cog source, and the lessons
+themselves still run on the VM through the local server. See `web/README.md`.
+Verify it with `cargo test --locked --test tutorial_logic -- --include-ignored`
+and `node --test web/server.test.mts`.
+
 Run the end-to-end suite with `cargo test --locked --test wasm -- --include-ignored`.
 The suite requires the WASI Rust target and Node. It executes the produced
 artifacts and compares output against the VM.
