@@ -1788,7 +1788,11 @@ impl<'a> Pass<'a> {
                             }
                         }
                     }
-                    return self.apply_call_summary(expr, &name, summary, &call_arguments);
+                    let mut result = self.apply_call_summary(expr, &name, summary, &call_arguments);
+                    if pending_specialization {
+                        self.add_pending_result(expr, &mut result);
+                    }
+                    return result;
                 }
                 if mutating_call {
                     self.mutate(&value, receiver);
@@ -2098,10 +2102,12 @@ impl<'a> Pass<'a> {
             return Access::default();
         }
         let specialized = self.facts.specializations.get(&expr_id(expr));
+        let pending_specialization =
+            specialized.is_some_and(|name| !self.summaries.contains_key(name));
         let summary = specialized
             .and_then(|name| self.summary_for(name))
             .or_else(|| self.summary_for(&name));
-        if specialized.is_some() && summary.is_none() {
+        if pending_specialization {
             for argument in &args {
                 for reference in &argument.refs {
                     self.attempted.extend(&reference.locals);
@@ -2145,9 +2151,24 @@ impl<'a> Pass<'a> {
             };
         }
         if let Some(summary) = summary {
-            return self.apply_call_summary(expr, &name, summary, &args);
+            let mut result = self.apply_call_summary(expr, &name, summary, &args);
+            if pending_specialization {
+                self.add_pending_result(expr, &mut result);
+            }
+            return result;
         }
         Access::default()
+    }
+
+    /// A call to a generic instance that does not exist yet is analyzed through
+    /// its template summary, where unresolved trait methods such as `clone`
+    /// contribute no result. The instance is checked again once generated, so
+    /// the placeholder only needs to stay writable: an independent value must
+    /// not be reported as an unmutated `var`. Aliases to read-only arguments
+    /// remain in the result and are still rejected.
+    fn add_pending_result(&mut self, expr: &Expr, result: &mut Access) {
+        let fresh = self.allocate(Root::Fresh(expr_id(expr), 0));
+        result.union(&fresh);
     }
 
     fn apply_call_summary(

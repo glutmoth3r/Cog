@@ -3294,6 +3294,7 @@ impl<'a> Checker<'a> {
             let unresolved = self.dynamic_bindings.len();
             self.scopes.push(Scope::default());
             self.in_comptime = f.comptime;
+            self.in_async = f.asynchronous;
             self.defaults(&f.params);
             for parameter in &f.params {
                 let ty = parameter

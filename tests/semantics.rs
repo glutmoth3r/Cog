@@ -196,6 +196,24 @@ fn continue_outside_a_loop_is_diagnosed() {
     );
 }
 
+#[test]
+fn await_stays_valid_when_function_body_is_rechecked_after_dynamic_refinement() {
+    let source = r#"
+@async fn load() { [1, 2] }
+@async fn handle(items) { items }
+@async fn main() -> nil {
+    var notes = await load()!!;
+    var n = 0;
+    while n < 2 {
+        notes = await handle(notes)!!;
+        n = n + 1;
+    }
+}
+"#;
+    cog::project::compile_source("await_recheck.cog", source)
+        .unwrap_or_else(|error| panic!("{error}"));
+}
+
 fn run(source: &str) -> String {
     let mut output = Vec::new();
     interpreter::run_with(&compile(source), &mut output).unwrap();

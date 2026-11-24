@@ -1075,3 +1075,62 @@ fn global_initializers_depend_on_late_settling_alias_helpers() {
         "[1, 2]\n"
     );
 }
+
+#[test]
+fn cloned_array_from_generic_clone_is_a_valid_mutation_target() {
+    assert_eq!(
+        run("use clone; fn main() { const arr: int[] = [1, 2, 3]; \
+             var x = clone::value(arr)!!; x << 4; io::println(x.len()); }"),
+        "4\n"
+    );
+    assert_eq!(
+        run(
+            "use clone; fn dup[T: type + clone::Clone](a: T) -> T { a.clone() } \
+             fn main() { const arr: int[] = [1]; var x = dup(arr); x << 2; io::println(x); }"
+        ),
+        "[1, 2]\n"
+    );
+}
+
+#[test]
+fn mutating_generic_clone_leaves_the_original_unchanged() {
+    assert_eq!(
+        run("use clone; fn main() { const arr: int[] = [1, 2, 3]; \
+             var x = clone::value(arr)!!; x << 4; \
+             io::println(arr); io::println(x); }"),
+        "[1, 2, 3]\n[1, 2, 3, 4]\n"
+    );
+}
+
+#[test]
+fn generic_alias_of_const_array_is_still_rejected_for_mutation() {
+    rejects(
+        "fn id[T: type](a: T) -> T { a } \
+         fn main() { const arr: int[] = [1]; var x = id(arr); x << 2; }",
+        "cannot mutate",
+    );
+    rejects(
+        "use clone; fn main() { const arr: int[] = [1]; \
+         const x = clone::value(arr)!!; x << 2; }",
+        "cannot mutate",
+    );
+}
+
+#[test]
+fn unmutated_var_passed_to_generic_function_is_still_reported() {
+    rejects(
+        "fn noop[T: type](a: T) -> nil { nil } fn main() { var v = [1]; noop(v); }",
+        "E1006",
+    );
+}
+
+#[test]
+fn local_mutated_only_through_generic_callee_needs_no_later_mutation() {
+    assert_eq!(
+        run(
+            "use random; fn main() { var rng = random::Seeded::new(1); var items = [1, 2, 3]; \
+             random::shuffle(rng, items)!!; io::println(items.len()); }"
+        ),
+        "3\n"
+    );
+}
