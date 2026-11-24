@@ -13,7 +13,7 @@ remaining release acceptance gates, and the next language goals. See the [langua
   source maps, a generational graph heap, iterative cycle collection, and
   optional execution limits. The optional object-count limit is not a byte or
   whole-process memory limit.
-- Portable `.cogb` v39 artifacts (v38 files are still accepted) with bounded decoding and structural
+- Portable `.cogb` v40 artifacts (v38 and v39 files are still accepted) with bounded decoding and structural
   verification. The VM checks declared callable argument/result types at call
   boundaries; static value-flow verification is still in progress.
 - Packages, KDL configuration, path/archive/user-store dependencies, `cog.lock`,
@@ -57,6 +57,20 @@ remaining release acceptance gates, and the next language goals. See the [langua
   at module and function scope. Unknown attributes fail during parsing;
   `@repr` and `@derive` have no semantics yet. Bare legacy declaration
   spellings are rejected.
+- Inline-frame error provenance (bytecode v40, `ErrorTraceFrame.inlined`), with
+  each propagation step recorded once.
+- Default resource limits and an 8 MiB output cap for `--restricted` runs, without
+  extra flags.
+- Local aggregate fact tracking in the bytecode verifier (BETA-08 partly done:
+  increments 2 and 3 of the differential-test plan), checked by a verifier-versus-VM
+  differential test.
+- Mutability analysis cost: only functions whose read summaries changed are
+  re-run, and scalar-typed constructor fields no longer carry references. `cog check`
+  of `packages/cogweb` dropped from 14 s to under 2 s, and of `web/tutorial` from
+  over 10 minutes to about 5 s.
+- `cogweb` 0.4.0 in `packages/cogweb` with `static_files::serve_file` and
+  `http::binary_response`. The tutorial server is a Cog program (`web/tutorial`)
+  on it, launched by `web/server.mts`, with 22 tests in `web/server.test.mts`.
 
 ## Beta release acceptance
 
@@ -167,19 +181,13 @@ thread-safe scheduler wakeups. Detach and async closures remain future work.
    E2001) and a way to unwrap an optional struct field. Without them a
    user-written `Clone` cannot copy recursive or optional struct fields. Decide
    whether struct `==` and `.clone()` should exist; today `==` fails at run time
-   with `type mismatch` and `cog check` does not report it.
-6. Fix the follow-up diagnostic `unknown trait $symbol9`, which appears after
-   "`Trait` is private to module" and exposes an internal name.
-7. Bound the compile-time cost of the mutability analysis. `cog check` of the
-   `cogweb` library takes about 10 seconds, and a server of roughly 550 lines
-   built on it does not finish within minutes, while ordinary programs check in
-   milliseconds. The cost is superlinear in helper calls over struct and Map values.
-8. Extend the WASI backend only by owner decision: `str::to_int`, `str::builder`
-   and `replace` are small steps; arrays, structs and `Map` change the supported
-   scope documented in [WebAssembly](docs/WEBASSEMBLY.md). A browser-hosted compiler
-   and VM are not implemented.
-9. Move the tutorial server to Cog on `packages/cogweb` (in progress): remaining
-   work is test parity with the former Node server and the CI time budget.
+   with `type mismatch in eq` and `cog check` does not report it.
+6. Extend the WASI backend only by owner decision. `str::to_int`, `to_uint`,
+   `to_bool`, `to_char`, `str::builder`, `build`, `fmt::write` and `replace` have
+   VM parity (tests/wasm.rs). Arrays, structs, `Map`, floats and async remain
+   unsupported; extending them changes the scope documented in
+   [WebAssembly](docs/WEBASSEMBLY.md). A browser-hosted compiler and VM are not
+   implemented.
 
 ## Readiness
 
