@@ -260,6 +260,7 @@ fn substitute_type(
             substitute_type(result, arguments);
         }
         TypeKind::Primitive(_)
+        | TypeKind::Bytes
         | TypeKind::Named(_)
         | TypeKind::ResolvedName { .. }
         | TypeKind::TypeParameter(_)

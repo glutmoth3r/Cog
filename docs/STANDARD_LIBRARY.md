@@ -548,11 +548,32 @@ Use `entropy::bytes` for OS entropy.
 | `bytes::set(buffer, index, value)` | Checked mutation; nil |
 | `bytes::to_str(buffer, offset, count)` | Strict UTF-8 decoding of a byte range |
 
-Buffers share storage through assignment. `bytes::set` requires writable access.
+The buffer type is spelled `bytes` in annotations, including struct fields and
+`bytes[]` arrays. Buffers share storage through assignment. `bytes::set` requires writable access.
 Copy, slice, and concat allocate independent storage and obey the runtime buffer
 limit; concat accepts aliases, including the same buffer for both arguments.
 Invalid byte values, negative/out-of-bounds ranges, and invalid UTF-8 produce Error.
 `len(str)` counts Unicode scalars; use `bytes::len(bytes::from_str(text))` for bytes.
+
+```cog
+@!include("std")
+use io;
+use bytes;
+
+struct Frame { payload: bytes, tag: str }
+
+fn fill(target: bytes, value: int) -> nil {
+    for index in 0..bytes::len(target)!! {
+        bytes::set(target, index, value)!!;
+    }
+}
+
+fn main() -> nil {
+    var frame = Frame(bytes::new(3), "ascii");
+    fill(frame.payload, 67);
+    io::println(bytes::to_str(frame.payload, 0, 3)!!)!!;
+}
+```
 
 ### Binary integers
 

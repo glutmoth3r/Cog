@@ -1997,7 +1997,8 @@ fn comptime_value_matches_annotation(value: &ComptimeValue, ty: &TypeAnnotation)
         | (TypeKind::Primitive(VarType::Str), ComptimeValue::Str(_))
         | (TypeKind::Primitive(VarType::Bool), ComptimeValue::Bool(_))
         | (TypeKind::Primitive(VarType::Nil), ComptimeValue::Nil) => true,
-        (TypeKind::Primitive(_), ComptimeValue::Nil) => ty.nilable,
+        (TypeKind::Bytes, ComptimeValue::Bytes(_)) => true,
+        (TypeKind::Primitive(_) | TypeKind::Bytes, ComptimeValue::Nil) => ty.nilable,
         (TypeKind::Named(expected), ComptimeValue::Struct { name, .. }) => expected == name,
         (TypeKind::ResolvedName { symbol, .. }, ComptimeValue::Struct { name, .. }) => {
             symbol == name
@@ -2081,7 +2082,10 @@ fn substitute_type(ty: &mut TypeAnnotation, aliases: &HashMap<String, TypeAnnota
             }
             substitute_type(result, aliases);
         }
-        TypeKind::Primitive(_) | TypeKind::TypeParameter(_) | TypeKind::SelfType => {}
+        TypeKind::Primitive(_)
+        | TypeKind::Bytes
+        | TypeKind::TypeParameter(_)
+        | TypeKind::SelfType => {}
     }
 }
 

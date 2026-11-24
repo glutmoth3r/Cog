@@ -13,7 +13,8 @@ fn stmt_id(stmt: &Stmt) -> usize {
 fn annotation_may_reference(ty: &TypeAnnotation) -> bool {
     matches!(
         &ty.kind,
-        TypeKind::Named(_)
+        TypeKind::Bytes
+            | TypeKind::Named(_)
             | TypeKind::ResolvedName { .. }
             | TypeKind::Applied { .. }
             | TypeKind::ResolvedApplied { .. }

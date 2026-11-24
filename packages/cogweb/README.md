@@ -123,10 +123,9 @@ route dispatch. The redirect helper only accepts 301, 302, 303, 307, and 308;
 `unauthorized_response(realm)` includes a Bearer challenge, and
 `not_acceptable_response(message)` pairs with Accept negotiation.
 
-`Request.body` is UTF-8 text. Cog currently cannot use its runtime `bytes`
-value type in a field or parameter annotation, so the request type cannot expose
-an arbitrary binary body. Responses can be text or JSON; callers with a byte
-buffer can use `http::write_bytes_response(socket, response, body)`.
+`Request.body` is UTF-8 text; the request type does not expose an arbitrary
+binary body. Responses can be text or JSON; callers with a byte buffer can use
+`http::write_bytes_response(socket, response, body)`.
 
 The optional [`ffi/gzip`](ffi/gzip/README.md) package uses Cog's C ABI v3 and a
 system zlib-compatible library to compress response bytes asynchronously. It is
@@ -151,8 +150,8 @@ images, `woff2`, and `mjs`. It answers 404 for rejected or missing files and 413
 above the cap. Unlike `serve_text` it writes to the socket itself, so the
 caller cannot add headers afterwards. For other byte buffers, build the head with
 `http::binary_response(status, content_type)` and send it with
-`write_bytes_response(_for)`. Cog cannot yet store `bytes` in a struct field, so
-the body is not part of `Response`. See `examples/binary_assets`.
+`write_bytes_response(_for)`; the byte body is passed separately and is not part
+of `Response`. See `examples/binary_assets`.
 
 The router maps method/path pairs to string route IDs. Cog does not have
 callable types for general handler callbacks, so the application dispatches

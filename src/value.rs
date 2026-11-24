@@ -42,6 +42,11 @@ impl RuntimeTypeLimit {
     }
 }
 
+/// Runtime nominal identity of byte buffers created by the `bytes` module. The
+/// `$` prefix cannot appear in source names, so it never collides with a
+/// user-defined struct or enum.
+pub(crate) const BYTES_TYPE: &str = "$core::bytes";
+
 /// Runtime identity carried by each shared array object. The descriptor is
 /// derived from values when an array is created and is fixed by its first
 /// insertion when an empty array is used without an explicit runtime hint.
@@ -1313,6 +1318,8 @@ fn value_matches_runtime_type(expected: &RuntimeType, value: &Value) -> bool {
             RuntimeType::Function,
             Value::Function(_) | Value::BoundFunction(_) | Value::Closure(_, _),
         )
+        // `Other` remains the opaque native category, so existing bytecode
+        // contracts keep accepting byte buffers.
         | (
             RuntimeType::Other,
             Value::Bytes(_) | Value::Handle(_) | Value::Cell(_) | Value::Iterator(_),
@@ -1329,6 +1336,7 @@ fn value_matches_runtime_type(expected: &RuntimeType, value: &Value) -> bool {
         (RuntimeType::Nominal(expected), Value::TypeTag(tag)) => tag.as_ref() == expected,
         (RuntimeType::Nominal(expected), Value::Error(_)) => expected == crate::error::ERROR_TYPE,
         (RuntimeType::Nominal(expected), Value::Task(_)) => expected == "$core::Task",
+        (RuntimeType::Nominal(expected), Value::Bytes(_)) => expected == BYTES_TYPE,
         (RuntimeType::Variant(expected), Value::Variant(tag, _)) => {
             tag.rsplit_once("::")
                 .map_or(tag.as_ref(), |(parent, _)| parent)
@@ -1691,6 +1699,9 @@ impl RuntimeType {
                 }
                 _ => false,
             },
+            Self::Other => {
+                actual == self || matches!(actual, Self::Nominal(name) if name == BYTES_TYPE)
+            }
             Self::Nominal(name) => {
                 actual == self
                     || matches!(actual, Self::Variant(parent) if parent == name)
@@ -1721,7 +1732,8 @@ impl RuntimeType {
             Value::TypeTag(tag) => Self::Variant(tag.to_string()),
             Value::Task(_) => Self::Nominal("$core::Task".to_owned()),
             Value::Function(_) | Value::BoundFunction(_) | Value::Closure(_, _) => Self::Function,
-            Value::Bytes(_) | Value::Handle(_) | Value::Cell(_) | Value::Iterator(_) => Self::Other,
+            Value::Bytes(_) => Self::Nominal(BYTES_TYPE.to_owned()),
+            Value::Handle(_) | Value::Cell(_) | Value::Iterator(_) => Self::Other,
         }
     }
 }

@@ -1468,6 +1468,8 @@ fn runtime_type_mask(
         RuntimeType::Function => TYPE_FUNCTION,
         RuntimeType::Other => TYPE_OTHER,
         RuntimeType::Nominal(name) if name == "$core::Task" => TYPE_TASK,
+        // Byte buffers share the opaque flow category with native handles.
+        RuntimeType::Nominal(name) if name == crate::value::BYTES_TYPE => TYPE_OTHER,
         RuntimeType::Nominal(_) => TYPE_RECORD | TYPE_VARIANT | TYPE_TYPE_TAG,
         RuntimeType::Nullable(inner) => runtime_type_mask(inner, fact_work, pc)? | TYPE_NIL,
     })
@@ -1546,6 +1548,9 @@ fn normal_type_may_match_runtime_type(
         RuntimeType::Function => value.normal_types & TYPE_FUNCTION != 0,
         RuntimeType::Other => value.normal_types & TYPE_OTHER != 0,
         RuntimeType::Nominal(name) if name == "$core::Task" => value.normal_types & TYPE_TASK != 0,
+        RuntimeType::Nominal(name) if name == crate::value::BYTES_TYPE => {
+            value.normal_types & TYPE_OTHER != 0
+        }
         RuntimeType::Nominal(name) => {
             let record_matches = value.normal_types & TYPE_RECORD != 0
                 && tag.is_none_or(|tag| {
@@ -1619,6 +1624,9 @@ fn normal_type_definitely_matches_runtime_type(
         RuntimeType::Function => value.normal_types == TYPE_FUNCTION,
         RuntimeType::Other => value.normal_types == TYPE_OTHER,
         RuntimeType::Nominal(name) if name == "$core::Task" => value.normal_types == TYPE_TASK,
+        // TYPE_OTHER also covers handles, cells, and iterators, so the flow
+        // domain cannot prove that a value is a byte buffer.
+        RuntimeType::Nominal(name) if name == crate::value::BYTES_TYPE => false,
         RuntimeType::Nominal(name) => match value.normal_types {
             TYPE_RECORD => {
                 tag.is_some_and(|tag| tag.strip_prefix("@struct::") == Some(name.as_str()))
@@ -2780,6 +2788,7 @@ mod tests {
             T::Other,
             T::Nominal("demo::A".into()),
             T::Nominal("demo::B".into()),
+            T::Nominal(crate::value::BYTES_TYPE.into()),
             T::Variant("demo::A".into()),
             T::Array(Box::new(T::Int)),
             T::Tuple(vec![T::Bool]),

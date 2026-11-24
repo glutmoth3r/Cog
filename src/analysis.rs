@@ -376,6 +376,7 @@ fn extension_target_uses_parameter(ty: &TypeAnnotation, name: &str) -> bool {
                 || extension_target_uses_parameter(result, name)
         }
         TypeKind::Primitive(_)
+        | TypeKind::Bytes
         | TypeKind::Named(_)
         | TypeKind::ResolvedName { .. }
         | TypeKind::SelfType => false,
@@ -465,6 +466,7 @@ fn match_extension_type(
             Type::Nil => *base == VarType::Nil,
             _ => false,
         },
+        TypeKind::Bytes => matches!(actual, Type::Bytes),
         TypeKind::ResolvedName { symbol, .. } | TypeKind::Named(symbol) => match actual {
             Type::Struct(_, name, arguments) => {
                 arguments.is_empty() && (symbol == name || name.ends_with(&format!("::{symbol}")))
@@ -527,6 +529,7 @@ fn trait_type_pattern(
     let pattern = match &ty.kind {
         TypeKind::Primitive(base) if *base == VarType::Nil && !ty.nilable => TraitTypePattern::Nil,
         TypeKind::Primitive(base) => TraitTypePattern::Primitive(*base),
+        TypeKind::Bytes => TraitTypePattern::Opaque("bytes".to_owned()),
         TypeKind::TypeParameter(name) => generic_parameters
             .get(name.as_str())
             .copied()
@@ -803,6 +806,7 @@ fn trait_annotation_cost(ty: &TypeAnnotation) -> usize {
             .sum::<usize>()
             .saturating_add(trait_annotation_cost(result)),
         TypeKind::Primitive(_)
+        | TypeKind::Bytes
         | TypeKind::Named(_)
         | TypeKind::ResolvedName { .. }
         | TypeKind::TypeParameter(_)
@@ -886,6 +890,7 @@ fn replace_self_type(ty: &mut TypeAnnotation, target: &TypeAnnotation) {
             replace_self_type(result, target);
         }
         TypeKind::Primitive(_)
+        | TypeKind::Bytes
         | TypeKind::Named(_)
         | TypeKind::ResolvedName { .. }
         | TypeKind::TypeParameter(_) => {}
@@ -920,6 +925,7 @@ fn substitute_trait_type(ty: &mut TypeAnnotation, substitutions: &HashMap<String
             substitute_trait_type(result, substitutions);
         }
         TypeKind::Primitive(_)
+        | TypeKind::Bytes
         | TypeKind::Named(_)
         | TypeKind::ResolvedName { .. }
         | TypeKind::TypeParameter(_)
@@ -2077,6 +2083,7 @@ impl<'a> Checker<'a> {
         let ty = match &annotation.kind {
             TypeKind::Primitive(base) if *base == VarType::Nil && !annotation.nilable => Type::Nil,
             TypeKind::Primitive(base) => Type::Primitive(*base, annotation.nilable),
+            TypeKind::Bytes => Type::Bytes,
             TypeKind::TypeParameter(name) => substitutions.get(name)?.clone(),
             TypeKind::SelfType => self_type.clone(),
             TypeKind::Array(element) => Type::Array(Box::new(self.concrete_annotation(
@@ -2223,11 +2230,11 @@ impl<'a> Checker<'a> {
                     symbol: name.clone(),
                 }
             }
+            Type::Bytes => TypeKind::Bytes,
             Type::Dynamic
             | Type::Generic(_)
             | Type::Never
             | Type::EmptyArray
-            | Type::Bytes
             | Type::StrBuf
             | Type::Handle
             | Type::Record
@@ -3363,6 +3370,7 @@ impl<'a> Checker<'a> {
         match &ty.kind {
             TypeKind::Primitive(base) if *base == VarType::Nil && !ty.nilable => Type::Nil,
             TypeKind::Primitive(base) => Type::Primitive(*base, ty.nilable),
+            TypeKind::Bytes => Type::Bytes,
             TypeKind::Named(name) => {
                 if name == "Task" {
                     self.error("E2001", "`Task` requires one result type argument", None);

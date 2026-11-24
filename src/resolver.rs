@@ -117,7 +117,7 @@ impl Resolver {
                 }
                 self.type_annotation(result, owner, scopes);
             }
-            TypeKind::Primitive(_) => {}
+            TypeKind::Primitive(_) | TypeKind::Bytes => {}
         }
     }
 
@@ -724,6 +724,7 @@ impl Resolver {
             "bool" => TypeKind::Primitive(VarType::Bool),
             "str" => TypeKind::Primitive(VarType::Str),
             "nil" => TypeKind::Primitive(VarType::Nil),
+            "bytes" if bytes_names_type(scopes) => TypeKind::Bytes,
             _ if self.active_type_parameters.contains(name) => {
                 TypeKind::TypeParameter(name.clone())
             }
@@ -880,6 +881,7 @@ impl Resolver {
                 if (matches!(name.as_str(), "int" | "float" | "bool" | "str" | "nil")
                     || self.active_type_parameters.contains(name))
                     && !scopes.iter().rev().any(|s| s.contains_key(name)) => {}
+            Expr::Ident(name) if name == "bytes" && bytes_names_type(scopes) => {}
             Expr::Ident(name) => *name = self.name(name, owner, scopes, location),
             Expr::Call(name, args) => {
                 if let Some((target, method)) =
@@ -1005,6 +1007,14 @@ impl Resolver {
                 for arm in arms {
                     scopes.push(Scope::new());
                     if let MatchPattern::Type(name) = &mut arm.pattern
+                        && name == "bytes"
+                        && bytes_names_type(scopes)
+                    {
+                        self.error(
+                            "type patterns do not support `bytes`; annotate the binding instead",
+                            location.clone(),
+                        );
+                    } else if let MatchPattern::Type(name) = &mut arm.pattern
                         && crate::instruction::ValueType::primitive(name).is_none()
                     {
                         *name = self.name(name, owner, scopes, location.clone());
@@ -1623,6 +1633,17 @@ fn native_names(module: &str) -> Vec<String> {
     .collect()
 }
 
+/// `use bytes;` binds the module name, but a bare `bytes` expression still
+/// names the byte-buffer type unless a value, declaration, or imported
+/// function shadows it.
+fn bytes_names_type(scopes: &[Scope]) -> bool {
+    match scopes.iter().rev().find_map(|scope| scope.get("bytes")) {
+        None | Some(Binding::Module(_)) => true,
+        Some(Binding::Native(path)) => crate::builtins::native_module(path),
+        Some(Binding::Local | Binding::Symbol(_) | Binding::Poison) => false,
+    }
+}
+
 fn replace_self_type(ty: &mut TypeAnnotation, target: &TypeAnnotation) {
     match &mut ty.kind {
         TypeKind::SelfType => {
@@ -1648,6 +1669,7 @@ fn replace_self_type(ty: &mut TypeAnnotation, target: &TypeAnnotation) {
             replace_self_type(result, target);
         }
         TypeKind::Primitive(_)
+        | TypeKind::Bytes
         | TypeKind::Named(_)
         | TypeKind::ResolvedName { .. }
         | TypeKind::TypeParameter(_) => {}

@@ -282,6 +282,8 @@ pub struct TypeAnnotation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeKind {
     Primitive(VarType),
+    /// Mutable byte buffer created by the `bytes` module.
+    Bytes,
     Named(String),
     Applied {
         source: String,
@@ -311,6 +313,7 @@ impl TypeAnnotation {
     pub fn canonical(&self) -> String {
         let base = match &self.kind {
             TypeKind::Primitive(base) => base.name().to_string(),
+            TypeKind::Bytes => "bytes".to_string(),
             TypeKind::Named(name) | TypeKind::TypeParameter(name) => name.clone(),
             TypeKind::Applied { source, arguments } => format!(
                 "{}[{}]",
@@ -364,6 +367,7 @@ impl TypeAnnotation {
     pub fn display(&self) -> String {
         let base = match &self.kind {
             TypeKind::Primitive(base) => base.name().to_string(),
+            TypeKind::Bytes => "bytes".to_string(),
             TypeKind::Named(name) => name.clone(),
             TypeKind::ResolvedName { source, .. } => source.clone(),
             TypeKind::Applied { source, arguments }

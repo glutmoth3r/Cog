@@ -789,6 +789,7 @@ fn runtime_type(annotation: &crate::ast::TypeAnnotation) -> Option<RuntimeType> 
         TypeKind::Primitive(VarType::Char) => RuntimeType::Char,
         TypeKind::Primitive(VarType::Str) => RuntimeType::Str,
         TypeKind::Primitive(VarType::Nil) => RuntimeType::Nil,
+        TypeKind::Bytes => RuntimeType::Nominal(crate::value::BYTES_TYPE.to_owned()),
         TypeKind::Array(element) => RuntimeType::Array(Box::new(runtime_type(element)?)),
         TypeKind::Named(name) => RuntimeType::Nominal(name.clone()),
         TypeKind::ResolvedName { symbol, .. } => RuntimeType::Nominal(symbol.clone()),

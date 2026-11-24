@@ -239,8 +239,8 @@ from the runtime call. Compile-time value parameters and type parameters on
 ## Types and casts
 
 Available annotations include `int`, `uint`, `bigint`, `float`, `bool`, `char`, `str`, singleton
-`nil`, user-defined struct/enum names, homogeneous dynamic arrays (`T[]`),
-fixed-shape tuples (`(T, U)`), and nullable forms such as `int?`. These types
+`nil`, the byte-buffer type `bytes`, user-defined struct/enum names, homogeneous dynamic
+arrays (`T[]`), fixed-shape tuples (`(T, U)`), and nullable forms such as `int?`. These types
 compose recursively, so `int[][]` is an array of arrays. Error is an orthogonal
 computational state, not an implicit member of the annotated normal type.
 
@@ -259,6 +259,14 @@ fn main() -> nil {
 }
 ```
 
+
+`bytes` names the mutable buffer returned by `bytes::new`, `bytes::from_str`, and the
+byte-reading I/O functions. It can annotate parameters, results, bindings, struct fields,
+array elements, tuples, and generic arguments, and `bytes?` admits nil. A buffer is a shared
+reference: a callee that mutates a `bytes` parameter requires a writable argument, like an
+array. The annotation name is distinct from the `bytes` module, so `use bytes;` and
+`fn f(data: bytes)` coexist. Comparing two buffers with `==` returns `TypeMismatch`, as for
+arrays; `as bytes` casts and `is bytes` type patterns are not supported.
 
 A non-nil initializer does not narrow declared `int?` to `int`. Control-flow
 checks can refine nullable values on paths that prove nil is absent, including a

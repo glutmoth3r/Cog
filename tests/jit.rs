@@ -1084,6 +1084,37 @@ fn jit_higher_order_array_callback_fallback_matches_vm() {
 }
 
 #[test]
+fn jit_bytes_annotated_parameters_and_results_match_vm() {
+    assert_jit_fallback_matches_vm(
+        r#"
+        @!include("std")
+        use io;
+        use bytes;
+
+        struct Buffer { data: bytes }
+
+        fn bump(target: bytes, index: int) -> bytes {
+            bytes::set(target, index, (bytes::get(target, index)!! + 1) % 256)!!;
+            target
+        }
+
+        fn main() {
+            var buffer = Buffer(bytes::new(4));
+            var index = 0;
+            while index < 6000 {
+                buffer.data = bump(buffer.data, index % 4);
+                index += 1;
+            }
+            io::println(bytes::get(buffer.data, 0)!!)!!;
+            io::println(bytes::get(buffer.data, 3)!!)!!;
+        }
+        "#,
+        "bytes-annotations",
+        "220\n220\n",
+    );
+}
+
+#[test]
 fn jit_user_iterator_fallback_matches_vm() {
     assert_jit_fallback_matches_vm(USER_ITERATOR_FALLBACK_SOURCE, "user-iterator", "18003000\n");
 }

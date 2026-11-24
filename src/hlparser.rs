@@ -1827,6 +1827,7 @@ impl<'a> Parser<'a> {
                         "char" => TypeKind::Primitive(VarType::Char),
                         "str" => TypeKind::Primitive(VarType::Str),
                         "float" => TypeKind::Primitive(VarType::Float),
+                        "bytes" => TypeKind::Bytes,
                         "Self" => TypeKind::SelfType,
                         _ if self
                             .type_parameters

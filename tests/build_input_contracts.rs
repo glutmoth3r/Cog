@@ -190,6 +190,33 @@ fn build_02_binary_and_empty_inputs_materialize_without_runtime_filesystem() {
 }
 
 #[test]
+fn build_02_included_bytes_satisfy_bytes_annotations() {
+    let inputs = Inputs::new();
+    inputs.write("binary.bin", &[7, 200]);
+    let compiled = inputs.compile(&format!(
+        r#"
+        @comptime fn load(path: str) -> bytes {{
+            return build::include_bytes(path);
+        }}
+        @comptime const DATA: bytes = load({});
+        struct Asset {{ data: bytes }}
+        fn last(asset: Asset) -> int {{ bytes::get(asset.data, bytes::len(asset.data)!! - 1)!! }}
+        fn main() {{ io::println(last(Asset(DATA))); }}
+        "#,
+        inputs.literal("binary.bin")
+    ));
+    assert_eq!(inputs.embedded_output(compiled, &["binary.bin"]), "200\n");
+    inputs.rejects_semantically(
+        r#"
+        @comptime fn load() -> bytes { return "text"; }
+        @comptime const DATA = load();
+        fn main() {}
+        "#,
+        &["bytes"],
+    );
+}
+
+#[test]
 fn build_03_required_read_and_decode_errors_can_be_recovered_in_comptime() {
     let inputs = Inputs::new();
     inputs.write("invalid.txt", &[255]);
