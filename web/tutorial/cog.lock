@@ -1,0 +1,5 @@
+COGLOCK 1
+root 0
+pkg 0 "cog-tutorial" "0.1.0" path "."
+pkg 1 "cogweb" "0.4.0" path "target/.cog-package-cache/15b6eaa36f21629dc961b325965c1319ed202019de9811f69cb8de92673476b4"
+dep 0 "cogweb" 1

@@ -10,13 +10,22 @@ Open **http://127.0.0.1:4173/web/get_started.html**. Edit an example, optionally
 stdin input, and choose Run. Output and compiler/runtime diagnostics appear below
 the editor. Reset restores the original example; Ctrl+Enter or Command+Enter runs it.
 
-The server builds Cog with locked, offline Cargo, then invokes the real compiler
-and runs its `.cogb` artifact. If dependencies are not cached, first run
-`cargo build --locked --bin cog` with network access. There are no npm dependencies
-or JavaScript implementations of Cog semantics.
+The tutorial server is a Cog program (`web/tutorial`) built on the `cogweb` library
+(`packages/cogweb`). `node web/server.mts` is only a launcher: it builds the Cog
+compiler with locked, offline Cargo, packs `packages/cogweb` into a `.cogpkg` and
+installs it in `$COG_HOME/libraries` (default `~/.cog/libraries`; skipped when the
+installed package is newer than the sources), then runs `cog run web/tutorial`.
+That server invokes the real compiler and runs each example's `.cogb` artifact.
+The first start compiles the server and can take minutes. If dependencies are not
+cached, first run `cargo build --locked --bin cog` with network access. There are no
+npm dependencies or JavaScript implementations of Cog semantics.
+
+To run the server without the launcher, install the library and start it from the
+repository root: `cog install --path packages/cogweb`, then
+`COG_BIN=$(which cog) PORT=4173 cog run web/tutorial`.
 
 `PORT` changes the local port; `COG_BIN` selects an already-built Cog executable
-that supports `--restricted`. The default binds only to loopback. Runs allow stdin
+that supports `--restricted`; `COG_HOME` selects the library store. The default binds only to loopback. Runs allow stdin
 and stdout, deny other runtime host effects, and have time/output limits. This is
 a local learning tool, not a service for hosting untrusted code. CLI runtime limits
 do not impose a total VM memory quota.
@@ -30,11 +39,12 @@ and actual output to `web/tutorial_logic.cog`, a Cog program compiled to a
 the final newline) executes in WebAssembly inside a module Worker; JavaScript only
 handles the DOM, the Worker, and moving strings.
 
-`GET /api/tutorial-checker.wasm` serves that one artifact (`application/wasm`). The
-server builds it on first request with `cog build --target wasm32-wasip1`, which needs
-`rustup target add wasm32-wasip1`; without it the endpoint returns 503 and the page
-shows an error. The server also serves `web/*.mjs` as JavaScript. It exposes no
-other build output. Limits: 96 KiB per text, no NUL characters, 5 s per fetch and per
+`GET /api/tutorial-checker.wasm` serves that one artifact (`application/wasm`) with
+`static_files::serve_file`. The server builds it at startup with
+`cog build --target wasm32-wasip1`, which needs `rustup target add wasm32-wasip1`;
+without it the endpoint returns 503 until the server is restarted, and the page
+shows an error. Cross-site fetches are refused. The server also serves `web/*.mjs`
+as JavaScript. It exposes no other build output. Limits: 96 KiB per text, no NUL characters, 5 s per fetch and per
 Worker run; violations produce an error message instead of a verdict.
 
 This does **not** compile arbitrary Cog source in the browser. The browser runs a

@@ -1,0 +1,201 @@
+use ascii;
+use bytes;
+use clone::Clone;
+use err::Error;
+use http;
+use str::{join, split, trim};
+
+// CORS rules are explicit allowlists. A wildcard origin cannot be combined
+// with credentials; requested headers are checked case-insensitively.
+public struct Policy {
+    origins: str[],
+    methods: str[],
+    headers: str[],
+    allow_credentials: bool = false,
+    max_age_seconds: int = 600,
+}
+
+fn normalized(value: str) -> str {
+    const source = bytes::from_str(trim(value)!!)!!;
+    const length = bytes::len(source)!!;
+    var result = bytes::new(length)!!;
+    for index in 0..length {
+        const byte = bytes::get(source, index)!!;
+        if byte >= 65 && byte <= 90 {
+            bytes::set(result, index, byte + 32)!!;
+        } else {
+            bytes::set(result, index, byte)!!;
+        }
+    }
+    bytes::to_str(result, 0, length)!!
+}
+
+fn wildcard_origin(policy: Policy) -> bool {
+    for origin in policy.origins {
+        if (origin as str) == "*" { return true; }
+    }
+    false
+}
+
+fn origin_is_allowed(origin: str, policy: Policy) -> bool {
+    for allowed in policy.origins {
+        if (allowed as str) == origin { return true; }
+    }
+    wildcard_origin(policy) && !policy.allow_credentials
+}
+
+fn valid_requested_header(name: str) -> bool {
+    const source = bytes::from_str(name)!!;
+    if bytes::len(source)!! == 0 { return false; }
+    for index in 0..bytes::len(source)!! {
+        const byte = bytes::get(source, index)!!;
+        if !ascii::is_alphanumeric(byte)!! && byte != 45 { return false; }
+    }
+    true
+}
+
+fn method_is_allowed(method: str, policy: Policy) -> bool {
+    for allowed in policy.methods {
+        if (allowed as str) == method { return true; }
+    }
+    false
+}
+
+fn header_is_allowed(name: str, policy: Policy) -> bool {
+    for allowed in policy.headers {
+        const candidate = trim(allowed as str)!!;
+        if candidate == "*" || normalized(candidate)!! == normalized(name)!! {
+            return true;
+        }
+    }
+    false
+}
+
+fn with_header(response: http::Response, name: str, value: str) -> http::Response {
+    const source = bytes::from_str(value)!!;
+    for index in 0..bytes::len(source)!! {
+        const byte = bytes::get(source, index)!!;
+        if byte == 127 || (byte < 32 && byte != 9) {
+            Error::InvalidArgument("CORS response header")!!;
+        }
+    }
+    var headers = response.headers.clone();
+    var old_names: str[] = [];
+    for entry in headers.entries() {
+        const current_name = entry.0 as str;
+        if normalized(current_name)!! == normalized(name)!! {
+            old_names << current_name;
+        }
+    }
+    for old_name in old_names { headers.remove(old_name as str)!!; }
+    headers.set(normalized(name)!!, value);
+    http::Response(
+        status: response.status,
+        headers: headers,
+        body: response.body,
+        set_cookies: response.set_cookies,
+    )
+}
+
+fn append_vary(response: http::Response, token: str) -> http::Response {
+    const current = response.header("vary");
+    if current == nil {
+        return with_header(response, "vary", token)!!;
+    }
+    const existing = current ?? "";
+    if trim(existing)!! == "*" { return response; }
+    for item in split(existing, ",")!! {
+        if normalized(item as str)!! == normalized(token)!! { return response; }
+    }
+    with_header(response, "vary", existing + ", " + token)!!
+}
+
+fn add_origin_headers(response: http::Response, origin: str, policy: Policy) -> http::Response {
+    var result = response;
+    if wildcard_origin(policy) && !policy.allow_credentials {
+        result = with_header(result, "access-control-allow-origin", "*")!!;
+    } else {
+        result = with_header(result, "access-control-allow-origin", origin)!!;
+        result = append_vary(result, "Origin")!!;
+    }
+    if policy.allow_credentials {
+        result = with_header(result, "access-control-allow-credentials", "true")!!;
+    }
+    result
+}
+
+@public fn apply(response: http::Response, request: http::Request, policy: Policy) -> http::Response {
+    var result = response;
+    if !(wildcard_origin(policy) && !policy.allow_credentials) {
+        result = append_vary(result, "Origin")!!;
+    }
+    const raw_origin = request.header("origin");
+    if raw_origin == nil { return result; }
+    const origin = raw_origin ?? "";
+    if origin == "" || !origin_is_allowed(origin, policy)!! { return result; }
+    add_origin_headers(result, origin, policy)!!
+}
+
+// Returns nil for ordinary OPTIONS requests. A CORS preflight receives either
+// a 204 response or a 403 response; route dispatch can handle the former case.
+@public fn preflight_response(request: http::Request, policy: Policy) -> http::Response? {
+    if request.method != "OPTIONS" { return nil; }
+    const requested_method = request.header("access-control-request-method");
+    if requested_method == nil { return nil; }
+    const raw_origin = request.header("origin");
+    if raw_origin == nil || !(origin_is_allowed(raw_origin ?? "", policy)!!) {
+        var denied = http::forbidden_response("CORS origin is not allowed.")!!;
+        denied = append_vary(denied, "Origin")!!;
+        denied = append_vary(denied, "Access-Control-Request-Method")!!;
+        return append_vary(denied, "Access-Control-Request-Headers")!!;
+    }
+    const method = trim(requested_method ?? "")!!;
+    if !method_is_allowed(method, policy)!! {
+        var denied = http::forbidden_response("CORS method is not allowed.")!!;
+        denied = append_vary(denied, "Origin")!!;
+        denied = append_vary(denied, "Access-Control-Request-Method")!!;
+        return append_vary(denied, "Access-Control-Request-Headers")!!;
+    }
+
+    const raw_headers = request.header("access-control-request-headers") ?? "";
+    var requested_headers: str[] = [];
+    if trim(raw_headers)!! != "" {
+        for item in split(raw_headers, ",")!! {
+            const name = trim(item as str)!!;
+            if !valid_requested_header(name)!! || !header_is_allowed(name, policy)!! {
+                var denied = http::forbidden_response("CORS header is not allowed.")!!;
+                denied = append_vary(denied, "Origin")!!;
+                denied = append_vary(denied, "Access-Control-Request-Method")!!;
+                return append_vary(denied, "Access-Control-Request-Headers")!!;
+            }
+            requested_headers << name;
+        }
+    }
+
+    var response = add_origin_headers(
+        http::no_content_response(),
+        raw_origin ?? "",
+        policy,
+    )!!;
+    response = with_header(
+        response,
+        "access-control-allow-methods",
+        join(policy.methods, ", ")!!,
+    )!!;
+    if requested_headers.len() > 0 {
+        response = with_header(
+            response,
+            "access-control-allow-headers",
+            join(requested_headers, ", ")!!,
+        )!!;
+    }
+    if policy.max_age_seconds >= 0 {
+        response = with_header(
+            response,
+            "access-control-max-age",
+            policy.max_age_seconds as str,
+        )!!;
+    }
+    response = append_vary(response, "Access-Control-Request-Method")!!;
+    append_vary(response, "Access-Control-Request-Headers")!!
+}

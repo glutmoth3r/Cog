@@ -91,7 +91,8 @@ export async function runWasi(module, args) {
         },
         // Newer Rust toolchains may import these even when the program does not use them.
         clock_time_get(id, _precision, result) {
-            if (id > 1) return EINVAL;
+            if (id > 3) return EINVAL;
+            // Clock 0 is wall time; monotonic and CPU-time clocks use the page's elapsed time.
             const nanoseconds = id === 0
                 ? BigInt(Date.now()) * 1000000n
                 : BigInt(Math.round(performance.now() * 1000000));

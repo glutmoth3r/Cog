@@ -1,0 +1,917 @@
+use ascii;
+use async::net;
+use bytes;
+use collections;
+use err::Error;
+use json;
+use str::{contains, ends_with, join, replace, split, starts_with, trim,};
+
+const MAX_HEADER_BYTES = 16 * 1024;
+const READ_CHUNK_BYTES = 8 * 1024;
+
+public struct Request {
+    method: str,
+    target: str,
+    path: str,
+    query: str,
+    version: str,
+    headers: collections::Map[str, str],
+    body: str,
+    content_length: int,
+    private valid: bool,
+}
+
+public struct Cookie {
+    name: str,
+    value: str,
+    path: str = "/",
+    domain: str = "",
+    max_age_seconds: int? = nil,
+    secure: bool = false,
+    http_only: bool = true,
+    same_site: str = "Lax",
+}
+
+public struct Response {
+    status: int,
+    headers: collections::Map[str, str],
+    body: str,
+    set_cookies: str[] = [],
+}
+
+fn parse_failure() -> Error {
+    Error::ParseFailure("http", "request")
+}
+
+fn invalid_request() -> Request {
+    Request(
+        method: "",
+        target: "",
+        path: "",
+        query: "",
+        version: "",
+        headers: collections::Map::new[str, str](),
+        body: "",
+        content_length: 0,
+        valid: false,
+    )
+}
+
+fn find_header_end(buffer) -> int {
+    const length = bytes::len(buffer)!!;
+    if length < 4 { return -1; }
+    for index in 0..(length - 3) {
+        if bytes::get(buffer, index)!! == 13
+            && bytes::get(buffer, index + 1)!! == 10
+            && bytes::get(buffer, index + 2)!! == 13
+            && bytes::get(buffer, index + 3)!! == 10 {
+            return index;
+        }
+    }
+    -1
+}
+
+fn find_byte(buffer, target: int) -> int {
+    for index in 0..bytes::len(buffer)!! {
+        if bytes::get(buffer, index)!! == target { return index; }
+    }
+    -1
+}
+
+fn hex_value(byte: int) -> int {
+    if byte >= 48 && byte <= 57 { return byte - 48; }
+    if byte >= 65 && byte <= 70 { return byte - 55; }
+    if byte >= 97 && byte <= 102 { return byte - 87; }
+    -1
+}
+
+fn decode_query_component(value: str) -> str {
+    const source = bytes::from_str(value)!!;
+    const length = bytes::len(source)!!;
+    var decoded = bytes::new(length)!!;
+    var input_index = 0;
+    var output_index = 0;
+    while input_index < length {
+        const byte = bytes::get(source, input_index)!!;
+        if byte == 43 {
+            bytes::set(decoded, output_index, 32)!!;
+            input_index += 1;
+        } else if byte == 37 {
+            if input_index + 2 >= length { parse_failure()!!; }
+            const high = hex_value(bytes::get(source, input_index + 1)!!);
+            const low = hex_value(bytes::get(source, input_index + 2)!!);
+            if high < 0 || low < 0 { parse_failure()!!; }
+            bytes::set(decoded, output_index, high * 16 + low)!!;
+            input_index += 3;
+        } else {
+            bytes::set(decoded, output_index, byte)!!;
+            input_index += 1;
+        }
+        output_index += 1;
+    }
+    bytes::to_str(decoded, 0, output_index)!!
+}
+
+fn value_from_encoded_fields(encoded: str, name: str) -> str? {
+    const values = values_from_encoded_fields(encoded, name)!!;
+    if values.len() == 0 { return nil; }
+    values[0]!! as str
+}
+
+fn values_from_encoded_fields(encoded: str, name: str) -> str[] {
+    var values: str[] = [];
+    if encoded == "" { return values; }
+    for item in split(encoded, "&")!! {
+        const pair = item as str;
+        const pair_bytes = bytes::from_str(pair)!!;
+        const equals = find_byte(pair_bytes, 61);
+        var raw_name = pair;
+        var raw_value = "";
+        if equals >= 0 {
+            raw_name = bytes::to_str(pair_bytes, 0, equals)!!;
+            raw_value = bytes::to_str(
+                pair_bytes,
+                equals + 1,
+                bytes::len(pair_bytes)!! - equals - 1
+            )!!;
+        }
+        if decode_query_component(raw_name)!! == name {
+            values << decode_query_component(raw_value)!!;
+        }
+    }
+    values
+}
+
+fn lower_ascii(value: str) -> str {
+    const source = bytes::from_str(value)!!;
+    const length = bytes::len(source)!!;
+    var lowered = bytes::new(length)!!;
+    for index in 0..length {
+        bytes::set(lowered, index, ascii::to_lowercase(bytes::get(source, index)!!)!!)!!;
+    }
+    bytes::to_str(lowered, 0, length)!!
+}
+
+fn valid_header_name(name: str) -> bool {
+    if name == "" { return false; }
+    const buffer = bytes::from_str(name)!!;
+    for index in 0..bytes::len(buffer)!! {
+        const byte = bytes::get(buffer, index)!!;
+        if !ascii::is_alphanumeric(byte)!! && byte != 45 { return false; }
+    }
+    true
+}
+
+fn valid_method(method: str) -> bool {
+    if method == "" { return false; }
+    const buffer = bytes::from_str(method)!!;
+    for index in 0..bytes::len(buffer)!! {
+        const byte = bytes::get(buffer, index)!!;
+        const alphanumeric = ascii::is_alphanumeric(byte)!!;
+        const punctuation = byte == 33 || byte == 35 || byte == 36 || byte == 37
+            || byte == 38 || byte == 39 || byte == 42 || byte == 43 || byte == 45
+            || byte == 46 || byte == 94 || byte == 95 || byte == 96 || byte == 124
+            || byte == 126;
+        if byte > 127 || (!alphanumeric && !punctuation) { return false; }
+    }
+    true
+}
+
+fn valid_header_value(value: str) -> bool {
+    const buffer = bytes::from_str(value)!!;
+    for index in 0..bytes::len(buffer)!! {
+        const byte = bytes::get(buffer, index)!!;
+        if byte == 127 || (byte < 32 && byte != 9) { return false; }
+    }
+    true
+}
+
+fn parse_content_length(headers: collections::Map[str, str], max_body_bytes: int) -> int {
+    if headers.contains("transfer-encoding") { parse_failure()!!; }
+    if !headers.contains("content-length") { return 0; }
+    const text = trim(headers.get("content-length")!!)!!;
+    const digits = bytes::from_str(text)!!;
+    if bytes::len(digits)!! == 0 { parse_failure()!!; }
+    for index in 0..bytes::len(digits)!! {
+        const byte = bytes::get(digits, index)!!;
+        if byte < 48 || byte > 57 { parse_failure()!!; }
+    }
+    const length = text as int;
+    if length < 0 { parse_failure()!!; }
+    if length > max_body_bytes { Error::ResourceLimit("HTTP body")!!; }
+    length
+}
+
+fn parse_head(buffer, header_end: int, max_body_bytes: int) -> Request {
+    const text = bytes::to_str(buffer, 0, header_end)!!;
+    const lines = split(text, "\r\n")!!;
+    if lines.len() == 0 { return invalid_request(); }
+    const parts = split(lines[0]!! as str, " ")!!;
+    if parts.len() != 3 { return invalid_request(); }
+
+    const method = parts[0]!! as str;
+    const target = parts[1]!! as str;
+    const version = parts[2]!! as str;
+    if !valid_method(method) || target == "" || version != "HTTP/1.1"
+        || contains(target, "#")!! {
+        return invalid_request();
+    }
+    if !starts_with(target, "/")!! { return invalid_request(); }
+
+    var headers = collections::Map::new[str, str]();
+    for index in 1..lines.len() {
+        const line = lines[index]!!;
+        const line_bytes = bytes::from_str(line)!!;
+        const colon = find_byte(line_bytes, 58);
+        if colon <= 0 { return invalid_request(); }
+        const name = bytes::to_str(line_bytes, 0, colon)!!;
+        const value = trim(bytes::to_str(
+            line_bytes,
+            colon + 1,
+            bytes::len(line_bytes)!! - colon - 1
+        )!!)!!;
+        if !valid_header_name(name) || !valid_header_value(value) { return invalid_request(); }
+        const key = lower_ascii(name);
+        if headers.contains(key) { return invalid_request(); }
+        headers.set(key, value);
+    }
+
+    const content_length = parse_content_length(headers, max_body_bytes);
+    const target_parts = split(target, "?")!!;
+    const path = target_parts[0]!! as str;
+    var query = "";
+    if target_parts.len() > 1 {
+        query = target_parts[1]!! as str;
+        for index in 2..target_parts.len() { query += "?" + (target_parts[index]!! as str); }
+    }
+    Request(
+        method: method,
+        target: target,
+        path: path,
+        query: query,
+        version: version,
+        headers: headers,
+        body: "",
+        content_length: content_length,
+        valid: true,
+    )
+}
+
+@public @async fn read_request(socket, max_body_bytes: int) -> Request {
+    if max_body_bytes < 0 { Error::InvalidArgument("http::read_request")!!; }
+    var buffer = bytes::new(0)!!;
+    var header_end = -1;
+    var head = Request(
+        method: "",
+        target: "",
+        path: "",
+        query: "",
+        version: "",
+        headers: collections::Map::new[str, str](),
+        body: "",
+        content_length: 0,
+        valid: false,
+    );
+
+    while true {
+        if header_end < 0 {
+            header_end = find_header_end(buffer);
+            if header_end < 0 && bytes::len(buffer)!! > MAX_HEADER_BYTES {
+                Error::ResourceLimit("HTTP headers")!!;
+            }
+            if header_end >= 0 {
+                if header_end > MAX_HEADER_BYTES { Error::ResourceLimit("HTTP headers")!!; }
+                head = parse_head(buffer, header_end, max_body_bytes);
+                if !head.valid { parse_failure()!!; }
+            }
+        }
+        if header_end >= 0
+            && bytes::len(buffer)!! >= header_end + 4 + head.content_length {
+            break;
+        }
+
+        const data = await net::read(socket, READ_CHUNK_BYTES)!!;
+        if bytes::len(data)!! == 0 { parse_failure()!!; }
+        buffer = bytes::concat(buffer, data)!!;
+    }
+
+    Request(
+        method: head.method,
+        target: head.target,
+        path: head.path,
+        query: head.query,
+        version: head.version,
+        headers: head.headers,
+        body: bytes::to_str(
+            buffer,
+            header_end + 4,
+            head.content_length
+        )!!,
+        content_length: head.content_length,
+        valid: head.valid,
+    )
+}
+
+extend Request {
+    public fn header(self, name: str) -> str? {
+        const key = lower_ascii(name);
+        if !self.headers.contains(key) { return nil; }
+        self.headers.get(key)!!
+    }
+
+    // Returns Content-Type without optional parameters, lowercased and trimmed.
+    public fn media_type(self) -> str? {
+        if !self.headers.contains("content-type") { return nil; }
+        const value = self.headers.get("content-type")!!;
+        const parts = split(value, ";")!!;
+        lower_ascii(trim(parts[0]!! as str)!!)!!
+    }
+
+    // Returns the first matching form-style query value. Percent escapes are
+    // UTF-8 decoded and '+' is treated as a space.
+    public fn query_param(self, name: str) -> str? {
+        value_from_encoded_fields(self.query, name)!!
+    }
+
+    // Returns every matching query value in wire order. This is useful for
+    // repeated filters such as ?tag=one&tag=two.
+    public fn query_params(self, name: str) -> str[] {
+        values_from_encoded_fields(self.query, name)!!
+    }
+
+    // Parses URL-encoded form text and returns the first matching field.
+    // The caller should first check that Content-Type is form-urlencoded.
+    public fn form_param(self, name: str) -> str? {
+        value_from_encoded_fields(self.body, name)!!
+    }
+
+    public fn form_params(self, name: str) -> str[] {
+        values_from_encoded_fields(self.body, name)!!
+    }
+
+    public fn is_json(self) -> bool {
+        const kind = self.media_type() ?? "";
+        kind == "application/json" || ends_with(kind, "+json")!!
+    }
+
+    public fn is_form_urlencoded(self) -> bool {
+        (self.media_type() ?? "") == "application/x-www-form-urlencoded"
+    }
+
+    // Parses a simple Cookie request header and returns the first raw value.
+    // Cookie values are not URL-decoded; applications choose their own format.
+    public fn cookie(self, name: str) -> str? {
+        if !valid_cookie_name(name) { return nil; }
+        const encoded = self.header("cookie") ?? "";
+        for part in split(encoded, ";")!! {
+            const item = trim(part as str)!!;
+            const item_bytes = bytes::from_str(item)!!;
+            const equals = find_byte(item_bytes, 61);
+            if equals <= 0 { continue; }
+            const item_name = bytes::to_str(item_bytes, 0, equals)!!;
+            if item_name == name {
+                var value = trim(bytes::to_str(
+                    item_bytes,
+                    equals + 1,
+                    bytes::len(item_bytes)!! - equals - 1
+                )!!)!!;
+                if starts_with(value, "\"")!! && ends_with(value, "\"")!!
+                    && len(value) >= 2 {
+                    const value_bytes = bytes::from_str(value)!!;
+                    value = bytes::to_str(value_bytes, 1, len(value) - 2)!!;
+                }
+                return value;
+            }
+        }
+        nil
+    }
+
+    // Returns the credential portion of an Authorization: Bearer header.
+    public fn bearer_token(self) -> str? {
+        const header = self.header("authorization") ?? "";
+        if !starts_with(lower_ascii(header)!!, "bearer ")!! { return nil; }
+        const encoded = bytes::from_str(header)!!;
+        const token = trim(bytes::to_str(
+            encoded,
+            7,
+            bytes::len(encoded)!! - 7
+        )!!)!!;
+        if token == "" { return nil; }
+        var saw_padding = false;
+        var saw_content = false;
+        const token_bytes = bytes::from_str(token)!!;
+        for index in 0..len(token) {
+            const byte = bytes::get(token_bytes, index)!!;
+            const alpha_num = ascii::is_alphanumeric(byte)!!;
+            const punctuation = byte == 45 || byte == 46 || byte == 95
+                || byte == 126 || byte == 43 || byte == 47;
+            if byte == 61 {
+                if !saw_content { return nil; }
+                saw_padding = true;
+            } else if !alpha_num && !punctuation || saw_padding {
+                return nil;
+            } else {
+                saw_content = true;
+            }
+        }
+        token
+    }
+
+    // RFC-style Accept matching supports exact types and */* or type/* ranges.
+    // Specific ranges override less-specific wildcard ranges, including q=0.
+    public fn accepts(self, media_type: str) -> bool {
+        request_accepts(self, media_type)!!
+    }
+
+    // Returns the standard-library JSON parse result, including Error values.
+    public fn json(self) {
+        json::parse(self.body)
+    }
+}
+
+fn parse_quality(value: str) -> int {
+    const text = trim(value)!!;
+    if text == "0" { return 0; }
+    if text == "1" { return 1000; }
+    const source = bytes::from_str(text)!!;
+    const length = bytes::len(source)!!;
+    if length < 3 || length > 5 || bytes::get(source, 1)!! != 46 { return -1; }
+    const whole = bytes::get(source, 0)!!;
+    if whole != 48 && whole != 49 { return -1; }
+    var fraction = 0;
+    var digits = 0;
+    for index in 2..length {
+        const byte = bytes::get(source, index)!!;
+        if byte < 48 || byte > 57 { return -1; }
+        fraction = fraction * 10 + byte - 48;
+        digits += 1;
+    }
+    while digits < 3 {
+        fraction *= 10;
+        digits += 1;
+    }
+    if whole == 49 {
+        if fraction != 0 { return -1; }
+        return 1000;
+    }
+    fraction
+}
+
+fn accept_range_quality(item: str) -> int {
+    const parameters = split(item, ";")!!;
+    var quality = 1000;
+    for index in 1..parameters.len() {
+        const parameter = trim(parameters[index]!! as str)!!;
+        const pair = split(parameter, "=")!!;
+        if pair.len() == 2 && lower_ascii(trim(pair[0]!! as str)!!)!! == "q" {
+            quality = parse_quality(pair[1]!! as str)!!;
+            if quality < 0 { return -1; }
+        }
+    }
+    quality
+}
+
+fn range_specificity(range: str, target: str) -> int {
+    if range == target { return 2; }
+    if range == "*/*" { return 0; }
+    const range_parts = split(range, "/")!!;
+    const target_parts = split(target, "/")!!;
+    if range_parts.len() != 2 || target_parts.len() != 2 { return -1; }
+    if range_parts[0]!! as str == target_parts[0]!! as str
+        && range_parts[1]!! as str == "*" {
+        return 1;
+    }
+    -1
+}
+
+fn request_accepts(request: Request, media_type: str) -> bool {
+    const header = request.header("accept");
+    if header == nil { return true; }
+    const target_parts = split(lower_ascii(trim(media_type)!!)!!, ";")!!;
+    const target = trim(target_parts[0]!! as str)!!;
+    if split(target, "/")!!.len() != 2 { return false; }
+    var best_specificity = -1;
+    var best_quality = -1;
+    for item in split(header ?? "", ",")!! {
+        const range_item = trim(item as str)!!;
+        const range_parts = split(range_item, ";")!!;
+        const range = lower_ascii(trim(range_parts[0]!! as str)!!)!!;
+        const specificity = range_specificity(range, target)!!;
+        if specificity < 0 { continue; }
+        const quality = accept_range_quality(range_item)!!;
+        if quality < 0 { continue; }
+        if specificity > best_specificity
+            || (specificity == best_specificity && quality > best_quality) {
+            best_specificity = specificity;
+            best_quality = quality;
+        }
+    }
+    best_specificity >= 0 && best_quality > 0
+}
+
+fn valid_cookie_name(name: str) -> bool {
+    if name == "" { return false; }
+    const source = bytes::from_str(name)!!;
+    for index in 0..bytes::len(source)!! {
+        const byte = bytes::get(source, index)!!;
+        const alpha_num = ascii::is_alphanumeric(byte)!!;
+        const punctuation = byte == 33 || byte == 35 || byte == 36 || byte == 37
+            || byte == 38 || byte == 39 || byte == 42 || byte == 43 || byte == 45
+            || byte == 46 || byte == 94 || byte == 95 || byte == 96 || byte == 124
+            || byte == 126;
+        if byte > 127 || (!alpha_num && !punctuation) { return false; }
+    }
+    true
+}
+
+fn valid_cookie_value(value: str) -> bool {
+    const source = bytes::from_str(value)!!;
+    for index in 0..bytes::len(source)!! {
+        const byte = bytes::get(source, index)!!;
+        const allowed = byte == 33 || (byte >= 35 && byte <= 43)
+            || (byte >= 45 && byte <= 58) || (byte >= 60 && byte <= 91)
+            || (byte >= 93 && byte <= 126);
+        if !allowed { return false; }
+    }
+    true
+}
+
+fn serialize_cookie(cookie: Cookie) -> str {
+    if !valid_cookie_name(cookie.name) || !valid_cookie_value(cookie.value) {
+        Error::InvalidArgument("http::Cookie")!!;
+    }
+    var result = cookie.name + "=" + cookie.value;
+    if cookie.path != "" {
+        if !starts_with(cookie.path, "/")!! { Error::InvalidArgument("cookie path")!!; }
+        const path_bytes = bytes::from_str(cookie.path)!!;
+        for index in 0..bytes::len(path_bytes)!! {
+            const byte = bytes::get(path_bytes, index)!!;
+            if byte < 32 || byte > 126 || byte == 59 || byte == 92 {
+                Error::InvalidArgument("cookie path")!!;
+            }
+        }
+        result += "; Path=" + cookie.path;
+    }
+    if cookie.domain != "" {
+        const domain_bytes = bytes::from_str(cookie.domain)!!;
+        if bytes::len(domain_bytes)!! == 0 { Error::InvalidArgument("cookie domain")!!; }
+        for index in 0..bytes::len(domain_bytes)!! {
+            const byte = bytes::get(domain_bytes, index)!!;
+            if !ascii::is_alphanumeric(byte)!! && byte != 45 && byte != 46 {
+                Error::InvalidArgument("cookie domain")!!;
+            }
+            if byte == 46 {
+                if index == 0 || index == bytes::len(domain_bytes)!! - 1
+                    || bytes::get(domain_bytes, index - 1)!! == 45
+                    || bytes::get(domain_bytes, index + 1)!! == 45
+                    || bytes::get(domain_bytes, index - 1)!! == 46
+                    || bytes::get(domain_bytes, index + 1)!! == 46 {
+                    Error::InvalidArgument("cookie domain")!!;
+                }
+            }
+            if byte == 45 {
+                if index == 0 || index == bytes::len(domain_bytes)!! - 1
+                    || bytes::get(domain_bytes, index - 1)!! == 46
+                    || bytes::get(domain_bytes, index + 1)!! == 46 {
+                    Error::InvalidArgument("cookie domain")!!;
+                }
+            }
+        }
+        result += "; Domain=" + cookie.domain;
+    }
+    when cookie.max_age_seconds is int {
+        result += "; Max-Age=" + (cookie.max_age_seconds as int) as str;
+    } else {}
+    if cookie.secure { result += "; Secure"; }
+    if cookie.http_only { result += "; HttpOnly"; }
+    const same_site = lower_ascii(cookie.same_site)!!;
+    if same_site == "lax" {
+        result += "; SameSite=Lax";
+    } else if same_site == "strict" {
+        result += "; SameSite=Strict";
+    } else if same_site == "none" && cookie.secure {
+        result += "; SameSite=None";
+    } else if same_site != "" {
+        Error::InvalidArgument("cookie SameSite")!!;
+    }
+    result
+}
+
+extend Cookie {
+    public fn new(name: str, value: str) -> Cookie {
+        Cookie(name: name, value: value)
+    }
+
+    public fn set_path(mut self, path: str) -> nil { self.path = path; }
+    public fn set_domain(mut self, domain: str) -> nil { self.domain = domain; }
+    public fn set_max_age(mut self, seconds: int?) -> nil { self.max_age_seconds = seconds; }
+    public fn set_secure(mut self, enabled: bool) -> nil { self.secure = enabled; }
+    public fn set_http_only(mut self, enabled: bool) -> nil { self.http_only = enabled; }
+    public fn set_same_site(mut self, policy: str) -> nil { self.same_site = policy; }
+}
+
+extend Response {
+    public fn add_cookie(mut self, cookie: Cookie) -> nil {
+        self.set_cookies << serialize_cookie(cookie)!!;
+    }
+
+    public fn header(self, name: str) -> str? {
+        const key = lower_ascii(name)!!;
+        for entry in self.headers.entries() {
+            const candidate = lower_ascii(entry.0 as str)!!;
+            if candidate == key { return entry.1 as str; }
+        }
+        nil
+    }
+
+    public fn set_default_header(mut self, name: str, value: str) -> nil {
+        const key = lower_ascii(name)!!;
+        if !valid_header_name(name) || !valid_header_value(value) {
+            Error::InvalidArgument("http::Response.set_default_header")!!;
+        }
+        if self.header(key) == nil { self.headers.set(key, value); }
+    }
+}
+
+@public fn response(status: int, body: str) -> Response {
+    Response(
+        status: status,
+        headers: collections::Map::new[str, str](),
+        body: body,
+    )
+}
+
+@public fn text_response(status: int, body: str) -> Response {
+    var headers = collections::Map::new[str, str]();
+    headers.set("content-type", "text/plain; charset=utf-8");
+    headers.set("cache-control", "no-store");
+    headers.set("x-content-type-options", "nosniff");
+    Response(status: status, headers: headers, body: body)
+}
+
+// Response head for a binary body. Cog cannot store a bytes value in a struct
+// field, so the body stays separate: send it with write_bytes_response(_for).
+// The body field is empty and the content length comes from the byte buffer.
+@public fn binary_response(status: int, content_type: str) -> Response {
+    if !valid_header_value(content_type) || content_type == "" {
+        Error::InvalidArgument("http::binary_response")!!;
+    }
+    var headers = collections::Map::new[str, str]();
+    headers.set("content-type", content_type);
+    headers.set("cache-control", "no-store");
+    headers.set("x-content-type-options", "nosniff");
+    Response(status: status, headers: headers, body: "")
+}
+
+@public fn html_response(status: int, body: str) -> Response {
+    var headers = collections::Map::new[str, str]();
+    headers.set("content-type", "text/html; charset=utf-8");
+    headers.set("cache-control", "no-store");
+    headers.set("x-content-type-options", "nosniff");
+    Response(status: status, headers: headers, body: body)
+}
+
+// Escape untrusted text before inserting it into an HTML text or quoted
+// attribute value. It does not sanitize complete HTML fragments or URLs.
+@public fn html_escape(value: str) -> str {
+    var escaped = replace(value, "&", "&amp;")!!;
+    escaped = replace(escaped, "<", "&lt;")!!;
+    escaped = replace(escaped, ">", "&gt;")!!;
+    escaped = replace(escaped, "\"", "&quot;")!!;
+    replace(escaped, "'", "&#39;")!!
+}
+
+// `content` is trusted markup; use html_escape for interpolated user values.
+@public fn html_document(title: str, content: str) -> str {
+    "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        + "<title>" + html_escape(title)!! + "</title></head><body>"
+        + content + "</body></html>"
+}
+
+@public fn html_page_response(status: int, title: str, content: str) -> Response {
+    html_response(status, html_document(title, content)!!)
+}
+
+@public fn json_response(status: int, value) -> Response {
+    var headers = collections::Map::new[str, str]();
+    headers.set("content-type", "application/json; charset=utf-8");
+    headers.set("cache-control", "no-store");
+    headers.set("x-content-type-options", "nosniff");
+    Response(status: status, headers: headers, body: json::stringify(value)!!)
+}
+
+@public fn redirect_response(location: str) -> Response {
+    redirect_status_response(302, location)!!
+}
+
+@public fn redirect_status_response(status: int, location: str) -> Response {
+    if status != 301 && status != 302 && status != 303
+        && status != 307 && status != 308 {
+        Error::InvalidArgument("http::redirect_status_response")!!;
+    }
+    if !valid_header_value(location) || location == "" {
+        Error::InvalidArgument("http::redirect_status_response")!!;
+    }
+    var headers = collections::Map::new[str, str]();
+    headers.set("location", location);
+    Response(status: status, headers: headers, body: "")
+}
+
+@public fn no_content_response() -> Response {
+    Response(
+        status: 204,
+        headers: collections::Map::new[str, str](),
+        body: "",
+    )
+}
+
+@public fn not_found_response() -> Response {
+    text_response(404, "Not Found")!!
+}
+
+@public fn method_not_allowed_response(methods: str[]) -> Response {
+    var headers = collections::Map::new[str, str]();
+    headers.set("content-type", "text/plain; charset=utf-8");
+    headers.set("cache-control", "no-store");
+    headers.set("x-content-type-options", "nosniff");
+    headers.set("allow", join(methods, ", ")!!);
+    Response(status: 405, headers: headers, body: "Method Not Allowed")
+}
+
+@public fn bad_request_response(message: str) -> Response { text_response(400, message)!! }
+@public fn forbidden_response(message: str) -> Response { text_response(403, message)!! }
+@public fn not_acceptable_response(message: str) -> Response { text_response(406, message)!! }
+@public fn conflict_response(message: str) -> Response { text_response(409, message)!! }
+@public fn payload_too_large_response(message: str) -> Response { text_response(413, message)!! }
+@public fn unsupported_media_type_response(message: str) -> Response { text_response(415, message)!! }
+@public fn unprocessable_response(message: str) -> Response { text_response(422, message)!! }
+@public fn too_many_requests_response(message: str) -> Response { text_response(429, message)!! }
+@public fn internal_error_response(message: str) -> Response { text_response(500, message)!! }
+@public fn service_unavailable_response(message: str) -> Response { text_response(503, message)!! }
+
+@public fn unauthorized_response(realm: str) -> Response {
+    var headers = collections::Map::new[str, str]();
+    headers.set("content-type", "text/plain; charset=utf-8");
+    headers.set("cache-control", "no-store");
+    headers.set("x-content-type-options", "nosniff");
+    if realm != "" {
+        if !valid_header_value(realm) || contains(realm, "\"")!!
+            || contains(realm, "\\")!! {
+            Error::InvalidArgument("http::unauthorized_response")!!;
+        }
+        headers.set("www-authenticate", "Bearer realm=\"" + realm + "\"");
+    }
+    Response(status: 401, headers: headers, body: "Unauthorized")
+}
+
+extend Response {
+    public fn set_header(mut self, name: str, value: str) -> nil {
+        if !valid_header_name(name) || !valid_header_value(value) {
+            Error::InvalidArgument("http::Response.set_header")!!;
+        }
+        const key = lower_ascii(name)!!;
+        if key == "set-cookie" {
+            Error::InvalidArgument("use Response.add_cookie for Set-Cookie")!!;
+        }
+        var previous_names: str[] = [];
+        for entry in self.headers.entries() {
+            const previous = entry.0 as str;
+            if lower_ascii(previous)!! == key { previous_names << previous; }
+        }
+        for previous in previous_names { self.headers.remove(previous as str)!!; }
+        self.headers.set(key, value);
+    }
+}
+
+fn reason_phrase(status: int) -> str {
+    if status == 100 { return "Continue"; }
+    if status == 101 { return "Switching Protocols"; }
+    if status == 200 { return "OK"; }
+    if status == 201 { return "Created"; }
+    if status == 202 { return "Accepted"; }
+    if status == 203 { return "Non-Authoritative Information"; }
+    if status == 204 { return "No Content"; }
+    if status == 205 { return "Reset Content"; }
+    if status == 301 { return "Moved Permanently"; }
+    if status == 302 { return "Found"; }
+    if status == 303 { return "See Other"; }
+    if status == 304 { return "Not Modified"; }
+    if status == 206 { return "Partial Content"; }
+    if status == 300 { return "Multiple Choices"; }
+    if status == 307 { return "Temporary Redirect"; }
+    if status == 308 { return "Permanent Redirect"; }
+    if status == 400 { return "Bad Request"; }
+    if status == 401 { return "Unauthorized"; }
+    if status == 402 { return "Payment Required"; }
+    if status == 403 { return "Forbidden"; }
+    if status == 404 { return "Not Found"; }
+    if status == 405 { return "Method Not Allowed"; }
+    if status == 406 { return "Not Acceptable"; }
+    if status == 407 { return "Proxy Authentication Required"; }
+    if status == 408 { return "Request Timeout"; }
+    if status == 409 { return "Conflict"; }
+    if status == 410 { return "Gone"; }
+    if status == 411 { return "Length Required"; }
+    if status == 412 { return "Precondition Failed"; }
+    if status == 413 { return "Content Too Large"; }
+    if status == 414 { return "URI Too Long"; }
+    if status == 415 { return "Unsupported Media Type"; }
+    if status == 416 { return "Range Not Satisfiable"; }
+    if status == 417 { return "Expectation Failed"; }
+    if status == 418 { return "I'm a Teapot"; }
+    if status == 421 { return "Misdirected Request"; }
+    if status == 422 { return "Unprocessable Content"; }
+    if status == 423 { return "Locked"; }
+    if status == 424 { return "Failed Dependency"; }
+    if status == 425 { return "Too Early"; }
+    if status == 426 { return "Upgrade Required"; }
+    if status == 428 { return "Precondition Required"; }
+    if status == 429 { return "Too Many Requests"; }
+    if status == 431 { return "Request Header Fields Too Large"; }
+    if status == 451 { return "Unavailable For Legal Reasons"; }
+    if status == 501 { return "Not Implemented"; }
+    if status == 500 { return "Internal Server Error"; }
+    if status == 502 { return "Bad Gateway"; }
+    if status == 503 { return "Service Unavailable"; }
+    if status == 504 { return "Gateway Timeout"; }
+    if status == 505 { return "HTTP Version Not Supported"; }
+    if status == 507 { return "Insufficient Storage"; }
+    if status == 508 { return "Loop Detected"; }
+    if status == 511 { return "Network Authentication Required"; }
+    "Response"
+}
+
+fn response_headers(value: Response, body_length: int) -> str {
+    if value.status < 100 || value.status > 599 {
+        Error::InvalidArgument("http::write_response")!!;
+    }
+    var header_text = $"HTTP/1.1 {value.status} {reason_phrase(value.status)}\r\n";
+    var seen_headers = collections::Map::new[str, bool]();
+    for entry in value.headers.entries() {
+        const name = entry.0 as str;
+        const header_value = entry.1 as str;
+        if !valid_header_name(name) || !valid_header_value(header_value) {
+            Error::InvalidArgument("http::write_response")!!;
+        }
+        const normalized_name = lower_ascii(name)!!;
+        if seen_headers.contains(normalized_name) {
+            Error::InvalidArgument("duplicate response header")!!;
+        }
+        seen_headers.set(normalized_name, true);
+        if normalized_name == "set-cookie" {
+            Error::InvalidArgument("use Response.add_cookie for Set-Cookie")!!;
+        }
+        if normalized_name != "content-length" && normalized_name != "connection"
+            && normalized_name != "transfer-encoding" {
+            header_text += $"{normalized_name}: {header_value}\r\n";
+        }
+    }
+    for cookie in value.set_cookies {
+        const text = cookie as str;
+        if !valid_header_value(text) {
+            Error::InvalidArgument("http::write_response Set-Cookie")!!;
+        }
+        header_text += $"set-cookie: {text}\r\n";
+    }
+    if value.status >= 200 && value.status != 204 {
+        var declared_length = body_length;
+        if value.status == 205 { declared_length = 0; }
+        header_text += $"content-length: {declared_length}\r\n";
+    }
+    header_text += "connection: close\r\n\r\n";
+    header_text
+}
+
+fn write_body_is_omitted(method: str, status: int) -> bool {
+    lower_ascii(method)!! == "head" || status < 200 || status == 204
+        || status == 205 || status == 304
+}
+
+@async fn write_bytes_response_method(socket, method: str, value: Response, body) -> nil {
+    const body_length = bytes::len(body)!!;
+    const header_text = response_headers(value, body_length)!!;
+    await net::write_all(socket, bytes::from_str(header_text)!!)!!;
+    if !write_body_is_omitted(method, value.status) && body_length > 0 {
+        await net::write_all(socket, body)!!;
+    }
+    await net::shutdown_write(socket)!!;
+}
+
+@public @async fn write_bytes_response(socket, value: Response, body) -> nil {
+    await write_bytes_response_method(socket, "GET", value, body)!!;
+}
+
+@public @async fn write_bytes_response_for(socket, request: Request, value: Response, body) -> nil {
+    await write_bytes_response_method(socket, request.method, value, body)!!;
+}
+
+@public @async fn write_response(socket, value: Response) -> nil {
+    const body = bytes::from_str(value.body)!!;
+    await write_bytes_response(socket, value, body)!!;
+}
+
+@public @async fn write_response_for(socket, request: Request, value: Response) -> nil {
+    const body = bytes::from_str(value.body)!!;
+    await write_bytes_response_for(socket, request, value, body)!!;
+}

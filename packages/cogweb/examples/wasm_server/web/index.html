@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Cog WASM server</title>
+<style>body{font:16px system-ui;margin:2rem;max-width:44rem}pre{background:#f1f5f0;padding:1rem;border-radius:6px}input{font:inherit}</style></head>
+<body><h1>Cog server building Cog to WebAssembly</h1>
+<p>This page is served by a Cog program. Choosing Run asks the server to compile <code>programs/NAME.cog</code>
+to <code>wasm32-wasip1</code>, then runs the returned module in your browser.</p>
+<label>Module: <input id="name" value="pyramid" size="12"></label>
+<label>Argument: <input id="arg" value="*****" size="12"></label>
+<button id="run">Run</button>
+<pre id="out">ready</pre>
+<script type="module">
+import { runWasi } from "/web/wasi.mjs";
+const out = document.getElementById("out");
+document.getElementById("run").onclick = async () => {
+    out.textContent = "building…";
+    try {
+        const name = document.getElementById("name").value;
+        const response = await fetch(`/wasm/${encodeURIComponent(name)}.wasm`);
+        if (!response.ok) throw new Error(await response.text());
+        const module = await WebAssembly.compile(await response.arrayBuffer());
+        const result = await runWasi(module, [document.getElementById("arg").value]);
+        out.textContent = result.stdout + (result.stderr ? "\nstderr: " + result.stderr : "") + `\nexit code: ${result.exitCode}`;
+    } catch (error) {
+        out.textContent = String(error.message ?? error);
+    }
+};
+</script></body></html>

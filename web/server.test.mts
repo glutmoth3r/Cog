@@ -7,17 +7,26 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runWasi } from "./wasi.mjs";
 import { checkOutput } from "./wasi-browser.mjs";
-import { buildCompiler, createTutorialServer } from "./server.mts";
+import { buildCompiler, freePort, installLibrary, startTutorial } from "./server.mts";
 
-let server: ReturnType<typeof createTutorialServer>;
+let tutorial: Awaited<ReturnType<typeof startTutorial>>;
 let origin: string;
+// The tutorial server is the Cog program in web/tutorial, started through the same launcher
+// users run. The first start builds the cogweb package and the server, which can take a while.
 before(async () => {
-    server = createTutorialServer({ compiler: await buildCompiler(), timeoutMs: 5000, outputLimit: 8192 });
-    server.listen(0, "127.0.0.1");
-    await once(server, "listening");
-    origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    const compiler = await buildCompiler();
+    await installLibrary(compiler);
+    tutorial = await startTutorial(compiler, await freePort());
+    origin = tutorial.origin;
+}, { timeout: 900000 });
+after(async () => {
+    if (!tutorial) return;
+    tutorial.child.removeAllListeners("close");
+    if (tutorial.child.exitCode === null && tutorial.child.signalCode === null) {
+        tutorial.child.kill("SIGTERM");
+        await once(tutorial.child, "close");
+    }
 });
-after(async () => { if (server) await new Promise<void>(done => { server.closeAllConnections(); server.close(() => done()); }); });
 
 async function run(source: string, input = "") {
     const response = await fetch(origin + "/api/run", { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: JSON.stringify({ source, input }) });

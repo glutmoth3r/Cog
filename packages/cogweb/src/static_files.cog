@@ -1,0 +1,208 @@
+use async::fs;
+use async::io as aio;
+use bytes;
+use collections;
+use err::Error;
+use http;
+use io;
+use path;
+use str::{contains, split, starts_with,};
+
+fn lower_ascii(value: str) -> str {
+    const source = bytes::from_str(value)!!;
+    const length = bytes::len(source)!!;
+    var lowered = bytes::new(length)!!;
+    for index in 0..length {
+        const byte = bytes::get(source, index)!!;
+        if byte >= 65 && byte <= 90 {
+            bytes::set(lowered, index, byte + 32)!!;
+        } else {
+            bytes::set(lowered, index, byte)!!;
+        }
+    }
+    bytes::to_str(lowered, 0, length)!!
+}
+
+fn safe_relative_path(url_path: str) -> str? {
+    if !starts_with(url_path, "/")!! || url_path == "/"
+        || contains(url_path, "%")!! || contains(url_path, "\\")!!
+        || contains(url_path, "?")!! || contains(url_path, "#")!! {
+        return nil;
+    }
+    const source = bytes::from_str(url_path)!!;
+    const length = bytes::len(source)!!;
+    const relative = bytes::to_str(source, 1, length - 1)!!;
+    var normalized = "";
+    for item in split(relative, "/")!! {
+        const segment = item as str;
+        if segment == "" || segment == "." || segment == ".."
+            || contains(segment, ":")!! {
+            return nil;
+        }
+        const segment_bytes = bytes::from_str(segment)!!;
+        for index in 0..bytes::len(segment_bytes)!! {
+            if bytes::get(segment_bytes, index)!! == 0 { return nil; }
+        }
+        if normalized == "" {
+            normalized = segment;
+        } else {
+            normalized = path::join(normalized, segment)!!;
+        }
+    }
+    if normalized == "" { return nil; }
+    normalized
+}
+
+fn extension_allowed(extension: str, allowed_extensions: str[]) -> bool {
+    const normalized_extension = lower_ascii(extension)!!;
+    for item in allowed_extensions {
+        if lower_ascii(item as str)!! == normalized_extension { return true; }
+    }
+    false
+}
+
+fn media_type(extension: str) -> str {
+    if extension == "html" { return "text/html; charset=utf-8"; }
+    if extension == "css" { return "text/css; charset=utf-8"; }
+    if extension == "js" { return "text/javascript; charset=utf-8"; }
+    if extension == "json" { return "application/json; charset=utf-8"; }
+    if extension == "svg" { return "image/svg+xml"; }
+    if extension == "xml" { return "application/xml; charset=utf-8"; }
+    if extension == "md" { return "text/markdown; charset=utf-8"; }
+    if extension == "mjs" { return "text/javascript; charset=utf-8"; }
+    if extension == "wasm" { return "application/wasm"; }
+    if extension == "png" { return "image/png"; }
+    if extension == "jpg" || extension == "jpeg" { return "image/jpeg"; }
+    if extension == "gif" { return "image/gif"; }
+    if extension == "webp" { return "image/webp"; }
+    if extension == "ico" { return "image/x-icon"; }
+    if extension == "woff2" { return "font/woff2"; }
+    if extension == "bin" { return "application/octet-stream"; }
+    "text/plain; charset=utf-8"
+}
+
+// Serves UTF-8 text only. URL-encoded path segments and symlink containment are
+// deliberately outside this helper's guarantee; keep roots trusted and explicit.
+@public @async fn serve_text(
+    root: str,
+    url_path: str,
+    allowed_extensions: str[],
+    max_file_bytes: int,
+) -> http::Response {
+    if max_file_bytes < 0 { Error::InvalidArgument("static_files::serve_text")!!; }
+    const relative = safe_relative_path(url_path)!!;
+    if relative == nil { return http::not_found_response()!!; }
+    const relative_path = relative ?? "";
+    const raw_extension = (path::extension(relative_path) ?? "") as str;
+    const extension = lower_ascii(raw_extension)!!;
+    if !extension_allowed(extension, allowed_extensions)!! {
+        return http::not_found_response()!!;
+    }
+
+    const full_path = path::join(root, relative_path)!!;
+    const metadata = await fs::metadata(full_path);
+    when metadata is Error::IoFailure { return http::not_found_response()!!; } else {}
+    const info = metadata!!;
+    if !(info.is_file as bool) { return http::not_found_response()!!; }
+    const size = info.len as int;
+    if size < 0 || size > max_file_bytes {
+        return http::text_response(413, "Static file is too large")!!;
+    }
+
+    const opened = await aio::open(full_path, "r", 0);
+    when opened is Error::IoFailure { return http::not_found_response()!!; } else {}
+    const file = opened!!;
+    defer { io::close(file)!!; }
+
+    const read = await aio::read_exact(file, size);
+    when read is Error::ResourceLimit {
+        return http::text_response(413, "Static file is too large")!!;
+    } else {}
+    when read is Error::IoFailure { return http::not_found_response()!!; } else {}
+    const data = read!!;
+
+    // Detect a file that grew after metadata without ever reading past the cap.
+    if size < max_file_bytes {
+        const extra = await aio::read(file, 1);
+        when extra is Error::ResourceLimit {
+            return http::text_response(413, "Static file is too large")!!;
+        } else {}
+        when extra is Error::IoFailure { return http::not_found_response()!!; } else {}
+        if bytes::len(extra!!)!! > 0 {
+            return http::text_response(413, "Static file is too large")!!;
+        }
+    }
+
+    const decoded = bytes::to_str(data, 0, bytes::len(data)!!);
+    when decoded is Error::ParseFailure {
+        return http::text_response(415, "Static file is not UTF-8 text")!!;
+    } else {}
+    const text = decoded!!;
+    var headers = collections::Map::new[str, str]();
+    headers.set("content-type", media_type(extension)!!);
+    headers.set("cache-control", "no-store");
+    headers.set("x-content-type-options", "nosniff");
+    http::Response(status: 200, headers: headers, body: text)
+}
+
+// Reads one allowlisted file as bytes. It fails with IoFailure when the path is
+// rejected, missing, or unreadable, and with ResourceLimit above max_file_bytes.
+@async fn load_file(root: str, url_path: str, allowed_extensions: str[], max_file_bytes: int) {
+    if max_file_bytes < 0 { Error::InvalidArgument("static_files::serve_file")!!; }
+    const relative = safe_relative_path(url_path)!!;
+    if relative == nil { Error::IoFailure("static_files::serve_file", "path rejected")!!; }
+    const relative_path = relative ?? "";
+    const extension = lower_ascii((path::extension(relative_path) ?? "") as str)!!;
+    if !extension_allowed(extension, allowed_extensions)!! {
+        Error::IoFailure("static_files::serve_file", "extension not allowed")!!;
+    }
+    const full_path = path::join(root, relative_path)!!;
+    const info = (await fs::metadata(full_path))!!;
+    if !(info.is_file as bool) { Error::IoFailure("static_files::serve_file", "not a file")!!; }
+    const size = info.len as int;
+    if size < 0 || size > max_file_bytes { Error::ResourceLimit("static file")!!; }
+    const file = (await aio::open(full_path, "r", 0))!!;
+    defer { io::close(file)!!; }
+    const data = (await aio::read_exact(file, size))!!;
+    // Detect a file that grew after metadata without ever reading past the cap.
+    if size < max_file_bytes {
+        const extra = (await aio::read(file, 1))!!;
+        if bytes::len(extra)!! > 0 { Error::ResourceLimit("static file")!!; }
+    }
+    data
+}
+
+// Writes an allowlisted file as raw bytes with a MIME type inferred from its
+// extension (including application/wasm). It answers 404 for rejected, missing,
+// or unreadable files and 413 for files above max_file_bytes. HEAD requests send
+// headers only. The same path rules and symlink caveat as serve_text apply.
+@public @async fn serve_file(
+    socket,
+    request: http::Request,
+    root: str,
+    url_path: str,
+    allowed_extensions: str[],
+    max_file_bytes: int,
+) -> nil {
+    const loaded = await load_file(root, url_path, allowed_extensions, max_file_bytes);
+    when loaded is Error::ResourceLimit {
+        await http::write_response_for(
+            socket, request, http::text_response(413, "Static file is too large")!!,
+        )!!;
+    } else {
+        // A negative size cap is a caller bug: surface it instead of answering 404.
+        when loaded is Error::InvalidArgument { loaded!!; } else {}
+        when loaded is Error {
+            await http::write_response_for(socket, request, http::not_found_response()!!)!!;
+        } else {
+            const relative = safe_relative_path(url_path)!! ?? "";
+            const extension = lower_ascii((path::extension(relative) ?? "") as str)!!;
+            var headers = collections::Map::new[str, str]();
+            headers.set("content-type", media_type(extension)!!);
+            headers.set("cache-control", "no-store");
+            headers.set("x-content-type-options", "nosniff");
+            const head = http::Response(status: 200, headers: headers, body: "");
+            await http::write_bytes_response_for(socket, request, head, loaded)!!;
+        }
+    }
+}

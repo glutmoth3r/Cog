@@ -1,0 +1,329 @@
+use ascii;
+use bytes;
+use collections;
+use err::Error;
+use str::{contains, ends_with, split, starts_with,};
+
+struct Route {
+    method: str,
+    path: str,
+    id: str,
+    kind: str,
+    static_segments: int,
+    fixed_segments: int,
+}
+
+public struct RouteMatch {
+    id: str,
+    private values: collections::Map[str, str],
+}
+
+public struct Router {
+    private routes: Route[],
+}
+
+fn invalid_route() -> Error {
+    Error::InvalidArgument("router route")
+}
+
+fn valid_method_char(byte: int) -> bool {
+    if ascii::is_alphanumeric(byte)!! { return true; }
+    byte == 33 || byte == 35 || byte == 36 || byte == 37 || byte == 38
+        || byte == 39 || byte == 42 || byte == 43 || byte == 45 || byte == 46
+        || byte == 94 || byte == 95 || byte == 96 || byte == 124 || byte == 126
+}
+
+fn validate_method(method: str) -> str {
+    const source = bytes::from_str(method)!!;
+    const length = bytes::len(source)!!;
+    if length == 0 { invalid_route()!!; }
+    for index in 0..length {
+        const byte = bytes::get(source, index)!!;
+        if byte > 127 || !valid_method_char(byte) { invalid_route()!!; }
+    }
+    method
+}
+
+fn valid_parameter_name(name: str) -> bool {
+    const source = bytes::from_str(name)!!;
+    const length = bytes::len(source)!!;
+    if length == 0 { return false; }
+    for index in 0..length {
+        const byte = bytes::get(source, index)!!;
+        const letter = (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122);
+        const digit = byte >= 48 && byte <= 57;
+        if index == 0 {
+            if !letter && byte != 95 { return false; }
+        } else if !letter && !digit && byte != 95 {
+            return false;
+        }
+    }
+    true
+}
+
+fn parameter_name(segment: str) -> str {
+    const source = bytes::from_str(segment)!!;
+    const length = bytes::len(source)!!;
+    bytes::to_str(source, 1, length - 1)!!
+}
+
+fn validate_path(path: str, prefix: bool, allow_parameters: bool) -> nil {
+    if !starts_with(path, "/")!! || contains(path, "?")!! || contains(path, "#")!! {
+        invalid_route()!!;
+    }
+    if prefix && path != "/" && !ends_with(path, "/")!! {
+        invalid_route()!!;
+    }
+
+    var names = collections::Map::new[str, bool]();
+    const parts = split(path, "/")!!;
+    for index in 0..parts.len() {
+        const segment = parts[index]!! as str;
+        const is_parameter = starts_with(segment, ":")!!;
+        const is_wildcard = starts_with(segment, "*")!!;
+        if is_wildcard && (!allow_parameters || index != parts.len() - 1) {
+            invalid_route()!!;
+        }
+        if allow_parameters && (is_parameter || is_wildcard) {
+            const name = parameter_name(segment)!!;
+            if !valid_parameter_name(name) || names.contains(name) {
+                invalid_route()!!;
+            }
+            names.set(name, true);
+        }
+    }
+}
+
+fn count_static_segments(path: str) -> int {
+    var count = 0;
+    for item in split(path, "/")!! {
+        const segment = item as str;
+        if segment != "" && !starts_with(segment, ":")!!
+            && !starts_with(segment, "*")!! { count += 1; }
+    }
+    count
+}
+
+fn count_fixed_segments(path: str) -> int {
+    var count = 0;
+    for item in split(path, "/")!! {
+        const segment = item as str;
+        if segment != "" && !starts_with(segment, "*")!! { count += 1; }
+    }
+    count
+}
+
+fn contains_parameters(path: str) -> bool {
+    for item in split(path, "/")!! {
+        const segment = item as str;
+        if starts_with(segment, ":")!! || starts_with(segment, "*")!! { return true; }
+    }
+    false
+}
+
+fn make_route(
+    method: str,
+    path: str,
+    id: str,
+    kind: str,
+) -> Route {
+    if id == "" { invalid_route()!!; }
+    validate_path(path, kind == "prefix", kind == "pattern")!!;
+    Route(
+        method: validate_method(method)!!,
+        path: path,
+        id: id,
+        kind: kind,
+        static_segments: count_static_segments(path)!!,
+        fixed_segments: count_fixed_segments(path)!!,
+    )
+}
+
+fn empty_match(id: str) -> RouteMatch {
+    RouteMatch(id: id, values: collections::Map::new[str, str]())
+}
+
+fn match_pattern(route: Route, path: str) -> RouteMatch? {
+    const pattern_parts = split(route.path, "/")!!;
+    const path_parts = split(path, "/")!!;
+    const last_pattern = pattern_parts[pattern_parts.len() - 1]!! as str;
+    const has_wildcard = starts_with(last_pattern, "*")!!;
+    if (!has_wildcard && pattern_parts.len() != path_parts.len())
+        || (has_wildcard && path_parts.len() < pattern_parts.len()) {
+        return nil;
+    }
+
+    var values = collections::Map::new[str, str]();
+    var fixed_length = pattern_parts.len();
+    if has_wildcard { fixed_length -= 1; }
+    for index in 0..fixed_length {
+        const expected = pattern_parts[index]!! as str;
+        const actual = path_parts[index]!! as str;
+        if starts_with(expected, ":")!! {
+            if actual == "" { return nil; }
+            values.set(parameter_name(expected)!!, actual);
+        } else if expected != actual {
+            return nil;
+        }
+    }
+    if has_wildcard {
+        var captured = "";
+        for index in fixed_length..path_parts.len() {
+            if index > fixed_length { captured += "/"; }
+            captured += path_parts[index]!! as str;
+        }
+        values.set(parameter_name(last_pattern)!!, captured);
+    }
+    RouteMatch(id: route.id, values: values)
+}
+
+fn route_match(route: Route, path: str) -> RouteMatch? {
+    if route.kind == "exact" {
+        if path == route.path { return empty_match(route.id); }
+        return nil;
+    }
+    if route.kind == "pattern" { return match_pattern(route, path)!!; }
+    if starts_with(path, route.path)!! { return empty_match(route.id); }
+    nil
+}
+
+fn resolve_for_method(routes: Route[], method: str, path: str) -> RouteMatch? {
+    for route in routes {
+        if route.method == method && route.kind == "exact" && route.path == path {
+            return empty_match(route.id);
+        }
+    }
+
+    var best_pattern: RouteMatch? = nil;
+    var best_score = -1;
+    var best_fixed = -1;
+    for route in routes {
+        if route.method != method || route.kind != "pattern" { continue; }
+        const candidate = match_pattern(route, path)!!;
+        if candidate != nil {
+            if route.static_segments > best_score
+                || (route.static_segments == best_score
+                    && route.fixed_segments > best_fixed) {
+                best_pattern = candidate;
+                best_score = route.static_segments;
+                best_fixed = route.fixed_segments;
+            }
+        }
+    }
+    if best_pattern != nil { return best_pattern; }
+
+    var best_prefix: RouteMatch? = nil;
+    var best_length = -1;
+    for route in routes {
+        if route.method != method || route.kind != "prefix" { continue; }
+        if starts_with(path, route.path)!! && len(route.path) > best_length {
+            best_prefix = empty_match(route.id)!!;
+            best_length = len(route.path);
+        }
+    }
+    best_prefix
+}
+
+extend RouteMatch {
+    // Captured values are percent-decoded when read. A captured %2F remains
+    // within its original route segment, but the returned value contains '/'.
+    public fn param(self, name: str) -> str? {
+        if !self.values.contains(name) { return nil; }
+        const encoded = bytes::from_str(self.values.get(name)!!)!!;
+        const length = bytes::len(encoded)!!;
+        var decoded = bytes::new(length)!!;
+        var input_index = 0;
+        var output_index = 0;
+        while input_index < length {
+            const byte = bytes::get(encoded, input_index)!!;
+            if byte == 37 {
+                if input_index + 2 >= length { Error::ParseFailure("path parameter", "percent escape")!!; }
+                const high = hex_value(bytes::get(encoded, input_index + 1)!!)!!;
+                const low = hex_value(bytes::get(encoded, input_index + 2)!!)!!;
+                if high < 0 || low < 0 { Error::ParseFailure("path parameter", "percent escape")!!; }
+                bytes::set(decoded, output_index, high * 16 + low)!!;
+                input_index += 3;
+            } else {
+                bytes::set(decoded, output_index, byte)!!;
+                input_index += 1;
+            }
+            output_index += 1;
+        }
+        bytes::to_str(decoded, 0, output_index)!!
+    }
+}
+
+fn hex_value(byte: int) -> int {
+    if byte >= 48 && byte <= 57 { return byte - 48; }
+    if byte >= 65 && byte <= 70 { return byte - 55; }
+    if byte >= 97 && byte <= 102 { return byte - 87; }
+    -1
+}
+
+extend Router {
+    public fn new() -> Router {
+        Router(routes: [])
+    }
+
+    // `route` accepts exact paths and `:name` whole-segment parameters.
+    public fn route(mut self, method: str, path: str, id: str) -> nil {
+        var kind = "exact";
+        if contains_parameters(path)!! { kind = "pattern"; }
+        self.routes << make_route(method, path, id, kind)!!;
+    }
+
+    public fn exact(mut self, method: str, path: str, id: str) -> nil {
+        self.routes << make_route(method, path, id, "exact")!!;
+    }
+
+    public fn prefix(mut self, method: str, path: str, id: str) -> nil {
+        self.routes << make_route(method, path, id, "prefix")!!;
+    }
+
+    public fn get(mut self, path: str, id: str) -> nil { self.route("GET", path, id)!!; }
+    public fn post(mut self, path: str, id: str) -> nil { self.route("POST", path, id)!!; }
+    public fn put(mut self, path: str, id: str) -> nil { self.route("PUT", path, id)!!; }
+    public fn patch(mut self, path: str, id: str) -> nil { self.route("PATCH", path, id)!!; }
+    public fn delete(mut self, path: str, id: str) -> nil { self.route("DELETE", path, id)!!; }
+    public fn head(mut self, path: str, id: str) -> nil { self.route("HEAD", path, id)!!; }
+    public fn options(mut self, path: str, id: str) -> nil { self.route("OPTIONS", path, id)!!; }
+    public fn get_prefix(mut self, path: str, id: str) -> nil { self.prefix("GET", path, id)!!; }
+
+    // Resolution order is exact, most-specific parameter pattern, then the
+    // longest matching prefix. HEAD falls back to GET if no HEAD route exists.
+    public fn resolve_match(self, method: str, path: str) -> RouteMatch? {
+        const direct = resolve_for_method(self.routes, validate_method(method)!!, path)!!;
+        if direct != nil { return direct; }
+        if method == "HEAD" {
+            return resolve_for_method(self.routes, "GET", path)!!;
+        }
+        nil
+    }
+
+    // Backwards-compatible ID-only lookup for existing applications.
+    public fn resolve(self, method: str, path: str) -> str? {
+        const result = self.resolve_match(method, path)!!;
+        if result == nil { return nil; }
+        result.id
+    }
+
+    // Returns each method with a matching path, once, in registration order.
+    public fn allowed_methods(self, path: str) -> str[] {
+        var methods: str[] = [];
+        var seen = collections::Map::new[str, bool]();
+        for route in self.routes {
+            const candidate = route_match(route, path)!!;
+            if candidate != nil {
+                if !seen.contains(route.method) {
+                    methods << route.method;
+                    seen.set(route.method, true);
+                }
+                if route.method == "GET" && !seen.contains("HEAD") {
+                    methods << "HEAD";
+                    seen.set("HEAD", true);
+                }
+            }
+        }
+        methods
+    }
+}

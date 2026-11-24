@@ -1,0 +1,84 @@
+use bytes;
+use ascii;
+use clone::Clone;
+use err::Error;
+use http;
+
+fn valid_header_value(value: str) -> bool {
+    const source = bytes::from_str(value)!!;
+    for index in 0..bytes::len(source)!! {
+        const byte = bytes::get(source, index)!!;
+        if byte == 127 || (byte < 32 && byte != 9) { return false; }
+    }
+    true
+}
+
+fn with_header(response: http::Response, name: str, value: str) -> http::Response {
+    if !valid_header_value(value) { Error::InvalidArgument("security header value")!!; }
+    var headers = response.headers.clone();
+    var old_names: str[] = [];
+    for entry in headers.entries() {
+        const current_name = entry.0 as str;
+        if lower_ascii(current_name)!! == lower_ascii(name)!! {
+            old_names << current_name;
+        }
+    }
+    for old_name in old_names { headers.remove(old_name as str)!!; }
+    headers.set(lower_ascii(name)!!, value);
+    http::Response(
+        status: response.status,
+        headers: headers,
+        body: response.body,
+        set_cookies: response.set_cookies,
+    )
+}
+
+fn lower_ascii(value: str) -> str {
+    const source = bytes::from_str(value)!!;
+    const length = bytes::len(source)!!;
+    var result = bytes::new(length)!!;
+    for index in 0..length {
+        const byte = bytes::get(source, index)!!;
+        bytes::set(result, index, ascii::to_lowercase(byte)!!)!!;
+    }
+    bytes::to_str(result, 0, length)!!
+}
+
+// Adds conservative defaults without replacing application-specific values.
+// This is a useful baseline, not a substitute for deployment review.
+@public fn apply_defaults(response: http::Response) -> http::Response {
+    var headers = response.headers.clone();
+    if response.header("x-content-type-options") == nil {
+        headers.set("x-content-type-options", "nosniff");
+    }
+    if response.header("referrer-policy") == nil {
+        headers.set("referrer-policy", "strict-origin-when-cross-origin");
+    }
+    if response.header("x-frame-options") == nil {
+        headers.set("x-frame-options", "SAMEORIGIN");
+    }
+    if response.header("x-permitted-cross-domain-policies") == nil {
+        headers.set("x-permitted-cross-domain-policies", "none");
+    }
+    if response.header("permissions-policy") == nil {
+        headers.set("permissions-policy", "camera=(), microphone=(), geolocation=()");
+    }
+    http::Response(
+        status: response.status,
+        headers: headers,
+        body: response.body,
+        set_cookies: response.set_cookies,
+    )
+}
+
+@public fn with_content_security_policy(
+    response: http::Response,
+    policy: str,
+) -> http::Response {
+    if policy == "" { Error::InvalidArgument("security CSP")!!; }
+    with_header(response, "content-security-policy", policy)!!
+}
+
+@public fn no_store(response: http::Response) -> http::Response {
+    with_header(response, "cache-control", "no-store")!!
+}

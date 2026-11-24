@@ -1,0 +1,126 @@
+@!include("std")
+@!include("cogweb")
+
+// A small Cog server that compiles Cog programs to WebAssembly on demand.
+//
+//   cd examples/wasm_server && COG_BIN=/path/to/cog cog run .
+//
+// GET /                    -> web/index.html
+// GET /web/wasi.mjs        -> browser WASI host
+// GET /wasm/NAME.wasm      -> builds programs/NAME.cog for wasm32-wasip1, then serves it
+//
+// The server must run without --restricted: it starts the Cog compiler. It handles
+// one connection at a time and rebuilds on every request, so edits show on refresh.
+// Only names made of a-z, 0-9 and _ map to files, always inside programs/.
+
+use async::net;
+use bytes;
+use err::Error;
+use http;
+use io;
+use process;
+use router;
+use static_files;
+use str::{ends_with, starts_with,};
+
+const PORT = 4177;
+const MAX_ARTIFACT_BYTES = 8 * 1024 * 1024;
+const BUILD_TIMEOUT_MS = 120000;
+
+fn build_router() -> router::Router {
+    var routes = router::Router::new();
+    routes.get("/", "home");
+    routes.get("/web/wasi.mjs", "script");
+    routes.get_prefix("/wasm/", "wasm");
+    routes
+}
+
+fn valid_module_name(name: str) -> bool {
+    const source = bytes::from_str(name)!!;
+    const length = bytes::len(source)!!;
+    if length == 0 || length > 40 { return false; }
+    for index in 0..length {
+        const byte = bytes::get(source, index)!!;
+        const lower = byte >= 97 && byte <= 122;
+        const digit = byte >= 48 && byte <= 57;
+        if !lower && !digit && byte != 95 { return false; }
+    }
+    true
+}
+
+// "/wasm/NAME.wasm" -> NAME, or "" when the path has another shape.
+fn module_name(url_path: str) -> str {
+    if !ends_with(url_path, ".wasm")!! { return ""; }
+    const source = bytes::from_str(url_path)!!;
+    const length = bytes::len(source)!!;
+    if length <= 11 { return ""; }
+    bytes::to_str(source, 6, length - 11)!!
+}
+
+// COG_BIN selects the compiler; otherwise `cog` from PATH is used.
+fn compiler() -> str {
+    const configured = process::env("COG_BIN")!!;
+    when configured is str {
+        if configured == "" { "cog" } else { configured }
+    } else {
+        "cog"
+    }
+}
+
+fn text_of(data) -> str {
+    const decoded = bytes::to_str(data, 0, bytes::len(data)!!);
+    when decoded is Error { "(output is not valid UTF-8)" } else { decoded }
+}
+
+@async fn handle(socket, routes: router::Router) -> nil {
+    defer { io::close(socket)!!; }
+    const incoming = await http::read_request(socket, 16 * 1024);
+    when incoming is Error {
+        await http::write_response(socket, http::text_response(400, "Bad request")!!)!!;
+        return nil;
+    }
+    const request = incoming;
+    const matched = routes.resolve_match(request.method, request.path);
+    if matched == nil {
+        await http::write_response_for(socket, request, http::not_found_response()!!)!!;
+    } else if matched.id == "home" {
+        await static_files::serve_file(socket, request, ".", "/web/index.html", ["html"], 64 * 1024)!!;
+    } else if matched.id == "script" {
+        await static_files::serve_file(socket, request, ".", "/web/wasi.mjs", ["mjs"], 256 * 1024)!!;
+    } else {
+        const name = module_name(request.path)!!;
+        if !valid_module_name(name)!! {
+            await http::write_response_for(socket, request, http::not_found_response()!!)!!;
+        } else {
+            const source = "programs/" + name + ".cog";
+            const artifact = "target/wasm/" + name + ".wasm";
+            const built = await process::run(
+                compiler()!!,
+                ["build", "--target", "wasm32-wasip1", source, "-o", artifact, "--color", "never"],
+                BUILD_TIMEOUT_MS,
+                64 * 1024,
+            );
+            when built is Error {
+                await http::write_response_for(socket, request,
+                    http::text_response(500, "Could not start the Cog compiler")!!)!!;
+            } else if !(built.success as bool) {
+                const message = text_of(built.stderr)!!;
+                await http::write_response_for(socket, request,
+                    http::text_response(422, "Build failed:\n" + message)!!)!!;
+            } else {
+                await static_files::serve_file(socket, request, "target/wasm", "/" + name + ".wasm",
+                    ["wasm"], MAX_ARTIFACT_BYTES)!!;
+            }
+        }
+    }
+}
+
+@async fn main() -> nil {
+    const routes = build_router()!!;
+    const listener = await net::listen("127.0.0.1", PORT)!!;
+    io::println($"Cog WASM server: http://127.0.0.1:{PORT}/")!!;
+    while true {
+        const accepted = await net::accept(listener, 300000, 10000);
+        when accepted is Error::Timeout {} else { await handle(accepted!!, routes)!!; }
+    }
+}

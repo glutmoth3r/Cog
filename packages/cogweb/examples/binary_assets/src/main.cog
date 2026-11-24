@@ -1,0 +1,67 @@
+@!include("std")
+@!include("cogweb")
+
+use async::net;
+use bytes;
+use err::Error;
+use http;
+use io;
+use router;
+use security;
+use static_files;
+
+const PORT = 4176;
+const ASSET_ROOT = "assets";
+
+fn build_router() -> router::Router {
+    var routes = router::Router::new();
+    routes.get("/", "home");
+    routes.get("/blob", "blob");
+    routes.get_prefix("/assets/", "asset");
+    routes
+}
+
+@async fn handle(socket, routes: router::Router) -> nil {
+    defer { io::close(socket)!!; }
+    const incoming = await http::read_request(socket, 16 * 1024);
+    when incoming is Error {
+        await http::write_response(socket, http::text_response(400, "Bad request")!!)!!;
+    } else {
+        const request = incoming;
+        const matched = routes.resolve_match(request.method, request.path);
+        if matched == nil {
+            await http::write_response_for(socket, request, http::not_found_response()!!)!!;
+        } else if matched.id == "blob" {
+            // Raw bytes that are not valid UTF-8: 0, 255, 128, 10, 13.
+            var data = bytes::new(5)!!;
+            bytes::set(data, 0, 0)!!;
+            bytes::set(data, 1, 255)!!;
+            bytes::set(data, 2, 128)!!;
+            bytes::set(data, 3, 10)!!;
+            bytes::set(data, 4, 13)!!;
+            const head = security::apply_defaults(
+                http::binary_response(200, "application/octet-stream")!!,
+            )!!;
+            await http::write_bytes_response_for(socket, request, head, data)!!;
+        } else if matched.id == "asset" {
+            // "/assets/pyramid.wasm" is served from ./assets/pyramid.wasm.
+            const raw = bytes::from_str(request.path)!!;
+            const name = bytes::to_str(raw, 8, bytes::len(raw)!! - 8)!!;
+            await static_files::serve_file(socket, request, ASSET_ROOT, "/" + name,
+                ["wasm", "mjs", "png", "bin"], 4 * 1024 * 1024)!!;
+        } else {
+            await http::write_response_for(socket, request,
+                http::html_response(200, "<p>/blob and /assets/NAME</p>")!!)!!;
+        }
+    }
+}
+
+@async fn main() -> nil {
+    const routes = build_router()!!;
+    const listener = await net::listen("127.0.0.1", PORT)!!;
+    io::println($"cogweb binary assets: http://127.0.0.1:{PORT}/")!!;
+    while true {
+        const accepted = await net::accept(listener, 300000, 10000);
+        when accepted is Error::Timeout {} else { await handle(accepted!!, routes)!!; }
+    }
+}

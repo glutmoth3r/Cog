@@ -1,0 +1,555 @@
+@!include("std")
+@!include("cogweb")
+use async::fs;
+use async::net;
+use bytes;
+use cors;
+use entropy;
+use err::Error;
+use hex;
+use http;
+use io;
+use json;
+use path;
+use process;
+use router;
+use security;
+use static_files;
+use str::{contains, ends_with, replace, split, starts_with, trim,};
+use task;
+use time;
+
+const MAX_REQUEST_BYTES = 96 * 1024;
+const MAX_SOURCE_BYTES = 64 * 1024;
+const MAX_INPUT_BYTES = 16 * 1024;
+const MAX_OUTPUT_BYTES = 128 * 1024;
+const MAX_STATIC_FILE_BYTES = 1024 * 1024;
+const RUN_TIMEOUT_MS = 5000;
+const RUN_ROOT = "target/tutorial-runs";
+
+enum ParsedRun {
+    Valid(source: str, input: str),
+    InvalidJson,
+    InvalidObject,
+    InvalidFields,
+}
+
+struct RunResult {
+    ok: bool,
+    stdout: str,
+    diagnostics: str,
+    phase: str,
+}
+
+fn build_router() -> router::Router {
+    var routes = router::Router::new();
+    routes.get("/", "home");
+    routes.get("/api/status", "status");
+    routes.get("/api/greet/:name", "greet");
+    routes.get("/api/path/:root/*tail", "path");
+    routes.post("/api/run", "run");
+    routes.get("/api/tutorial-checker.wasm", "checker");
+    routes.get("/README.md", "static");
+    routes.get("/ROADMAP.md", "static");
+    routes.get("/LICENSE", "static");
+    routes.get("/LICENSE-MPL-2.0", "static");
+    routes.get("/LICENSE-APACHE-2.0", "static");
+    routes.get_prefix("/docs/", "static");
+    routes.get_prefix("/examples/", "static");
+    routes.get_prefix("/web/", "static");
+    routes
+}
+
+fn allowed_static_path(pathname: str) -> bool {
+    if pathname == "/README.md" || pathname == "/ROADMAP.md"
+        || pathname == "/LICENSE" || pathname == "/LICENSE-MPL-2.0"
+        || pathname == "/LICENSE-APACHE-2.0" {
+        return true;
+    }
+    if contains(pathname, "%")!! || contains(pathname, "\\")!! { return false; }
+    if !starts_with(pathname, "/docs/")!!
+        && !starts_with(pathname, "/examples/")!!
+        && !starts_with(pathname, "/web/")!! {
+        return false;
+    }
+    for part in split(pathname, "/")!! {
+        const segment = part as str;
+        if segment == "." || segment == ".." { return false; }
+    }
+    if starts_with(pathname, "/web/")!! && ends_with(pathname, ".mjs")!! {
+        // Only files directly in web/, not subdirectories.
+        const raw = bytes::from_str(pathname)!!;
+        const rest = bytes::to_str(raw, 5, bytes::len(raw)!! - 5)!!;
+        return !contains(rest, "/")!!;
+    }
+    ends_with(pathname, ".md")!! || ends_with(pathname, ".html")!!
+        || ends_with(pathname, ".cog")!! || ends_with(pathname, ".kdl")!!
+}
+
+const TUTORIAL_PAGE = "web/get_started.html";
+const CHECKER_SOURCE = "web/tutorial_logic.cog";
+const CHECKER_DIRECTORY = "target/tutorial";
+const CHECKER_FILE = "checker.wasm";
+const MAX_CHECKER_BYTES = 16 * 1024 * 1024;
+
+// Builds the one fixed WASM artifact the browser may fetch. A failure only disables
+// the optional checker endpoint (it then answers 503); the tutorial still runs examples.
+@async fn prepare_checker(compiler: str) -> nil {
+    const created = await fs::create_dir_all(CHECKER_DIRECTORY);
+    when created is Error {
+        io::println("warning: could not prepare the WASM checker directory")!!;
+        return nil;
+    } else {}
+    // A failed rebuild must not leave an older artifact that the endpoint would serve.
+    await fs::remove_file(CHECKER_DIRECTORY + "/" + CHECKER_FILE);
+    const built = await process::run(
+        compiler,
+        ["build", "--target", "wasm32-wasip1", CHECKER_SOURCE, "-o",
+            CHECKER_DIRECTORY + "/" + CHECKER_FILE, "--color", "never"],
+        120000,
+        64 * 1024,
+    );
+    when built is Error {
+        io::println("warning: could not build the WASM checker")!!;
+    } else {
+        if !(built.success as bool) {
+            io::println("warning: the WASM checker build failed; run `rustup target add wasm32-wasip1`")!!;
+        }
+    }
+}
+
+fn request_port() -> int {
+    const configured = process::env("PORT")!!;
+    when configured is str {
+        const port = configured as int;
+        if port < 1 || port > 65535 { Error::InvalidArgument("PORT")!!; }
+        port
+    } else {
+        4173
+    }
+}
+
+fn parse_run_payload(body: str) -> ParsedRun {
+    const decoded = json::parse(body);
+    when decoded is Error {
+        return ParsedRun::InvalidJson();
+    } else {
+        const value = decoded!!;
+        var source = "";
+        var input = "";
+        try {
+            const raw_source = value.source;
+            when raw_source is str { source = raw_source as str; }
+            else { return ParsedRun::InvalidFields(); }
+        } catch(_error) {
+            return ParsedRun::InvalidObject();
+        }
+        try {
+            const raw_input = value.input;
+            when raw_input is str { input = raw_input as str; }
+            else { return ParsedRun::InvalidFields(); }
+        } catch(error) {
+            when error is Error::MissingField {} else {
+                return ParsedRun::InvalidObject();
+            }
+        }
+        if trim(source) == "" { return ParsedRun::InvalidFields(); }
+        if bytes::len(bytes::from_str(source)!!)!! > MAX_SOURCE_BYTES
+            || bytes::len(bytes::from_str(input)!!)!! > MAX_INPUT_BYTES {
+            return ParsedRun::InvalidFields();
+        }
+        ParsedRun::Valid(source, input)
+    }
+}
+
+fn decode_bytes(value) -> str {
+    const decoded = bytes::to_str(value, 0, bytes::len(value)!!);
+    when decoded is Error { "[non-UTF-8 output]" }
+    else { decoded as str }
+}
+
+// The launcher passes the compiler it validated in COG_BIN; otherwise use `cog` from PATH.
+fn select_compiler() -> str {
+    const configured = process::env("COG_BIN")!!;
+    when configured is str {
+        if configured == "" { "cog" } else { configured }
+    } else {
+        "cog"
+    }
+}
+
+@async fn validate_compiler(compiler: str) -> nil {
+    const result = await process::run(compiler, ["--help"], 5000, 64 * 1024)!!;
+    const help = decode_bytes(result.stdout) + decode_bytes(result.stderr);
+    if !(result.success as bool) || !contains(help, "--restricted")!! {
+        Error::InvalidArgument("COG_BIN does not support --restricted")!!;
+    }
+}
+
+fn remaining_ms(started: int) -> int {
+    const elapsed = (time::monotonic_nanos() - started) / 1000000;
+    if elapsed >= RUN_TIMEOUT_MS { 0 } else { RUN_TIMEOUT_MS - elapsed }
+}
+
+fn process_failure(error: Error, phase: str) -> RunResult {
+    when error is Error::Timeout {
+        RunResult(
+            ok: false,
+            stdout: "",
+            diagnostics: "Execution time limit reached. Check for an infinite loop.",
+            phase: phase,
+        )
+    } else {
+        when error is Error::ResourceLimit {
+            RunResult(
+                ok: false,
+                stdout: "",
+                diagnostics: "Output limit reached. Print fewer values.",
+                phase: phase,
+            )
+        } else {
+            RunResult(
+                ok: false,
+                stdout: "",
+                diagnostics: "Could not start the Cog compiler.",
+                phase: phase,
+            )
+        }
+    }
+}
+
+@async fn cleanup_run(directory: str) -> nil {
+    await fs::remove_file(directory + "/main.cog");
+    await fs::remove_file(directory + "/program.cogb");
+    await fs::remove_dir(directory);
+}
+
+@async fn finish_run(directory: str, result: RunResult) -> RunResult {
+    await cleanup_run(directory)!!;
+    result
+}
+
+@async fn run_example(compiler: str, source: str, input: str) -> RunResult {
+    const created_root = await fs::create_dir_all(RUN_ROOT);
+    when created_root is Error {
+        return RunResult(ok: false, stdout: "", diagnostics: "Could not prepare the example.", phase: "compile");
+    } else {}
+
+    const token = hex::encode(entropy::bytes(16)!!)!!;
+    const directory = path::join(RUN_ROOT, "cog-" + token)!!;
+    const created = await fs::create_dir(directory);
+    when created is Error {
+        return RunResult(ok: false, stdout: "", diagnostics: "Could not prepare the example.", phase: "compile");
+    } else {}
+
+    const source_path = path::join(directory, "main.cog")!!;
+    const bytecode_path = path::join(directory, "program.cogb")!!;
+    const stored = await fs::write_text(source_path, source);
+    when stored is Error {
+        return await finish_run(
+            directory,
+            RunResult(ok: false, stdout: "", diagnostics: "Could not prepare the example.", phase: "compile"),
+        )!!;
+    } else {}
+
+    const started = time::monotonic_nanos();
+    const compile = await process::run(
+        compiler,
+        ["build", source_path, "-o", bytecode_path, "--color", "never"],
+        RUN_TIMEOUT_MS,
+        MAX_OUTPUT_BYTES,
+    );
+    var output = RunResult(ok: false, stdout: "", diagnostics: "", phase: "compile");
+    when compile is Error {
+        output = process_failure(compile, "compile");
+    } else {
+        if compile.success as bool {
+            const timeout = remaining_ms(started);
+            if timeout == 0 {
+                output = process_failure(Error::Timeout(), "run");
+            } else {
+                const execution = await process::run(
+                    compiler,
+                    ["run", bytecode_path, "--restricted", "--color", "never"],
+                    bytes::from_str(input)!!,
+                    timeout,
+                    MAX_OUTPUT_BYTES,
+                );
+                when execution is Error {
+                    output = process_failure(execution, "run");
+                } else {
+                    output = RunResult(
+                        ok: execution.success as bool,
+                        stdout: decode_bytes(execution.stdout),
+                        diagnostics: replace(decode_bytes(execution.stderr), directory + "/", "")!!,
+                        phase: "run",
+                    );
+                }
+            }
+        } else {
+            output = RunResult(
+                ok: false,
+                stdout: "",
+                diagnostics: replace(decode_bytes(compile.stderr), directory + "/", "")!!,
+                phase: "compile",
+            );
+        }
+    }
+    await finish_run(directory, output)!!
+}
+
+@async fn send_json(socket, status: int, value) -> nil {
+    const response = security::apply_defaults(http::json_response(status, value))!!;
+    await http::write_response(socket, response)!!;
+}
+
+@async fn send_error(socket, status: int, message: str) -> nil {
+    await send_json(socket, status, { error: message })!!;
+}
+
+fn tutorial_cors_policy(host: str) -> cors::Policy {
+    cors::Policy(
+        origins: ["http://" + host],
+        methods: ["GET", "POST", "OPTIONS"],
+        headers: ["content-type"],
+        allow_credentials: false,
+        max_age_seconds: 600,
+    )
+}
+
+@async fn send_response_with_policy(
+    socket,
+    request: http::Request,
+    response: http::Response,
+    policy: cors::Policy,
+) -> nil {
+    const cors_response = cors::apply(response, request, policy)!!;
+    const secured = security::apply_defaults(cors_response)!!;
+    await http::write_response_for(socket, request, secured)!!;
+}
+
+@async fn send_response_for(
+    socket,
+    request: http::Request,
+    response: http::Response,
+) -> nil {
+    const host = request.header("host") ?? "";
+    await send_response_with_policy(
+        socket,
+        request,
+        response,
+        tutorial_cors_policy(host)!!,
+    )!!;
+}
+
+@async fn send_json_for(socket, request: http::Request, status: int, value) -> nil {
+    await send_response_for(socket, request, http::json_response(status, value))!!;
+}
+
+@async fn send_error_for(socket, request: http::Request, status: int, message: str) -> nil {
+    await send_json_for(socket, request, status, { error: message })!!;
+}
+
+@async fn send_run_result_for(socket, request: http::Request, result: RunResult) -> nil {
+    await send_json_for(socket, request, 200, {
+        ok: result.ok,
+        stdout: result.stdout,
+        diagnostics: result.diagnostics,
+        phase: result.phase,
+    })!!;
+}
+
+@async fn serve_static(socket, request: http::Request) -> nil {
+    if !allowed_static_path(request.path) {
+        await send_error_for(socket, request, 404, "Not found.")!!;
+        return;
+    }
+
+    if starts_with(request.path, "/docs/")!!
+        || starts_with(request.path, "/examples/")!!
+        || starts_with(request.path, "/web/")!! {
+        var extensions = ["md", "html", "cog", "kdl"];
+        if starts_with(request.path, "/web/")!! { extensions << "mjs"; }
+        const response = await static_files::serve_text(
+            ".",
+            request.path,
+            extensions,
+            MAX_STATIC_FILE_BYTES,
+        )!!;
+        await send_response_for(socket, request, response)!!;
+        return;
+    }
+
+    const relative = bytes::to_str(
+        bytes::from_str(request.path)!!,
+        1,
+        bytes::len(bytes::from_str(request.path)!!)!! - 1,
+    )!!;
+    const content = await fs::read_text(relative);
+    when content is Error {
+        await send_error_for(socket, request, 404, "Not found.")!!;
+    } else {
+        if ends_with(request.path, ".html")!! {
+            await send_response_for(socket, request, http::html_response(200, content))!!;
+        } else {
+            await send_response_for(socket, request, http::text_response(200, content))!!;
+        }
+    }
+}
+
+@async fn dispatch(socket, request: http::Request, port: int, compiler: str, routes: router::Router) -> nil {
+    const host = request.header("host") ?? "";
+    if host != $"127.0.0.1:{port}" && host != $"localhost:{port}" {
+        await send_error(socket, 403, "Invalid host.")!!;
+        return;
+    }
+    const cors_policy = tutorial_cors_policy(host)!!;
+    const preflight = cors::preflight_response(request, cors_policy)!!;
+    if preflight != nil {
+        await send_response_with_policy(
+            socket,
+            request,
+            preflight ?? http::forbidden_response("CORS request denied.")!!,
+            cors_policy,
+        )!!;
+        return;
+    }
+
+    const matched = routes.resolve_match(request.method, request.path);
+    if matched != nil {
+        const route_id = matched.id;
+        if route_id == "home" {
+            await send_response_for(socket, request, http::redirect_response("/web/get_started.html"))!!;
+        } else if route_id == "status" {
+            await send_json_for(socket, request, 200, { ready: true })!!;
+        } else if route_id == "greet" {
+            const name = matched.param("name") ?? "";
+            await send_json_for(socket, request, 200, {
+                greeting: "Hello, " + name,
+                tags: request.query_params("tag"),
+            })!!;
+        } else if route_id == "path" {
+            await send_json_for(socket, request, 200, {
+                root: matched.param("root") ?? "",
+                tail: matched.param("tail") ?? "",
+            })!!;
+        } else if route_id == "checker" {
+            const fetch_site = request.header("sec-fetch-site");
+            if fetch_site != nil && fetch_site != "same-origin" && fetch_site != "none" {
+                await send_error_for(socket, request, 403, "Load the checker from the local tutorial page.")!!;
+            } else {
+                const present = await fs::metadata(CHECKER_DIRECTORY + "/" + CHECKER_FILE);
+                when present is Error {
+                    await send_error_for(socket, request, 503, "The WASM checker is unavailable. Install the wasm32-wasip1 Rust target (rustup target add wasm32-wasip1) and restart the tutorial.")!!;
+                } else {
+                    await static_files::serve_file(socket, request, CHECKER_DIRECTORY,
+                        "/" + CHECKER_FILE, ["wasm"], MAX_CHECKER_BYTES)!!;
+                }
+            }
+        } else if route_id == "run" {
+            const origin = request.header("origin") ?! "";
+            if origin != $"http://{host}" || !request.is_json() {
+                await send_error_for(socket, request, 403, "Run examples from the local tutorial page.")!!;
+            } else {
+                const parsed = parse_run_payload(request.body);
+                match parsed {
+                    ParsedRun::InvalidJson => await send_error_for(socket, request, 400, "Invalid JSON request.")!!,
+                    ParsedRun::InvalidObject => await send_error_for(socket, request, 400, "Expected an object containing source and input.")!!,
+                    ParsedRun::InvalidFields => await send_error_for(socket, request, 400, "Provide source code (up to 64 KiB) and text input (up to 16 KiB).")!!,
+                    ParsedRun::Valid(source, input) => {
+                        const result = await run_example(compiler, source, input)!!;
+                        await send_run_result_for(socket, request, result)!!;
+                    },
+                }
+            }
+        } else {
+            await serve_static(socket, request)!!;
+        }
+    } else {
+        const methods = routes.allowed_methods(request.path);
+        if methods.len() > 0 {
+            await send_response_for(
+                socket,
+                request,
+                http::method_not_allowed_response(methods)!!,
+            )!!;
+        } else {
+            await send_error_for(socket, request, 404, "Not found.")!!;
+        }
+    }
+}
+
+@async fn handle_connection(socket, port: int, compiler: str, routes: router::Router) -> nil {
+    defer { io::close(socket)!!; }
+    const incoming = await http::read_request(socket, MAX_REQUEST_BYTES);
+    when incoming is Error::ResourceLimit {
+        await send_error(socket, 413, "Example request is too large.")!!;
+    } else {
+        when incoming is Error::ParseFailure {
+            await send_error(socket, 400, "Invalid HTTP request.")!!;
+        } else {
+            when incoming is Error {
+                incoming!!;
+            } else {
+                await dispatch(socket, incoming, port, compiler, routes)!!;
+            }
+        }
+    }
+}
+
+@async fn accept_event(listener) {
+    const accepted = await net::accept(listener, 300000, 10000);
+    when accepted is Error::Timeout {
+        { kind: "timeout" }
+    } else {
+        { kind: "accept", socket: accepted!! }
+    }
+}
+
+@async fn client_event(socket, port: int, compiler: str, routes: router::Router) {
+    const result = await handle_connection(socket, port, compiler, routes);
+    when result is Error {}
+    { kind: "done" }
+}
+
+@async fn main() -> nil {
+    await fs::read_text(TUTORIAL_PAGE)!!;
+    const compiler = select_compiler()!!;
+    await validate_compiler(compiler)!!;
+    await prepare_checker(compiler)!!;
+    const port = request_port()!!;
+    const routes = build_router()!!;
+    const listener = await net::listen("127.0.0.1", port)!!;
+    io::println($"Cog tutorial: http://127.0.0.1:{port}/web/get_started.html")!!;
+
+    var tasks = [spawn(accept_event(listener))];
+    var active_handlers = 0;
+    var accept_pending = true;
+    while true {
+        const selected = await task::select(tasks)!!;
+        const event = await tasks[selected]!!;
+        var remaining = tasks.empty_like()!!;
+        for index in 0..tasks.len() {
+            if index != selected { remaining << tasks[index]!!; }
+        }
+        tasks = remaining;
+        if event.kind == "accept" {
+            tasks << spawn(client_event(event.socket, port, compiler, routes));
+            active_handlers += 1;
+            accept_pending = false;
+            if active_handlers < 2 {
+                tasks << spawn(accept_event(listener));
+                accept_pending = true;
+            }
+        } else if event.kind == "done" {
+            active_handlers -= 1;
+            if !accept_pending && active_handlers < 2 {
+                tasks << spawn(accept_event(listener));
+                accept_pending = true;
+            }
+        } else {
+            tasks << spawn(accept_event(listener));
+            accept_pending = true;
+        }
+    }
+}

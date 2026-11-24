@@ -1,0 +1,13 @@
+@!include("std")
+use io;
+
+// Drop another .cog file into programs/ and request /wasm/NAME.wasm to add a module.
+fn main(args: str[]) -> nil {
+    if args.len() == 0 {
+        io::println("Hello from Cog running as WebAssembly!")!!;
+    } else {
+        io::print("Hello, ")!!;
+        io::print(args[0])!!;
+        io::println("!")!!;
+    }
+}

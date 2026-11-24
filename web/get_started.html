@@ -67,7 +67,7 @@ footer { color:var(--muted); font-size:13px; padding:5px 0 25px; }
 <a href="#stdlib">12. Standard library</a>
 <a href="#comptime">13. Comptime</a></nav></aside>
 <main><h1>Get started with Cog</h1><p>Work through these small programs to learn the basics. Edit an example and choose Run, or press Ctrl+Enter / Command+Enter in its editor.</p>
-<div class="setup"><h2>Run this tutorial locally</h2><p>Requires Rust 1.95 or newer, Cargo, and Node.js 24.12 or newer. From the Cog repository:</p><pre><code>node web/server.mts</code></pre><p>The server builds Cog and prints a local URL. Open that URL to run examples with the actual compiler and VM. No npm installation is needed. If Cargo dependencies are not cached, run <code>cargo build --locked --bin cog</code> first.</p><p>The optional output check runs a precompiled Cog checker as WebAssembly in your browser. It needs <code>rustup target add wasm32-wasip1</code> on the machine running the server. The browser does not compile your Cog code; examples still run on the local VM.</p><p>For a standalone program: save the source as <code>main.cog</code>, then run <code>cargo run --locked --bin cog -- run main.cog</code>.</p></div>
+<div class="setup"><h2>Run this tutorial locally</h2><p>Requires Rust 1.95 or newer, Cargo, and Node.js 24.12 or newer. From the Cog repository:</p><pre><code>node web/server.mts</code></pre><p>The server is a Cog program on the <code>cogweb</code> library. The launcher builds Cog, installs <code>packages/cogweb</code> into <code>~/.cog/libraries</code>, and prints a local URL. Open that URL to run examples with the actual compiler and VM. No npm installation is needed. If Cargo dependencies are not cached, run <code>cargo build --locked --bin cog</code> first.</p><p>The optional output check runs a precompiled Cog checker as WebAssembly in your browser. It needs <code>rustup target add wasm32-wasip1</code> on the machine running the server. The browser does not compile your Cog code; examples still run on the local VM.</p><p>For a standalone program: save the source as <code>main.cog</code>, then run <code>cargo run --locked --bin cog -- run main.cog</code>.</p></div>
 <div id="connection" role="status" aria-live="polite">Start the local server to run examples. You can still read and edit them here.</div>
 <section id="hello" class="lesson"><h2>1. A first program</h2><p>Import io to print text. Execution starts in main. The postfix !! passes a successful result through and returns an Error if printing fails.</p>
 <label class="editor-label" for="code-hello">Cog example</label><textarea class="source" id="code-hello" rows="6" spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off">@!include("std")
@@ -368,7 +368,7 @@ fn main() -&gt; nil {
                 if (mine !== generation) return;
                 showVerdict('error', error.name === 'TimeoutError' || error.name === 'AbortError' ? 'The WASM checker timed out.' : (error.message || 'The WASM checker failed.') + (location.protocol === 'file:' ? ' Open the tutorial through node web/server.mts.' : ''));
             } finally {
-                checkRun.disabled = false;
+                if (mine === generation) checkRun.disabled = false;
             }
         };
         checkRun.addEventListener('click', runCheck);
@@ -383,6 +383,7 @@ fn main() -&gt; nil {
             diagnosticGroup.hidden = true;
             lastOutput = null;
             generation += 1;
+            checkRun.disabled = false;
             check.hidden = true;
             verdict.hidden = true;
             try {
@@ -410,7 +411,7 @@ fn main() -&gt; nil {
         };
         run.addEventListener('click', execute);
         editor.addEventListener('keydown', event => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); execute(); } });
-        reset.addEventListener('click', () => { editor.value = editor.defaultValue; if (input) input.value = input.defaultValue; result.hidden = true; check.hidden = true; lastOutput = null; generation += 1; status.textContent = ''; editor.focus(); });
+        reset.addEventListener('click', () => { editor.value = editor.defaultValue; if (input) input.value = input.defaultValue; result.hidden = true; check.hidden = true; lastOutput = null; generation += 1; checkRun.disabled = false; status.textContent = ''; editor.focus(); });
     });
     document.querySelectorAll('aside a').forEach(link => link.addEventListener('click', () => {
         document.querySelectorAll('aside a').forEach(item => item.removeAttribute('aria-current'));

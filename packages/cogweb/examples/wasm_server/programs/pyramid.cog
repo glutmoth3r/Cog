@@ -1,0 +1,22 @@
+@!include("std")
+use io;
+
+// Same shape as examples/pyramid.cog: row n has width-n spaces and 2n-1 stars.
+// The height is the length of the first argument (the WASI backend has no str::to_int).
+fn row(n: int, height: int) -> nil {
+    var spaces = height - n;
+    while spaces > 0 { io::print(" ")!!; spaces -= 1; }
+    var stars = 2 * n - 1;
+    while stars > 0 { io::print("*")!!; stars -= 1; }
+    io::println("")!!;
+}
+
+fn main(args: str[]) -> nil {
+    var height = 5;
+    if args.len() > 0 { height = args[0].len(); }
+    var n = 1;
+    var total = 0;
+    while n <= height { row(n, height)!!; total += 2 * n - 1; n += 1; }
+    io::print("total stars: ")!!;
+    io::println(total)!!;
+}

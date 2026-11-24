@@ -13,7 +13,7 @@ remaining release acceptance gates, and the next language goals. See the [langua
   source maps, a generational graph heap, iterative cycle collection, and
   optional execution limits. The optional object-count limit is not a byte or
   whole-process memory limit.
-- Portable `.cogb` v38 artifacts with bounded decoding and structural
+- Portable `.cogb` v39 artifacts (v38 files are still accepted) with bounded decoding and structural
   verification. The VM checks declared callable argument/result types at call
   boundaries; static value-flow verification is still in progress.
 - Packages, KDL configuration, path/archive/user-store dependencies, `cog.lock`,
@@ -163,6 +163,23 @@ thread-safe scheduler wakeups. Detach and async closures remain future work.
 4. Implement Windows process-tree termination to match Unix process-group
    cancellation. Buffered TCP framing helpers and detached tasks need separate memory,
    ownership, cancellation, and shutdown contracts.
+5. Add runtime struct type tests (`when value is Struct` currently reports
+   E2001) and a way to unwrap an optional struct field. Without them a
+   user-written `Clone` cannot copy recursive or optional struct fields. Decide
+   whether struct `==` and `.clone()` should exist; today `==` fails at run time
+   with `type mismatch` and `cog check` does not report it.
+6. Fix the follow-up diagnostic `unknown trait $symbol9`, which appears after
+   "`Trait` is private to module" and exposes an internal name.
+7. Bound the compile-time cost of the mutability analysis. `cog check` of the
+   `cogweb` library takes about 10 seconds, and a server of roughly 550 lines
+   built on it does not finish within minutes, while ordinary programs check in
+   milliseconds. The cost is superlinear in helper calls over struct and Map values.
+8. Extend the WASI backend only by owner decision: `str::to_int`, `str::builder`
+   and `replace` are small steps; arrays, structs and `Map` change the supported
+   scope documented in [WebAssembly](docs/WEBASSEMBLY.md). A browser-hosted compiler
+   and VM are not implemented.
+9. Move the tutorial server to Cog on `packages/cogweb` (in progress): remaining
+   work is test parity with the former Node server and the CI time budget.
 
 ## Readiness
 
