@@ -124,6 +124,116 @@ fn effects_cross_helpers_aliases_returns_and_recursive_cycles() {
 }
 
 #[test]
+fn effects_reach_callers_through_helper_chains_settled_in_later_iterations() {
+    // Each level only learns its callee's effect after the previous fixed-point
+    // iteration, while unrelated helpers have already settled.
+    let chain = "fn level0(a) { a << 2; } fn level1(a) { level0(a); } \
+                 fn level2(a) { level1(a); } fn level3(a) { level2(a); } \
+                 fn level4(a) { level3(a); } fn settled(a) { a }";
+    rejects(
+        &format!("{chain} fn main() {{ const a = [1]; level4(settled(a)); }}"),
+        "cannot mutate",
+    );
+    rejects(
+        &format!(
+            "{chain} fn pick(a, b) {{ settled(a); level4(b); }} \
+             fn main() {{ var a = [1]; const b = [2]; pick(a, b); a << 3; }}"
+        ),
+        "cannot mutate",
+    );
+    rejects(
+        "fn bottom(a) { a } fn middle(a) { bottom(a) } fn top(a) { middle(a) } \
+         fn main() { const a = [1]; top(a) << 2; }",
+        "cannot mutate",
+    );
+    // The local is mutated only through the deepest helper; it must not be
+    // reported as needing `const`.
+    assert_eq!(
+        run(&format!(
+            "{chain} fn main() {{ var a = [1]; level4(a); io::println(a); }}"
+        )),
+        "[1, 2]\n"
+    );
+}
+
+#[test]
+fn map_helpers_keep_effects_through_generic_specializations() {
+    let helpers = "use collections; use clone::Clone; \
+        fn with_entry(items: collections::Map[str, str], key: str) -> collections::Map[str, str] { \
+            items.set(key, key)!!; items } \
+        fn copied_entry(items: collections::Map[str, str], key: str) -> collections::Map[str, str] { \
+            var copy = items.clone(); copy.set(key, key)!!; copy } \
+        fn twice(items: collections::Map[str, str]) -> collections::Map[str, str] { \
+            with_entry(with_entry(items, \"a\")!!, \"b\")!! } \
+        fn copied_twice(items: collections::Map[str, str]) -> collections::Map[str, str] { \
+            copied_entry(copied_entry(items, \"a\")!!, \"b\")!! }";
+    rejects(
+        &format!(
+            "{helpers} fn main() {{ const items = collections::Map::new[str, str](); twice(items)!!; }}"
+        ),
+        "cannot mutate",
+    );
+    assert_eq!(
+        run(&format!(
+            "{helpers} fn main() {{ const items = collections::Map::new[str, str](); \
+             io::println(copied_twice(items)!!.len()); io::println(items.len()); }}"
+        )),
+        "2\n0\n"
+    );
+}
+
+#[test]
+fn chained_helpers_over_map_records_keep_effects_and_check_quickly() {
+    // Generic map internals store scalar fields such as hashes and links.
+    // Their declared types keep those fields free of reference capabilities,
+    // so repeated helper calls do not multiply symbolic heap contents.
+    let helpers = "use collections; use clone::Clone; \
+        struct Response { status: int, headers: collections::Map[str, str], body: str } \
+        fn with_header(response: Response, name: str, value: str) -> Response { \
+            var headers = response.headers.clone(); \
+            var old: str[] = []; \
+            for entry in headers.entries() { if entry.0 == name { old << entry.0; } } \
+            for key in old { headers.remove(key)!!; } \
+            headers.set(name, value)!!; \
+            Response(status: response.status, headers: headers, body: response.body) } \
+        fn decorate(response: Response, strict: bool) -> Response { \
+            var result = with_header(response, \"a\", \"1\")!!; \
+            if strict { result = with_header(result, \"b\", \"2\")!!; } \
+            else { result = with_header(result, \"c\", \"3\")!!; } \
+            result = with_header(result, \"d\", \"4\")!!; \
+            result = with_header(result, \"e\", \"5\")!!; \
+            if strict { result = with_header(result, \"f\", \"6\")!!; } \
+            result = with_header(result, \"g\", \"7\")!!; \
+            result = with_header(result, \"a\", \"8\")!!; \
+            result }";
+    let started = std::time::Instant::now();
+    assert_eq!(
+        run(&format!(
+            "{helpers} fn main() {{ \
+             const original = Response(status: 200, headers: collections::Map::new[str, str](), body: \"\"); \
+             const strict = decorate(original, true)!!; \
+             const relaxed = decorate(original, false)!!; \
+             io::println(strict.headers.len()); io::println(relaxed.headers.len()); \
+             io::println(original.headers.len()); }}"
+        )),
+        "6\n5\n0\n"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(60),
+        "mutability analysis took {:?}",
+        started.elapsed()
+    );
+    rejects(
+        &format!(
+            "{helpers} fn main() {{ \
+             const original = Response(status: 200, headers: collections::Map::new[str, str](), body: \"\"); \
+             original.headers.set(\"x\", \"y\")!!; }}"
+        ),
+        "cannot mutate",
+    );
+}
+
+#[test]
 fn local_constants_and_default_arguments_are_checked_in_declaration_context() {
     rejects(
         "fn mutate(a) { const b = a; b << 2; } fn main() { var a = [1]; mutate(a); }",
@@ -815,5 +925,153 @@ fn repeated_allocations_do_not_clear_capabilities_of_escaped_older_objects() {
     rejects(
         "fn make() { { item: [2] } } fn main() { var saved = { item: [0] }; const a = [1]; for i in 0..2 { var fresh = make(); if i == 0 { fresh.item = a; saved = fresh; } else { saved.item << 3; } } }",
         "cannot mutate",
+    );
+}
+
+/// Helpers whose mutation effect on the first parameter becomes visible only
+/// after several fixed-point iterations; every level needs one more iteration
+/// than its callee.
+const LATE_CHAIN: &str = "fn level0(a: int[]) { a << 2; } fn level1(a: int[]) { level0(a); } \
+     fn level2(a: int[]) { level1(a); } fn level3(a: int[]) { level2(a); } \
+     fn level4(a: int[]) { level3(a); }";
+
+/// Helpers that return their argument; the alias becomes visible one level
+/// per fixed-point iteration.
+const LATE_ALIAS: &str = "fn bottom(a: int[]) -> int[] { a } fn middle(a: int[]) -> int[] { bottom(a) } \
+     fn top(a: int[]) -> int[] { middle(a) }";
+
+#[test]
+fn indirect_calls_depend_on_late_settling_function_value_candidates() {
+    // Arguments of indirect calls are treated as mutated conservatively, so the
+    // late effect travels through a global that the target rebinds.
+    let chain = "const protected = [10]; var shared = [1]; \
+         fn step0() -> nil { SET } fn step1() -> nil { step0(); } \
+         fn step2() -> nil { step1(); } fn step3() -> nil { step2(); } \
+         fn step4() -> nil { step3(); }";
+    for (apply, call) in [
+        (
+            "fn apply(f: fn() -> nil) -> nil { (f)(); }",
+            "apply(step4);",
+        ),
+        (
+            "fn apply() -> nil { const f: fn() -> nil = step4; (f)(); }",
+            "apply();",
+        ),
+    ] {
+        rejects(
+            &format!(
+                "{} {apply} fn main() {{ {call} shared << 99; }}",
+                chain.replace("SET", "shared = protected;")
+            ),
+            "cannot mutate",
+        );
+        assert_eq!(
+            run(&format!(
+                "{} {apply} fn main() {{ {call} shared << 99; io::println(shared); }}",
+                chain.replace("SET", "shared = [5];")
+            )),
+            "[5, 99]\n",
+            "{call}"
+        );
+    }
+}
+
+#[test]
+fn closures_depend_on_late_settling_helpers_called_in_their_bodies() {
+    let wrapper = "fn wrapper(a: int[]) { var local = a; \
+                   const f = fn[var local]() -> int { level4(local); 0 }; (f)(); }";
+    rejects(
+        &format!("{LATE_CHAIN} {wrapper} fn main() {{ const a = [1]; wrapper(a); }}"),
+        "cannot mutate",
+    );
+    assert_eq!(
+        run(&format!(
+            "{LATE_CHAIN} {wrapper} fn main() {{ var a = [1]; wrapper(a); io::println(a); }}"
+        )),
+        "[1, 2]\n"
+    );
+}
+
+#[test]
+fn user_defined_iteration_depends_on_late_settling_protocol_helpers() {
+    for protocol in ["next", "current"] {
+        let (next, current) = if protocol == "next" {
+            ("level4(self.values);", "")
+        } else {
+            ("", "level4(self.values);")
+        };
+        let declarations = format!(
+            r#"
+            use iter;
+            {LATE_CHAIN}
+            struct Source {{ values: int[] }}
+            struct Cursor {{ values: int[], position: int }}
+            extend Source with iter::IntoIterator[Cursor, int] {{
+                fn into_iter(self) -> Cursor {{ Cursor(self.values, 0) }}
+            }}
+            extend Cursor with iter::Iterator[int] {{
+                fn next(mut self) -> bool {{
+                    {next}
+                    if self.position > 0 {{ return false; }}
+                    self.position += 1;
+                    true
+                }}
+                fn current(self) -> int {{ {current} self.position }}
+            }}
+            fn drain(source: Source) {{ for value in source {{ value; }} }}
+            "#
+        );
+        rejects(
+            &format!("{declarations} fn main() {{ const a = [1]; drain(Source(a)); }}"),
+            "cannot mutate",
+        );
+        assert_eq!(
+            run(&format!(
+                "{declarations} fn main() {{ var a = [1]; drain(Source(a)); io::println(a); }}"
+            )),
+            if protocol == "next" {
+                "[1, 2, 2]\n"
+            } else {
+                "[1, 2]\n"
+            },
+            "{protocol}"
+        );
+    }
+}
+
+#[test]
+fn mutual_recursion_exposes_effects_after_extra_iterations() {
+    let cycle = "fn ping(a: int[], n: int) { if n > 0 { pong(a, n - 1); } } \
+                 fn pong(a: int[], n: int) { level4(a); ping(a, n); }";
+    rejects(
+        &format!("{LATE_CHAIN} {cycle} fn main() {{ const a = [1]; ping(a, 1); }}"),
+        "cannot mutate",
+    );
+    assert_eq!(
+        run(&format!(
+            "{LATE_CHAIN} {cycle} fn main() {{ var a = [1]; ping(a, 1); io::println(a); }}"
+        )),
+        "[1, 2]\n"
+    );
+}
+
+#[test]
+fn global_initializers_depend_on_late_settling_alias_helpers() {
+    // The global aliases a constant only through a late-settling helper chain;
+    // the reader's returned capability must follow once that alias is visible.
+    rejects(
+        &format!(
+            "{LATE_ALIAS} const protected = [1]; var shared: int[] = top(protected); \
+             fn reader() -> int[] {{ shared }} fn main() {{ reader() << 2; }}"
+        ),
+        "cannot mutate",
+    );
+    assert_eq!(
+        run(&format!(
+            "{LATE_ALIAS} var base: int[] = [1]; var shared: int[] = top(base); \
+             fn reader() -> int[] {{ shared }} \
+             fn main() {{ reader() << 2; io::println(base); }}"
+        )),
+        "[1, 2]\n"
     );
 }

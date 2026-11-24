@@ -1365,6 +1365,26 @@ pub(crate) fn check_with_methods_and_names(
     function_modules: &HashMap<String, String>,
     names: &BTreeMap<String, String>,
 ) -> CheckResult {
+    check_program(program, function_modules, names, true)
+}
+
+/// Resolves calls and specializations for clients that discard diagnostics.
+/// The interprocedural mutability pass only produces diagnostics, so it is
+/// skipped here.
+pub(crate) fn resolve_methods_and_names(
+    program: &Program,
+    function_modules: &HashMap<String, String>,
+    names: &BTreeMap<String, String>,
+) -> CheckResult {
+    check_program(program, function_modules, names, false)
+}
+
+fn check_program(
+    program: &Program,
+    function_modules: &HashMap<String, String>,
+    names: &BTreeMap<String, String>,
+    effects: bool,
+) -> CheckResult {
     let mut c = Checker {
         functions: HashMap::new(),
         traits: HashMap::new(),
@@ -1708,8 +1728,10 @@ pub(crate) fn check_with_methods_and_names(
             _ => {}
         }
     }
-    c.diagnostics
-        .extend(crate::mutability::check(program, &c.access_facts));
+    if effects {
+        c.diagnostics
+            .extend(crate::mutability::check(program, &c.access_facts));
+    }
     CheckResult {
         diagnostics: c.diagnostics,
         method_calls: c.method_calls,
@@ -2246,6 +2268,15 @@ impl<'a> Checker<'a> {
             .get(trait_name)
             .map(|declaration| (*declaration).clone())
         else {
+            // A trait path the resolver already rejected is bound to a poisoned
+            // placeholder; its diagnostic was reported, so do not cascade.
+            if self
+                .globals
+                .get(trait_name)
+                .is_some_and(|binding| binding.ty == Type::Poison)
+            {
+                return;
+            }
             self.error(
                 "E1002",
                 format!("unknown trait `{trait_name}`"),

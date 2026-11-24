@@ -4020,3 +4020,28 @@ fn imported_generic_structs_keep_their_types_across_module_boundaries() {
     );
     assert_eq!(f.run(), "42\n");
 }
+
+#[test]
+fn private_trait_in_extend_reports_only_the_privacy_error() {
+    let f = Fixture::new();
+    f.write(
+        "describe.cog",
+        "trait Describe { fn describe(self) -> str; }",
+    );
+    f.write(
+        "main.cog",
+        r#"
+        use describe;
+        struct Local { n: int }
+        extend Local with describe::Describe {
+            fn describe(self) -> str { "local" }
+        }
+        fn main() {}
+        "#,
+    );
+    let error = f.compile().unwrap_err();
+    assert!(error.contains("`Describe` is private"), "{error}");
+    assert!(!error.contains("unknown trait"), "{error}");
+    assert!(!error.contains("$symbol"), "{error}");
+    assert_eq!(error.matches("error[").count(), 1, "{error}");
+}

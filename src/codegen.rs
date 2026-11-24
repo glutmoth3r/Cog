@@ -3452,6 +3452,9 @@ impl<'a> Codegen<'a> {
         let saved_error_handler = self.error_handler.take();
         let saved_cleanup_boundary = self.cleanup_boundary.take();
         let implicit_propagation = std::mem::replace(&mut self.implicit_propagation, false);
+        // Arguments belong to the caller; the body keeps the callee as a
+        // logical frame for runtime Error provenance.
+        let outer_inline_frame = self.out.enter_inline(name);
         let result = (|| {
             let mut deferred = self.active_defers.clone();
             for binding in &function.bindings {
@@ -3459,6 +3462,7 @@ impl<'a> Codegen<'a> {
             }
             self.compile_expr(function.body, scopes)
         })();
+        self.out.leave_inline(outer_inline_frame);
         self.cleanup_boundary = saved_cleanup_boundary;
         self.error_handler = saved_error_handler;
         self.implicit_propagation = implicit_propagation;

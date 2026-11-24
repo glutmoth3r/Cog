@@ -9,7 +9,9 @@ as an instruction result. The record includes the bytecode instruction, the
 source file and coordinates when present, the executing Cog function, and the
 import identity when a native call produced the Error. It also saves the
 active synchronous callers, innermost first. Returning an Error records the
-call site, and a propagating return records the propagation site. An Error
+call site, and a propagating return records the propagation site. When the
+caller propagates automatically at the call expression that returned the
+Error, both records name the same step, which is recorded once. An Error
 that reaches the program entry boundary also gets an observation record.
 
 ```text
@@ -36,15 +38,35 @@ and suppressed diagnostics. The context clears the previous diagnostic before
 each run. The runtime Error's display text, patterns, and payload access keep
 their existing behavior.
 
-Bytecode version 39 preserves function names alongside source locations.
-Version 38 artifacts remain readable and can report instruction coordinates
-without function names. Instructions without a source span retain their
-bytecode address in the trace.
+When the compiler inlines a function, its body keeps a logical frame. The
+trace names the inlined function at the failing coordinate and marks it
+`(inlined)`. The next frame is its caller at the call expression. Both frames
+refer to the same bytecode instruction, and inlining does not otherwise
+change the function and location sequence. Function names are module
+qualified, as in the example below, when the CLI builds a file or project.
+`ErrorTraceFrame` has an `inlined` boolean, and the serialized record always
+includes it (`false` for ordinary frames).
+
+```text
+runtime error at example.cog:2:35: division by zero
+  origin: example::ratio at example.cog:2:35 (inlined)
+  called from example::work at example.cog:7:26
+```
+
+Bytecode version 40 stores a table of inline frames. Each record contains the
+inlined function name, the optional call-site coordinate, and an optional
+enclosing inline frame with a smaller index. Each source map range can name
+its innermost inline frame. The loader rejects tables that are larger than
+the instruction table, are nested more than 64 deep, contain forward parent
+references, or contain frames that no source map range reaches. Version 39
+artifacts have function names and no inline frames. Version 38 artifacts
+also lack function names and report instruction coordinates only. Both remain
+readable. Instructions without a source span retain their bytecode address in
+the trace.
 
 VM fallback and synchronous runtime calls from compiled code preserve
 provenance. For errors reproduced by the VM after a native fault, the trace
-records the instruction where the VM observed that fault. The format does
-not yet describe logical inlined frames. It records the source span of the
-instruction and the enclosing compiled function. Ordinary Error values from
-async Cog bodies retain their origin. Task creation, observation through
-`await`, and structured joins do not yet add async causal frames.
+records the instruction where the VM observed that fault, including its
+inline frames. Ordinary Error values from async Cog bodies retain their
+origin. Task creation, observation through `await`, and structured joins do
+not yet add async causal frames.

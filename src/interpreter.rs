@@ -61,19 +61,58 @@ impl CaptureValues {
 
 type CallFrame = (usize, usize, CaptureValues, usize, usize, usize);
 
+/// The innermost logical frame of an instruction. Propagation and observation
+/// sites use one frame each.
 fn trace_frame(artifact: &CompiledProgram, entry: usize, pc: usize) -> ErrorTraceFrame {
-    ErrorTraceFrame {
-        instruction: pc,
-        function: artifact.functions.get(&entry).cloned(),
-        location: artifact.source_location(pc).cloned(),
-        native_operation: match artifact.instructions.get(pc) {
-            Some(Instruction::CallNative(index)) => artifact
-                .imports
-                .get(*index)
-                .map(|import| import.name().to_owned()),
-            _ => None,
-        },
-    }
+    let mut frames = trace_frames(artifact, entry, pc);
+    frames
+        .next()
+        .expect("every instruction has a physical frame")
+}
+
+/// Logical frames of an instruction, innermost first: inlined callees followed
+/// by the compiled function that contains `pc`.
+fn trace_frames(
+    artifact: &CompiledProgram,
+    entry: usize,
+    pc: usize,
+) -> impl Iterator<Item = ErrorTraceFrame> + '_ {
+    let source = artifact.source_entry(pc);
+    let mut location = source.map(|source| source.location.clone());
+    let mut inline = source.and_then(|source| source.inline);
+    let mut native_operation = match artifact.instructions.get(pc) {
+        Some(Instruction::CallNative(index)) => artifact
+            .imports
+            .get(*index)
+            .map(|import| import.name().to_owned()),
+        _ => None,
+    };
+    let mut physical_done = false;
+    std::iter::from_fn(move || {
+        if physical_done {
+            return None;
+        }
+        let frame = inline.and_then(|index| artifact.inline_frames.get(index));
+        let function = match frame {
+            Some(frame) => Some(frame.function.clone()),
+            None => {
+                physical_done = true;
+                artifact.functions.get(&entry).cloned()
+            }
+        };
+        let next = ErrorTraceFrame {
+            instruction: pc,
+            function,
+            location: match frame {
+                Some(frame) => std::mem::replace(&mut location, frame.call_site.clone()),
+                None => location.take(),
+            },
+            native_operation: native_operation.take(),
+            inlined: frame.is_some(),
+        };
+        inline = frame.and_then(|frame| frame.parent);
+        Some(next)
+    })
 }
 
 #[cold]
@@ -88,21 +127,59 @@ fn trace_error(
     if artifact.source_map.is_empty() || error.provenance().is_some() {
         return;
     }
-    let mut callers = frames
-        .iter()
-        .rev()
-        .chain(bridge_callers.iter().rev())
-        .filter_map(|(return_pc, _, _, _, entry, _)| {
-            let pc = return_pc.checked_sub(1)?;
-            Some(trace_frame(artifact, *entry, pc))
-        });
+    let mut logical = trace_frames(artifact, entry, pc);
+    let origin = logical
+        .next()
+        .expect("every instruction has a physical frame");
+    let mut callers = logical.chain(
+        frames
+            .iter()
+            .rev()
+            .chain(bridge_callers.iter().rev())
+            .filter_map(|(return_pc, _, _, _, entry, _)| {
+                let pc = return_pc.checked_sub(1)?;
+                Some(trace_frames(artifact, *entry, pc))
+            })
+            .flatten(),
+    );
     error.attach_provenance(ErrorProvenance {
-        origin: trace_frame(artifact, entry, pc),
+        origin,
         callers: callers.by_ref().take(MAX_ERROR_TRACE_FRAMES).collect(),
         propagation: Vec::new(),
         observation: None,
         truncated: callers.next().is_some(),
     });
+}
+
+/// Records the site of a propagating return. A caller that propagates
+/// automatically from the call expression that just returned the Error is
+/// already named by the call-site record, so that step is recorded once.
+/// A later or different propagation site in the same function stays distinct.
+#[cold]
+fn record_propagation_site(
+    error: &mut RuntimeError,
+    artifact: &CompiledProgram,
+    callable: std::ops::Range<usize>,
+    pc: usize,
+) {
+    let site = trace_frame(artifact, callable.start, pc);
+    let continues_call = error
+        .provenance()
+        .and_then(|trace| trace.propagation.last())
+        .is_some_and(|call| {
+            call.location.is_some()
+                && call.location == site.location
+                && call.function == site.function
+                && call.inlined == site.inlined
+                && callable.contains(&call.instruction)
+                && matches!(
+                    artifact.instructions.get(call.instruction),
+                    Some(Instruction::Call(..) | Instruction::CallValue(_))
+                )
+        });
+    if !continues_call {
+        error.record_propagation(site);
+    }
 }
 
 struct VmContinuation {
@@ -6119,7 +6196,12 @@ fn execute_vm(
                         );
                         if error.provenance().is_some() {
                             if propagates {
-                                error.record_propagation(trace_frame(artifact, callable_start, pc));
+                                record_propagation_site(
+                                    error,
+                                    artifact,
+                                    callable_start..callable_end,
+                                    pc,
+                                );
                             }
                             if let Some((return_pc, _, _, _, entry, _)) = call_stack.last() {
                                 error.record_propagation(trace_frame(

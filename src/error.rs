@@ -18,6 +18,9 @@ pub struct ErrorTraceFrame {
     pub function: Option<String>,
     pub location: Option<SourceLocation>,
     pub native_operation: Option<String>,
+    /// The compiler inlined this function into the next frame; both frames
+    /// share the bytecode instruction.
+    pub inlined: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -149,6 +152,9 @@ impl std::fmt::Display for ErrorTraceFrame {
         }
         if let Some(operation) = &self.native_operation {
             write!(f, " (native {})", operation.escape_debug())?;
+        }
+        if self.inlined {
+            write!(f, " (inlined)")?;
         }
         Ok(())
     }

@@ -329,12 +329,16 @@ pub(crate) fn optimize(program: &CompiledProgram) -> CompiledProgram {
         return program.clone();
     };
 
+    // Removed instructions can leave inline frames without a source range.
+    let inline_frames =
+        crate::backend::retain_referenced_inline_frames(&program.inline_frames, &mut source_map);
     let mut optimized = CompiledProgram {
         instructions: rewritten,
         imports: program.imports.clone(),
         functions,
         callables,
         source_map,
+        inline_frames,
     };
     compact_local_slots(&mut optimized);
     optimized
@@ -934,11 +938,14 @@ fn fold_binary(instruction: &Instruction, left: Fact, right: Fact) -> Option<Fac
         .and_then(Fact::from_value)
 }
 
+/// Source coordinate and innermost inline frame of one instruction.
+type SourcePoint = (crate::diagnostic::SourceLocation, Option<usize>);
+
 fn source_location(
     program: &CompiledProgram,
     pc: usize,
     source_index: &mut usize,
-) -> Option<crate::diagnostic::SourceLocation> {
+) -> Option<SourcePoint> {
     while program
         .source_map
         .get(*source_index)
@@ -950,23 +957,24 @@ fn source_location(
         .source_map
         .get(*source_index)
         .filter(|entry| entry.start <= pc && pc < entry.end)
-        .map(|entry| entry.location.clone())
+        .map(|entry| (entry.location.clone(), entry.inline))
 }
 
 fn push_instruction(
     instructions: &mut Vec<Instruction>,
     source_map: &mut Vec<SourceMapEntry>,
     instruction: Instruction,
-    location: Option<crate::diagnostic::SourceLocation>,
+    location: Option<SourcePoint>,
 ) {
     let pc = instructions.len();
     instructions.push(instruction);
-    let Some(location) = location else {
+    let Some((location, inline)) = location else {
         return;
     };
     if let Some(previous) = source_map.last_mut()
         && previous.end == pc
         && previous.location == location
+        && previous.inline == inline
     {
         previous.end += 1;
     } else {
@@ -974,6 +982,7 @@ fn push_instruction(
             start: pc,
             end: pc + 1,
             location,
+            inline,
         });
     }
 }

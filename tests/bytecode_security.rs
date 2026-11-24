@@ -1,4 +1,4 @@
-use cog::backend::{CallableSignature, CompiledProgram, SourceMapEntry};
+use cog::backend::{CallableSignature, CompiledProgram, InlineFrame, SourceMapEntry};
 use cog::diagnostic::SourceLocation;
 use cog::instruction::{Instruction as I, ValueType};
 use cog::runtime::NativeImport;
@@ -50,7 +50,8 @@ fn untrusted_instructions(instruction_count: usize, encoded: &[u8]) -> Vec<u8> {
     let seed = CompiledProgram::new((0..instruction_count).map(|_| I::Halt).collect());
     let mut bytes = bytecode::encode(&seed).expect("valid seed artifact should encode");
     let instruction_start = 20; // Fixed header with empty import and callable tables.
-    let diagnostic_tables_start = bytes.len() - 8;
+    // Empty function name, inline frame, and source map tables.
+    let diagnostic_tables_start = bytes.len() - 12;
     bytes.splice(
         instruction_start..diagnostic_tables_start,
         encoded.iter().copied(),
@@ -124,7 +125,7 @@ fn typed_aggregate_metadata_is_bounded_canonical_and_versioned() {
     assert!(
         bytecode::decode(&legacy)
             .unwrap_err()
-            .contains("unsupported bytecode version 10; expected 39")
+            .contains("unsupported bytecode version 10; expected 40")
     );
 }
 
@@ -2488,6 +2489,7 @@ fn untrusted_source_map_names_cannot_inject_terminal_controls() {
             line: 1,
             column: 1,
         },
+        inline: None,
     });
     let bytes = bytecode::encode(&program).unwrap();
     let nonce = std::time::SystemTime::now()
@@ -2511,5 +2513,115 @@ fn untrusted_source_map_names_cannot_inject_terminal_controls() {
     assert!(
         !stderr.contains('\u{1b}'),
         "raw terminal escape in {stderr:?}"
+    );
+}
+
+#[test]
+fn inline_frame_tables_are_bounded_acyclic_and_canonical() {
+    let location = |line| SourceLocation {
+        file: "inline.cog".into(),
+        line,
+        column: 1,
+    };
+    let frame = |function: &str, parent| InlineFrame {
+        function: function.into(),
+        call_site: Some(location(1)),
+        parent,
+    };
+    let program = |frames: Vec<InlineFrame>, inline| {
+        let mut program = CompiledProgram::new(vec![I::Push(Value::Nil), I::Halt]);
+        program.source_map.push(SourceMapEntry {
+            start: 0,
+            end: 2,
+            location: location(2),
+            inline,
+        });
+        program.inline_frames = frames;
+        program
+    };
+
+    let nested = program(vec![frame("outer", None), frame("inner", Some(0))], Some(1));
+    let encoded = bytecode::encode(&nested).unwrap();
+    assert_eq!(
+        bytecode::decode(&encoded).unwrap().inline_frames,
+        nested.inline_frames
+    );
+
+    rejected(
+        program(vec![frame("a", None)], Some(1)),
+        "missing inline frame",
+    );
+    rejected(program(vec![frame("a", Some(0))], Some(0)), "precede");
+    rejected(
+        program(vec![frame("a", Some(1)), frame("b", None)], Some(0)),
+        "precede",
+    );
+    rejected(program(vec![frame("a", None)], None), "unreferenced");
+    rejected(
+        program(vec![frame("a", None), frame("b", None)], Some(1)),
+        "unreferenced",
+    );
+    rejected(program(vec![frame("", None)], Some(0)), "function name");
+    let mut unlocated = frame("a", None);
+    unlocated.call_site = Some(location(0));
+    rejected(program(vec![unlocated], Some(0)), "call site");
+    rejected(
+        program(
+            vec![frame("a", None), frame("b", None), frame("c", None)],
+            Some(2),
+        ),
+        "inline frame count",
+    );
+
+    let mut deep = CompiledProgram::new(vec![I::Push(Value::Nil); 70]);
+    deep.instructions.push(I::Halt);
+    deep.inline_frames = (0..65_usize)
+        .map(|index| frame("deep", index.checked_sub(1)))
+        .collect();
+    deep.source_map.push(SourceMapEntry {
+        start: 0,
+        end: 1,
+        location: location(1),
+        inline: Some(64),
+    });
+    rejected(deep, "too deep");
+
+    // A corrupt parent index in an encoded artifact fails during loading.
+    let mut corrupt = encoded;
+    let inner = corrupt
+        .windows(5)
+        .position(|window| window == b"inner")
+        .unwrap();
+    corrupt[inner + 5..inner + 9].copy_from_slice(&3u32.to_le_bytes());
+    assert!(bytecode::decode(&corrupt).unwrap_err().contains("precede"));
+}
+
+#[path = "fixtures/verifier_vm_differential.rs"]
+mod verifier_vm_differential;
+
+#[test]
+fn verifier_facts_agree_with_vm_scalars_and_errors() {
+    verifier_vm_differential::run_profile(
+        verifier_vm_differential::Profile::Scalars,
+        0x9E37_79B9_7F4A_7C15,
+        160,
+    );
+}
+
+#[test]
+fn verifier_facts_agree_with_vm_aggregates_and_aliasing() {
+    verifier_vm_differential::run_profile(
+        verifier_vm_differential::Profile::Aggregates,
+        0xD1B5_4A32_D192_ED03,
+        160,
+    );
+}
+
+#[test]
+fn verifier_facts_agree_with_vm_calls_closures_and_loops() {
+    verifier_vm_differential::run_profile(
+        verifier_vm_differential::Profile::Calls,
+        0x94D0_49BB_1331_11EB,
+        160,
     );
 }

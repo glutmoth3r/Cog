@@ -255,6 +255,8 @@ calls run once per visited element and stop at the first propagated Error.
 A successful find may return a stored nil. These calls share the
 reference access rules for map, filter, and fold above.
 
+Related helpers: `clone::value(item)` returns `item.clone()` for any type implementing `Clone`. `text_order::compare(left, right)` compares two strings by UTF-8 bytes and returns -1, 0, or 1. `hash::of(value)` returns an int hash for int, uint, bigint, bool, char, or str values (other types produce TypeMismatch); the hash is seeded per process, so do not persist it. `str::to_char(text)` converts a one-scalar string to char, returns a char unchanged, and produces ParseFailure for empty or longer strings.
+
 ## Collections
 
 `collections::Map[K, V]` is an insertion-ordered hash table. Its
@@ -769,6 +771,8 @@ separator according to the host OS.
 | --- | --- |
 | `task::select(tasks)` | Cold `Task[int]`; returns the index of the first completed task in a nonempty array of spawned siblings |
 | `task::select2(first, second)` | Cold `Task[int]`; two-task form of `task::select` |
+
+`spawn(task)` queues a task as a structured child of the current async function, and `yield_now()` returns a cold `Task[nil]` that gives other ready tasks a turn when awaited.
 
 Every input must already be a spawned child of the same async scope. Await the
 selected handle to observe its result or Error; the structured parent still joins

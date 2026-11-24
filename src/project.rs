@@ -997,7 +997,12 @@ pub fn compile_library_with_inputs_and_warnings(
     }
     let mut compiled = crate::codegen::compile_library(&program, names)
         .map_err(|error| render(error.diagnostics))?;
-    for name in compiled.functions.values_mut() {
+    for name in compiled.functions.values_mut().chain(
+        compiled
+            .inline_frames
+            .iter_mut()
+            .map(|frame| &mut frame.function),
+    ) {
         if let Some(original) = names.get(name) {
             *name = original.clone();
         }
@@ -1054,7 +1059,12 @@ pub fn compile_with_inputs_and_warnings(
     let warnings = crate::lint::check_with_names(&program, names);
     let mut compiled =
         crate::codegen::compile_with_names(&program, names).map_err(|e| render(e.diagnostics))?;
-    for name in compiled.functions.values_mut() {
+    for name in compiled.functions.values_mut().chain(
+        compiled
+            .inline_frames
+            .iter_mut()
+            .map(|frame| &mut frame.function),
+    ) {
         if let Some(original) = names.get(name) {
             *name = original.clone();
         }

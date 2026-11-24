@@ -1560,3 +1560,43 @@ fn jit_bridge_does_not_replay_effects_on_terminal_failure() {
     );
     std::fs::remove_file(&profile).unwrap();
 }
+
+#[test]
+fn jit_and_vm_report_the_same_inlined_error_frames() {
+    let artifact = project::compile_source(
+        "jit-inline.cog",
+        r#"
+        @!include("std") use io;
+        fn ratio(a: int, b: int) -> int { a / b }
+        @inline("never")
+        fn work(n: int) -> int {
+            var i = 0;
+            var sum = 0;
+            while i < n { sum += ratio(100, n - 1 - i); i += 1; }
+            sum
+        }
+        fn main() -> nil {
+            const total = work(10000)!!;
+            io::println(total);
+        }
+        "#,
+    )
+    .unwrap();
+    let artifact = cog::bytecode::decode(&cog::bytecode::encode(&artifact).unwrap()).unwrap();
+    assert!(!artifact.inline_frames.is_empty());
+    let run = |jit| {
+        let mut output = Vec::new();
+        let mut context = RuntimeContext::new(&mut output, VmCapabilities::default());
+        context.configure_jit(jit, None, false);
+        let error = interpreter::run_with_context(&artifact, &mut context).unwrap_err();
+        let diagnostic = context.last_runtime_diagnostic().cloned().unwrap();
+        drop(context);
+        (error.to_string(), output, diagnostic)
+    };
+    let vm = run(false);
+    let trace = vm.2.provenance.as_ref().unwrap();
+    assert_eq!(trace.origin.function.as_deref(), Some("ratio"));
+    assert!(trace.origin.inlined);
+    assert_eq!(trace.callers[0].function.as_deref(), Some("work"));
+    assert_eq!(run(true), vm);
+}

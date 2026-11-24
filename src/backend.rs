@@ -20,6 +20,9 @@ pub struct CompiledProgram {
     pub functions: BTreeMap<usize, String>,
     pub callables: BTreeMap<usize, CallableSignature>,
     pub source_map: Vec<SourceMapEntry>,
+    /// Logical frames of callees whose bodies the compiler inlined. Source map
+    /// entries refer to the innermost frame by index.
+    pub inline_frames: Vec<InlineFrame>,
 }
 
 /// A half-open instruction range attributed to one source coordinate.
@@ -28,6 +31,62 @@ pub struct SourceMapEntry {
     pub start: usize,
     pub end: usize,
     pub location: crate::diagnostic::SourceLocation,
+    /// Innermost inlined callee that produced these instructions, if any.
+    pub inline: Option<usize>,
+}
+
+/// One inlined call. The frame has no VM call record: its caller is `parent`,
+/// or the compiled function containing the instruction when `parent` is `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineFrame {
+    pub function: String,
+    /// Source coordinate of the call expression in the caller.
+    pub call_site: Option<crate::diagnostic::SourceLocation>,
+    /// Enclosing inline frame. It always has a smaller index.
+    pub parent: Option<usize>,
+}
+
+/// Drops frames that no source map entry reaches and renumbers the rest in
+/// their original order, so parents keep smaller indices.
+pub(crate) fn retain_referenced_inline_frames(
+    frames: &[InlineFrame],
+    source_map: &mut [SourceMapEntry],
+) -> Vec<InlineFrame> {
+    let mut used = vec![false; frames.len()];
+    for entry in source_map.iter() {
+        let mut current = entry.inline;
+        while let Some(index) = current {
+            // Out-of-range references are left for the bytecode validator.
+            let Some(seen) = used.get_mut(index) else {
+                break;
+            };
+            if std::mem::replace(seen, true) {
+                break;
+            }
+            current = frames[index].parent.filter(|parent| *parent < index);
+        }
+    }
+    let mut renumbered = vec![None; frames.len()];
+    let mut retained = Vec::new();
+    for (index, frame) in frames.iter().enumerate() {
+        if used[index] {
+            renumbered[index] = Some(retained.len());
+            retained.push(InlineFrame {
+                parent: frame
+                    .parent
+                    .and_then(|parent| renumbered.get(parent).copied().flatten()),
+                ..frame.clone()
+            });
+        }
+    }
+    for entry in source_map {
+        if let Some(index) = entry.inline
+            && let Some(renumbered) = renumbered.get(index)
+        {
+            entry.inline = *renumbered;
+        }
+    }
+    retained
 }
 
 /// Runtime call contract. Entries partition the instruction table into regions;
@@ -71,6 +130,8 @@ pub(crate) struct Emitter {
     error: Option<String>,
     source_location: Option<crate::diagnostic::SourceLocation>,
     source_map: Vec<SourceMapEntry>,
+    inline_frames: Vec<InlineFrame>,
+    inline_frame: Option<usize>,
 }
 
 impl Emitter {
@@ -83,6 +144,7 @@ impl Emitter {
             if let Some(last) = self.source_map.last_mut()
                 && last.end == pc
                 && last.location == *location
+                && last.inline == self.inline_frame
             {
                 last.end += 1;
             } else {
@@ -90,6 +152,7 @@ impl Emitter {
                     start: pc,
                     end: pc + 1,
                     location: location.clone(),
+                    inline: self.inline_frame,
                 });
             }
         }
@@ -150,6 +213,21 @@ impl Emitter {
 
     pub fn leave_source(&mut self, previous: Option<crate::diagnostic::SourceLocation>) {
         self.source_location = previous;
+    }
+
+    /// Attributes following instructions to an inlined body of `function`,
+    /// called at the current source coordinate.
+    pub fn enter_inline(&mut self, function: &str) -> Option<usize> {
+        self.inline_frames.push(InlineFrame {
+            function: function.to_owned(),
+            call_site: self.source_location.clone(),
+            parent: self.inline_frame,
+        });
+        self.inline_frame.replace(self.inline_frames.len() - 1)
+    }
+
+    pub fn leave_inline(&mut self, previous: Option<usize>) {
+        self.inline_frame = previous;
     }
 
     pub fn label(&mut self) -> Label {
@@ -333,12 +411,15 @@ impl Emitter {
                 _ => return Err("internal error: invalid bytecode fixup".into()),
             }
         }
+        let inline_frames =
+            retain_referenced_inline_frames(&self.inline_frames, &mut self.source_map);
         let program = CompiledProgram {
             instructions: self.instructions,
             imports,
             functions: self.functions,
             callables: self.callables,
             source_map: self.source_map,
+            inline_frames,
         };
         let optimized = crate::optimizer::optimize(&program);
         match crate::bytecode::validate(&optimized) {
@@ -365,13 +446,16 @@ impl CompiledProgram {
         &self,
         instruction: usize,
     ) -> Option<&crate::diagnostic::SourceLocation> {
+        self.source_entry(instruction).map(|entry| &entry.location)
+    }
+
+    pub fn source_entry(&self, instruction: usize) -> Option<&SourceMapEntry> {
         let index = self
             .source_map
             .partition_point(|entry| entry.end <= instruction);
         self.source_map
             .get(index)
             .filter(|entry| entry.start <= instruction && instruction < entry.end)
-            .map(|entry| &entry.location)
     }
 
     pub fn source_location_before(

@@ -251,6 +251,27 @@ policy. `cog run --restricted` allows stdin/stdout and denies other runtime host
 effects; restricted embedding can disable all host effects. Imports do not grant authority.
 This is a host boundary, not a completed untrusted-package delegation model.
 
+`--restricted` (for both `cog run` and `cog eval`) also applies fixed default runtime
+limits, with no flags or environment variables to change them:
+
+| Limit | Value |
+|-------|-------|
+| `max_steps` | 200,000,000 |
+| `max_heap_objects` | 1,000,000 |
+| `max_call_frames` | 10,000 |
+| `max_buffer_bytes` | 16 MiB |
+| `max_resources` | 16 |
+| `max_slots` / `max_operand_values` | 1,000,000 each |
+| `max_numeric_digits` | 10,000 |
+| standard output | 8 MiB |
+
+The values live in `RuntimeLimits::restricted_defaults()`. Exceeding one ends the run
+with a recoverable runtime resource-limit error (exit code 1); exceeding the output cap
+fails the write with `restricted output limit of 8 MiB exceeded`. Active limits disable
+the JIT, so restricted runs always use the VM. Unrestricted runs are unchanged and set
+no limits. Embedders keep full control through `RunContext::with_limits`; `sdk::Limits`
+still defaults to `None` for every field.
+
 `run_with_context` calls `finish` on every VM exit, including terminal failure.
 Finish closes resources, flushes eligible output, invalidates handles, and is
 idempotent. A finish failure becomes primary after successful execution or secondary
@@ -270,6 +291,7 @@ time, entropy, and processes use native calls rather than dedicated opcodes.
 
 Source diagnostics retain file/line/column origins through frontend linking and
 recover independent errors. The current artifact format carries validated
-serialized source maps. Public runtime APIs are listed in
+serialized source maps and inline frame records; see
+[diagnostics](DIAGNOSTICS.md). Public runtime APIs are listed in
 [standard library](STANDARD_LIBRARY.md);
 cleanup and error boundaries are defined in [errors](ERRORS.md).

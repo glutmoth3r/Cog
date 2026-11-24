@@ -1325,8 +1325,9 @@ fn artifact(imports: &[(&str, u16, &[u8], u8)], instructions: &[u8], count: u32)
     bytes.extend_from_slice(&0u32.to_le_bytes()); // No callable descriptors.
     bytes.extend_from_slice(&count.to_le_bytes());
     bytes.extend_from_slice(instructions);
-    bytes.extend_from_slice(&0u32.to_le_bytes()); // No source map.
     bytes.extend_from_slice(&0u32.to_le_bytes()); // No diagnostic function names.
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // No inline frames.
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // No source map.
     bytes
 }
 

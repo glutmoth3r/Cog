@@ -608,6 +608,8 @@ remains unsupported. `T[N]` and general user-container operators remain future w
 `len(array)` or `array.len()` returns the element count; `len(str)`
 counts Unicode scalars, not UTF-8 bytes.
 
+### User-defined collection iteration
+
 User-defined collection types can participate in `for` loops through the
 `iter::IntoIterator[Iter, Item]` and `iter::Iterator[Item]` traits. Import the
 standard `iter` module, implement `into_iter()` on the collection, then implement
@@ -824,6 +826,7 @@ An executable may define `fn main()` or `fn main(args: str[])`; in the latter
 form, `run` supplies command-line arguments after `--`, excluding the executable
 name. No other `main` parameter signature is supported. `--restricted` denies
 access to `process::args()` and therefore to this argument list.
+`--restricted` also applies fixed runtime limits; see [runtime](RUNTIME.md).
 `use math::{PI, max as larger};` and `use math::*;` are supported. Only `len` and
 `exclusive` are in the ordinary prelude. Imports can also be block-local.
 

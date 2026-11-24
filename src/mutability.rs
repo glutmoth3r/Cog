@@ -105,7 +105,29 @@ impl Access {
         }
     }
     fn union(&mut self, other: &Self) {
-        self.refs.extend(other.refs.iter().cloned());
+        if self.refs.is_empty() {
+            self.refs.clone_from(&other.refs);
+            return;
+        }
+        for reference in &other.refs {
+            if !self.refs.contains(reference) {
+                self.refs.insert(reference.clone());
+            }
+        }
+    }
+    /// Unions `value` as observed through `through`, whose read-only origins
+    /// and local provenance apply to every reference reached through it.
+    fn union_through(&mut self, value: &Self, through: &Reference) {
+        if through.readonly.is_empty() && through.locals.is_empty() {
+            self.union(value);
+            return;
+        }
+        for reference in &value.refs {
+            let mut reference = reference.clone();
+            reference.readonly.extend(through.readonly.iter().cloned());
+            reference.locals.extend(&through.locals);
+            self.refs.insert(reference);
+        }
     }
     fn map(&self, mut f: impl FnMut(&mut Reference)) -> Self {
         Self {
@@ -280,6 +302,8 @@ struct Pass<'a> {
     generic_mutating_targets: HashMap<String, BTreeSet<String>>,
     generic_mutating_methods: HashMap<String, BTreeSet<String>>,
     generic_template: bool,
+    // Summaries read by this pass, used to skip unchanged fixed-point work.
+    dependencies: BTreeSet<String>,
 }
 
 pub(crate) fn check(program: &Program, facts: &Facts) -> Vec<Diagnostic> {
@@ -332,9 +356,20 @@ pub(crate) fn check(program: &Program, facts: &Facts) -> Vec<Diagnostic> {
         .collect();
     // Monotone fixed point, including mutually recursive helpers. Effects are
     // compiler data, not mandatory source annotations or runtime string lookup.
+    // A pass is a deterministic function of the summaries it reads. A function
+    // whose dependencies did not change would recompute the summary already
+    // joined into its entry, so only functions reading changed summaries rerun.
+    let mut dependencies: HashMap<&str, BTreeSet<String>> = HashMap::new();
+    let mut changed: Option<BTreeSet<String>> = None;
     loop {
         let mut next = summaries.clone();
         for function in functions.values() {
+            if let (Some(changed), Some(read)) =
+                (&changed, dependencies.get(function.name.as_str()))
+                && read.is_disjoint(changed)
+            {
+                continue;
+            }
             let mut p = Pass::new(
                 facts,
                 &functions,
@@ -345,13 +380,20 @@ pub(crate) fn check(program: &Program, facts: &Facts) -> Vec<Diagnostic> {
             );
             p.globals(program);
             p.function(function);
+            dependencies.insert(function.name.as_str(), std::mem::take(&mut p.dependencies));
             next.entry(function.name.clone())
                 .or_default()
                 .join(p.summary);
         }
-        if next == summaries {
+        let difference: BTreeSet<String> = next
+            .iter()
+            .filter(|(name, summary)| summaries.get(*name) != Some(*summary))
+            .map(|(name, _)| name.clone())
+            .collect();
+        if difference.is_empty() {
             break;
         }
+        changed = Some(difference);
         summaries = next;
     }
     let mut all_locals = BTreeMap::new();
@@ -457,7 +499,15 @@ impl<'a> Pass<'a> {
             generic_mutating_targets: generic_mutating_targets.clone(),
             generic_mutating_methods: HashMap::new(),
             generic_template: false,
+            dependencies: BTreeSet::new(),
         }
+    }
+    fn summary_for(&mut self, name: &str) -> Option<&'a Summary> {
+        let summary = self.summaries.get(name);
+        if summary.is_some() {
+            self.dependencies.insert(name.to_owned());
+        }
+        summary
     }
     fn kind(&self, expr: &Expr) -> ValueKind {
         self.facts
@@ -616,6 +666,45 @@ impl<'a> Pass<'a> {
                 })
         }
     }
+    /// Heap cells sharing `root`, in heap order. Paths order by root first.
+    fn cells(&self, root: &Root) -> impl Iterator<Item = (&Path, &Access)> {
+        let start = Path {
+            root: root.clone(),
+            keys: vec![],
+        };
+        self.state
+            .heap
+            .range(start..)
+            .take_while(move |(path, _)| &path.root == root)
+    }
+    /// Value of `parent.key`, before applying the capabilities of the
+    /// reference through which `parent` was reached.
+    fn child_value(&self, parent: &Path, key: &Key) -> Access {
+        let child = parent.child(key.clone());
+        let mut value = self
+            .state
+            .heap
+            .get(&child)
+            .cloned()
+            .unwrap_or_else(|| symbolic(child.clone()));
+        for (path, stored) in self.cells(&child.root) {
+            let same_parent = path.keys.len() == child.keys.len()
+                && path.keys[..path.keys.len().saturating_sub(1)]
+                    == child.keys[..child.keys.len().saturating_sub(1)];
+            if same_parent
+                && (key == &Key::AnyIndex || path.keys.last() == Some(&Key::AnyIndex))
+                && !matches!(path.keys.last(), Some(Key::Field(_)))
+            {
+                value.union(stored);
+            }
+            if path.keys.last() == Some(&Key::Descendant)
+                && child.keys.starts_with(&path.keys[..path.keys.len() - 1])
+            {
+                value.union(stored);
+            }
+        }
+        value
+    }
     fn project(&self, access: &Access, key: &Key) -> Access {
         if key == &Key::Descendant {
             let mut result = access.clone();
@@ -625,10 +714,8 @@ impl<'a> Pass<'a> {
                 if !visited.insert(reference.path.clone()) {
                     continue;
                 }
-                for (path, value) in &self.state.heap {
-                    if path.root == reference.path.root
-                        && path.keys.starts_with(&reference.path.keys)
-                    {
+                for (path, value) in self.cells(&reference.path.root) {
+                    if path.keys.starts_with(&reference.path.keys) {
                         let value = value.map(|r| {
                             r.readonly.extend(reference.readonly.iter().cloned());
                             r.locals.extend(&reference.locals);
@@ -641,37 +728,19 @@ impl<'a> Pass<'a> {
             return result;
         }
         let mut result = Access::default();
+        // References are ordered by path first, so capability variants of one
+        // path are adjacent and share the same heap lookup.
+        let mut cached: Option<(&Path, Access)> = None;
         for reference in &access.refs {
-            let child = reference.path.child(key.clone());
-            let mut value = self
-                .state
-                .heap
-                .get(&child)
-                .cloned()
-                .unwrap_or_else(|| symbolic(child.clone()));
-            for (path, stored) in &self.state.heap {
-                if path.root != child.root {
-                    continue;
-                }
-                let same_parent = path.keys.len() == child.keys.len()
-                    && path.keys[..path.keys.len().saturating_sub(1)]
-                        == child.keys[..child.keys.len().saturating_sub(1)];
-                if same_parent
-                    && (key == &Key::AnyIndex || path.keys.last() == Some(&Key::AnyIndex))
-                    && !matches!(path.keys.last(), Some(Key::Field(_)))
-                {
-                    value.union(stored);
-                }
-                if path.keys.last() == Some(&Key::Descendant)
-                    && child.keys.starts_with(&path.keys[..path.keys.len() - 1])
-                {
-                    value.union(stored);
-                }
+            if cached
+                .as_ref()
+                .is_none_or(|(path, _)| *path != &reference.path)
+            {
+                cached = Some((&reference.path, self.child_value(&reference.path, key)));
             }
-            result.union(&value.map(|r| {
-                r.readonly.extend(reference.readonly.iter().cloned());
-                r.locals.extend(&reference.locals);
-            }));
+            if let Some((_, value)) = &cached {
+                result.union_through(value, reference);
+            }
         }
         result
     }
@@ -1251,7 +1320,7 @@ impl<'a> Pass<'a> {
         } else {
             template
         };
-        let result = if let Some(summary) = self.summaries.get(name).cloned() {
+        let result = if let Some(summary) = self.summary_for(name) {
             self.apply_call_summary(site, name, summary, std::slice::from_ref(receiver))
         } else {
             if self.emit {
@@ -1695,7 +1764,7 @@ impl<'a> Pass<'a> {
                     .filter(|name| self.summaries.contains_key(*name))
                     .or_else(|| self.facts.calls.get(&expr_id(expr)));
                 if let Some(name) = target
-                    && let Some(summary) = self.summaries.get(name).cloned()
+                    && let Some(summary) = self.summary_for(name)
                 {
                     if mutating_call
                         && !summary
@@ -1899,12 +1968,13 @@ impl<'a> Pass<'a> {
                                 .then(|| {
                                     self.summaries
                                         .get(name)
-                                        .cloned()
                                         .map(|summary| (name.clone(), summary))
                                 })
                                 .flatten()
                         })
                         .collect::<Vec<_>>();
+                    self.dependencies
+                        .extend(candidates.iter().map(|(name, _)| name.clone()));
                     let before = self.state.clone();
                     let mut joined = before.clone();
                     for (name, summary) in candidates {
@@ -1948,11 +2018,21 @@ impl<'a> Pass<'a> {
     }
     fn substitute_access(&self, value: &Access, args: &[Access], site: usize) -> Access {
         let mut result = Access::default();
+        // Capability variants of one path are adjacent; substitute it once.
+        let mut cached: Option<(&Path, Access)> = None;
         for reference in &value.refs {
-            result.union(&self.substitute(&reference.path, args, site).map(|r| {
-                r.readonly.extend(reference.readonly.iter().cloned());
-                r.locals.extend(&reference.locals);
-            }));
+            if cached
+                .as_ref()
+                .is_none_or(|(path, _)| *path != &reference.path)
+            {
+                cached = Some((
+                    &reference.path,
+                    self.substitute(&reference.path, args, site),
+                ));
+            }
+            if let Some((_, substituted)) = &cached {
+                result.union_through(substituted, reference);
+            }
         }
         result
     }
@@ -2019,9 +2099,8 @@ impl<'a> Pass<'a> {
         }
         let specialized = self.facts.specializations.get(&expr_id(expr));
         let summary = specialized
-            .and_then(|name| self.summaries.get(name))
-            .or_else(|| self.summaries.get(&name))
-            .cloned();
+            .and_then(|name| self.summary_for(name))
+            .or_else(|| self.summary_for(&name));
         if specialized.is_some() && summary.is_none() {
             for argument in &args {
                 for reference in &argument.refs {
@@ -2032,6 +2111,13 @@ impl<'a> Pass<'a> {
         if self.constructors.contains_key(&name) {
             let result = self.allocate(Root::Fresh(expr_id(expr), 0));
             for (i, (field, value)) in fields.unwrap().iter().zip(args).enumerate() {
+                // A field declared with a scalar type cannot hold a reference,
+                // even where a generic template body has no type facts.
+                let value = if field.ty.as_ref().is_none_or(annotation_may_reference) {
+                    value
+                } else {
+                    Access::default()
+                };
                 self.store(&result, Key::Field(field.name.clone()), value.clone(), true);
                 self.store(&result, Key::Index(i as i64), value, true);
             }
@@ -2068,7 +2154,7 @@ impl<'a> Pass<'a> {
         &mut self,
         expr: &Expr,
         name: &str,
-        summary: Summary,
+        summary: &Summary,
         args: &[Access],
     ) -> Access {
         let asynchronous = self
@@ -2120,7 +2206,7 @@ impl<'a> Pass<'a> {
         result
     }
 
-    fn apply_summary(&mut self, expr: &Expr, summary: Summary, args: &[Access]) -> Access {
+    fn apply_summary(&mut self, expr: &Expr, summary: &Summary, args: &[Access]) -> Access {
         let site = expr_id(expr);
         for root in &summary.allocations {
             if let Root::Fresh(id, _) = root {
@@ -2159,7 +2245,7 @@ impl<'a> Pass<'a> {
             let access = self.substitute(path, args, site);
             self.mutate(&access, expr);
         }
-        self.apply_heap(&summary, args, site);
+        self.apply_heap(summary, args, site);
         for path in &summary.mutations {
             let access = self.substitute(path, args, site);
             self.mutate(&access, expr);

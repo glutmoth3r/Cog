@@ -4,7 +4,7 @@
 //! artifacts face the same structural checks. The decoder bounds file sizes,
 //! allocations, constants, and type descriptors before constructing an executable
 //! program; live host pointers and managed runtime objects are never serialized.
-use crate::backend::{CallableSignature, CompiledProgram, SourceMapEntry};
+use crate::backend::{CallableSignature, CompiledProgram, InlineFrame, SourceMapEntry};
 use crate::instruction::{Instruction, ValueType};
 use crate::runtime::{NativeImport, NativeType};
 use crate::template::{ArrayItem, ArrayTemplate};
@@ -12,8 +12,11 @@ use crate::value::{RuntimeType, Value};
 use std::rc::Rc;
 
 const MAGIC: &[u8; 4] = b"COG\0";
-pub(crate) const VERSION: u16 = 39;
+pub(crate) const VERSION: u16 = 40;
+const VERSION_WITHOUT_INLINE_FRAMES: u16 = 39;
 const VERSION_WITHOUT_FUNCTION_NAMES: u16 = 38;
+/// Nesting limit for inlined calls attributed to one instruction.
+const MAX_INLINE_DEPTH: usize = 64;
 pub(crate) const LIMIT: usize = crate::value::MAX_RUNTIME_TYPE_NODES;
 const MAX_DEPTH: usize = crate::value::MAX_RUNTIME_TYPE_DEPTH;
 pub const MAX_FILE_BYTES: usize = 128 * 1024 * 1024;
@@ -399,13 +402,21 @@ pub fn encode(program: &CompiledProgram) -> Result<Vec<u8>> {
         w.index(*entry)?;
         w.string(name)?;
     }
+    w.index(program.inline_frames.len())?;
+    for frame in &program.inline_frames {
+        w.string(&frame.function)?;
+        w.optional_index(frame.parent)?;
+        w.byte(u8::from(frame.call_site.is_some()))?;
+        if let Some(location) = &frame.call_site {
+            w.location(location)?;
+        }
+    }
     w.index(program.source_map.len())?;
     for entry in &program.source_map {
         w.index(entry.start)?;
         w.index(entry.end)?;
-        w.string(&entry.location.file)?;
-        w.index(entry.location.line)?;
-        w.index(entry.location.column)?;
+        w.location(&entry.location)?;
+        w.optional_index(entry.inline)?;
     }
     if w.0.len() > MAX_FILE_BYTES {
         return Err("bytecode file exceeds the format limit".into());
@@ -430,7 +441,10 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
             .try_into()
             .expect("Reader::take returned the requested width"),
     );
-    if !matches!(version, VERSION | VERSION_WITHOUT_FUNCTION_NAMES) {
+    if !matches!(
+        version,
+        VERSION | VERSION_WITHOUT_INLINE_FRAMES | VERSION_WITHOUT_FUNCTION_NAMES
+    ) {
         return Err(format!(
             "unsupported bytecode version {version}; expected {VERSION}"
         ));
@@ -702,7 +716,7 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
         program.push(instruction);
     }
     let mut functions = std::collections::BTreeMap::new();
-    if version == VERSION {
+    if version >= VERSION_WITHOUT_INLINE_FRAMES {
         let function_count = r.index()?;
         if function_count > callables.len() {
             return Err("invalid diagnostic function name count".into());
@@ -718,6 +732,27 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
             previous = Some(entry);
         }
     }
+    let mut inline_frames = Vec::new();
+    if version >= VERSION {
+        let frame_count = r.index()?;
+        if frame_count > count {
+            return Err("invalid inline frame count".into());
+        }
+        inline_frames
+            .try_reserve_exact(frame_count)
+            .map_err(|_| "cannot allocate bytecode inline frames")?;
+        for _ in 0..frame_count {
+            inline_frames.push(InlineFrame {
+                function: r.owned_string()?,
+                parent: r.optional_index()?,
+                call_site: match r.byte()? {
+                    0 => None,
+                    1 => Some(r.location()?),
+                    _ => return Err("invalid inline call site tag".into()),
+                },
+            });
+        }
+    }
     let source_map_count = r.index()?;
     if source_map_count > count {
         return Err("invalid source map entry count".into());
@@ -730,10 +765,11 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
         source_map.push(SourceMapEntry {
             start: r.index()?,
             end: r.index()?,
-            location: crate::diagnostic::SourceLocation {
-                file: r.owned_string()?,
-                line: r.index()?,
-                column: r.index()?,
+            location: r.location()?,
+            inline: if version >= VERSION {
+                r.optional_index()?
+            } else {
+                None
             },
         });
     }
@@ -746,6 +782,7 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
         functions,
         callables,
         source_map,
+        inline_frames,
     };
     validate(&program)?;
     Ok(program)
@@ -806,6 +843,32 @@ pub fn validate(artifact: &CompiledProgram) -> Result<()> {
     if artifact.source_map.len() > program.len() {
         return Err("invalid source map entry count".into());
     }
+    if artifact.inline_frames.len() > program.len() {
+        return Err("invalid inline frame count".into());
+    }
+    let mut inline_depths = Vec::with_capacity(artifact.inline_frames.len());
+    for (index, frame) in artifact.inline_frames.iter().enumerate() {
+        let depth = match frame.parent {
+            None => 1,
+            Some(parent) if parent < index => inline_depths[parent] + 1,
+            Some(_) => return Err("inline frame parents must precede their children".into()),
+        };
+        if depth > MAX_INLINE_DEPTH {
+            return Err("inline frame nesting is too deep".into());
+        }
+        if frame.function.is_empty() {
+            return Err("invalid inline frame function name".into());
+        }
+        budget.string(frame.function.len())?;
+        if let Some(location) = &frame.call_site {
+            if location.line == 0 || location.column == 0 {
+                return Err("invalid inline frame call site".into());
+            }
+            budget.string(location.file.len())?;
+        }
+        inline_depths.push(depth);
+    }
+    let mut inline_referenced = vec![false; artifact.inline_frames.len()];
     let mut previous_end = 0;
     let mut previous_entry: Option<&SourceMapEntry> = None;
     for entry in &artifact.source_map {
@@ -818,13 +881,28 @@ pub fn validate(artifact: &CompiledProgram) -> Result<()> {
             return Err("invalid or noncanonical source map range".into());
         }
         if previous_entry.is_some_and(|previous| {
-            previous.end == entry.start && previous.location == entry.location
+            previous.end == entry.start
+                && previous.location == entry.location
+                && previous.inline == entry.inline
         }) {
             return Err("adjacent identical source map ranges are not canonical".into());
+        }
+        let mut current = entry.inline;
+        while let Some(index) = current {
+            let referenced = inline_referenced
+                .get_mut(index)
+                .ok_or("source map refers to a missing inline frame")?;
+            if std::mem::replace(referenced, true) {
+                break;
+            }
+            current = artifact.inline_frames[index].parent;
         }
         budget.string(entry.location.file.len())?;
         previous_end = entry.end;
         previous_entry = Some(entry);
+    }
+    if inline_referenced.contains(&false) {
+        return Err("unreferenced inline frames are not canonical".into());
     }
     for instruction in program {
         match instruction {
@@ -999,6 +1077,22 @@ impl Writer {
         self.data(value.as_bytes())?;
         Ok(())
     }
+    /// `0` encodes `None`; other values are the index plus one.
+    fn optional_index(&mut self, value: Option<usize>) -> Result<()> {
+        match value {
+            None => self.index(0),
+            Some(value) => self.index(
+                value
+                    .checked_add(1)
+                    .ok_or("bytecode operand does not fit u32")?,
+            ),
+        }
+    }
+    fn location(&mut self, location: &crate::diagnostic::SourceLocation) -> Result<()> {
+        self.string(&location.file)?;
+        self.index(location.line)?;
+        self.index(location.column)
+    }
     fn value(&mut self, value: &Value) -> Result<()> {
         match value {
             Value::Int(n) => {
@@ -1162,6 +1256,16 @@ impl<'a> Reader<'a> {
             .try_reserve_exact(capacity)
             .map_err(|_| "cannot allocate bytecode string")?;
         Ok(buffer)
+    }
+    fn optional_index(&mut self) -> Result<Option<usize>> {
+        Ok(self.index()?.checked_sub(1))
+    }
+    fn location(&mut self) -> Result<crate::diagnostic::SourceLocation> {
+        Ok(crate::diagnostic::SourceLocation {
+            file: self.owned_string()?,
+            line: self.index()?,
+            column: self.index()?,
+        })
     }
     fn owned_string(&mut self) -> Result<String> {
         let text = self.string_slice()?;

@@ -55,7 +55,7 @@ pub(crate) fn check_with_names(
         }
     }
     let resolved_methods =
-        crate::analysis::check_with_methods_and_names(program, &HashMap::new(), names);
+        crate::analysis::resolve_methods_and_names(program, &HashMap::new(), names);
     let async_specializations = resolved_methods
         .specializations
         .iter()
