@@ -24,23 +24,52 @@ command with `-O`. The artifact contains Wasm code for the Cog program and a
 small guest runtime for the supported values and operations. Set `RUSTC` to
 select a different Rust compiler executable when building.
 
-Supported values include `int`, `uint`, `bool`, `char`, `str`, and `nil`.
-Integer overflow and division by zero produce Error values. Branches, loops,
-recursion, direct calls, scalar assignments, Error tests, and `!!` use the
-existing verified control flow. `main(args: str[])` and `process::args()` can
-read host arguments using length and index operations. The guest supports the
-subset of `io` and `bytes` operations used by `io::print` and `io::println`.
-The compiler limits direct recursion to 64 nested calls and rejects excessive
-instruction, generated source, and frame sizes at build time.
+Supported values include `int`, `uint`, `bool`, `char`, `str`, and `nil`, plus
+shared mutable byte buffers and string builders. Integer overflow and division
+by zero produce Error values. Branches, loops, recursion, direct calls, scalar
+assignments, Error tests, and `!!` use the existing verified control flow.
+`main(args: str[])` and `process::args()` can read host arguments using length
+and index operations. The guest supports these host operations, which follow
+the VM's semantics, including Error kinds and payload fields:
+
+- `io::stdout`, `io::write_all`, and `io::flush`, which `io::print` and
+  `io::println` use.
+- `bytes::from_str`, `bytes::render`, `bytes::len`, `bytes::new`, `bytes::get`,
+  `bytes::set`, and `bytes::to_str`. Ranges are checked like the VM
+  (`InvalidArgument` for `bytes range`), and `bytes::to_str` reports a
+  `ParseFailure` for invalid UTF-8.
+- `str::to_int`, `str::to_uint`, `str::to_bool`, and `str::to_char`, so
+  `text as int` works. Parsing uses Rust's rules: an optional `+` (or `-` for
+  `int`), ASCII digits only, no surrounding whitespace, and a `ParseFailure`
+  from `str` to the target type on empty text, overflow, or any other
+  character. Converting between `int` and `uint` reports `Overflow` when the
+  value does not fit.
+- `str::builder`, `str::build`, and `fmt::write`. Only the first `{}` in a
+  template is replaced. `str::build` returns a snapshot.
+
+Standard-library functions written in Cog compile when they use only these
+operations. This includes `str::replace`, whose empty pattern returns
+`Error::InvalidArgument("str::replace")`, and functions such as
+`http::html_escape`. The guest builds `Error::Variant(...)` values from the core
+`Error` enum. Other record or struct construction is rejected.
+
+A call made at call depth 64 raises a runtime `CallDepthLimit` Error. This
+applies to every nested call, not only direct recursion. The compiler rejects
+more than 20,000 reachable instructions, more than 256 slots in a function frame,
+and generated source above 16 MiB at build time.
 
 Support is based on the instructions reachable from the entry point.
 Unsupported instructions and native imports cause build errors. Current limits
-include floating point, BigInt, general collection construction and mutation,
-closures, async, crash, filesystem access, user native imports, and other host
-operations. This guest reports a source origin with the final Error. It does
-not carry the VM's full diagnostics and its own compact values do not require
-Cog's tracing GC. The WASI command target is separate from running the Cog
-compiler and VM in browser WebAssembly.
+include floating point (so `str::to_float` and `str::to_bigint`), BigInt,
+arrays other than the argument list, structs, maps, closures, async, crash,
+filesystem access, user native imports, and other host operations such as
+`str::to_str`, `bytes::copy`, `bytes::slice`, and `bytes::concat`; any other
+reachable host operation fails the build. The guest has no VM resource limits:
+allocation failure for `bytes::new` reports `ResourceLimit`, but string and
+builder sizes are bounded only by Wasm memory. This guest reports a source origin
+with the final Error. It does not carry the VM's full diagnostics and its own
+compact values do not require Cog's tracing GC. The WASI command target is
+separate from running the Cog compiler and VM in browser WebAssembly.
 
 ## Tutorial checker in the browser
 

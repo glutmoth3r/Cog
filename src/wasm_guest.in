@@ -1,5 +1,7 @@
 #![allow(dead_code, unused_assignments, unused_mut, unused_variables)]
 
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::io::Write;
 use std::rc::Rc;
@@ -14,14 +16,16 @@ enum V {
     Str(Rc<str>),
     Tag(Rc<str>),
     Args(Rc<[Rc<str>]>),
-    Bytes(Rc<[u8]>),
+    // Shared and mutable like the VM's byte buffers: aliases observe writes.
+    Bytes(Rc<RefCell<Vec<u8>>>),
+    StrBuf(Rc<RefCell<String>>),
     Stdout,
     Error(Fault),
 }
 
 #[derive(Clone)]
 struct Fault {
-    kind: &'static str,
+    kind: Cow<'static, str>,
     pc: usize,
     detail: Detail,
 }
@@ -31,7 +35,9 @@ enum Detail {
     None,
     Operation(&'static str),
     Index(i64, usize),
-    ParseFailure,
+    Parse(&'static str, &'static str),
+    Resource(&'static str),
+    Fields(Vec<(Rc<str>, V)>),
     IoWrite(Rc<str>),
     Missing(Rc<str>),
 }
@@ -39,13 +45,17 @@ enum Detail {
 impl Fault {
     fn new(kind: &'static str, pc: usize) -> Self {
         Self {
-            kind,
+            kind: Cow::Borrowed(kind),
             pc,
             detail: Detail::None,
         }
     }
     fn value(kind: &'static str, pc: usize, detail: Detail) -> V {
-        V::Error(Self { kind, pc, detail })
+        V::Error(Self {
+            kind: Cow::Borrowed(kind),
+            pc,
+            detail,
+        })
     }
     fn tag(&self) -> String {
         format!("$core::err::Error::{}", self.kind)
@@ -55,24 +65,39 @@ impl Fault {
             (Detail::Operation(op), "op") => Some(V::Str((*op).into())),
             (Detail::Index(index, _), "index") => Some(V::Int(*index)),
             (Detail::Index(_, len), "len") => Some(V::Int(*len as i64)),
-            (Detail::ParseFailure, "from") => Some(V::Str("OS argument".into())),
-            (Detail::ParseFailure, "to") => Some(V::Str("str".into())),
+            (Detail::Parse(from, _), "from") => Some(V::Str((*from).into())),
+            (Detail::Parse(_, to), "to") => Some(V::Str((*to).into())),
+            (Detail::Resource(resource), "resource") => Some(V::Str((*resource).into())),
+            (Detail::Fields(fields), name) => fields
+                .iter()
+                .find(|(key, _)| &**key == name)
+                .map(|(_, value)| value.clone()),
             (Detail::IoWrite(message), "message") => Some(V::Str(message.clone())),
             (Detail::Missing(field), "field") => Some(V::Str(field.clone())),
             _ => None,
         }
     }
     fn message(&self) -> String {
-        match (&self.detail, self.kind) {
+        match (&self.detail, &*self.kind) {
             (_, "Overflow") => "integer arithmetic overflow".into(),
             (_, "DivisionByZero") => "division by zero".into(),
             (Detail::Operation(op), "TypeMismatch") => format!("type mismatch in `{op}`"),
             (Detail::Operation(op), "InvalidArgument") => format!("invalid argument in `{op}`"),
             (Detail::Index(index, len), _) => format!("index {index} out of bounds (length {len})"),
             (Detail::IoWrite(message), _) => format!("failed to write output: {message}"),
-            (Detail::ParseFailure, _) => "cannot parse OS argument as str".into(),
+            (Detail::Parse(from, to), _) => format!("cannot parse {from} as {to}"),
+            (Detail::Resource(resource), _) => format!("runtime resource limit: {resource}"),
+            (Detail::Fields(fields), _) if fields.is_empty() => self.kind.to_string(),
+            (Detail::Fields(fields), _) => {
+                let mut fields = fields.iter().collect::<Vec<_>>();
+                fields.sort_by(|a, b| a.0.cmp(&b.0));
+                let fields = fields.into_iter().map(|(key, value)| {
+                    format!("{key}: {}", render_text(value.clone()))
+                });
+                fields.collect::<Vec<_>>().join(", ")
+            }
             (Detail::Missing(field), _) => format!("missing field `{field}`"),
-            _ => self.kind.into(),
+            _ => self.kind.to_string(),
         }
     }
 }
@@ -256,7 +281,7 @@ fn process_args(_: [V; 0], pc: usize) -> V {
     let mut args = Vec::new();
     for argument in std::env::args_os().skip(1) {
         let Some(text) = argument.to_str() else {
-            return Fault::value("ParseFailure", pc, Detail::ParseFailure);
+            return Fault::value("ParseFailure", pc, Detail::Parse("OS argument", "str"));
         };
         args.push(Rc::from(text));
     }
@@ -284,10 +309,14 @@ fn check_native(
 
 fn to_bytes([value]: [V; 1], pc: usize) -> V {
     match value {
-        V::Str(text) => V::Bytes(Rc::from(text.as_bytes())),
+        V::Str(text) => new_bytes(text.as_bytes().to_vec()),
         V::Error(_) => value,
         _ => type_mismatch(pc, "bytes::from_str"),
     }
+}
+
+fn new_bytes(bytes: Vec<u8>) -> V {
+    V::Bytes(Rc::new(RefCell::new(bytes)))
 }
 
 fn render_text(value: V) -> String {
@@ -297,24 +326,259 @@ fn render_text(value: V) -> String {
         V::Bool(value) => value.to_string(),
         V::Char(value) => value.to_string(),
         V::Nil => "nil".into(),
-        V::Str(value) | V::Tag(value) => value.to_string(),
-        V::Bytes(value) => format!("<bytes:{}>", value.len()),
+        V::Str(value) => value.to_string(),
+        V::Tag(value) => format!("<type:{value}>"),
+        V::Bytes(value) => format!("<bytes:{}>", value.borrow().len()),
+        V::StrBuf(value) => value.borrow().clone(),
         V::Args(values) => format!("[{}]", values.join(", ")),
         V::Stdout => "<resource>".into(),
-        V::Error(error) => format!("Error: {}", error.message()),
+        V::Error(error) => match &error.detail {
+            Detail::Fields(fields) => {
+                let mut fields = fields.iter().collect::<Vec<_>>();
+                fields.sort_by(|a, b| a.0.cmp(&b.0));
+                let fields = fields
+                    .into_iter()
+                    .map(|(key, value)| format!("{key}: {}", render_text(value.clone())))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("Error: Error::{}({fields})", error.kind)
+            }
+            _ => format!("Error: {}", error.message()),
+        },
     }
 }
 
 fn render([value]: [V; 1], _: usize) -> V {
-    V::Bytes(render_text(value).into_bytes().into())
+    new_bytes(render_text(value).into_bytes())
 }
 
 fn bytes_len([value]: [V; 1], pc: usize) -> V {
     match value {
-        V::Bytes(bytes) => V::Int(bytes.len() as i64),
+        V::Bytes(bytes) => V::Int(bytes.borrow().len() as i64),
         V::Error(_) => value,
         _ => type_mismatch(pc, "bytes::len"),
     }
+}
+
+/// Native parameter kinds. The VM checks them in order: an Error in a typed
+/// parameter is returned unchanged before a later parameter can mismatch.
+#[derive(Clone, Copy)]
+enum T {
+    Any,
+    Int,
+    Str,
+    Bytes,
+    StrBuf,
+}
+
+fn check<const N: usize>(arguments: &[V; N], types: [T; N], pc: usize, op: &'static str) -> Option<V> {
+    for (value, ty) in arguments.iter().zip(types) {
+        if !matches!(ty, T::Any) && matches!(value, V::Error(_)) {
+            return Some(value.clone());
+        }
+        let accepted = matches!(
+            (ty, value),
+            (T::Any, _)
+                | (T::Int, V::Int(_))
+                | (T::Str, V::Str(_))
+                | (T::Bytes, V::Bytes(_))
+                | (T::StrBuf, V::StrBuf(_))
+        );
+        if !accepted {
+            return Some(type_mismatch(pc, op));
+        }
+    }
+    None
+}
+
+fn invalid_range() -> Detail {
+    Detail::Operation("bytes range")
+}
+
+/// The VM's `range` helper: a non-negative offset and count inside the buffer.
+fn byte_range(offset: i64, count: i64, len: usize) -> Option<std::ops::Range<usize>> {
+    let offset = usize::try_from(offset).ok()?;
+    let end = offset.checked_add(usize::try_from(count).ok()?)?;
+    (end <= len).then_some(offset..end)
+}
+
+fn bytes_new(arguments: [V; 1], pc: usize) -> V {
+    if let Some(error) = check(&arguments, [T::Int], pc, "bytes::new") {
+        return error;
+    }
+    let [V::Int(size)] = arguments else { unreachable!() };
+    let limit = || Fault::value("ResourceLimit", pc, Detail::Resource("bytes"));
+    let Ok(size) = usize::try_from(size) else {
+        return limit();
+    };
+    let mut bytes = Vec::new();
+    if bytes.try_reserve_exact(size).is_err() {
+        return limit();
+    }
+    bytes.resize(size, 0);
+    new_bytes(bytes)
+}
+
+fn bytes_get(arguments: [V; 2], pc: usize) -> V {
+    if let Some(error) = check(&arguments, [T::Bytes, T::Int], pc, "bytes::get") {
+        return error;
+    }
+    let [V::Bytes(bytes), V::Int(offset)] = arguments else { unreachable!() };
+    let bytes = bytes.borrow();
+    match byte_range(offset, 1, bytes.len()) {
+        Some(span) => V::Int(bytes[span.start] as i64),
+        None => Fault::value("InvalidArgument", pc, invalid_range()),
+    }
+}
+
+fn bytes_set(arguments: [V; 3], pc: usize) -> V {
+    if let Some(error) = check(&arguments, [T::Bytes, T::Int, T::Int], pc, "bytes::set") {
+        return error;
+    }
+    let [V::Bytes(bytes), V::Int(offset), V::Int(value)] = arguments else { unreachable!() };
+    let mut bytes = bytes.borrow_mut();
+    let Some(span) = byte_range(offset, 1, bytes.len()) else {
+        return Fault::value("InvalidArgument", pc, invalid_range());
+    };
+    let Ok(value) = u8::try_from(value) else {
+        return Fault::value("InvalidArgument", pc, Detail::Operation("bytes::set"));
+    };
+    bytes[span.start] = value;
+    V::Nil
+}
+
+fn bytes_to_str(arguments: [V; 3], pc: usize) -> V {
+    if let Some(error) = check(&arguments, [T::Bytes, T::Int, T::Int], pc, "bytes::to_str") {
+        return error;
+    }
+    let [V::Bytes(bytes), V::Int(offset), V::Int(count)] = arguments else { unreachable!() };
+    let bytes = bytes.borrow();
+    let Some(span) = byte_range(offset, count, bytes.len()) else {
+        return Fault::value("InvalidArgument", pc, invalid_range());
+    };
+    match std::str::from_utf8(&bytes[span]) {
+        Ok(text) => V::Str(text.into()),
+        Err(_) => Fault::value("ParseFailure", pc, Detail::Parse("bytes", "str")),
+    }
+}
+
+fn parse_failure(pc: usize, to: &'static str) -> V {
+    Fault::value("ParseFailure", pc, Detail::Parse("str", to))
+}
+
+fn to_int([value]: [V; 1], pc: usize) -> V {
+    match value {
+        V::Error(_) | V::Int(_) => value,
+        V::UInt(value) => i64::try_from(value).map_or_else(|_| Fault::value("Overflow", pc, Detail::None), V::Int),
+        V::Str(text) => text.parse().map_or_else(|_| parse_failure(pc, "int"), V::Int),
+        _ => type_mismatch(pc, "str::to_int"),
+    }
+}
+
+fn to_uint([value]: [V; 1], pc: usize) -> V {
+    match value {
+        V::Error(_) | V::UInt(_) => value,
+        V::Int(value) => u64::try_from(value).map_or_else(|_| Fault::value("Overflow", pc, Detail::None), V::UInt),
+        V::Str(text) => text.parse().map_or_else(|_| parse_failure(pc, "uint"), V::UInt),
+        _ => type_mismatch(pc, "str::to_uint"),
+    }
+}
+
+fn to_bool([value]: [V; 1], pc: usize) -> V {
+    match value {
+        V::Error(_) | V::Bool(_) => value,
+        V::Str(text) => match &*text {
+            "true" => V::Bool(true),
+            "false" => V::Bool(false),
+            _ => parse_failure(pc, "bool"),
+        },
+        _ => type_mismatch(pc, "str::to_bool"),
+    }
+}
+
+fn to_char([value]: [V; 1], pc: usize) -> V {
+    match value {
+        V::Error(_) | V::Char(_) => value,
+        V::Str(text) => {
+            let mut chars = text.chars();
+            match (chars.next(), chars.next()) {
+                (Some(character), None) => V::Char(character),
+                _ => parse_failure(pc, "char"),
+            }
+        }
+        _ => type_mismatch(pc, "str::to_char"),
+    }
+}
+
+fn str_builder(_: [V; 0], _: usize) -> V {
+    V::StrBuf(Rc::new(RefCell::new(String::new())))
+}
+
+fn str_build(arguments: [V; 1], pc: usize) -> V {
+    if let Some(error) = check(&arguments, [T::StrBuf], pc, "str::build") {
+        return error;
+    }
+    let [V::StrBuf(buffer)] = arguments else { unreachable!() };
+    // Snapshot: later writes through any builder alias cannot change this str.
+    let text = buffer.borrow();
+    V::Str(text.as_str().into())
+}
+
+fn fmt_write(arguments: [V; 3], pc: usize) -> V {
+    if let Some(error) = check(&arguments, [T::StrBuf, T::Str, T::Any], pc, "fmt::write") {
+        return error;
+    }
+    let [V::StrBuf(buffer), V::Str(template), value] = arguments else { unreachable!() };
+    if matches!(value, V::Error(_)) {
+        return value;
+    }
+    // Only the first `{}` is a placeholder. The value is rendered before the
+    // buffer is borrowed, so a builder may be written into itself.
+    let (prefix, rendered, suffix) = match template.find("{}") {
+        Some(position) => (
+            &template[..position],
+            render_text(value),
+            &template[position + 2..],
+        ),
+        None => (&*template, String::new(), ""),
+    };
+    let mut text = buffer.borrow_mut();
+    text.push_str(prefix);
+    text.push_str(&rendered);
+    text.push_str(suffix);
+    drop(text);
+    V::StrBuf(buffer)
+}
+
+/// Build an Error from `MakeRecord` entries. The compiler verified statically
+/// that the record is a core Error variant, never a struct.
+fn make_error(entries: Vec<(V, V)>, pc: usize) -> V {
+    let mut fields: Vec<(Rc<str>, V)> = Vec::new();
+    let mut tag = None;
+    let mut error = None;
+    for (key, value) in entries {
+        match key {
+            V::Tag(name) if tag.is_none() => tag = Some(name),
+            V::Str(key) => match fields.iter_mut().find(|(name, _)| *name == key) {
+                Some(slot) => slot.1 = value,
+                None => fields.push((key, value)),
+            },
+            V::Error(_) if error.is_none() => error = Some(key),
+            _ if error.is_none() => error = Some(type_mismatch(pc, "record")),
+            _ => {}
+        }
+    }
+    if let Some(error) = error {
+        return error;
+    }
+    let Some(tag) = tag else {
+        return type_mismatch(pc, "record");
+    };
+    V::Error(Fault {
+        kind: Cow::Owned(tag.rsplit("::").next().unwrap_or(&tag).to_owned()),
+        pc,
+        detail: Detail::Fields(fields),
+    })
 }
 
 fn io_result(result: std::io::Result<()>, pc: usize) -> V {
@@ -347,6 +611,7 @@ fn write_all([handle, bytes, offset, count]: [V; 4], pc: usize) -> V {
     let (V::Bytes(bytes), V::Int(offset), V::Int(count)) = (bytes, offset, count) else {
         unreachable!()
     };
+    let bytes = bytes.borrow();
     let range = usize::try_from(offset)
         .ok()
         .zip(usize::try_from(count).ok())

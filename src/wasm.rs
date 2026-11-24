@@ -347,7 +347,7 @@ impl LowerFunction<'_, '_> {
             Len => writeln!(out, "v{a} = length(take(&mut v{a}), {pc});").unwrap(),
             ConstrainArrayFrom => writeln!(out, "take(&mut v{b});").unwrap(),
             Index => writeln!(out, "v{a} = index(take(&mut v{a}), take(&mut v{b}), {pc});").unwrap(),
-            ErrorKind => writeln!(out, "v{a} = V::Str(match &v{a} {{ V::Error(error) => error.kind, _ => \"ok\" }}.into());").unwrap(),
+            ErrorKind => writeln!(out, "v{a} = V::Str(match &v{a} {{ V::Error(error) => error.kind.as_ref(), _ => \"ok\" }}.into());").unwrap(),
             Call(target, arity) => {
                 self.called.push_back(*target);
                 let signature = &self.program.callables[target];
@@ -382,6 +382,17 @@ impl LowerFunction<'_, '_> {
                     "bytes::from_str" => "to_bytes",
                     "bytes::render" => "render",
                     "bytes::len" => "bytes_len",
+                    "bytes::new" => "bytes_new",
+                    "bytes::get" => "bytes_get",
+                    "bytes::set" => "bytes_set",
+                    "bytes::to_str" => "bytes_to_str",
+                    "str::to_int" => "to_int",
+                    "str::to_uint" => "to_uint",
+                    "str::to_bool" => "to_bool",
+                    "str::to_char" => "to_char",
+                    "str::builder" => "str_builder",
+                    "str::build" => "str_build",
+                    "fmt::write" => "fmt_write",
                     name => return Err(unsupported(self.program, pc, format!("host operation `{name}`"))),
                 };
                 if import.is_registered() {
@@ -390,6 +401,16 @@ impl LowerFunction<'_, '_> {
                 write!(out, "v{a} = native({function}, {pc}, [").unwrap();
                 emit_arguments(out, a, pops);
                 writeln!(out, "]);").unwrap();
+            }
+            MakeRecord(count) => {
+                if !constructs_error(self.program, &self.function, pc, a) {
+                    return Err(unsupported(self.program, pc, "records other than Error values"));
+                }
+                write!(out, "v{a} = make_error(vec![").unwrap();
+                for i in 0..*count {
+                    write!(out, "(take(&mut v{}), take(&mut v{})),", a + 2 * i, a + 2 * i + 1).unwrap();
+                }
+                writeln!(out, "], {pc});").unwrap();
             }
             Jump(target) => {
                 writeln!(out, "block = {target};").unwrap();
@@ -426,6 +447,35 @@ impl LowerFunction<'_, '_> {
         }
         Ok(false)
     }
+}
+
+/// The compiler emits the type tag first, as the nearest earlier constant
+/// written to the record's base slot. Only core Error variants are values the
+/// guest can build; structs and other records remain unsupported.
+///
+/// This relies on codegen pushing the record's `TypeTag` before any field
+/// value, and on user types carrying their own module-qualified tags that never
+/// start with the `$core::err::Error::` prefix. If codegen changes the order,
+/// the search finds no tag and the record is rejected (fails closed).
+fn constructs_error(
+    program: &CompiledProgram,
+    function: &Function<'_>,
+    pc: usize,
+    base: usize,
+) -> bool {
+    let prefix = format!("{}::", crate::error::ERROR_TYPE);
+    (function.entry..pc)
+        .rev()
+        .find(|candidate| {
+            function.heights.get(candidate) == Some(&base)
+                && matches!(program.instructions[*candidate], Instruction::Push(_))
+        })
+        .is_some_and(|candidate| {
+            matches!(
+                &program.instructions[candidate],
+                Instruction::Push(Value::TypeTag(tag)) if tag.starts_with(&prefix)
+            )
+        })
 }
 
 fn emit_arguments(out: &mut String, start: usize, arity: usize) {
