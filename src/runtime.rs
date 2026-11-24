@@ -1207,6 +1207,26 @@ pub struct RuntimeLimits {
     pub max_numeric_digits: Option<usize>,
 }
 impl RuntimeLimits {
+    /// Maximum bytes of standard output a restricted CLI run may produce.
+    pub const RESTRICTED_MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
+    /// Fixed default limits applied by `cog run --restricted` and
+    /// `cog eval --restricted`. Embedders choose their own limits through
+    /// `RunContext::with_limits`; the unrestricted CLI sets none. Any active
+    /// limit disables the JIT, so restricted runs use the VM.
+    pub const fn restricted_defaults() -> Self {
+        Self {
+            max_buffer_bytes: Some(16 * 1024 * 1024),
+            max_resources: Some(16),
+            max_steps: Some(200_000_000),
+            max_operand_values: Some(1_000_000),
+            max_call_frames: Some(10_000),
+            max_slots: Some(1_000_000),
+            max_heap_objects: Some(1_000_000),
+            max_numeric_digits: Some(10_000),
+        }
+    }
+
     /// Return the active buffer cap, or `usize::MAX` when no VM cap is set.
     /// Checked growth and fallible allocation still apply where implemented;
     /// this does not promise protection from process-wide memory exhaustion.

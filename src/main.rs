@@ -19,6 +19,42 @@ const NAME: &str = env!("CARGO_PKG_NAME");
 #[allow(dead_code)]
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Counts bytes written to stdout and fails once the restricted-mode output
+/// cap is exceeded, so the VM reports a recoverable write error.
+struct OutputCap {
+    inner: std::io::Stdout,
+    remaining: Option<usize>,
+}
+
+impl OutputCap {
+    fn new(inner: std::io::Stdout, restricted: bool) -> Self {
+        Self {
+            inner,
+            remaining: restricted
+                .then_some(cog::runtime::RuntimeLimits::RESTRICTED_MAX_OUTPUT_BYTES),
+        }
+    }
+}
+
+impl std::io::Write for OutputCap {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(remaining) = &mut self.remaining {
+            if buf.len() > *remaining {
+                *remaining = 0;
+                return Err(std::io::Error::other(
+                    "restricted output limit of 8 MiB exceeded",
+                ));
+            }
+            *remaining -= buf.len();
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Check,
@@ -499,8 +535,11 @@ fn command(color: &mut Color) -> Result<(), String> {
             } else {
                 VmCapabilities::default()
             };
-            let mut stdout = std::io::stdout();
+            let mut stdout = OutputCap::new(std::io::stdout(), options.restricted);
             let mut context = RuntimeContext::new(&mut stdout, capabilities);
+            if options.restricted {
+                context.limits = cog::runtime::RuntimeLimits::restricted_defaults();
+            }
             context.configure_jit(options.jit, Some(&jit_profile_path(target)), options.debug);
             context.set_process_arguments(options.program_args);
             interpreter::run_with_context(
@@ -564,8 +603,11 @@ fn eval_expression(expression: &str, options: &Options, color: &Color) -> Result
     } else {
         VmCapabilities::default()
     };
-    let mut stdout = std::io::stdout();
+    let mut stdout = OutputCap::new(std::io::stdout(), options.restricted);
     let mut context = RuntimeContext::new(&mut stdout, capabilities);
+    if options.restricted {
+        context.limits = cog::runtime::RuntimeLimits::restricted_defaults();
+    }
     interpreter::run_with_context(&compiled, &mut context).map_err(|error| {
         format_runtime_error(
             &error,
@@ -699,7 +741,9 @@ fn print_usage() {
     eprintln!("       eval compiles and runs one expression; --debug prints its bytecode");
     eprintln!("       bytecode is recognized by its COG header regardless of the filename");
     eprintln!("       --allow-asm  enable the standalone assembler for VM diagnostics");
-    eprintln!("       --restricted  allow only stdin/stdout runtime host effects");
+    eprintln!(
+        "       --restricted  allow only stdin/stdout host effects, with fixed resource limits"
+    );
     eprintln!(
         "       --plugin <manifest.kdl>  explicit trusted plugin for standalone sources/bytecode (repeatable)"
     );
