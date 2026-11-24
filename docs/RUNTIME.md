@@ -99,7 +99,9 @@ recoverable `Error` value, and existing `Error` values continue to propagate thr
 typed boundaries. Full static value-type verification remains planned. Source
 maps carry file/line/column metadata without embedding source text. The verifier
 also tracks bounded value, callable, capture, aggregate-field, and exact tagged
-variant facts; this partial analysis does not prove general type safety. The CLI adds
+variant facts. Element facts of a freshly constructed aggregate follow it into
+frame locals until an alias of it may be written or escape the frame; this
+partial analysis does not prove general type safety. The CLI adds
 the mapped location to terminal runtime errors, and embedders can inspect
 `RuntimeContext::last_source_location`; catchable Errors handled by Cog are not
 annotated. This does not provide OS isolation or a total memory guarantee. Runtime buffers, handles,

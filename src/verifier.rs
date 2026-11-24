@@ -17,6 +17,7 @@ const MAX_FACT_WORK: usize = 4_000_000;
 const MAX_VISITS: usize = 4_000_000;
 const MAX_TRACKED_AGGREGATES: usize = 128;
 const MAX_TRACKED_AGGREGATE_ITEMS: usize = 32;
+const MAX_TRACKED_ALIASES: usize = 128;
 const MAX_TRACKED_CLOSURE_TARGETS: usize = 128;
 const MAX_SUMMARIZED_CALLABLES: usize = 128;
 const MAX_SUMMARY_INSTRUCTIONS: usize = 128;
@@ -27,11 +28,127 @@ struct State {
     height: usize,
     initialized: Rc<BTreeSet<usize>>,
     stack_values: Rc<BTreeMap<usize, FlowValue>>,
+    // Shapes of freshly constructed aggregates. The stack slot holds the only
+    // reference to such a container; Dup forgets the shape.
     aggregate_shapes: Rc<BTreeMap<usize, Rc<Vec<FlowValue>>>>,
     record_shapes: Rc<BTreeMap<usize, Rc<BTreeMap<u32, FlowValue>>>>,
+    local_aggregates: Rc<LocalAggregates>,
     local_values: Rc<BTreeMap<usize, FlowValue>>,
     global_values: Rc<BTreeMap<usize, FlowValue>>,
     capture_values: Option<Rc<Vec<FlowValue>>>,
+}
+
+/// Element facts of fresh aggregates stored in frame locals.
+///
+/// Storing a fresh aggregate makes its local the owner of the shape. Every
+/// other location that may reference the same container in this frame, a
+/// reloaded stack slot or another local, records that owner as an alias. No
+/// reference exists outside these locations: any other use of an alias (a
+/// write, a call argument, a capture, a nested or global store) forgets the
+/// owner's shape. An alias therefore names exactly the owner's container,
+/// and joined paths must agree on every alias or forget its owner.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct LocalAggregates {
+    tuples: BTreeMap<usize, Rc<Vec<FlowValue>>>,
+    records: BTreeMap<usize, Rc<BTreeMap<u32, FlowValue>>>,
+    stack_aliases: BTreeMap<usize, usize>,
+    local_aliases: BTreeMap<usize, usize>,
+}
+
+impl LocalAggregates {
+    fn cost(&self) -> usize {
+        aggregate_shape_cost(&self.tuples)
+            .saturating_add(record_shape_cost(&self.records))
+            .saturating_add(self.stack_aliases.len())
+            .saturating_add(self.local_aliases.len())
+    }
+
+    fn is_owner(&self, local: usize) -> bool {
+        self.tuples.contains_key(&local) || self.records.contains_key(&local)
+    }
+
+    fn owner_of_local(&self, local: usize) -> Option<usize> {
+        if self.is_owner(local) {
+            Some(local)
+        } else {
+            self.local_aliases.get(&local).copied()
+        }
+    }
+
+    fn forget(&mut self, owner: usize) {
+        self.tuples.remove(&owner);
+        self.records.remove(&owner);
+        self.stack_aliases.retain(|_, alias| *alias != owner);
+        self.local_aliases.retain(|_, alias| *alias != owner);
+    }
+
+    fn has_alias_capacity(&self) -> bool {
+        self.stack_aliases.len() + self.local_aliases.len() < MAX_TRACKED_ALIASES
+    }
+
+    fn add_stack_alias(&mut self, slot: usize, owner: usize) {
+        // An untracked alias could write the container unnoticed, so a full
+        // alias table forgets the owner instead of dropping the alias.
+        if self.has_alias_capacity() {
+            self.stack_aliases.insert(slot, owner);
+        } else {
+            self.forget(owner);
+        }
+    }
+
+    fn add_local_alias(&mut self, local: usize, owner: usize) {
+        if self.has_alias_capacity() {
+            self.local_aliases.insert(local, owner);
+        } else {
+            self.forget(owner);
+        }
+    }
+
+    fn join(&self, other: &Self) -> Self {
+        let mut tuples = join_aggregate_shapes(&self.tuples, &other.tuples);
+        let mut records = join_record_shapes(&self.records, &other.records);
+        // A location that aliases an owner on only one path may reference that
+        // owner's container after the join, so the owner cannot keep a shape.
+        let mut forgotten = BTreeSet::new();
+        for (left, right) in [
+            (&self.stack_aliases, &other.stack_aliases),
+            (&self.local_aliases, &other.local_aliases),
+        ] {
+            for (location, owner) in left {
+                if right.get(location) != Some(owner) {
+                    forgotten.insert(*owner);
+                }
+            }
+            for (location, owner) in right {
+                if left.get(location) != Some(owner) {
+                    forgotten.insert(*owner);
+                }
+            }
+        }
+        for owner in &forgotten {
+            tuples.remove(owner);
+            records.remove(owner);
+        }
+        let tracked = |owner: &usize| tuples.contains_key(owner) || records.contains_key(owner);
+        let stack_aliases = self
+            .stack_aliases
+            .iter()
+            .filter(|(_, owner)| tracked(owner))
+            .map(|(slot, owner)| (*slot, *owner))
+            .collect();
+        let local_aliases = self
+            .local_aliases
+            .iter()
+            .filter(|(_, owner)| tracked(owner))
+            .map(|(local, owner)| (*local, *owner))
+            .collect();
+        Self {
+            tuples,
+            records,
+            stack_aliases,
+            local_aliases,
+        }
+    }
 }
 
 struct VerifyContext<'a> {
@@ -611,6 +728,7 @@ fn callable_result_summaries(
                 stack_values: Rc::default(),
                 aggregate_shapes: Rc::default(),
                 record_shapes: Rc::default(),
+                local_aggregates: Rc::default(),
                 local_values: Rc::default(),
                 global_values: Rc::default(),
                 capture_values: None,
@@ -741,6 +859,7 @@ fn region(
         stack_values: Rc::default(),
         aggregate_shapes: Rc::default(),
         record_shapes: Rc::default(),
+        local_aggregates: Rc::default(),
         local_values: Rc::default(),
         global_values: Rc::default(),
         capture_values: flow.capture_values.map(|values| Rc::new(values.to_vec())),
@@ -910,6 +1029,22 @@ fn region(
                     let common = join_record_shapes(&previous.record_shapes, &state.record_shapes);
                     if &common != previous.record_shapes.as_ref() {
                         previous.record_shapes = Rc::new(common);
+                        changed = true;
+                    }
+                }
+                if !Rc::ptr_eq(&previous.local_aggregates, &state.local_aggregates) {
+                    charge(
+                        flow.fact_work,
+                        previous
+                            .local_aggregates
+                            .cost()
+                            .saturating_add(state.local_aggregates.cost())
+                            .saturating_add(1),
+                        successor,
+                    )?;
+                    let common = previous.local_aggregates.join(&state.local_aggregates);
+                    if &common != previous.local_aggregates.as_ref() {
+                        previous.local_aggregates = Rc::new(common);
                         changed = true;
                     }
                 }
@@ -1179,12 +1314,30 @@ fn flow_at(facts: &BTreeMap<usize, FlowValue>, slot: usize) -> FlowValue {
     facts.get(&slot).copied().unwrap_or(FlowValue::UNKNOWN)
 }
 
-fn aggregate_index_flow(state: &State, old_height: usize) -> FlowValue {
+fn aggregate_index_flow(
+    state: &State,
+    old_height: usize,
+    strings: &[Rc<str>],
+    pc: usize,
+    fact_work: &mut usize,
+) -> Result<FlowValue, String> {
     let aggregate_slot = old_height - 2;
     let aggregate = flow_at(&state.stack_values, aggregate_slot);
     let key = flow_at(&state.stack_values, old_height - 1);
+    // A reloaded local reads the shape its owner recorded at the store.
+    let (tuple_shape, record_shape) =
+        match state.local_aggregates.stack_aliases.get(&aggregate_slot) {
+            Some(owner) => (
+                state.local_aggregates.tuples.get(owner),
+                state.local_aggregates.records.get(owner),
+            ),
+            None => (
+                state.aggregate_shapes.get(&aggregate_slot),
+                state.record_shapes.get(&aggregate_slot),
+            ),
+        };
     if let Some(index) = key.known_int {
-        return if let Some(shape) = state.aggregate_shapes.get(&aggregate_slot) {
+        return Ok(if let Some(shape) = tuple_shape {
             let element = usize::try_from(index)
                 .ok()
                 .and_then(|index| shape.get(index).copied())
@@ -1196,16 +1349,36 @@ fn aggregate_index_flow(state: &State, old_height: usize) -> FlowValue {
             } else {
                 element
             }
-        } else if state.record_shapes.contains_key(&aggregate_slot) {
-            FlowValue::ERROR
+        } else if let Some(shape) = record_shape {
+            // A record reads the field named by a non-negative decimal index.
+            // Tagged variants and constructor Errors reject integer keys.
+            if index < 0 || aggregate.normal_types & TYPE_RECORD == 0 {
+                FlowValue::ERROR
+            } else {
+                charge(fact_work, shape.len().saturating_add(1), pc)?;
+                let name = index.to_string();
+                let field = shape
+                    .iter()
+                    .find(|(id, _)| {
+                        strings
+                            .get(**id as usize)
+                            .is_some_and(|field| field.as_ref() == name)
+                    })
+                    .map_or(FlowValue::ERROR, |(_, value)| *value);
+                if aggregate.may_error || aggregate.normal_types != TYPE_RECORD {
+                    field.join(FlowValue::ERROR)
+                } else {
+                    field
+                }
+            }
         } else {
             FlowValue::UNKNOWN
-        };
+        });
     }
     if let Some(field) = key.known_string {
-        return if let Some(shape) = state.record_shapes.get(&aggregate_slot) {
+        return Ok(if let Some(shape) = record_shape {
             shape.get(&field).copied().unwrap_or(FlowValue::ERROR)
-        } else if state.aggregate_shapes.contains_key(&aggregate_slot) {
+        } else if tuple_shape.is_some() {
             // Arrays reject string keys, but a constructor Error can expose
             // fields such as TypeMismatch.op or ResourceLimit.resource.
             if aggregate.may_error {
@@ -1215,9 +1388,9 @@ fn aggregate_index_flow(state: &State, old_height: usize) -> FlowValue {
             }
         } else {
             FlowValue::UNKNOWN
-        };
+        });
     }
-    FlowValue::UNKNOWN
+    Ok(FlowValue::UNKNOWN)
 }
 
 fn value_flow(value: &Value, string_id: Option<u32>) -> FlowValue {
@@ -1910,7 +2083,13 @@ fn produced_flow(
         Instruction::Exclusive => Some(recoverable(TYPE_BOOL)),
         Instruction::MakeCell => Some(FlowValue::normal(TYPE_OTHER)),
         Instruction::CellGet => Some(FlowValue::UNKNOWN),
-        Instruction::Index => Some(aggregate_index_flow(state, old_height)),
+        Instruction::Index => Some(aggregate_index_flow(
+            state,
+            old_height,
+            context.strings,
+            pc,
+            fact_work,
+        )?),
         Instruction::CellSet => Some(recoverable(TYPE_OTHER)),
         // IndexSet returns the mutated container, including tuple-backed arrays.
         Instruction::IndexSet => Some(recoverable(TYPE_ARRAY | TYPE_TUPLE | TYPE_RECORD)),
@@ -2098,6 +2277,8 @@ fn update_value_facts(
         }
         _ => None,
     };
+    // Runs before the stack shapes below drop a stored constructor's shape.
+    update_local_aggregates(instruction, old_height, required, state, pc, fact_work)?;
     match instruction {
         Instruction::Store(slot) => {
             let value_index = old_height - 1;
@@ -2232,6 +2413,132 @@ fn update_value_facts(
         // Unknown callees and regions that may write globals retain the
         // conservative invalidation policy.
         truncate_values(&mut state.global_values, 0, pc, fact_work)?;
+    }
+    Ok(())
+}
+
+/// Moves aggregate shapes between the stack and frame locals and forgets an
+/// owner's shape when one of its aliases is used in a way that may mutate the
+/// container or let a reference escape the tracked locations.
+fn update_local_aggregates(
+    instruction: &Instruction,
+    old_height: usize,
+    required: usize,
+    state: &mut State,
+    pc: usize,
+    fact_work: &mut usize,
+) -> Result<(), String> {
+    let facts = state.local_aggregates.as_ref();
+    let first_operand = match instruction {
+        Instruction::StackTruncate(depth) => *depth,
+        _ => old_height - required,
+    };
+    let affected = match instruction {
+        Instruction::Load(local) => facts.owner_of_local(*local).is_some(),
+        Instruction::Store(local) => {
+            let slot = old_height - 1;
+            facts.stack_aliases.contains_key(&slot)
+                || facts.is_owner(*local)
+                || facts.local_aliases.contains_key(local)
+                || state.aggregate_shapes.contains_key(&slot)
+                || state.record_shapes.contains_key(&slot)
+        }
+        _ => facts.stack_aliases.range(first_operand..).next().is_some(),
+    };
+    if !affected {
+        return Ok(());
+    }
+    charge(fact_work, facts.cost().saturating_add(1), pc)?;
+    let facts = Rc::make_mut(&mut state.local_aggregates);
+    match instruction {
+        Instruction::Load(local) => {
+            if let Some(owner) = facts.owner_of_local(*local) {
+                facts.add_stack_alias(old_height, owner);
+            }
+        }
+        Instruction::Store(local) => {
+            let slot = old_height - 1;
+            let incoming = facts.stack_aliases.remove(&slot);
+            if incoming == Some(*local) {
+                // Storing a reload back into its owner keeps the shape.
+                return Ok(());
+            }
+            if facts.is_owner(*local) {
+                // Aliases of the overwritten container stay untracked.
+                facts.forget(*local);
+            }
+            facts.local_aliases.remove(local);
+            if let Some(owner) = incoming {
+                facts.add_local_alias(*local, owner);
+            } else if facts.tuples.len() + facts.records.len() < MAX_TRACKED_AGGREGATES {
+                // A constructor result on the stack has no other reference.
+                if let Some(shape) = state.aggregate_shapes.get(&slot) {
+                    facts.tuples.insert(*local, shape.clone());
+                } else if let Some(shape) = state.record_shapes.get(&slot) {
+                    facts.records.insert(*local, shape.clone());
+                }
+            }
+        }
+        Instruction::Dup => {
+            if let Some(owner) = facts.stack_aliases.get(&(old_height - 1)).copied() {
+                facts.add_stack_alias(old_height, owner);
+            }
+        }
+        Instruction::Swap => {
+            let (left, right) = (old_height - 2, old_height - 1);
+            let left_owner = facts.stack_aliases.remove(&left);
+            let right_owner = facts.stack_aliases.remove(&right);
+            if let Some(owner) = right_owner {
+                facts.stack_aliases.insert(left, owner);
+            }
+            if let Some(owner) = left_owner {
+                facts.stack_aliases.insert(right, owner);
+            }
+        }
+        _ => {
+            // These operations only read their operands, and their results
+            // never reference an operand container.
+            let read_only = matches!(
+                instruction,
+                Instruction::Pop
+                    | Instruction::StackTruncate(_)
+                    | Instruction::Index
+                    | Instruction::Len
+                    | Instruction::IsType(_)
+                    | Instruction::ErrorKind
+                    | Instruction::Not
+                    | Instruction::Eq
+                    | Instruction::Ne
+                    | Instruction::Lt
+                    | Instruction::Le
+                    | Instruction::Gt
+                    | Instruction::Ge
+                    | Instruction::And
+                    | Instruction::Or
+                    | Instruction::Xor
+                    | Instruction::JumpIfFalse(_)
+                    | Instruction::JumpIfTrue(_)
+            );
+            let consumed: Vec<usize> = facts
+                .stack_aliases
+                .range(first_operand..)
+                .map(|(_, owner)| *owner)
+                .collect();
+            facts.stack_aliases.retain(|slot, _| *slot < first_operand);
+            if !read_only {
+                // Each forgotten owner rescans the alias tables.
+                charge(
+                    fact_work,
+                    consumed
+                        .len()
+                        .saturating_mul(facts.cost().saturating_add(1)),
+                    pc,
+                )?;
+                for owner in consumed {
+                    facts.forget(owner);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -2571,6 +2878,7 @@ mod tests {
             ])),
             aggregate_shapes: Rc::new(BTreeMap::new()),
             record_shapes: Rc::new(BTreeMap::new()),
+            local_aggregates: Rc::default(),
             local_values: Rc::new(BTreeMap::new()),
             global_values: Rc::new(BTreeMap::new()),
             capture_values: None,
@@ -2588,6 +2896,45 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("complexity limit"));
+    }
+
+    #[test]
+    fn local_aggregate_tracking_uses_the_shared_work_budget() {
+        let shape = Rc::new(vec![FlowValue::boolean(true)]);
+        let mut state = State {
+            height: 1,
+            initialized: Rc::new(BTreeSet::from([0])),
+            stack_values: Rc::new(BTreeMap::new()),
+            aggregate_shapes: Rc::new(BTreeMap::from([(0, shape.clone())])),
+            record_shapes: Rc::new(BTreeMap::new()),
+            local_aggregates: Rc::default(),
+            local_values: Rc::new(BTreeMap::new()),
+            global_values: Rc::new(BTreeMap::new()),
+            capture_values: None,
+        };
+        // Storing a constructor result records a local shape.
+        let mut budget = 0;
+        let error =
+            update_local_aggregates(&Instruction::Store(0), 1, 1, &mut state, 3, &mut budget)
+                .unwrap_err();
+        assert!(error.contains("complexity limit"), "{error}");
+        let mut budget = MAX_FACT_WORK;
+        update_local_aggregates(&Instruction::Store(0), 1, 1, &mut state, 3, &mut budget).unwrap();
+        assert_eq!(state.local_aggregates.tuples.get(&0), Some(&shape));
+
+        // Reloading the owner creates an alias, which is charged as well.
+        let mut budget = 0;
+        let error =
+            update_local_aggregates(&Instruction::Load(0), 0, 0, &mut state, 4, &mut budget)
+                .unwrap_err();
+        assert!(error.contains("complexity limit"), "{error}");
+
+        // Joined paths that disagree about an alias forget its owner.
+        let mut aliased = state.local_aggregates.as_ref().clone();
+        aliased.stack_aliases.insert(0, 0);
+        let joined = state.local_aggregates.join(&aliased);
+        assert!(joined.tuples.is_empty() && joined.stack_aliases.is_empty());
+        assert_eq!(aliased.join(&aliased), aliased);
     }
 
     #[test]

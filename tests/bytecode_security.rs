@@ -824,6 +824,43 @@ fn verifier_keeps_overstack_callable_summary_unknown() {
 }
 
 #[test]
+fn verifier_keeps_result_summaries_beyond_their_caps_unknown() {
+    // The callee returns `false`, so a summary prunes the trap. Only the first
+    // 128 callables and bodies of at most 128 instructions are summarized.
+    let program_with = |fillers: usize, padding: usize| {
+        let mut instructions = vec![
+            I::Call(0, 0),
+            I::JumpIfFalse(4),
+            I::Load(99),
+            I::Pop,
+            I::Halt,
+        ];
+        let mut callables = std::collections::BTreeMap::new();
+        for _ in 0..fillers {
+            callables.insert(instructions.len(), CallableSignature::dynamic(0, 0));
+            instructions.extend([I::Push(Value::Nil), I::Return]);
+        }
+        let target = instructions.len();
+        callables.insert(target, CallableSignature::dynamic(0, 0));
+        for _ in 0..padding {
+            instructions.extend([I::Push(Value::Nil), I::Pop]);
+        }
+        instructions.extend([I::Push(Value::Bool(false)), I::Return]);
+        instructions[0] = I::Call(target, 0);
+        let mut program = CompiledProgram::new(instructions);
+        program.callables = callables;
+        interpreter::run_with(&program, &mut Vec::new()).unwrap();
+        program
+    };
+    // The 128th callable and a 128-instruction body are summarized.
+    bytecode::validate(&program_with(127, 0)).unwrap();
+    bytecode::validate(&program_with(0, 63)).unwrap();
+    // The 129th callable and a 130-instruction body keep a dynamic result.
+    rejected(program_with(128, 0), "not initialized");
+    rejected(program_with(0, 64), "not initialized");
+}
+
+#[test]
 fn verifier_uses_checked_native_any_result_contracts() {
     for (mut instructions, name, predicate) in [
         (
@@ -1665,6 +1702,545 @@ fn verifier_forgets_array_element_facts_after_aliasing_mutation() {
         I::Halt,
     ]);
     rejected(program, "not initialized");
+}
+
+/// Appends a probe that reads element `key` of the aggregate in local 0 (or
+/// on top of the stack), applies `predicate`, and jumps to an
+/// uninitialized-local trap when the result is false.
+fn element_probe(mut instructions: Vec<I>, reload: bool, key: Value, predicate: &[I]) -> Vec<I> {
+    if reload {
+        instructions.push(I::Load(0));
+    }
+    instructions.extend([I::Push(key), I::Index]);
+    instructions.extend_from_slice(predicate);
+    let trap = instructions.len() + 3;
+    instructions.extend([
+        I::JumpIfFalse(trap),
+        I::Push(Value::Nil),
+        I::Jump(trap + 1),
+        I::Load(99),
+        I::Pop,
+        I::Halt,
+    ]);
+    instructions
+}
+
+/// Tuple and array elements read through Index may be a constructor Error,
+/// so only their type categories decide a branch. The trap needs a `str`.
+const NOT_STR: [I; 2] = [I::IsType(ValueType::Str), I::Not];
+
+/// Record `{"0": true}` stored in local 0. Integer index 0 reads its field.
+fn record_in_local_zero() -> Vec<I> {
+    vec![
+        I::Push(Value::Str("0".into())),
+        I::Push(Value::Bool(true)),
+        I::MakeRecord(1),
+        I::Store(0),
+    ]
+}
+
+fn trap_taken(program: &CompiledProgram) -> bool {
+    matches!(
+        interpreter::run_with(program, &mut Vec::new()),
+        Err(cog::error::RuntimeError::InvalidLocal(99))
+    )
+}
+
+#[test]
+fn verifier_tracks_aggregate_elements_through_locals() {
+    use cog::value::RuntimeType;
+
+    let constructors: [(Vec<I>, Value, &[I]); 5] = [
+        (
+            vec![
+                I::Push(Value::Bool(true)),
+                I::Push(Value::Int(7)),
+                I::MakeTuple(2),
+            ],
+            Value::Int(0),
+            &NOT_STR,
+        ),
+        (
+            vec![
+                I::Push(Value::Bool(true)),
+                I::MakeTypedTuple(1, vec![RuntimeType::Bool]),
+            ],
+            Value::Int(0),
+            &NOT_STR,
+        ),
+        (
+            vec![I::Push(Value::Bool(true)), I::MakeArray(1)],
+            Value::Int(0),
+            &NOT_STR,
+        ),
+        (
+            vec![
+                I::Push(Value::Str("done".into())),
+                I::Push(Value::Bool(true)),
+                I::MakeRecord(1),
+            ],
+            Value::Str("done".into()),
+            &[],
+        ),
+        (
+            vec![
+                I::Push(Value::Str("done".into())),
+                I::Push(Value::Bool(true)),
+                I::MakeRecord(1),
+                I::Store(1),
+                // Local 0 becomes a second name for the record in local 1.
+                I::Load(1),
+            ],
+            Value::Str("done".into()),
+            &[],
+        ),
+    ];
+    for (case, (mut instructions, key, predicate)) in constructors.into_iter().enumerate() {
+        instructions.extend([
+            I::Store(0),
+            // Reloads, Dup of a reload, read-only uses, self-stores and
+            // moves through Swap keep the local's element facts.
+            I::Load(0),
+            I::Dup,
+            I::Len,
+            I::Pop,
+            I::Pop,
+            I::Load(0),
+            I::Store(0),
+            I::Push(Value::Nil),
+            I::Load(0),
+            I::Swap,
+            I::Pop,
+            I::Store(0),
+        ]);
+        let program = CompiledProgram::new(element_probe(instructions, true, key, predicate));
+        bytecode::validate(&program).unwrap_or_else(|error| panic!("case {case}: {error}"));
+        let decoded = bytecode::decode(&bytecode::encode(&program).unwrap()).unwrap();
+        interpreter::run_with(&decoded, &mut Vec::new()).unwrap();
+    }
+
+    // Both sides of a join store a tuple with the same element categories.
+    let join = vec![
+        I::Push(Value::Int(1)),
+        I::Push(Value::Int(1)),
+        I::Eq,
+        I::JumpIfFalse(8),
+        I::Push(Value::Bool(true)),
+        I::MakeTuple(1),
+        I::Store(0),
+        I::Jump(11),
+        I::Push(Value::Bool(false)),
+        I::MakeTuple(1),
+        I::Store(0),
+    ];
+    let program = CompiledProgram::new(element_probe(join, true, Value::Int(0), &NOT_STR));
+    bytecode::validate(&program).unwrap();
+    interpreter::run_with(&program, &mut Vec::new()).unwrap();
+}
+
+#[test]
+fn verifier_reads_decimal_record_fields_through_integer_indexes() {
+    for reload in [false, true] {
+        let mut instructions = record_in_local_zero();
+        if !reload {
+            instructions.pop();
+        }
+        // Integer index 0 reads the field named "0", which is `true`.
+        let program = CompiledProgram::new(element_probe(
+            instructions.clone(),
+            reload,
+            Value::Int(0),
+            &[],
+        ));
+        bytecode::validate(&program).unwrap_or_else(|error| panic!("reload={reload}: {error}"));
+        interpreter::run_with(&program, &mut Vec::new()).unwrap();
+
+        // The VM reaches the trap because the read is not an Error. A summary
+        // that treats every integer record key as missing would prune it.
+        let program = CompiledProgram::new(element_probe(
+            instructions,
+            reload,
+            Value::Int(0),
+            &[I::IsType(ValueType::Error)],
+        ));
+        assert!(trap_taken(&program), "reload={reload}");
+        rejected(program, "not initialized");
+    }
+}
+
+#[test]
+fn verifier_does_not_apply_a_new_local_shape_to_an_older_reload() {
+    // The reload of `{"0": false}` stays on the stack while local 0 receives
+    // `{"0": true}`; reading the old record reaches the trap.
+    let program = CompiledProgram::new(element_probe(
+        vec![
+            I::Push(Value::Str("0".into())),
+            I::Push(Value::Bool(false)),
+            I::MakeRecord(1),
+            I::Store(0),
+            I::Load(0),
+            I::Push(Value::Str("0".into())),
+            I::Push(Value::Bool(true)),
+            I::MakeRecord(1),
+            I::Store(0),
+        ],
+        false,
+        Value::Int(0),
+        &[],
+    ));
+    assert!(trap_taken(&program));
+    rejected(program, "not initialized");
+}
+
+#[test]
+fn verifier_does_not_read_a_local_shape_through_a_slot_joined_from_another_value() {
+    // The fall-through side reloads `{"0": true}` from local 0 and reaches
+    // the join first; the VM takes the other side, which builds
+    // `{"0": false}`. Reading the merged slot must not use local 0's shape.
+    for (left, right) in [(1, 2), (1, 1)] {
+        let (reload, fresh) = (
+            vec![I::Load(0)],
+            vec![
+                I::Push(Value::Str("0".into())),
+                I::Push(Value::Bool(false)),
+                I::MakeRecord(1),
+            ],
+        );
+        // With equal operands the fresh record is on the fall-through side.
+        let (first, second) = if left == right {
+            (fresh, reload)
+        } else {
+            (reload, fresh)
+        };
+        let mut instructions = record_in_local_zero();
+        instructions.extend([I::Push(Value::Int(left)), I::Push(Value::Int(right)), I::Eq]);
+        let branch = instructions.len();
+        instructions.push(I::JumpIfFalse(0));
+        instructions.extend(first);
+        let jump = instructions.len();
+        instructions.push(I::Jump(0));
+        instructions[branch] = I::JumpIfFalse(instructions.len());
+        instructions.extend(second);
+        instructions[jump] = I::Jump(instructions.len());
+        let program = CompiledProgram::new(element_probe(instructions, false, Value::Int(0), &[]));
+        assert!(trap_taken(&program), "{left} == {right}");
+        rejected(program, "not initialized");
+    }
+}
+
+#[test]
+fn verifier_forgets_a_local_shape_when_its_aliases_exceed_the_tracking_cap() {
+    // 129 reloads exceed the alias table. The write goes through the last
+    // one, so an alias dropped at the cap would leave a stale shape.
+    let mut instructions = record_in_local_zero();
+    instructions.extend(std::iter::repeat_n(I::Load(0), 129));
+    instructions.extend([
+        I::Push(Value::Int(0)),
+        I::Push(Value::Bool(false)),
+        I::IndexSet,
+        I::Pop,
+        I::StackTruncate(0),
+    ]);
+    let program = CompiledProgram::new(element_probe(instructions, true, Value::Int(0), &[]));
+    assert!(trap_taken(&program));
+    rejected(program, "not initialized");
+
+    // Within the cap, the same reloads keep the shape.
+    let mut instructions = record_in_local_zero();
+    instructions.extend(std::iter::repeat_n(I::Load(0), 100));
+    instructions.push(I::StackTruncate(0));
+    let program = CompiledProgram::new(element_probe(instructions, true, Value::Int(0), &[]));
+    bytecode::validate(&program).unwrap();
+    interpreter::run_with(&program, &mut Vec::new()).unwrap();
+}
+
+#[test]
+fn verifier_forgets_local_array_length_after_an_aliasing_push() {
+    // Element 1 of `[true]` is out of bounds until a push through local 1.
+    let program = CompiledProgram::new(element_probe(
+        vec![
+            I::Push(Value::Bool(true)),
+            I::MakeArray(1),
+            I::Store(0),
+            I::Load(0),
+            I::Store(1),
+            I::Load(1),
+            I::Push(Value::Bool(true)),
+            I::ArrayPush,
+            I::Pop,
+        ],
+        true,
+        Value::Int(1),
+        &[I::IsType(ValueType::Error)],
+    ));
+    assert!(trap_taken(&program));
+    rejected(program, "not initialized");
+}
+
+#[test]
+fn verifier_forgets_local_aggregate_facts_after_aliasing_writes() {
+    // Local 0 holds `{"0": true}`. Each mutation stores `false` into field "0"
+    // through an alias, so the VM reaches the probe's trap and the verifier
+    // must keep that branch.
+    let set = |mut code: Vec<I>| {
+        code.extend([
+            I::Push(Value::Int(0)),
+            I::Push(Value::Bool(false)),
+            I::IndexSet,
+            I::Pop,
+        ]);
+        code
+    };
+    let prefix = record_in_local_zero();
+    let mutations: Vec<(&str, Vec<I>)> = vec![
+        ("reload", set(vec![I::Load(0)])),
+        ("dup of a reload", {
+            let mut code = set(vec![I::Load(0), I::Dup]);
+            code.push(I::Pop);
+            code
+        }),
+        (
+            "second local",
+            set(vec![I::Load(0), I::Store(1), I::Load(1)]),
+        ),
+        (
+            "global",
+            set(vec![I::Load(0), I::StoreGlobal(0), I::LoadGlobal(0)]),
+        ),
+        ("cell", set(vec![I::Load(0), I::MakeCell, I::CellGet])),
+        (
+            "nested aggregate",
+            set(vec![
+                I::Load(0),
+                I::MakeTuple(1),
+                I::Store(1),
+                I::Load(1),
+                I::Push(Value::Int(0)),
+                I::Index,
+            ]),
+        ),
+        (
+            "swap",
+            set(vec![I::Push(Value::Nil), I::Load(0), I::Swap, I::Pop]),
+        ),
+        (
+            "one side of a join",
+            // Absolute targets after the four-instruction prefix. The reload
+            // side runs; the other side builds a fresh record, so the merged
+            // slot only may alias local 0.
+            set(vec![
+                I::Push(Value::Int(1)),
+                I::Push(Value::Int(1)),
+                I::Eq,
+                I::JumpIfFalse(10),
+                I::Load(0),
+                I::Jump(13),
+                I::Push(Value::Str("0".into())),
+                I::Push(Value::Bool(true)),
+                I::MakeRecord(1),
+            ]),
+        ),
+        (
+            "old container restored after an overwrite",
+            // Local 1 keeps the original record while local 0 is replaced;
+            // the write goes through local 1 before the original returns.
+            {
+                let mut code = set(vec![
+                    I::Load(0),
+                    I::Store(1),
+                    I::Push(Value::Str("0".into())),
+                    I::Push(Value::Bool(true)),
+                    I::MakeRecord(1),
+                    I::Store(0),
+                    I::Load(1),
+                ]);
+                code.extend([I::Load(1), I::Store(0)]);
+                code
+            },
+        ),
+        (
+            "alias kept on the stack across an overwrite",
+            // The reload outlives the store of a fresh record into local 0,
+            // is written, and then replaces that record.
+            vec![
+                I::Load(0),
+                I::Push(Value::Str("0".into())),
+                I::Push(Value::Bool(true)),
+                I::MakeRecord(1),
+                I::Store(0),
+                I::Push(Value::Int(0)),
+                I::Push(Value::Bool(false)),
+                I::IndexSet,
+                I::Store(0),
+            ],
+        ),
+        (
+            "write before the alias is stored",
+            // The mutated container replaces local 0 through IndexSet's
+            // result, which aliases the original record.
+            vec![
+                I::Load(0),
+                I::Push(Value::Int(0)),
+                I::Push(Value::Bool(false)),
+                I::IndexSet,
+                I::Store(0),
+            ],
+        ),
+    ];
+    for (name, mutation) in mutations {
+        let mut instructions = prefix.clone();
+        instructions.extend(mutation);
+        if name == "one side of a join" {
+            // Keep the join targets aligned with the four-instruction prefix.
+            assert!(matches!(instructions[7], I::JumpIfFalse(10)));
+            assert!(matches!(instructions[9], I::Jump(13)));
+        }
+        let program = CompiledProgram::new(element_probe(instructions, true, Value::Int(0), &[]));
+        assert!(
+            trap_taken(&program),
+            "{name}: the VM must take the trap branch"
+        );
+        let error = bytecode::validate(&program).unwrap_err();
+        assert!(error.contains("not initialized"), "{name}: {error}");
+    }
+}
+
+#[test]
+fn verifier_forgets_local_aggregate_facts_after_mutating_calls() {
+    // A direct, indirect or closure callee writes `false` into field "0" of
+    // the record held by local 0.
+    for kind in ["direct", "indirect", "closure"] {
+        let mut instructions = record_in_local_zero();
+        instructions.push(I::Load(0));
+        let call_at = instructions.len();
+        match kind {
+            "direct" => instructions.push(I::Call(0, 1)),
+            "indirect" => instructions.extend([I::Push(Value::Function(0)), I::CallValue(1)]),
+            _ => instructions.extend([I::MakeClosure(0, 1), I::CallValue(0)]),
+        }
+        instructions.push(I::Pop);
+        let mut instructions = element_probe(instructions, true, Value::Int(0), &[]);
+        let entry = instructions.len();
+        match &mut instructions[call_at] {
+            I::Call(target, _) | I::MakeClosure(target, _) => *target = entry,
+            I::Push(Value::Function(target)) => *target = entry,
+            other => panic!("unexpected call instruction {other:?}"),
+        }
+        if kind == "closure" {
+            instructions.push(I::LoadCapture(0));
+        } else {
+            instructions.extend([I::Store(0), I::Load(0)]);
+        }
+        instructions.extend([
+            I::Push(Value::Int(0)),
+            I::Push(Value::Bool(false)),
+            I::IndexSet,
+            I::Return,
+        ]);
+        let closure = kind == "closure";
+        let program = callable(
+            instructions,
+            entry,
+            usize::from(!closure),
+            usize::from(closure),
+        );
+        assert!(trap_taken(&program), "{kind}");
+        rejected(program, "not initialized");
+    }
+}
+
+#[test]
+fn verifier_keeps_aggregates_over_the_tracking_caps_unknown() {
+    // 32 items are tracked and 33 are not. The probe reads the last item, a
+    // `bool`, so tracking prunes the trap that needs a `str`.
+    for (items, tracked) in [(32, true), (33, false)] {
+        for record in [false, true] {
+            for reload in [false, true] {
+                let mut instructions = Vec::new();
+                for item in 0..items {
+                    if record {
+                        instructions.push(I::Push(Value::Str(format!("f{item}").into())));
+                    }
+                    instructions.push(I::Push(Value::Bool(item + 1 == items)));
+                }
+                instructions.push(if record {
+                    I::MakeRecord(items)
+                } else {
+                    I::MakeTuple(items)
+                });
+                if reload {
+                    instructions.push(I::Store(0));
+                }
+                let key = if record {
+                    Value::Str(format!("f{}", items - 1).into())
+                } else {
+                    Value::Int(items as i64 - 1)
+                };
+                let program =
+                    CompiledProgram::new(element_probe(instructions, reload, key, &NOT_STR));
+                interpreter::run_with(&program, &mut Vec::new()).unwrap();
+                let result = bytecode::validate(&program);
+                assert_eq!(
+                    result.is_ok(),
+                    tracked,
+                    "items={items} record={record} reload={reload}: {result:?}"
+                );
+                if let Err(error) = result {
+                    assert!(error.contains("not initialized"), "{error}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn verifier_invalidates_global_facts_after_writers_beyond_summary_capacity() {
+    // The writer is the 130th callable. A forwarder among the first callables
+    // calls it, so neither may preserve global facts at a call site.
+    let fillers = 128;
+    for (indirect, through_forwarder) in [(false, false), (true, false), (false, true)] {
+        let mut instructions = vec![I::Push(Value::Bool(false)), I::StoreGlobal(0)];
+        let call_at = instructions.len();
+        if indirect {
+            instructions.extend([I::Push(Value::Function(0)), I::CallValue(0)]);
+        } else {
+            instructions.push(I::Call(0, 0));
+        }
+        instructions.extend([I::Pop, I::LoadGlobal(0)]);
+        let trap = instructions.len() + 2;
+        instructions.extend([I::JumpIfFalse(trap + 2), I::Push(Value::Nil)]);
+        instructions.extend([I::Load(99), I::Pop, I::Halt]);
+        let mut callables = std::collections::BTreeMap::new();
+        let forwarder = instructions.len();
+        callables.insert(forwarder, CallableSignature::dynamic(0, 0));
+        instructions.extend([I::Call(0, 0), I::Return]);
+        for _ in 0..fillers {
+            callables.insert(instructions.len(), CallableSignature::dynamic(0, 0));
+            instructions.extend([I::Push(Value::Nil), I::Return]);
+        }
+        let writer = instructions.len();
+        callables.insert(writer, CallableSignature::dynamic(0, 0));
+        assert_eq!(callables.len(), fillers + 2);
+        instructions.extend([
+            I::Push(Value::Bool(true)),
+            I::StoreGlobal(0),
+            I::Push(Value::Nil),
+            I::Return,
+        ]);
+        instructions[forwarder] = I::Call(writer, 0);
+        let target = if through_forwarder { forwarder } else { writer };
+        match &mut instructions[call_at] {
+            I::Call(callee, _) | I::Push(Value::Function(callee)) => *callee = target,
+            other => panic!("unexpected call instruction {other:?}"),
+        }
+        let mut program = CompiledProgram::new(instructions);
+        program.callables = callables;
+        assert!(matches!(
+            interpreter::run_with(&program, &mut Vec::new()),
+            Err(cog::error::RuntimeError::InvalidLocal(99))
+        ));
+        rejected(program, "not initialized");
+    }
 }
 
 #[test]
