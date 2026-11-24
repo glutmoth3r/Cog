@@ -13,8 +13,12 @@ the editor. Reset restores the original example; Ctrl+Enter or Command+Enter run
 The tutorial server is a Cog program (`web/tutorial`) built on the `cogweb` library
 (`packages/cogweb`). `node web/server.mts` is only a launcher: it builds the Cog
 compiler with locked, offline Cargo, packs `packages/cogweb` into a `.cogpkg` and
-installs it in `$COG_HOME/libraries` (default `~/.cog/libraries`; skipped when the
-installed package is newer than the sources), then runs `cog run web/tutorial`.
+installs it in `$COG_HOME/libraries` (default `~/.cog/libraries`), then runs
+`cog run web/tutorial`. The install is skipped when a stamp under `target/tutorial/`
+matches the digest of the library sources, the compiler path and the store. After
+editing `packages/cogweb`, bump its `version` in `package.kdl` and the dependency in
+`web/tutorial/dependencies.kdl`: an installed release is immutable and the installer
+refuses different contents under the same version.
 That server invokes the real compiler and runs each example's `.cogb` artifact.
 The first start compiles the server and can take minutes. If dependencies are not
 cached, first run `cargo build --locked --bin cog` with network access. There are no

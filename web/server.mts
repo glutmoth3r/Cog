@@ -12,7 +12,7 @@ const library = join(root, "packages", "cogweb");
 
 // Cargo reports the executable path, including any configured target triple.
 export async function buildCompiler(): Promise<string> {
-    const child = spawn("cargo", ["build", "--locked", "--offline", "--bin", "cog", "--target-dir", join(root, "target", "tutorial"), "--message-format=json"], { cwd: root });
+    const child = spawn("cargo", ["build", "--locked", "--offline", "--bin", "cog", "--target-dir", process.env.CARGO_TARGET_DIR ?? join(root, "target", "tutorial"), "--message-format=json"], { cwd: root });
     let output = "";
     child.stdout.setEncoding("utf8").on("data", text => { output += text; });
     child.stderr.pipe(process.stderr);
@@ -72,7 +72,13 @@ async function libraryIsInstalled(compiler: string): Promise<boolean> {
     try {
         if ((await readFile(stamp, "utf8")) !== await libraryStamp(compiler)) return false;
         const version = /version="([^"]+)"/.exec(await readFile(join(library, "package.kdl"), "utf8"))?.[1];
-        return (await readdir(storeDirectory())).some(name => name.startsWith("cogweb-"));
+        if (!version) return false;
+        // Store layout: libraries/cogweb-<hash>/<version>-<hash>/package.cogpkg.
+        for (const name of (await readdir(storeDirectory())).filter(entry => entry.startsWith("cogweb-"))) {
+            const releases = await readdir(join(storeDirectory(), name));
+            if (releases.some(release => release.startsWith(`${version}-`))) return true;
+        }
+        return false;
     } catch { return false; }
 }
 
@@ -82,7 +88,9 @@ export async function installLibrary(compiler: string): Promise<void> {
     console.log("Installing the cogweb library into the local Cog store…");
     const child = spawn(compiler, ["install", "--path", library, "--color", "never"], { cwd: root, stdio: ["ignore", "inherit", "inherit"] });
     const [code] = await once(child, "close");
-    if (code !== 0) throw new Error("Could not install packages/cogweb. Run cog install --path packages/cogweb for details.");
+    if (code !== 0) {
+        throw new Error("Could not install packages/cogweb. If you changed its sources, bump the version in packages/cogweb/package.kdl (and the dependency in web/tutorial/dependencies.kdl): an installed release is immutable. Run cog install --path packages/cogweb for details.");
+    }
     await mkdir(dirname(stamp), { recursive: true });
     await writeFile(stamp, await libraryStamp(compiler));
 }
@@ -105,7 +113,14 @@ export async function startTutorial(compiler: string, port: number): Promise<{ c
         stdio: ["ignore", "pipe", "inherit"],
     });
     // Register before the server is ready so a signal during startup cannot orphan the child.
-    for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, () => { child.kill(signal); process.exitCode = 130; });
+    let interrupted = false;
+    for (const signal of ["SIGINT", "SIGTERM"] as const) {
+        process.once(signal, () => {
+            interrupted = true;
+            child.kill(signal);
+            setTimeout(() => child.kill("SIGKILL"), 5000).unref();
+        });
+    }
     process.once("exit", () => { child.kill("SIGTERM"); });
     let buffered = "";
     return await new Promise((resolveStart, reject) => {
@@ -132,5 +147,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
         const { child } = await startTutorial(compiler, port);
         child.removeAllListeners("close");
         child.on("close", code => { process.exitCode = code ?? 1; });
+        process.once("SIGINT", () => { process.exitCode = 130; });
+        process.once("SIGTERM", () => { process.exitCode = 143; });
     } catch (error) { console.error(error instanceof Error ? error.message : error); process.exitCode = 1; }
 }

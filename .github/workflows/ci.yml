@@ -115,6 +115,7 @@ jobs:
           path: target/ci-evidence/
   tutorial:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       RUSTUP_TOOLCHAIN: stable
     steps:

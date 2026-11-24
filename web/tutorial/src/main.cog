@@ -15,7 +15,7 @@ use process;
 use router;
 use security;
 use static_files;
-use str::{contains, ends_with, replace, split, starts_with, trim,};
+use str::{contains, ends_with, join, replace, split, starts_with, trim,};
 use task;
 use time;
 
@@ -219,38 +219,107 @@ fn process_failure(error: Error, phase: str) -> RunResult {
 }
 
 @async fn cleanup_run(directory: str) -> nil {
+    // `cog build` keeps a dependency cache beside the source: <directory>/target/.cog-cache.
+    const cache = directory + "/target/.cog-cache";
+    const cached = await fs::read_dir(cache);
+    when cached is Error {} else {
+        for entry in cached!! {
+            await fs::remove_file(cache + "/" + (entry as str));
+        }
+    }
+    await fs::remove_dir(cache);
+    await fs::remove_dir(directory + "/target");
     await fs::remove_file(directory + "/main.cog");
     await fs::remove_file(directory + "/program.cogb");
     await fs::remove_dir(directory);
 }
 
-@async fn finish_run(directory: str, result: RunResult) -> RunResult {
-    await cleanup_run(directory)!!;
-    result
+fn is_run_directory_name(name: str) -> bool {
+    const raw = bytes::from_str(name)!!;
+    const length = bytes::len(raw)!!;
+    // "cog-" followed by the 32 lowercase hex digits of a 16-byte token.
+    if length != 36 || !starts_with(name, "cog-")!! { return false; }
+    for index in 4..length {
+        const digit = bytes::get(raw, index)!!;
+        if !((digit >= 48 && digit <= 57) || (digit >= 97 && digit <= 102)) { return false; }
+    }
+    true
+}
+
+// Removes run directories that an earlier crashed server left behind. Only entries of
+// RUN_ROOT whose names are exactly `cog-` plus a hex token are touched.
+@async fn remove_stale_runs() -> nil {
+    const listed = await fs::read_dir(RUN_ROOT);
+    when listed is Error { return nil; } else {}
+    for entry in listed!! {
+        const name = entry as str;
+        if is_run_directory_name(name) {
+            await cleanup_run(path::join(RUN_ROOT, name)!!);
+        }
+    }
+}
+
+// The compiler prints absolute source paths. Strip the run directory together with
+// everything before it so a response never reveals where the server runs.
+fn strip_path_prefix(piece: str) -> str {
+    const data = bytes::from_str(piece)!!;
+    var end = bytes::len(data)!!;
+    while end > 0 {
+        const byte = bytes::get(data, end - 1)!!;
+        if byte == 32 || byte == 9 || byte == 10 || byte == 13 || byte == 34 || byte == 39 || byte == 40 {
+            break;
+        }
+        end -= 1;
+    }
+    bytes::to_str(data, 0, end)!!
+}
+
+fn scrub_paths(text: str, directory: str) -> str {
+    var cleaned = text;
+    const working = process::env("PWD")!!;
+    when working is str {
+        if working != "" && working != "/" {
+            cleaned = replace(cleaned, working + "/" + directory + "/", "")!!;
+        }
+    } else {}
+    var kept: str[] = [];
+    const pieces = split(cleaned, directory + "/")!!;
+    const count = pieces.len();
+    for index in 0..count {
+        const piece = pieces[index]!! as str;
+        if index + 1 < count { kept << strip_path_prefix(piece); } else { kept << piece; }
+    }
+    cleaned = join(kept, "")!!;
+    when working is str {
+        if working != "" && working != "/" { cleaned = replace(cleaned, working + "/", "")!!; }
+    } else {}
+    cleaned
+}
+
+fn prepare_failure() -> RunResult {
+    RunResult(ok: false, stdout: "", diagnostics: "Could not prepare the example.", phase: "compile")
 }
 
 @async fn run_example(compiler: str, source: str, input: str) -> RunResult {
     const created_root = await fs::create_dir_all(RUN_ROOT);
-    when created_root is Error {
-        return RunResult(ok: false, stdout: "", diagnostics: "Could not prepare the example.", phase: "compile");
-    } else {}
+    when created_root is Error { return prepare_failure(); } else {}
 
     const token = hex::encode(entropy::bytes(16)!!)!!;
     const directory = path::join(RUN_ROOT, "cog-" + token)!!;
     const created = await fs::create_dir(directory);
-    when created is Error {
-        return RunResult(ok: false, stdout: "", diagnostics: "Could not prepare the example.", phase: "compile");
-    } else {}
+    when created is Error { return prepare_failure(); } else {}
+    // `await` is not allowed in `defer`, so cleanup runs after the awaited body and
+    // before its result (value or Error) is returned.
+    const result = await execute_in_directory(compiler, directory, source, input);
+    await cleanup_run(directory);
+    result!!
+}
 
+@async fn execute_in_directory(compiler: str, directory: str, source: str, input: str) -> RunResult {
     const source_path = path::join(directory, "main.cog")!!;
     const bytecode_path = path::join(directory, "program.cogb")!!;
     const stored = await fs::write_text(source_path, source);
-    when stored is Error {
-        return await finish_run(
-            directory,
-            RunResult(ok: false, stdout: "", diagnostics: "Could not prepare the example.", phase: "compile"),
-        )!!;
-    } else {}
+    when stored is Error { return prepare_failure(); } else {}
 
     const started = time::monotonic_nanos();
     const compile = await process::run(
@@ -259,43 +328,31 @@ fn process_failure(error: Error, phase: str) -> RunResult {
         RUN_TIMEOUT_MS,
         MAX_OUTPUT_BYTES,
     );
-    var output = RunResult(ok: false, stdout: "", diagnostics: "", phase: "compile");
-    when compile is Error {
-        output = process_failure(compile, "compile");
-    } else {
-        if compile.success as bool {
-            const timeout = remaining_ms(started);
-            if timeout == 0 {
-                output = process_failure(Error::Timeout(), "run");
-            } else {
-                const execution = await process::run(
-                    compiler,
-                    ["run", bytecode_path, "--restricted", "--color", "never"],
-                    bytes::from_str(input)!!,
-                    timeout,
-                    MAX_OUTPUT_BYTES,
-                );
-                when execution is Error {
-                    output = process_failure(execution, "run");
-                } else {
-                    output = RunResult(
-                        ok: execution.success as bool,
-                        stdout: decode_bytes(execution.stdout),
-                        diagnostics: replace(decode_bytes(execution.stderr), directory + "/", "")!!,
-                        phase: "run",
-                    );
-                }
-            }
-        } else {
-            output = RunResult(
-                ok: false,
-                stdout: "",
-                diagnostics: replace(decode_bytes(compile.stderr), directory + "/", "")!!,
-                phase: "compile",
-            );
-        }
+    when compile is Error { return process_failure(compile, "compile"); } else {}
+    if !(compile.success as bool) {
+        return RunResult(
+            ok: false,
+            stdout: "",
+            diagnostics: scrub_paths(decode_bytes(compile.stderr), directory)!!,
+            phase: "compile",
+        );
     }
-    await finish_run(directory, output)!!
+    const timeout = remaining_ms(started);
+    if timeout == 0 { return process_failure(Error::Timeout(), "run"); }
+    const execution = await process::run(
+        compiler,
+        ["run", bytecode_path, "--restricted", "--color", "never"],
+        bytes::from_str(input)!!,
+        timeout,
+        MAX_OUTPUT_BYTES,
+    );
+    when execution is Error { return process_failure(execution, "run"); } else {}
+    RunResult(
+        ok: execution.success as bool,
+        stdout: decode_bytes(execution.stdout),
+        diagnostics: scrub_paths(decode_bytes(execution.stderr), directory)!!,
+        phase: "run",
+    )
 }
 
 @async fn send_json(socket, status: int, value) -> nil {
@@ -517,6 +574,7 @@ fn tutorial_cors_policy(host: str) -> cors::Policy {
     const compiler = select_compiler()!!;
     await validate_compiler(compiler)!!;
     await prepare_checker(compiler)!!;
+    await remove_stale_runs()!!;
     const port = request_port()!!;
     const routes = build_router()!!;
     const listener = await net::listen("127.0.0.1", port)!!;

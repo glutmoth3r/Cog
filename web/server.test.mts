@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import { before, after, test } from "node:test";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { readFile, access, mkdtemp, rm } from "node:fs/promises";
+import { readFile, access, mkdtemp, rm, readdir, mkdir, writeFile } from "node:fs/promises";
+import { request as httpRequest } from "node:http";
+import { connect } from "node:net";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { runWasi } from "./wasi.mjs";
 import { checkOutput } from "./wasi-browser.mjs";
 import { buildCompiler, freePort, installLibrary, startTutorial } from "./server.mts";
@@ -16,10 +19,16 @@ let origin: string;
 before(async () => {
     const compiler = await buildCompiler();
     await installLibrary(compiler);
+    // Directories from a crashed earlier run: one matching the run pattern, one decoy.
+    const runs = join(dirname(fileURLToPath(import.meta.url)), "..", "target", "tutorial-runs");
+    await mkdir(join(runs, "cog-" + "0123456789abcdef".repeat(2)), { recursive: true });
+    await writeFile(join(runs, "cog-" + "0123456789abcdef".repeat(2), "main.cog"), "fn main() {}");
+    await mkdir(join(runs, "cog-keep-me"), { recursive: true });
     tutorial = await startTutorial(compiler, await freePort());
     origin = tutorial.origin;
 }, { timeout: 900000 });
 after(async () => {
+    await rm(join(dirname(fileURLToPath(import.meta.url)), "..", "target", "tutorial-runs", "cog-keep-me"), { recursive: true, force: true });
     if (!tutorial) return;
     tutorial.child.removeAllListeners("close");
     if (tutorial.child.exitCode === null && tutorial.child.signalCode === null) {
@@ -238,4 +247,104 @@ test("the WASI host links guests that import clocks or unknown WASI functions", 
     ]);
     const result = await runWasi(await WebAssembly.compile(bytes), []);
     assert.equal(result.exitCode, 0);
+});
+
+const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+
+// Sends a raw request so tests can control the Host header, which fetch forbids.
+function rawRequest(options: { method?: string; path: string; headers?: Record<string, string>; body?: string }): Promise<{ status: number; headers: Record<string, string | string[] | undefined>; text: string }> {
+    return new Promise((resolve, reject) => {
+        const url = new URL(origin);
+        const request = httpRequest({ host: url.hostname, port: url.port, method: options.method ?? "GET", path: options.path, headers: options.headers, setHost: false }, response => {
+            let text = "";
+            response.setEncoding("utf8").on("data", chunk => { text += chunk; });
+            response.on("end", () => resolve({ status: response.statusCode!, headers: response.headers, text }));
+        });
+        request.on("error", reject);
+        request.end(options.body);
+    });
+}
+
+test("a wrong Host header is rejected with security headers", async () => {
+    const response = await rawRequest({ path: "/api/status", headers: { Host: "example.invalid" } });
+    assert.equal(response.status, 403);
+    assert.equal(response.headers["x-content-type-options"], "nosniff");
+    const body = JSON.stringify({ source: "fn main() {}", input: "" });
+    const rebound = await rawRequest({ method: "POST", path: "/api/run", headers: { Host: "evil.example:80", Origin: "http://evil.example:80", "Content-Type": "application/json", "Content-Length": String(body.length) }, body });
+    assert.equal(rebound.status, 403);
+    const localhost = await rawRequest({ path: "/api/status", headers: { Host: `localhost:${new URL(origin).port}` } });
+    assert.equal(localhost.status, 200);
+});
+
+test("run requests need the local Origin and a JSON content type", async () => {
+    const body = JSON.stringify({ source: "fn main() {}", input: "" });
+    const post = (headers: Record<string, string>) => fetch(origin + "/api/run", { method: "POST", headers, body });
+    assert.equal((await post({ "Content-Type": "application/json" })).status, 403, "missing Origin");
+    assert.equal((await post({ Origin: origin, "Content-Type": "text/plain" })).status, 403, "wrong content type");
+    assert.equal((await post({ Origin: origin })).status, 403, "default content type");
+    assert.equal((await post({ Origin: origin, "Content-Type": "application/json; charset=utf-8" })).status, 200);
+});
+
+test("concurrent runs are queued and all complete", async () => {
+    const results = await Promise.all([1, 2, 3].map(n => run(`@!include("std")\nuse io;\nfn main() { io::println("run ${n}"); }`)));
+    results.forEach((result, index) => {
+        assert.equal(result.ok, true, result.diagnostics);
+        assert.equal(result.stdout, `run ${index + 1}\n`);
+    });
+});
+
+test("silent clients do not block other requests", async () => {
+    const url = new URL(origin);
+    const idle = [connect({ host: url.hostname, port: Number(url.port) }), connect({ host: url.hostname, port: Number(url.port) })];
+    try {
+        await Promise.all(idle.map(socket => once(socket, "connect")));
+        const started = Date.now();
+        const response = await fetch(origin + "/api/status", { signal: AbortSignal.timeout(15000) });
+        assert.equal(response.status, 200);
+        assert.ok(Date.now() - started < 15000);
+    } finally {
+        idle.forEach(socket => socket.destroy());
+    }
+});
+
+test("early errors still carry security headers and reveal no filesystem paths", async () => {
+    const tooLarge = await fetch(origin + "/api/run", { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: JSON.stringify({ source: "x".repeat(100 * 1024) }) });
+    assert.equal(tooLarge.status, 413);
+    assert.equal(tooLarge.headers.get("x-content-type-options"), "nosniff");
+    assert.doesNotMatch(await tooLarge.text(), /\/home\/|target\/tutorial/);
+    const url = new URL(origin);
+    const socket = connect({ host: url.hostname, port: Number(url.port) });
+    await once(socket, "connect");
+    let raw = "";
+    socket.setEncoding("utf8").on("data", chunk => { raw += chunk; });
+    socket.on("error", () => {});
+    socket.write("NOT A REQUEST\r\n\r\n");
+    await once(socket, "close");
+    assert.match(raw, /^HTTP\/1\.1 400/);
+    assert.match(raw.toLowerCase(), /x-content-type-options: nosniff/);
+    assert.doesNotMatch(raw, /\/home\/|target\/tutorial/);
+});
+
+test("diagnostics never reveal run directories or absolute paths", async () => {
+    const forbidden = [/target\/tutorial-runs/, /\/home\//, new RegExp(repositoryRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))];
+    const compile = await run('fn main() { const x = ; }');
+    const failure = await run('@!include("std")\nuse io;\nfn main() { io::println("before"); (1 / 0)!!; }');
+    assert.equal(compile.phase, "compile");
+    assert.equal(failure.phase, "run");
+    assert.match(compile.diagnostics, /main\.cog:1:/);
+    assert.match(failure.diagnostics, /division by zero/);
+    assert.match(failure.diagnostics, /main\.cog:3:/);
+    for (const text of [compile.diagnostics, failure.diagnostics]) {
+        for (const pattern of forbidden) assert.doesNotMatch(text, pattern);
+    }
+});
+
+test("limit messages are stable and run directories are removed", async () => {
+    const timeout = await run("fn main() { while true {} }");
+    assert.equal(timeout.diagnostics, "Execution time limit reached. Check for an infinite loop.");
+    const output = await run('@!include("std")\nuse io;\nfn main() { while true { io::println("too much output"); } }');
+    assert.equal(output.diagnostics, "Output limit reached. Print fewer values.");
+    const leftovers = (await readdir(join(repositoryRoot, "target", "tutorial-runs")).catch(() => [] as string[])).filter(name => name.startsWith("cog-"));
+    // The startup sweep removed the stale run directory but left the decoy alone.
+    assert.deepEqual(leftovers, ["cog-keep-me"]);
 });

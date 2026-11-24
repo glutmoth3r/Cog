@@ -92,6 +92,10 @@ fn request(port: u16, method: &str, path: &str) -> Response {
 }
 
 fn prepare_example(scratch: &Path, port: u16) {
+    prepare_example_with_cap(scratch, port, &SIZE_CAP.to_string());
+}
+
+fn prepare_example_with_cap(scratch: &Path, port: u16, cap: &str) {
     let cogweb = Path::new(env!("CARGO_MANIFEST_DIR")).join("packages/cogweb");
     let source = cogweb.join("examples/binary_assets");
     let _ = fs::remove_dir_all(scratch);
@@ -109,9 +113,9 @@ fn prepare_example(scratch: &Path, port: u16) {
     let main = fs::read_to_string(source.join("src/main.cog")).unwrap();
     let patched = main
         .replace("const PORT = 4176;", &format!("const PORT = {port};"))
-        .replace("4 * 1024 * 1024", &SIZE_CAP.to_string());
+        .replace("4 * 1024 * 1024", cap);
     assert!(patched.contains(&format!("const PORT = {port};")));
-    assert!(patched.contains(&format!(", {SIZE_CAP})")));
+    assert!(patched.contains(&format!(", {cap})")));
     assert!(!patched.contains("4 * 1024 * 1024"));
     fs::write(scratch.join("src/main.cog"), patched).unwrap();
 
@@ -157,14 +161,14 @@ fn start_server(scratch: &Path) -> Server {
     server
 }
 
-fn scratch_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("cogweb_binary_assets")
+fn scratch_dir(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
 }
 
 #[test]
 fn cogweb_binary_assets_example_serves_bytes_and_rejects_bad_paths() {
     let port = free_port();
-    let scratch = scratch_dir();
+    let scratch = scratch_dir("cogweb_binary_assets");
     prepare_example(&scratch, port);
     let _server = start_server(&scratch);
 
@@ -206,4 +210,32 @@ fn cogweb_binary_assets_example_serves_bytes_and_rejects_bad_paths() {
         Some("application/octet-stream")
     );
     assert!(head.body.is_empty());
+}
+
+#[test]
+fn cogweb_serve_file_surfaces_a_negative_size_cap_instead_of_answering_not_found() {
+    let port = free_port();
+    let scratch = scratch_dir("cogweb_binary_assets_negative_cap");
+    prepare_example_with_cap(&scratch, port, "-1");
+    let mut server = start_server(&scratch);
+
+    // The caller bug propagates out of the handler: the connection closes without
+    // any response, in particular without a 404.
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    write!(
+        stream,
+        "GET /assets/all.bin HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut raw = Vec::new();
+    let _ = stream.read_to_end(&mut raw);
+    assert!(
+        !String::from_utf8_lossy(&raw).contains("404"),
+        "negative cap must not map to 404: {raw:?}"
+    );
+    assert!(raw.is_empty(), "no response is expected: {raw:?}");
+    server.child.kill().unwrap();
 }
