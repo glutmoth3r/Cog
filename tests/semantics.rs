@@ -327,6 +327,110 @@ fn nominal_enum_patterns_do_not_confuse_similarly_named_variants() {
 }
 
 #[test]
+fn struct_type_tests_match_only_records_built_by_the_named_struct() {
+    assert_eq!(
+        run(r#"
+        struct Point { x: int }
+        struct Other { x: int }
+        struct UserId(int);
+        struct Marker;
+        enum Shape { Point(x: int) }
+        var evaluations = 0;
+        fn point() -> Point { evaluations += 1; Point(x: 1) }
+        fn is_point[T: type](value: T) -> bool { when value is Point { true } else { false } }
+        fn main() {
+            const missing: Point? = nil;
+            io::println(when point() is Point { true } else { false });
+            io::println(evaluations);
+            io::println(when Other(x: 1) is Point { true } else { false });
+            io::println(when missing is Point { true } else { false });
+            io::println(when (1 / 0) is Point { true } else { false });
+            io::println(when { x: 1 } is Point { true } else { false });
+            io::println(when Shape::Point(1) is Point { true } else { false });
+            io::println(when Point(x: 1) is Shape { true } else { false });
+            io::println(when UserId(4) is UserId { true } else { false });
+            io::println(when Marker() is Marker { true } else { false });
+            io::println(when Marker() is UserId { true } else { false });
+            io::println($"{is_point(Point(x: 2))} {is_point(2)} {is_point(Other(x: 2))}");
+            const label = match missing {
+                Point => "point",
+                nil => "nil",
+                _ => "other",
+            };
+            io::println(label);
+            const leaf = Point(x: 1 / 0);
+            when leaf is Point { io::println("leaf error keeps the struct"); }
+            when leaf.x is Point { crash("an Error matched a struct type test"); }
+        }
+    "#),
+        "true\n1\nfalse\nfalse\nfalse\nfalse\nfalse\nfalse\ntrue\ntrue\nfalse\n\
+         true false false\nnil\nleaf error keeps the struct\n"
+    );
+}
+
+#[test]
+fn comptime_struct_type_tests_match_runtime_identity() {
+    assert_eq!(
+        run(r#"
+        struct Point { x: int }
+        struct Other { x: int }
+        @comptime fn is_point(value: Point) -> bool { when value is Point { true } else { false } }
+        @comptime fn other_is_point(value: Other) -> bool {
+            when value is Point { true } else { false }
+        }
+        @comptime const YES: bool = is_point(Point(x: 1));
+        @comptime const NO: bool = other_is_point(Other(x: 1));
+        fn main() { io::println($"{YES} {NO}"); }
+    "#),
+        "true false\n"
+    );
+}
+
+#[test]
+fn struct_type_tests_reject_generic_struct_templates() {
+    let source = r#"
+        @!include("std")
+        struct Box[T: type] { value: T }
+        fn main() { const box = Box(1); when box is Box { crash("unreachable"); } }
+    "#;
+    let error = project::compile_source("main.cog", source).unwrap_err();
+    assert!(
+        error.contains("type test on generic struct `Box` is not supported"),
+        "{error}"
+    );
+}
+
+#[test]
+fn user_clone_copies_recursive_optional_struct_fields() {
+    assert_eq!(
+        run(r#"
+        use clone;
+        use clone::Clone;
+        struct Node { value: int, next: Node? }
+        extend Node with Clone {
+            fn clone(self) -> Node {
+                var next: Node? = nil;
+                when self.next is Node { next = self.next.clone(); }
+                Node(value: self.value, next: next)
+            }
+        }
+        fn main() {
+            var head = Node(value: 1, next: Node(value: 2, next: Node(value: 3, next: nil)));
+            const copy = head.clone();
+            const generic = clone::value(head);
+            head.value = 10;
+            var second = head.next;
+            second.value = 20;
+            io::println($"{head.value} {head.next.value} {copy.value} {copy.next.value}");
+            io::println($"{copy.next.next.value} {generic.next.value}");
+            io::println(when copy.next.next.next is Node { "linked" } else { "end" });
+        }
+    "#),
+        "10 20 1 2\n3 2\nend\n"
+    );
+}
+
+#[test]
 fn primitive_patterns_inspect_values_without_casting_nullable_bindings() {
     assert_eq!(
         run(r#"

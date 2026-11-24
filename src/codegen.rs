@@ -3341,6 +3341,9 @@ impl<'a> Codegen<'a> {
         if self.enum_visibility.contains_key(&name) {
             return Ok(ValueType::Enum(name.into()));
         }
+        if self.struct_defs.contains_key(&name) {
+            return Ok(ValueType::Struct(name.into()));
+        }
         Err(CodegenError::new(format!("unsupported type test `{name}`")))
     }
 

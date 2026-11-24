@@ -3809,12 +3809,15 @@ impl<'a> Checker<'a> {
                 crate::instruction::ValueType::Str => Some(Type::concrete(VarType::Str)),
                 crate::instruction::ValueType::Nil | crate::instruction::ValueType::Error => None,
                 crate::instruction::ValueType::Enum(_)
-                | crate::instruction::ValueType::Variant(_) => None,
+                | crate::instruction::ValueType::Variant(_)
+                | crate::instruction::ValueType::Struct(_) => None,
             }
+        } else if let Some(id) = self.enums.get(name) {
+            Some(Type::Enum(*id, name.to_owned()))
         } else {
-            self.enums
+            self.constructors
                 .get(name)
-                .map(|id| Type::Enum(*id, name.to_owned()))
+                .map(|(id, _)| Type::Struct(*id, name.to_owned(), Vec::new()))
         };
 
         if positive {
@@ -3921,7 +3924,17 @@ impl<'a> Checker<'a> {
             return None;
         }
         let message = if self.constructors.contains_key(&resolved) {
-            "struct type tests require nominal runtime identity and are not implemented".to_owned()
+            if self
+                .struct_parameters
+                .get(&resolved)
+                .is_none_or(|parameters| parameters.is_empty())
+            {
+                return Some(resolved);
+            }
+            format!(
+                "type test on generic struct `{name}` is not supported; \
+                 patterns cannot name its type arguments"
+            )
         } else {
             format!("unknown type or enum variant `{name}` in type test")
         };

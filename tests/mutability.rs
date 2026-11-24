@@ -20,6 +20,40 @@ fn rejects(body: &str, expected: &str) {
 }
 
 #[test]
+fn when_without_else_keeps_the_unmatched_path_reachable_for_mutability() {
+    assert_eq!(
+        run(r#"
+        struct Node { value: int, next: Node? }
+        extend Node {
+            fn depth(self) -> int {
+                var below = 0;
+                when self.next is Node { below = self.next.depth(); }
+                below + 1
+            }
+        }
+        fn early(value: int) -> int {
+            var result = 0;
+            when value is int { return 1; }
+            result = 2;
+            result
+        }
+        fn main() {
+            var node = Node(value: 1, next: Node(value: 2, next: nil));
+            io::println(node.depth());
+            node.value = 3;
+            io::println($"{node.value} {early(5)}");
+        }
+    "#),
+        "2\n3 1\n"
+    );
+    rejects(
+        "fn f(v: int) -> int { var r = 0; when v is int { return 1; } else { return 2; } r = 3; r } \
+         fn main() { io::println(f(1)); }",
+        "requires a reachable mutation",
+    );
+}
+
+#[test]
 fn shared_aliases_keep_independent_access_paths_without_moves() {
     assert_eq!(
         run("fn main() { var a = [1]; const b = a; a << 2; io::println(a); io::println(b); }"),

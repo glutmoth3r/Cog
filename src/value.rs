@@ -1398,6 +1398,11 @@ impl RecordValue {
         self.nominal.is_some()
     }
 
+    /// Resolved name of the declared struct that constructed this record.
+    pub(crate) fn nominal_name(&self) -> Option<&str> {
+        self.nominal.as_deref()
+    }
+
     pub(crate) fn try_borrow_fields(
         &self,
     ) -> Result<std::cell::Ref<'_, HashMap<String, Value>>, std::cell::BorrowError> {

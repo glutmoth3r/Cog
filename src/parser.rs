@@ -488,6 +488,11 @@ pub fn assemble(source: &str) -> Result<crate::backend::CompiledProgram, ParseEr
                     .filter(|name| !name.is_empty())
                 {
                     ValueType::Variant(name.into())
+                } else if let Some(name) = operand
+                    .strip_prefix("struct ")
+                    .filter(|name| !name.is_empty())
+                {
+                    ValueType::Struct(name.into())
                 } else {
                     return Err(ParseError::InvalidOperand {
                         line: r.line,

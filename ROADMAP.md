@@ -13,7 +13,7 @@ remaining release acceptance gates, and the next language goals. See the [langua
   source maps, a generational graph heap, iterative cycle collection, and
   optional execution limits. The optional object-count limit is not a byte or
   whole-process memory limit.
-- Portable `.cogb` v40 artifacts (v38 and v39 files are still accepted) with bounded decoding and structural
+- Portable `.cogb` v41 artifacts (v38 to v40 files are still accepted) with bounded decoding and structural
   verification. The VM checks declared callable argument/result types at call
   boundaries; static value-flow verification is still in progress.
 - Packages, KDL configuration, path/archive/user-store dependencies, `cog.lock`,
@@ -82,9 +82,9 @@ remaining release acceptance gates, and the next language goals. See the [langua
     Error unchanged and returns no partial JSON string. Direct coverage for array,
     tuple, record, and Map writes plus nested JSON serialization lives in
     `tests/semantic_contracts.rs`; run it as part of Beta validation.
-  - Beta excludes struct patterns and runtime nominal struct-type tests. Structs
-    keep static type identities but use runtime record storage; Beta does not add
-    runtime nominal struct identity.
+  - Beta excludes struct patterns with field bindings. Struct values carry
+    their nominal identity at run time, and `when value is Struct` tests it for
+    non-generic structs.
   - Beta's comptime contract is the implemented subset in [compile-time
     evaluation](docs/LANGUAGE.md#compile-time-evaluation) and [its semantic
     contracts](docs/SEMANTIC_CONTRACTS.md#implemented-comptime-evaluation-and-functions):
@@ -177,11 +177,13 @@ thread-safe scheduler wakeups. Detach and async closures remain future work.
 4. Implement Windows process-tree termination to match Unix process-group
    cancellation. Buffered TCP framing helpers and detached tasks need separate memory,
    ownership, cancellation, and shutdown contracts.
-5. Add runtime struct type tests (`when value is Struct` currently reports
-   E2001) and a way to unwrap an optional struct field. Without them a
-   user-written `Clone` cannot copy recursive or optional struct fields. Decide
-   whether struct `==` and `.clone()` should exist; today `==` fails at run time
-   with `type mismatch in eq` and `cog check` does not report it.
+5. Struct type tests (`when value is Struct`) can guard an optional struct
+   field, so a user-written `Clone` can copy recursive fields. The checker still
+   treats `Node?` like `Node` and joins `nil` with a struct to `dynamic`, so
+   `if field == nil { nil } else { field.clone() }` is rejected; decide whether
+   to track struct nullability. Decide whether struct `==` and `.clone()` should
+   exist; today `==` fails at run time with `type mismatch in eq` and `cog check`
+   does not report it.
 6. Extend the WASI backend only by owner decision. `str::to_int`, `to_uint`,
    `to_bool`, `to_char`, `str::builder`, `build`, `fmt::write` and `replace` have
    VM parity (tests/wasm.rs). Arrays, structs, `Map`, floats and async remain

@@ -463,20 +463,47 @@ the scrutinee remains dynamic. Both evaluate the scrutinee once and share patter
 semantics. Arms may contain blocks or expressions and can return a value.
 
 Patterns support `_`, primitive int/uint/bigint/float/bool/char/str/nil types, declared enum
-types, character and string literals, and variants. A character literal matches
+and non-generic struct types, character and string literals, and variants. A character literal matches
 one exact Unicode scalar. A string literal pattern matches exact text and does
 not make a string match exhaustive; include `_` for other values. A variant without
 `(bindings)` ignores its payload; bindings require
 exact positional arity and exist only in the selected arm. Binding names do not
 select payload fields. Alternatives use `|`; guards run after a pattern matches.
-Enums have nominal identities, including package/module identity. Struct patterns
-and struct type tests such as `when value is Person` are rejected because structs
-use runtime record storage without nominal runtime identity. Both are outside the
-Beta contract.
+Enums and structs have nominal identities, including package/module identity.
+`when value is Person` matches only a value constructed by `Person`, including
+tuple and empty structs; nil, Error, anonymous records, enum variants, and other
+structs with the same fields do not match. A struct type test never makes a
+`match` exhaustive. Generic struct templates such as `Box` cannot be tested
+because a pattern cannot name type arguments. Struct patterns with field bindings
+are not supported.
 
 `is` is only the separator inside `when`; `if x is int` and `const b = x is int`
 are errors. Patterns inspect values without casting or narrowing declared nullable
 types. Explicit Error patterns inspect errors before a surrounding catch.
+
+A struct type test guards access to an optional struct field. For example, a
+`Clone` implementation can copy a recursive field:
+
+```cog
+@!include("std")
+use io;
+use clone::Clone;
+
+struct Node { value: int, next: Node? }
+
+extend Node with Clone {
+    fn clone(self) -> Node {
+        var next: Node? = nil;
+        when self.next is Node { next = self.next.clone(); }
+        Node(value: self.value, next: next)
+    }
+}
+
+fn main() -> nil {
+    const copy = Node(value: 1, next: Node(value: 2, next: nil)).clone();
+    io::println(copy.next.value)!!;
+}
+```
 
 The existing `when var name = expression { ... } else { ... }` form selects success
 when the result is not Error, including nil. Its binding is immutable despite the

@@ -7,8 +7,8 @@ use crate::template::ArrayTemplate;
 use crate::value::{RuntimeType, Value};
 use std::rc::Rc;
 
-/// Runtime value classification. Nominal enum identities are resolved by the
-/// compiler; predicates never cast, narrow a binding, or propagate an Error.
+/// Runtime value classification. Nominal enum and struct identities are resolved
+/// by the compiler; predicates never cast, narrow a binding, or propagate an Error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValueType {
     Int,
@@ -22,6 +22,9 @@ pub enum ValueType {
     Error,
     Enum(Rc<str>),
     Variant(Rc<str>),
+    /// A declared, non-generic struct identified by its resolved name. It
+    /// matches only records constructed by that struct, never nil or Error.
+    Struct(Rc<str>),
 }
 
 impl ValueType {
@@ -54,6 +57,9 @@ impl ValueType {
                 .rsplit_once("::")
                 .is_some_and(|(parent, _)| parent == name.as_ref()),
             (Self::Variant(name), Value::Variant(tag, _)) => name == tag,
+            (Self::Struct(name), Value::Record(record)) => {
+                record.nominal_name() == Some(name.as_ref())
+            }
             (Self::Variant(name), Value::Error(error)) => match error.primary() {
                 crate::error::RuntimeError::LanguageError { tag, .. } => name == tag,
                 error => {
@@ -72,6 +78,7 @@ impl std::fmt::Display for ValueType {
         match self {
             Self::Enum(name) => write!(f, "enum {name}"),
             Self::Variant(name) => write!(f, "variant {name}"),
+            Self::Struct(name) => write!(f, "struct {name}"),
             Self::Int => f.write_str("int"),
             Self::UInt => f.write_str("uint"),
             Self::BigInt => f.write_str("bigint"),

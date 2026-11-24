@@ -53,7 +53,7 @@ runtime error at example.cog:2:35: division by zero
   called from example::work at example.cog:7:26
 ```
 
-Bytecode version 40 stores a table of inline frames. Each record contains the
+Bytecode versions 40 and later store a table of inline frames. Each record contains the
 inlined function name, the optional call-site coordinate, and an optional
 enclosing inline frame with a smaller index. Each source map range can name
 its innermost inline frame. The loader rejects tables that are larger than
@@ -61,7 +61,8 @@ the instruction table, are nested more than 64 deep, contain forward parent
 references, or contain frames that no source map range reaches. Version 39
 artifacts have function names and no inline frames. Version 38 artifacts
 also lack function names and report instruction coordinates only. Both remain
-readable. Instructions without a source span retain their bytecode address in
+readable. Version 41 adds struct type tests; older versions reject that
+type-test tag. Instructions without a source span retain their bytecode address in
 the trace.
 
 VM fallback and synchronous runtime calls from compiled code preserve

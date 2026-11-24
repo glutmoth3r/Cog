@@ -631,6 +631,32 @@ fn main() -> nil {
 }
 "#;
 
+const JIT_STRUCT_TYPE_FALLBACK_SOURCE: &str = r#"
+@!include("std")
+use io;
+
+struct Point { x: int }
+struct Other { x: int }
+
+fn score(point: Point?, other: Other, n: int) -> int {
+    var index = 0;
+    var total = 0;
+    while index < n {
+        when point is Point { total += 1; }
+        when other is Point { total += 2; }
+        when (1 / 0) is Point { total += 4; }
+        when index is Point { total += 8; }
+        index += 1;
+    }
+    return total;
+}
+
+fn main() -> nil {
+    io::println(score(Point(x: 1), Other(x: 2), 6000))!!;
+    io::println(score(nil, Other(x: 2), 6000))!!;
+}
+"#;
+
 fn execute_result(source: &str, jit: bool, profile_path: Option<&Path>) -> Result<String, String> {
     let artifact =
         project::compile_source("jit-smoke.cog", source).unwrap_or_else(|error| panic!("{error}"));
@@ -1286,6 +1312,11 @@ fn jit_nil_equality_preserves_errors_in_both_operands() {
 #[test]
 fn jit_enum_and_variant_type_tests_match_vm() {
     assert_jit_matches_vm(JIT_ENUM_TYPE_SOURCE, "enum-types", "18000\n30000\n");
+}
+
+#[test]
+fn jit_struct_type_tests_fall_back_to_vm_matching() {
+    assert_jit_fallback_matches_vm(JIT_STRUCT_TYPE_FALLBACK_SOURCE, "struct-types", "6000\n0\n");
 }
 
 #[test]

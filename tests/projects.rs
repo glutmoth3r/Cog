@@ -356,6 +356,36 @@ fn nominal_type_patterns_respect_aliases_modules_and_visibility() {
 }
 
 #[test]
+fn struct_type_tests_respect_module_identity_aliases_and_visibility() {
+    let f = Fixture::new();
+    f.write(
+        "model.cog",
+        "public struct Point { x: int } struct Hidden { x: int } public fn point() { return Point(x: 1); }",
+    );
+    f.write("other.cog", "public struct Point { x: int }");
+    f.write(
+        "main.cog",
+        r#"
+        use io; use model; use other; use model::Point as P;
+        fn main() {
+            const value = model::point();
+            io::println(when value is P { true } else { false });
+            io::println(when value is model::Point { true } else { false });
+            io::println(when value is other::Point { true } else { false });
+            io::println(when other::Point(x: 1) is P { true } else { false });
+        }
+    "#,
+    );
+    assert_eq!(f.run(), "true\ntrue\nfalse\nfalse\n");
+    f.write(
+        "main.cog",
+        "use model; fn main() { const v = model::point(); when v is model::Hidden {} }",
+    );
+    let error = f.compile().unwrap_err();
+    assert!(error.contains("private"), "{error}");
+}
+
+#[test]
 fn selective_core_constant_alias_works_in_interpolation() {
     let f = Fixture::new();
     f.write("package.kdl", "package \"app\" version=\"1\"\n");

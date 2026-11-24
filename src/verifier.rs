@@ -1809,7 +1809,7 @@ fn type_test_flow(
         .flatten()
         .and_then(|tag| strings.get(tag as usize))
         .map(|tag| tag.as_ref());
-    if let ValueType::Enum(name) | ValueType::Variant(name) = expected {
+    if let ValueType::Enum(name) | ValueType::Variant(name) | ValueType::Struct(name) = expected {
         charge(
             fact_work,
             name.len().saturating_add(tag.map_or(0, str::len)),
@@ -1861,6 +1861,18 @@ fn type_test_flow(
             Some(tag == name.as_ref())
         }
         ValueType::Variant(_) => None,
+        // Only records built by a declared struct constructor carry the
+        // nominal identity; nil, Error, and type-tag operands never match.
+        ValueType::Struct(_) if value.is_type_tag => Some(false),
+        ValueType::Struct(_) if value.normal_types & TYPE_RECORD == 0 => Some(false),
+        ValueType::Struct(name)
+            if value.normal_types == TYPE_RECORD
+                && !value.may_error
+                && let Some(actual) = tag.and_then(|tag| tag.strip_prefix("@struct::")) =>
+        {
+            Some(actual == name.as_ref())
+        }
+        ValueType::Struct(_) => None,
     };
     Ok(known.map_or_else(|| FlowValue::normal(TYPE_BOOL), FlowValue::boolean))
 }
@@ -3069,6 +3081,79 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("complexity limit"));
+    }
+
+    #[test]
+    fn struct_type_test_facts_agree_with_runtime_matching() {
+        use crate::heap::HeapRef;
+        use crate::instruction::ValueType;
+        use crate::value::{RecordValue, ValueFields};
+        use std::collections::HashMap;
+
+        let strings: [Rc<str>; 3] = [
+            Rc::from("@struct::demo::A"),
+            Rc::from("demo::A::Ready"),
+            Rc::from("demo::A"),
+        ];
+        let nominal = |name: &str| {
+            Value::Record(
+                HeapRef::try_new(RecordValue::nominal(HashMap::new(), name.into())).unwrap(),
+            )
+        };
+        let values = [
+            (Value::Int(1), None),
+            (Value::Nil, None),
+            (
+                Value::Error(Box::new(crate::error::RuntimeError::DivisionByZero)),
+                None,
+            ),
+            (
+                Value::Record(HeapRef::try_new(RecordValue::new(HashMap::new())).unwrap()),
+                None,
+            ),
+            (nominal("demo::A"), Some(0)),
+            (nominal("demo::A"), None),
+            (
+                Value::Variant(
+                    strings[1].clone(),
+                    HeapRef::try_new(ValueFields::new(HashMap::new())).unwrap(),
+                ),
+                Some(1),
+            ),
+            (Value::TypeTag(strings[2].clone()), Some(2)),
+        ];
+        for expected in ["demo::A", "demo::B"] {
+            let expected = ValueType::Struct(Rc::from(expected));
+            for (value, tag) in &values {
+                let mut flow = value_flow(value, *tag);
+                if matches!(value, Value::Record(_)) {
+                    flow.known_tag = *tag;
+                }
+                let mut budget = MAX_FACT_WORK;
+                let result = type_test_flow(&expected, flow, &strings, 0, &mut budget).unwrap();
+                let runtime = expected.matches(value);
+                assert!(
+                    result.known_bool.is_none_or(|known| known == runtime),
+                    "{expected} on {value:?}: verifier {:?}, runtime {runtime}",
+                    result.known_bool
+                );
+                assert_eq!(result.normal_types, TYPE_BOOL);
+                assert!(!result.may_error);
+            }
+        }
+        // Possible Errors keep a known record tag from deciding the result.
+        let mut flow = FlowValue::recoverable(TYPE_RECORD);
+        flow.known_tag = Some(0);
+        let mut budget = MAX_FACT_WORK;
+        let result = type_test_flow(
+            &ValueType::Struct(Rc::from("demo::A")),
+            flow,
+            &strings,
+            0,
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(result.known_bool, None);
     }
 
     #[test]

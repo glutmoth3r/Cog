@@ -2798,7 +2798,7 @@ fn matches_pattern(pattern: &MatchPattern, value: &ComptimeValue) -> bool {
             ComptimeValue::Char(_) => name == "char",
             ComptimeValue::Str(_) => name == "str",
             ComptimeValue::Nil => name == "nil",
-            ComptimeValue::Struct { .. } => false,
+            ComptimeValue::Struct { name: actual, .. } => name == actual,
             ComptimeValue::Type(_) => name == "type",
             ComptimeValue::Bytes(_) => name == "bytes",
             ComptimeValue::Error(error) => {

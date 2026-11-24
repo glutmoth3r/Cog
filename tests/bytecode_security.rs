@@ -60,6 +60,35 @@ fn untrusted_instructions(instruction_count: usize, encoded: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn struct_type_tests_require_current_bytecode_and_a_struct_identity() {
+    let program = |name: &str| {
+        CompiledProgram::new(vec![
+            I::Push(Value::Nil),
+            I::IsType(ValueType::Struct(name.into())),
+            I::Pop,
+            I::Halt,
+        ])
+    };
+    let mut bytes = bytecode::encode(&program("demo::Point")).unwrap();
+    let decoded = bytecode::decode(&bytes).unwrap();
+    assert!(matches!(
+        &decoded.instructions[1],
+        I::IsType(ValueType::Struct(name)) if name.as_ref() == "demo::Point"
+    ));
+    assert_eq!(bytecode::encode(&decoded).unwrap(), bytes);
+    let mut output = Vec::new();
+    interpreter::run_with(&decoded, &mut output).unwrap();
+
+    // Version 40 predates struct type tests, so its decoder rejects the tag.
+    bytes[4..6].copy_from_slice(&40_u16.to_le_bytes());
+    let error = bytecode::decode(&bytes).unwrap_err();
+    assert!(error.contains("unknown type-test tag 11"), "{error}");
+
+    rejected(program(""), "struct identity");
+    rejected(program("@struct::demo::Point"), "struct identity");
+}
+
+#[test]
 fn typed_instruction_descriptors_reject_empty_identities_in_dead_code() {
     use cog::value::RuntimeType as T;
 
@@ -125,7 +154,7 @@ fn typed_aggregate_metadata_is_bounded_canonical_and_versioned() {
     assert!(
         bytecode::decode(&legacy)
             .unwrap_err()
-            .contains("unsupported bytecode version 10; expected 40")
+            .contains("unsupported bytecode version 10; expected 41")
     );
 }
 

@@ -119,7 +119,8 @@ same-type comparisons for these numeric types, exact mixed `int`/`uint`
 comparisons, `char` ordering, boolean equality, and boolean branches. Other
 mixed numeric operations, float remainder, and unsupported instructions return
 to the interpreter at their bytecode position. Primitive type tests are lowered
-when their runtime tag is represented directly. Strings, BigInts, Errors,
+when their runtime tag is represented directly; struct type tests resume in the
+interpreter. Strings, BigInts, Errors,
 aggregates, and other opaque values can remain rooted across OSR. The call bridge
 runs synchronous Cog and native calls through the current execution context and
 can resume machine execution with the returned result. It also covers indexing,
@@ -286,7 +287,9 @@ Embedding code making native calls directly must call finish itself.
 `call target argc`, `callv argc`, and symbolic `call_native io::write_all`.
 Direct calls supply callable arities automatically. Indirect functions and closures
 require `.function label argc captures` declarations before bytecode encoding.
-`is_type error` consumes a value and produces bool; use `dup` to retain it. The
+`is_type error` consumes a value and produces bool; use `dup` to retain it.
+`is_type enum Name`, `is_type variant Name::Item`, and `is_type struct Name` test
+nominal identities. The
 `record n` primitive consumes key/value pairs. Typed-array construction and runtime
 type constraints have dedicated instructions. Printing, conversions, formatting,
 time, entropy, and processes use native calls rather than dedicated opcodes.

@@ -1836,7 +1836,11 @@ impl<'a> Pass<'a> {
                 catch_name,
                 catch_block,
             } => self.try_blocks(body, catch_name, catch_block),
-            Expr::Match { value, arms, .. } => {
+            Expr::Match {
+                value,
+                arms,
+                exhaustive,
+            } => {
                 let value = self.expr(value);
                 let initial = self.state.clone();
                 let mut joined: Option<State<'a>> = None;
@@ -1865,6 +1869,19 @@ impl<'a> Pass<'a> {
                         } else {
                             joined = Some(self.state.clone());
                         }
+                    }
+                }
+                // A `when` without `else` finishes without running an arm when
+                // its pattern does not match; keep that path reachable.
+                let falls_through = !*exhaustive
+                    && !arms.iter().any(|arm| {
+                        arm.guard.is_none() && matches!(arm.pattern, MatchPattern::Wildcard)
+                    });
+                if falls_through && initial.alive {
+                    if let Some(joined) = &mut joined {
+                        joined.join(&initial);
+                    } else {
+                        joined = Some(initial.clone());
                     }
                 }
                 if let Some(joined) = joined {

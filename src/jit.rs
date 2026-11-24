@@ -4631,7 +4631,7 @@ fn type_tag(value_type: &ValueType) -> Option<u64> {
         ValueType::Str => TAG_STR,
         ValueType::Nil => TAG_NIL,
         ValueType::Error => TAG_ERROR,
-        ValueType::Enum(_) | ValueType::Variant(_) => return None,
+        ValueType::Enum(_) | ValueType::Variant(_) | ValueType::Struct(_) => return None,
     })
 }
 

@@ -12,7 +12,8 @@ use crate::value::{RuntimeType, Value};
 use std::rc::Rc;
 
 const MAGIC: &[u8; 4] = b"COG\0";
-pub(crate) const VERSION: u16 = 40;
+pub(crate) const VERSION: u16 = 41;
+const VERSION_WITHOUT_STRUCT_TYPE_TESTS: u16 = 40;
 const VERSION_WITHOUT_INLINE_FRAMES: u16 = 39;
 const VERSION_WITHOUT_FUNCTION_NAMES: u16 = 38;
 /// Nesting limit for inlined calls attributed to one instruction.
@@ -216,6 +217,10 @@ pub fn encode(program: &CompiledProgram) -> Result<Vec<u8>> {
                         w.string(name)?;
                     }
                     ValueType::Char => w.byte(8)?,
+                    ValueType::Struct(name) => {
+                        w.byte(11)?;
+                        w.string(name)?;
+                    }
                 }
             }
             Instruction::ErrorKind => w.byte(21)?,
@@ -443,7 +448,10 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
     );
     if !matches!(
         version,
-        VERSION | VERSION_WITHOUT_INLINE_FRAMES | VERSION_WITHOUT_FUNCTION_NAMES
+        VERSION
+            | VERSION_WITHOUT_STRUCT_TYPE_TESTS
+            | VERSION_WITHOUT_INLINE_FRAMES
+            | VERSION_WITHOUT_FUNCTION_NAMES
     ) {
         return Err(format!(
             "unsupported bytecode version {version}; expected {VERSION}"
@@ -589,6 +597,7 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
                 8 => ValueType::Char,
                 9 => ValueType::UInt,
                 10 => ValueType::BigInt,
+                11 if version >= VERSION => ValueType::Struct(r.string()?),
                 tag => return Err(format!("unknown type-test tag {tag}")),
             }),
             21 => Instruction::ErrorKind,
@@ -733,7 +742,7 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
         }
     }
     let mut inline_frames = Vec::new();
-    if version >= VERSION {
+    if version >= VERSION_WITHOUT_STRUCT_TYPE_TESTS {
         let frame_count = r.index()?;
         if frame_count > count {
             return Err("invalid inline frame count".into());
@@ -766,7 +775,7 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
             start: r.index()?,
             end: r.index()?,
             location: r.location()?,
-            inline: if version >= VERSION {
+            inline: if version >= VERSION_WITHOUT_STRUCT_TYPE_TESTS {
                 r.optional_index()?
             } else {
                 None
@@ -936,7 +945,9 @@ pub fn validate(artifact: &CompiledProgram) -> Result<()> {
                     validate_runtime_type(ty, 0)?;
                 }
             }
-            Instruction::IsType(ValueType::Enum(name) | ValueType::Variant(name))
+            Instruction::IsType(
+                ValueType::Enum(name) | ValueType::Variant(name) | ValueType::Struct(name),
+            )
             | Instruction::Crash(Some(name)) => budget.string(name.len())?,
             _ => {}
         }
@@ -965,6 +976,11 @@ pub fn validate(artifact: &CompiledProgram) -> Result<()> {
         match instruction {
             Instruction::IsType(ValueType::Enum(name)) if name.is_empty() => {
                 return Err("empty enum identity in type test".into());
+            }
+            Instruction::IsType(ValueType::Struct(name))
+                if name.is_empty() || name.starts_with("@struct::") =>
+            {
+                return Err("invalid struct identity in type test".into());
             }
             Instruction::IsType(ValueType::Variant(name))
                 if !name
