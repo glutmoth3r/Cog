@@ -71,6 +71,29 @@ impl Resolver {
     fn type_annotation(&mut self, ty: &mut TypeAnnotation, owner: &ModuleKey, scopes: &[Scope]) {
         match &mut ty.kind {
             TypeKind::Named(name) if name == "type" => {}
+            TypeKind::Named(name) if name == "bytes" => {
+                // Value bindings never name types, so locals do not shadow here.
+                let imported = scopes
+                    .iter()
+                    .rev()
+                    .filter_map(|scope| scope.get("bytes"))
+                    .find(|binding| !matches!(binding, Binding::Local));
+                let scopes = match imported {
+                    Some(Binding::Poison) => scopes,
+                    Some(Binding::Symbol(symbol)) if self.type_symbols.contains(&symbol.bound) => {
+                        scopes
+                    }
+                    // `use bytes;` must not hide this module's own declaration.
+                    _ if self.declares_bytes_type(owner) => &[],
+                    _ => {
+                        ty.kind = TypeKind::Bytes;
+                        return;
+                    }
+                };
+                let source = name.clone();
+                let symbol = self.name(&source, owner, scopes, None);
+                ty.kind = TypeKind::ResolvedName { source, symbol };
+            }
             TypeKind::Named(name) if name == "Task" => {
                 let source = name.clone();
                 ty.kind = TypeKind::ResolvedName {
@@ -703,7 +726,37 @@ impl Resolver {
         })
     }
 
-    fn expression_type(&self, expr: &Expr, scopes: &[Scope]) -> Option<TypeAnnotation> {
+    fn declares_bytes_type(&self, owner: &ModuleKey) -> bool {
+        self.symbols
+            .get(&(owner.clone(), "bytes".to_owned()))
+            .is_some_and(|symbol| self.type_symbols.contains(&symbol.bound))
+    }
+
+    /// `use bytes;` binds the module name, but a bare `bytes` expression still
+    /// names the byte-buffer type unless a type parameter, value, declaration,
+    /// or imported item shadows it.
+    fn bytes_names_type(&self, owner: &ModuleKey, scopes: &[Scope]) -> bool {
+        if self.active_type_parameters.contains("bytes") {
+            return false;
+        }
+        match scopes.iter().rev().find_map(|scope| scope.get("bytes")) {
+            None => !self
+                .symbols
+                .contains_key(&(owner.clone(), "bytes".to_owned())),
+            Some(Binding::Module(_)) => !self.declares_bytes_type(owner),
+            Some(Binding::Native(path)) => {
+                crate::builtins::native_module(path) && !self.declares_bytes_type(owner)
+            }
+            Some(Binding::Local | Binding::Symbol(_) | Binding::Poison) => false,
+        }
+    }
+
+    fn expression_type(
+        &self,
+        expr: &Expr,
+        owner: &ModuleKey,
+        scopes: &[Scope],
+    ) -> Option<TypeAnnotation> {
         if let Expr::TypeLiteral(ty) = expr.node() {
             return Some(ty.clone());
         }
@@ -724,7 +777,7 @@ impl Resolver {
             "bool" => TypeKind::Primitive(VarType::Bool),
             "str" => TypeKind::Primitive(VarType::Str),
             "nil" => TypeKind::Primitive(VarType::Nil),
-            "bytes" if bytes_names_type(scopes) => TypeKind::Bytes,
+            "bytes" if self.bytes_names_type(owner, scopes) => TypeKind::Bytes,
             _ if self.active_type_parameters.contains(name) => {
                 TypeKind::TypeParameter(name.clone())
             }
@@ -751,7 +804,7 @@ impl Resolver {
             .iter_mut()
             .filter_map(|argument| {
                 self.expr(argument, owner, scopes, location.clone());
-                let ty = self.expression_type(argument, scopes);
+                let ty = self.expression_type(argument, owner, scopes);
                 if ty.is_none() {
                     self.error(
                         "generic arguments must be compile-time types",
@@ -850,7 +903,7 @@ impl Resolver {
                         nilable: false,
                     });
                 } else if arguments.is_empty() {
-                    if let Some(ty) = self.expression_type(receiver, scopes) {
+                    if let Some(ty) = self.expression_type(receiver, owner, scopes) {
                         *expr = Expr::TypeLiteral(TypeAnnotation {
                             kind: TypeKind::Array(Box::new(ty)),
                             nilable: false,
@@ -881,7 +934,14 @@ impl Resolver {
                 if (matches!(name.as_str(), "int" | "float" | "bool" | "str" | "nil")
                     || self.active_type_parameters.contains(name))
                     && !scopes.iter().rev().any(|s| s.contains_key(name)) => {}
-            Expr::Ident(name) if name == "bytes" && bytes_names_type(scopes) => {}
+            Expr::Ident(name)
+                if name == "bytes"
+                    && (self.bytes_names_type(owner, scopes)
+                        || self.active_type_parameters.contains(name)
+                            && !scopes
+                                .iter()
+                                .rev()
+                                .any(|s| matches!(s.get(name), Some(Binding::Local)))) => {}
             Expr::Ident(name) => *name = self.name(name, owner, scopes, location),
             Expr::Call(name, args) => {
                 if let Some((target, method)) =
@@ -1008,7 +1068,7 @@ impl Resolver {
                     scopes.push(Scope::new());
                     if let MatchPattern::Type(name) = &mut arm.pattern
                         && name == "bytes"
-                        && bytes_names_type(scopes)
+                        && self.bytes_names_type(owner, scopes)
                     {
                         self.error(
                             "type patterns do not support `bytes`; annotate the binding instead",
@@ -1631,17 +1691,6 @@ fn native_names(module: &str) -> Vec<String> {
     .chain(crate::runtime::names())
     .filter(|name| name.starts_with(&format!("{module}::")))
     .collect()
-}
-
-/// `use bytes;` binds the module name, but a bare `bytes` expression still
-/// names the byte-buffer type unless a value, declaration, or imported
-/// function shadows it.
-fn bytes_names_type(scopes: &[Scope]) -> bool {
-    match scopes.iter().rev().find_map(|scope| scope.get("bytes")) {
-        None | Some(Binding::Module(_)) => true,
-        Some(Binding::Native(path)) => crate::builtins::native_module(path),
-        Some(Binding::Local | Binding::Symbol(_) | Binding::Poison) => false,
-    }
 }
 
 fn replace_self_type(ty: &mut TypeAnnotation, target: &TypeAnnotation) {

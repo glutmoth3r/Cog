@@ -266,7 +266,9 @@ array elements, tuples, and generic arguments, and `bytes?` admits nil. A buffer
 reference: a callee that mutates a `bytes` parameter requires a writable argument, like an
 array. The annotation name is distinct from the `bytes` module, so `use bytes;` and
 `fn f(data: bytes)` coexist. Comparing two buffers with `==` returns `TypeMismatch`, as for
-arrays; `as bytes` casts and `is bytes` type patterns are not supported.
+arrays; `as bytes` casts and `is bytes` type patterns are not supported. A generic type
+parameter, or a declared or imported struct, enum, or type alias, named `bytes` takes
+precedence over the built-in type.
 
 A non-nil initializer does not narrow declared `int?` to `int`. Control-flow
 checks can refine nullable values on paths that prove nil is absent, including a

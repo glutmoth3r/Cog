@@ -7,10 +7,19 @@ fn source(body: &str) -> String {
     format!("@!include(\"std\") use io; use bytes; use err::Error;\n{body}")
 }
 
-fn compile(body: &str) -> cog::backend::CompiledProgram {
-    let program = project::compile_source("bytes_annotations.cog", &source(body))
-        .unwrap_or_else(|error| panic!("{error}"));
+/// Source that includes the standard library without importing `bytes`.
+fn unimported(body: &str) -> String {
+    format!("@!include(\"std\") use io;\n{body}")
+}
+
+fn round_trip(program: cog::backend::CompiledProgram) -> cog::backend::CompiledProgram {
     bytecode::decode(&bytecode::encode(&program).unwrap()).unwrap()
+}
+
+fn compile(text: &str) -> cog::backend::CompiledProgram {
+    let program = project::compile_source("bytes_annotations.cog", text)
+        .unwrap_or_else(|error| panic!("{error}"));
+    round_trip(program)
 }
 
 fn execute(program: &cog::backend::CompiledProgram, jit: bool) -> String {
@@ -25,7 +34,14 @@ fn execute(program: &cog::backend::CompiledProgram, jit: bool) -> String {
 /// Runs the program through bytecode encode/decode on the VM and with the JIT
 /// enabled, and requires both backends to agree.
 fn run(body: &str) -> String {
-    let program = compile(body);
+    run_source(&source(body))
+}
+
+fn run_source(text: &str) -> String {
+    run_program(compile(text))
+}
+
+fn run_program(program: cog::backend::CompiledProgram) -> String {
     let vm = execute(&program, false);
     let jit = execute(&program, true);
     assert_eq!(jit, vm, "JIT and VM output differ");
@@ -33,7 +49,11 @@ fn run(body: &str) -> String {
 }
 
 fn rejects(body: &str, expected: &str) {
-    let error = project::compile_source("bytes_annotations.cog", &source(body))
+    rejects_source(&source(body), expected);
+}
+
+fn rejects_source(text: &str, expected: &str) {
+    let error = project::compile_source("bytes_annotations.cog", text)
         .expect_err("the program must be rejected")
         .to_string();
     assert!(
@@ -217,4 +237,173 @@ fn bytes_type_name_coexists_with_the_bytes_module_and_local_names() {
         "#),
         "2\n"
     );
+}
+
+#[test]
+fn user_struct_named_bytes_takes_precedence_over_the_builtin_type() {
+    assert_eq!(
+        run_source(&unimported(
+            r#"
+        struct bytes { x: int }
+        struct Holder { item: bytes, rest: bytes[] }
+        struct Box[T: type] { value: T }
+
+        fn f(b: bytes) -> int { b.x }
+        fn pass(b: bytes?) -> bytes? { b }
+        fn id[T: type](v: T) -> T { v }
+
+        fn main() {
+            io::println(f(bytes(x: 3)))!!;
+            io::println(pass(nil) == nil)!!;
+            const held = Holder(bytes(x: 4), [bytes(x: 5)]);
+            io::println(f(held.item) + f(held.rest[0]))!!;
+            io::println(f(id[bytes](bytes(x: 6))))!!;
+            const boxed: Box[bytes] = Box[bytes](bytes(x: 7));
+            io::println(f(boxed.value))!!;
+            io::println(match held.item { bytes => "struct", _ => "other" })!!;
+        }
+        "#
+        )),
+        "3\ntrue\n9\n6\n7\nstruct\n"
+    );
+    // The module import does not hide the declaration from annotations.
+    rejects(
+        "struct bytes { x: int } fn f(b: bytes) -> int { b.x } \
+         fn main() { f(bytes::new(1)); }",
+        "declared as bytes but given bytes",
+    );
+}
+
+#[test]
+fn user_enum_named_bytes_takes_precedence_over_the_builtin_type() {
+    assert_eq!(
+        run_source(&unimported(
+            r#"
+        enum bytes { Small(size: int), Large }
+
+        fn size(b: bytes) -> int {
+            match b { bytes::Small(n) => n, bytes::Large => 100 }
+        }
+
+        fn main() {
+            io::println(size(bytes::Small(2)))!!;
+            io::println(size(bytes::Large()))!!;
+        }
+        "#
+        )),
+        "2\n100\n"
+    );
+}
+
+#[test]
+fn comptime_type_alias_named_bytes_takes_precedence_over_the_builtin_type() {
+    assert_eq!(
+        run("@comptime const bytes: type = int; \
+             fn next(b: bytes) -> bytes { b + 1 } \
+             fn main() { io::println(next(1))!!; }"),
+        "2\n"
+    );
+}
+
+#[test]
+fn generic_type_parameter_named_bytes_takes_precedence_over_the_builtin_type() {
+    for imports in ["", "use bytes;"] {
+        assert_eq!(
+            run_source(&format!(
+                "@!include(\"std\") use io; {imports}\n{}",
+                r#"
+        struct Box[bytes: type] { value: bytes }
+
+        fn id[bytes: type](v: bytes) -> bytes {
+            const copy: bytes = v;
+            copy
+        }
+
+        fn forward[bytes: type](v: bytes) -> bytes { id[bytes](v) }
+
+        fn main() {
+            io::println(id(3))!!;
+            io::println(forward("text"))!!;
+            io::println(Box(true).value)!!;
+        }
+        "#
+            )),
+            "3\ntext\ntrue\n"
+        );
+    }
+}
+
+#[test]
+fn builtin_bytes_type_works_with_and_without_the_module_import() {
+    let body = r#"
+        fn same(b: bytes) -> bytes { b }
+        fn id[T: type](v: T) -> T { v }
+
+        fn main() {
+            var all: bytes[] = [];
+            all << id[bytes](same(buffers::from_str("abc")));
+            io::println(buffers::len(all[0])!!)!!;
+        }
+        "#;
+    for (imports, module) in [("use bytes;", "bytes"), ("use bytes as raw;", "raw")] {
+        assert_eq!(
+            run_source(&format!(
+                "@!include(\"std\") use io; {imports}\n{}",
+                body.replace("buffers::", &format!("{module}::"))
+            )),
+            "3\n"
+        );
+    }
+    assert_eq!(
+        run_source(&unimported(
+            "fn size(b: bytes?) -> int { if b == nil { return 0; } 1 } \
+             fn id[T: type](v: T) -> T { v } \
+             fn main() { const none: bytes? = nil; io::println(size(none))!!; }"
+        )),
+        "0\n"
+    );
+    // A function named `bytes` is not a type and leaves annotations alone.
+    assert_eq!(
+        run_source(&unimported(
+            "use entropy::bytes; fn size(b: bytes?) -> int { 4 } \
+             fn main() { io::println(size(nil))!!; }"
+        )),
+        "4\n"
+    );
+}
+
+#[test]
+fn imported_user_type_named_bytes_takes_precedence_over_the_builtin_type() {
+    let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("bytes-import-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("shapes.cog"),
+        "public struct bytes { x: int } public struct Frame { y: int }",
+    )
+    .unwrap();
+    for (import, name) in [
+        ("use shapes::bytes;", "bytes"),
+        ("use shapes::*;", "bytes"),
+        ("use shapes::Frame as bytes;", "Frame"),
+    ] {
+        let field = if name == "Frame" { "y" } else { "x" };
+        std::fs::write(
+            root.join("main.cog"),
+            format!(
+                "@!include(\"std\")\nuse io; {import}\n\
+                 fn f(b: bytes) -> int {{ b.{field} }} \
+                 fn id[T: type](v: T) -> T {{ v }} \
+                 fn main() {{ io::println(f(id[bytes](bytes({field}: 8))))!!; }}"
+            ),
+        )
+        .unwrap();
+        let loaded = project::load(&root.join("main.cog"), None, false)
+            .unwrap_or_else(|errors| panic!("{}", cog::frontend::render(&errors)));
+        let program = project::compile(loaded.program, loaded.diagnostics, &loaded.names)
+            .unwrap_or_else(|error| panic!("{import}: {error}"));
+        assert_eq!(run_program(round_trip(program)), "8\n", "{import}");
+    }
+    std::fs::remove_dir_all(&root).unwrap();
 }
