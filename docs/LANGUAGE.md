@@ -386,6 +386,49 @@ a ?! b ?? c   = a ?! (b ?? c)
 a ?? b || c  = a ?? (b || c)
 ```
 
+### Struct equality
+
+`==` and `!=` between two values of the same struct type call that type's
+`eq::Eq[Self]` implementation, selected statically; `!=` negates the result of
+`equals`. Equality is never derived. A missing implementation and a comparison of
+two different struct types, including different type arguments of one generic
+struct, are compile errors. A generic function requires the bound
+`T: type + eq::Eq[T]`, and each specialization uses the implementation for its
+concrete type.
+
+```cog
+@!include("std")
+use io;
+use eq;
+
+struct Point { x: int, label: str }
+
+extend Point with eq::Eq[Point] {
+    fn equals(self, other: Point) -> bool { self.x == other.x }
+}
+
+fn same[T: type + eq::Eq[T]](left: T, right: T) -> bool { left == right }
+
+fn main() {
+    io::println(Point(1, "a") != Point(1, "b"))!!;
+    io::println(same(Point(1, "a"), Point(2, "a")))!!;
+}
+```
+
+Both operands are evaluated once, from left to right. When either operand is an
+Error or `nil`, `equals` is not called: the first Error is preserved and `nil` is
+equal only to `nil`. Errors from `equals` behave as for an explicit method call.
+Comparing two values of the implementing type inside its `equals` calls `equals`
+again, so compare their fields.
+
+Other comparisons are checked at run time. This includes a struct compared through
+a dynamic operand (two such records produce `TypeMismatch`) and a struct compared
+with a value of another runtime kind (unequal). Comparing two arrays, tuples, or
+records produces `TypeMismatch`; library functions that compare untyped elements,
+such as `array::contains`, therefore do not call `Eq` for struct elements.
+Compile-time evaluation does not call trait methods, so struct comparisons there
+do not follow this contract and must not be relied on.
+
 ## Control flow
 
 ```cog

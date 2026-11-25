@@ -736,3 +736,135 @@ fn generic_clone_uses_custom_nominal_implementations() {
         "{x: 8}\n"
     );
 }
+
+#[test]
+fn generic_equality_operators_use_the_bound_implementation() {
+    assert_eq!(
+        run(r#"
+            use eq::Eq;
+            use io;
+
+            struct Point { x: int }
+            extend Point with Eq[Point] {
+                fn equals(self, other: Point) -> bool { self.x == other.x }
+            }
+            fn same[T: type + Eq[T]](left: T, right: T) -> bool { left == right }
+            fn differ[T: type + Eq[T]](left: T, right: T) -> bool { left != right }
+            fn main() {
+                io::println(same(Point(1), Point(1)))!!;
+                io::println(differ(Point(1), Point(1)))!!;
+                io::println(differ(Point(1), Point(2)))!!;
+                io::println(same(4, 4))!!;
+                io::println(differ("a", "b"))!!;
+            }
+            "#)
+        .unwrap(),
+        "true\nfalse\ntrue\ntrue\ntrue\n"
+    );
+}
+
+#[test]
+fn generic_structs_compare_through_a_specialized_generic_implementation() {
+    assert_eq!(
+        run(r#"
+            use eq::Eq;
+            use io;
+
+            struct Point { x: int }
+            extend Point with Eq[Point] {
+                fn equals(self, other: Point) -> bool { self.x == other.x }
+            }
+            struct Box[T: type] { value: T }
+            extend[T: type + Eq[T]] Box[T] with Eq[Box[T]] {
+                fn equals(self, other: Box[T]) -> bool { self.value == other.value }
+            }
+            fn same[T: type + Eq[T]](left: T, right: T) -> bool { left == right }
+            fn main() {
+                io::println(Box(1) == Box(1))!!;
+                io::println(Box("a") != Box("b"))!!;
+                io::println(Box(Point(1)) == Box(Point(2)))!!;
+                io::println(same(Box(Box(Point(3))), Box(Box(Point(3)))))!!;
+            }
+            "#)
+        .unwrap(),
+        "true\ntrue\nfalse\ntrue\n"
+    );
+}
+
+#[test]
+fn struct_equality_in_generic_code_requires_an_implementation() {
+    let unbounded = run(r#"
+        struct Point { x: int }
+        fn same[T: type](left: T, right: T) -> bool { left == right }
+        fn main() { same(Point(1), Point(1)); }
+        "#)
+    .unwrap_err();
+    assert!(
+        unbounded.contains("type `Point` does not implement `eq::Eq[Point]`"),
+        "{unbounded}"
+    );
+
+    let arguments = run(r#"
+        use eq::Eq;
+        struct Box[T: type] { value: T }
+        extend Box[int] with Eq[Box[int]] {
+            fn equals(self, other: Box[int]) -> bool { true }
+        }
+        fn main() { Box("a") == Box("b"); }
+        "#)
+    .unwrap_err();
+    assert!(
+        arguments.contains("type `Box[str]` does not implement `eq::Eq[Box[str]]`"),
+        "{arguments}"
+    );
+
+    let different = run(r#"
+        struct Box[T: type] { value: T }
+        fn main() { Box(1) != Box("b"); }
+        "#)
+    .unwrap_err();
+    assert!(
+        different.contains("cannot compare different struct types `Box[int]` and `Box[str]`"),
+        "{different}"
+    );
+}
+
+#[test]
+fn struct_equality_uses_implementations_declared_in_another_module() {
+    let root = std::env::temp_dir().join(format!("cog-struct-equality-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    for (path, source) in [
+        ("package.kdl", "package \"app\" version=\"0.1.0\"\n"),
+        (
+            "src/shapes.cog",
+            "use eq;
+             public struct Point { x: int }
+             extend Point with eq::Eq[Point] {
+                 fn equals(self, other: Point) -> bool { self.x == other.x }
+             }",
+        ),
+        (
+            "src/main.cog",
+            "@!include(\"std\")
+             use eq::Eq;
+             use io;
+             use shapes::Point;
+             fn same[T: type + Eq[T]](left: T, right: T) -> bool { left == right }
+             fn main() {
+                 io::println(Point(1) == Point(1))!!;
+                 io::println(Point(1) != Point(2))!!;
+                 io::println(same(Point(3), Point(4)))!!;
+             }",
+        ),
+    ] {
+        std::fs::write(root.join(path), source).unwrap();
+    }
+    let loaded = project::load(&root, None, false);
+    std::fs::remove_dir_all(&root).unwrap();
+    let loaded = loaded.unwrap_or_else(|errors| panic!("{}", cog::frontend::render(&errors)));
+    let compiled = project::compile(loaded.program, loaded.diagnostics, &loaded.names).unwrap();
+    let compiled = bytecode::decode(&bytecode::encode(&compiled).unwrap()).unwrap();
+    let mut output = Vec::new();
+    interpreter::run_with(&compiled, &mut output).unwrap();
+    assert_eq!(String::from_utf8(output).unwrap(), "true\ntrue\nfalse\n");
+}

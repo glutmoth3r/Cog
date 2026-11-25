@@ -1158,3 +1158,244 @@ fn aggregate_equality_remains_a_recoverable_type_error() {
         "eq\neq\n"
     );
 }
+
+#[test]
+fn struct_equality_operators_call_the_eq_implementation() {
+    assert_eq!(
+        run(r#"
+        use eq;
+        struct Point { x: int, label: str }
+        var calls = 0;
+        extend Point with eq::Eq[Point] {
+            fn equals(self, other: Point) -> bool {
+                calls += 1;
+                self.x == other.x
+            }
+        }
+        fn main() {
+            const a = Point(1, "a");
+            io::println(a == Point(1, "b"));
+            io::println(a == Point(2, "a"));
+            io::println(a != Point(1, "b"));
+            io::println(a != Point(2, "a"));
+            io::println(a == a);
+            io::println(calls);
+        }
+    "#),
+        "true\nfalse\nfalse\ntrue\ntrue\n5\n"
+    );
+}
+
+#[test]
+fn struct_equality_evaluates_operands_once_from_left_to_right() {
+    assert_eq!(
+        run(r#"
+        use eq;
+        struct Id { value: int }
+        extend Id with eq::Eq[Id] {
+            fn equals(self, other: Id) -> bool {
+                io::println($"equals {self.value} {other.value}");
+                self.value == other.value
+            }
+        }
+        fn make(value: int) -> Id { io::println($"make {value}"); Id(value) }
+        fn main() {
+            io::println(make(1) == make(2));
+            io::println(make(3) != make(3));
+        }
+    "#),
+        "make 1\nmake 2\nequals 1 2\nfalse\nmake 3\nmake 3\nequals 3 3\nfalse\n"
+    );
+}
+
+#[test]
+fn struct_equality_preserves_error_operands_without_calling_equals() {
+    assert_eq!(
+        run(r#"
+        use eq;
+        struct Id { value: int }
+        extend Id with eq::Eq[Id] {
+            fn equals(self, other: Id) -> bool { io::println("equals ran"); true }
+        }
+        fn valid(label: str) -> Id { io::println(label); Id(1) }
+        fn missing(label: str) -> Id { io::println(label); Error::MissingKey() }
+        fn overflow(label: str) -> Id { io::println(label); Error::Overflow() }
+        fn report(result) { io::println(result.error_kind()); }
+        fn main() {
+            report(missing("a") == valid("b"));
+            report(valid("c") == missing("d"));
+            report(missing("e") != overflow("f"));
+            report(overflow("g") != missing("h"));
+        }
+    "#),
+        "a\nb\nMissingKey\nc\nd\nMissingKey\ne\nf\nMissingKey\ng\nh\nOverflow\n"
+    );
+}
+
+#[test]
+fn struct_equality_keeps_nil_comparisons() {
+    assert_eq!(
+        run(r#"
+        use eq;
+        struct Node { value: int, next: Node? = nil }
+        extend Node with eq::Eq[Node] {
+            fn equals(self, other: Node) -> bool { self.value == other.value }
+        }
+        fn main() {
+            const leaf = Node(1);
+            const chain = Node(2, leaf);
+            io::println(leaf.next == leaf.next);
+            io::println(leaf.next != leaf.next);
+            io::println(leaf.next == chain.next);
+            io::println(chain.next != leaf.next);
+            io::println(chain.next == leaf);
+            io::println(leaf == nil);
+            io::println(nil != leaf);
+        }
+    "#),
+        "true\nfalse\nfalse\ntrue\ntrue\nfalse\ntrue\n"
+    );
+}
+
+#[test]
+fn errors_raised_inside_equals_follow_method_call_semantics() {
+    assert_eq!(
+        run(r#"
+        use eq;
+        struct Id { value: int }
+        extend Id with eq::Eq[Id] {
+            fn equals(self, other: Id) -> bool {
+                const quotient = (self.value / other.value)!!;
+                quotient == 1
+            }
+        }
+        fn compare(a: Id, b: Id) -> bool {
+            const result = a != b;
+            io::println("compared");
+            result
+        }
+        fn main() {
+            when Id(1) == Id(0) is Error::DivisionByZero() { io::println("when"); }
+            else { crash("expected an error"); }
+            io::println((Id(1) == Id(0)) ?! true);
+            when compare(Id(1), Id(0)) is Error::DivisionByZero() { io::println("propagated"); }
+            else { crash("expected an error"); }
+            try { const ignored = Id(1) == Id(0); io::println("skipped"); }
+            catch(error) { io::println(error.error_kind()); }
+            io::println(compare(Id(2), Id(2)));
+        }
+    "#),
+        "when\ntrue\npropagated\nDivisionByZero\ncompared\nfalse\n"
+    );
+}
+
+#[test]
+fn struct_equality_composes_with_conditions_globals_defaults_and_cleanup() {
+    assert_eq!(
+        run(r#"
+        use eq;
+        struct Id { value: int }
+        extend Id with eq::Eq[Id] {
+            fn equals(self, other: Id) -> bool { self.value == other.value }
+        }
+        const SAME = Id(1) == Id(1);
+        fn check(a: Id, b: Id = Id(4), same: bool = Id(4) == Id(4)) -> bool {
+            defer { io::println(a != b); }
+            if a == b && same { return true; }
+            false
+        }
+        fn main() {
+            io::println(SAME);
+            io::println(check(Id(4)));
+            io::println(check(Id(5)));
+        }
+    "#),
+        "true\nfalse\ntrue\ntrue\nfalse\n"
+    );
+}
+
+#[test]
+fn comparisons_with_dynamic_operands_keep_runtime_equality() {
+    assert_eq!(
+        run(r#"
+        use eq;
+        struct Id { value: int }
+        extend Id with eq::Eq[Id] {
+            fn equals(self, other: Id) -> bool { true }
+        }
+        fn same(a, b) { a == b }
+        fn main() {
+            when same(Id(1), Id(1)) is Error::TypeMismatch(op) { io::println(op); }
+            else { crash("dynamic struct equality unexpectedly succeeded"); }
+            io::println(same(Id(1), 1));
+            io::println(Id(1) == 1);
+        }
+    "#),
+        "eq\nfalse\nfalse\n"
+    );
+}
+
+fn compile_error(source: &str) -> String {
+    let source = format!("@!include(\"std\") use io; {source}");
+    project::compile_source("equality.cog", &source).unwrap_err()
+}
+
+#[test]
+fn struct_equality_without_an_implementation_is_a_compile_error() {
+    for (source, operator) in [
+        (
+            "struct Point { x: int } fn main() { Point(1) == Point(1); }",
+            "==",
+        ),
+        (
+            "use eq; struct Point { x: int }
+             fn main() { var a = Point(1); const same = a != a; }",
+            "!=",
+        ),
+    ] {
+        let error = compile_error(source);
+        assert!(
+            error.contains(&format!(
+                "type `Point` does not implement `eq::Eq[Point]` required by `{operator}`"
+            )),
+            "{error}"
+        );
+        assert!(error.contains("extend Point with eq::Eq[Point]"), "{error}");
+    }
+}
+
+#[test]
+fn comparing_different_struct_types_is_a_compile_error() {
+    let error = compile_error(
+        "use eq;
+         struct Left { x: int } struct Right { x: int }
+         extend Left with eq::Eq[Left] { fn equals(self, other: Left) -> bool { true } }
+         fn main() { Left(1) == Right(1); }",
+    );
+    assert!(
+        error.contains("cannot compare different struct types `Left` and `Right` with `==`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_mutating_equals_requires_writable_operands() {
+    let source = |binding: &str| {
+        format!(
+            "use eq;
+             struct Counter {{ seen: int }}
+             extend Counter with eq::Eq[Counter] {{
+                 fn equals(self, other: Counter) -> bool {{ other.seen += 1; true }}
+             }}
+             fn main() {{
+                 const a = Counter(0);
+                 {binding} b = Counter(0);
+                 a == b;
+                 io::println(b.seen);
+             }}"
+        )
+    };
+    let error = compile_error(&source("const"));
+    assert!(error.contains("const/read-only"), "{error}");
+    assert_eq!(run(&source("var")), "1\n");
+}

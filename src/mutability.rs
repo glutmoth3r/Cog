@@ -1699,6 +1699,9 @@ impl<'a> Pass<'a> {
                     return Access::default();
                 }
                 let b = self.expr(right);
+                if matches!(op, BinOp::Eq | BinOp::NotEq) {
+                    return self.equality_call(expr, a, b);
+                }
                 match op {
                     BinOp::Append => {
                         self.mutate(&a, left);
@@ -2174,6 +2177,27 @@ impl<'a> Pass<'a> {
                 self.add_pending_result(expr, &mut result);
             }
             return result;
+        }
+        Access::default()
+    }
+
+    /// Struct `==` and `!=` call an `Eq::equals` method, so its effects apply
+    /// to both operands. Other comparisons have no effects.
+    fn equality_call(&mut self, expr: &Expr, left: Access, right: Access) -> Access {
+        let specialized = self.facts.specializations.get(&expr_id(expr));
+        if specialized.is_some_and(|name| !self.summaries.contains_key(name)) {
+            for reference in left.refs.iter().chain(&right.refs) {
+                self.attempted.extend(&reference.locals);
+            }
+        }
+        let target = specialized
+            .filter(|name| self.summaries.contains_key(*name))
+            .or_else(|| self.facts.calls.get(&expr_id(expr)));
+        if let Some(name) = target
+            && let Some(summary) = self.summary_for(name)
+        {
+            let name = name.clone();
+            self.apply_call_summary(expr, &name, summary, &[left, right]);
         }
         Access::default()
     }

@@ -2671,6 +2671,50 @@ impl<'a> Codegen<'a> {
         self.guard_error(scopes)
     }
 
+    /// The `Eq::equals` function selected for a struct `==` or `!=` site.
+    fn equality_method(&self, site: &crate::analysis::CallSite) -> Option<String> {
+        self.call_specializations
+            .get(site)
+            .or_else(|| self.method_calls.get(site))
+            .cloned()
+    }
+
+    /// Both operands are already on the operand stack. A nil or Error operand
+    /// keeps the ordinary comparison instruction; otherwise `equals` is called.
+    fn compile_struct_equality(
+        &mut self,
+        op: BinOp,
+        equals: &str,
+        site: &crate::analysis::CallSite,
+        scopes: &mut Scopes,
+    ) -> Result<(), CodegenError> {
+        let left_special = self.fresh_label("equality_left_special");
+        let right_special = self.fresh_label("equality_right_special");
+        let end = self.fresh_label("equality_end");
+        for ty in [ValueType::Error, ValueType::Nil] {
+            self.out.extend([Instruction::Dup, Instruction::IsType(ty)]);
+            self.out.jump(Instruction::JumpIfTrue(0), right_special);
+        }
+        self.out.emit(Instruction::Swap);
+        for ty in [ValueType::Error, ValueType::Nil] {
+            self.out.extend([Instruction::Dup, Instruction::IsType(ty)]);
+            self.out.jump(Instruction::JumpIfTrue(0), left_special);
+        }
+        self.out.emit(Instruction::Swap);
+        self.out.call(equals, 2);
+        self.propagate_call_error(scopes, site)?;
+        if op == BinOp::NotEq {
+            self.out.emit(Instruction::Not);
+        }
+        self.out.jump(Instruction::Jump(0), end);
+        self.out.bind(left_special);
+        self.out.emit(Instruction::Swap);
+        self.out.bind(right_special);
+        self.out.emit(binop_instruction(op));
+        self.out.bind(end);
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn compile_declared_call(
         &mut self,
@@ -3737,6 +3781,14 @@ impl<'a> Codegen<'a> {
                 self.current_function.as_deref(),
                 expr,
             )),
+            Expr::Binary(BinOp::Eq | BinOp::NotEq, ..) => {
+                let site = crate::analysis::expression_site(self.current_function.as_deref(), expr);
+                if self.equality_method(&site).is_some() {
+                    Some(site)
+                } else {
+                    observed_call.clone()
+                }
+            }
             _ => observed_call.clone(),
         };
         let result = self.compile_expr(expr, scopes);
@@ -4281,7 +4333,12 @@ impl<'a> Codegen<'a> {
             Expr::Binary(op, l, r) => {
                 self.compile_expr(l, scopes)?;
                 self.compile_expr(r, scopes)?;
-                self.out.emit(binop_instruction(*op));
+                let site = crate::analysis::expression_site(self.current_function.as_deref(), expr);
+                if let Some(equals) = self.equality_method(&site) {
+                    self.compile_struct_equality(*op, &equals, &site, scopes)?;
+                } else {
+                    self.out.emit(binop_instruction(*op));
+                }
             }
             Expr::Unary(UnOp::Not, e) => {
                 self.compile_expr(e, scopes)?;

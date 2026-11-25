@@ -181,9 +181,11 @@ thread-safe scheduler wakeups. Detach and async closures remain future work.
    field, so a user-written `Clone` can copy recursive fields. The checker still
    treats `Node?` like `Node` and joins `nil` with a struct to `dynamic`, so
    `if field == nil { nil } else { field.clone() }` is rejected; decide whether
-   to track struct nullability. Decide whether struct `==` and `.clone()` should
-   exist; today `==` fails at run time with `type mismatch in eq` and `cog check`
-   does not report it.
+   to track struct nullability. Struct `==` and `!=` call an explicit
+   `eq::Eq[Self]` implementation, and `cog check` rejects structs without one.
+   Compile-time evaluation still compares structs without that implementation
+   (equal records compare as `false`). Decide whether a built-in struct
+   `.clone()` should exist.
 6. Extend the WASI backend only by owner decision. `str::to_int`, `to_uint`,
    `to_bool`, `to_char`, `str::builder`, `build`, `fmt::write` and `replace` have
    VM parity (tests/wasm.rs). Arrays, structs, `Map`, floats and async remain

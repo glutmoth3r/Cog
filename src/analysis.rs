@@ -4803,6 +4803,144 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// A rechecked body can widen an operand after an earlier pass selected a
+    /// struct equality implementation, so each visit starts without one.
+    fn forget_equality_call(&mut self, expr: &Expr) {
+        let site = expression_site(self.current_function.as_deref(), expr);
+        self.method_calls.remove(&site);
+        self.call_specializations.remove(&site);
+        let id = crate::mutability::expr_id(expr);
+        self.access_facts.calls.remove(&id);
+        self.access_facts.specializations.remove(&id);
+    }
+
+    /// Resolves `==` and `!=` between two statically known structs to the
+    /// `equals` method of their `eq::Eq[Self]` implementation.
+    fn struct_equality(
+        &mut self,
+        op: BinOp,
+        (left_expr, left): (&Expr, Type),
+        (right_expr, right): (&Expr, Type),
+        expr: &Expr,
+    ) -> Type {
+        let operator = if op == BinOp::Eq { "==" } else { "!=" };
+        if left != right {
+            // Unknown type arguments keep the dynamic runtime comparison.
+            if let (Type::Struct(left_id, _, a), Type::Struct(right_id, _, b)) = (&left, &right)
+                && left_id == right_id
+                && !a.iter().chain(b).all(is_concrete_trait_argument)
+            {
+                return Type::concrete(VarType::Bool);
+            }
+            let message = format!(
+                "cannot compare different struct types `{}` and `{}` with `{operator}`",
+                self.source_type_name(&left),
+                self.source_type_name(&right)
+            );
+            self.error("E2002", message, expr.span());
+            return Type::Poison;
+        }
+        // Without resolved names (for example while reporting earlier front-end
+        // errors) the standard trait cannot be identified.
+        if self.access_facts.symbol_names.is_empty() {
+            return Type::concrete(VarType::Bool);
+        }
+        let arguments = std::slice::from_ref(&left);
+        let Some(equality) = self
+            .standard_trait_symbol("eq::Eq")
+            .filter(|name| self.implements_trait(&left, name, arguments))
+        else {
+            let name = self.source_type_name(&left);
+            // An extension in the declaring module spells the type unqualified.
+            let base = name.split('[').next().unwrap_or(&name);
+            let local = &name[base.rfind("::").map_or(0, |index| index + 2)..];
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E2001",
+                    format!(
+                        "type `{name}` does not implement `eq::Eq[{name}]` required by `{operator}`"
+                    ),
+                    expr.span().cloned().or_else(|| self.location.clone()),
+                )
+                .help(format!(
+                    "import `eq` and add `extend {local} with eq::Eq[{local}]` defining \
+                     `fn equals(self, other: {local}) -> bool`"
+                )),
+            );
+            return Type::Poison;
+        };
+        // A concrete implementation registers its method under the target type.
+        // Otherwise the matching generic implementation supplies it.
+        let key = (left.clone(), equality.clone(), arguments.to_vec());
+        let method = if self.trait_implementations.contains(&key) {
+            self.extension_methods
+                .get(&(left.clone(), "equals".to_owned()))
+                .copied()
+        } else {
+            self.generic_trait_implementations
+                .iter()
+                .find(|extension| {
+                    self.generic_trait_implementation_arguments(
+                        extension,
+                        &left,
+                        &equality,
+                        Some(arguments),
+                        &mut HashSet::new(),
+                    )
+                    .is_some()
+                })
+                .and_then(|extension| {
+                    extension
+                        .methods
+                        .iter()
+                        .find(|method| method.name == "equals")
+                })
+        };
+        let Some(method) = method else {
+            // The implementation was rejected with its own diagnostic.
+            return Type::Poison;
+        };
+        let function = &method.function;
+        self.invalidate_mutable_flow_facts();
+        self.access_facts
+            .calls
+            .insert(crate::mutability::expr_id(expr), function.name.clone());
+        if function.type_params.is_empty() {
+            self.method_calls.insert(
+                expression_site(self.current_function.as_deref(), expr),
+                function.name.clone(),
+            );
+        } else {
+            let operands = [
+                CallArgument::positional(left_expr.clone()),
+                CallArgument::positional(right_expr.clone()),
+            ];
+            self.generic_call(&function.name, function, &operands, vec![left, right], expr);
+        }
+        Type::concrete(VarType::Bool)
+    }
+
+    /// Spells a type the way the source declares it, for diagnostics.
+    fn source_type_name(&self, ty: &Type) -> String {
+        match ty {
+            Type::Struct(_, symbol, arguments) => {
+                let name = self.access_facts.symbol_names.get(symbol).unwrap_or(symbol);
+                if arguments.is_empty() {
+                    name.clone()
+                } else {
+                    let arguments = arguments
+                        .iter()
+                        .map(|argument| self.source_type_name(argument))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{name}[{arguments}]")
+                }
+            }
+            Type::Array(element) => format!("{}[]", self.source_type_name(element)),
+            other => other.display(),
+        }
+    }
+
     fn assignment(
         &mut self,
         target: &Expr,
@@ -5837,6 +5975,15 @@ impl<'a> Checker<'a> {
                 }
                 if matches!(op, BinOp::Prepend) {
                     self.refine_empty_array(b, &left);
+                }
+                if matches!(op, BinOp::Eq | BinOp::NotEq) {
+                    self.forget_equality_call(expr);
+                    // Compile-time evaluation cannot call runtime trait methods.
+                    if !self.in_comptime
+                        && matches!((&left, &right), (Type::Struct(..), Type::Struct(..)))
+                    {
+                        return self.struct_equality(*op, (a, left), (b, right), expr);
+                    }
                 }
                 self.binary_types(*op, left, right, expr.span(), Some((a, b)))
             }

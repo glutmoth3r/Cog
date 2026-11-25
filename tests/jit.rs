@@ -657,6 +657,59 @@ fn main() -> nil {
 }
 "#;
 
+const JIT_STRUCT_EQUALITY_SOURCE: &str = r#"
+@!include("std")
+use io;
+use eq;
+use err::Error;
+
+struct Point { x: int, scale: int }
+struct Node { value: int, next: Node? = nil }
+
+extend Point with eq::Eq[Point] {
+    fn equals(self, other: Point) -> bool {
+        (self.x / self.scale)!! == (other.x / other.scale)!!
+    }
+}
+extend Node with eq::Eq[Node] {
+    fn equals(self, other: Node) -> bool { self.value == other.value }
+}
+
+fn matches[T: type + eq::Eq[T]](left: T, right: T) -> bool { left == right }
+
+fn score(origin: Point, leaf: Node, chain: Node, n: int) -> int {
+    var index = 0;
+    var total = 0;
+    while index < n {
+        const point = Point(index % 3, 1);
+        if point == origin { total += 1; }
+        if point != origin { total += 10; }
+        if matches(point, point) { total += 100; }
+        if chain.next != leaf.next { total += 1000; }
+        if leaf.next != leaf.next { total += 10000; }
+        index += 1;
+    }
+    return total;
+}
+
+fn failing(origin: Point, n: int) -> bool {
+    var index = 0;
+    var same = false;
+    while index < n {
+        same = (Point(0, n - 1 - index) == origin)!!;
+        index += 1;
+    }
+    same
+}
+
+fn main() -> nil {
+    const leaf = Node(1);
+    const chain = Node(2, leaf);
+    io::println(score(Point(0, 1), leaf, chain, 6000))!!;
+    when failing(Point(0, 1), 6000) is Error::DivisionByZero { io::println("DivisionByZero"); }
+}
+"#;
+
 fn execute_result(source: &str, jit: bool, profile_path: Option<&Path>) -> Result<String, String> {
     let artifact =
         project::compile_source("jit-smoke.cog", source).unwrap_or_else(|error| panic!("{error}"));
@@ -1348,6 +1401,15 @@ fn jit_enum_and_variant_type_tests_match_vm() {
 #[test]
 fn jit_struct_type_tests_fall_back_to_vm_matching() {
     assert_jit_fallback_matches_vm(JIT_STRUCT_TYPE_FALLBACK_SOURCE, "struct-types", "6000\n0\n");
+}
+
+#[test]
+fn jit_hot_struct_equality_matches_vm() {
+    assert_jit_fallback_matches_vm(
+        JIT_STRUCT_EQUALITY_SOURCE,
+        "struct-equality",
+        "6642000\nDivisionByZero\n",
+    );
 }
 
 #[test]
