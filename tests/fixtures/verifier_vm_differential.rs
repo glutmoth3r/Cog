@@ -793,6 +793,22 @@ fn tests(profile: Profile) -> Vec<Vec<I>> {
     out
 }
 
+/// Whether the VM reaches the instruction named by a verifier error. Errors
+/// without an instruction index count as reached.
+fn executes_reported_instruction(program: &CompiledProgram, error: &str) -> bool {
+    let Some(pc) = error
+        .strip_prefix("bytecode verification at instruction ")
+        .and_then(|rest| rest.split(':').next())
+        .and_then(|pc| pc.parse::<usize>().ok())
+        .filter(|pc| *pc < program.instructions.len())
+    else {
+        return true;
+    };
+    let mut crashed = program.clone();
+    crashed.instructions[pc] = I::Crash(None);
+    interpreter::run_with(&crashed, &mut Vec::new()).is_err()
+}
+
 /// `COG_VERIFIER_DIFF_PROGRAMS` and `COG_VERIFIER_DIFF_SEED` override the
 /// committed program count and seed for longer local soundness hunts.
 pub fn run_profile(profile: Profile, seed: u64, programs: usize) {
@@ -825,10 +841,12 @@ pub fn run_profile(profile: Profile, seed: u64, programs: usize) {
         // well-behaved ones are probed.
         let directly_runs = interpreter::run_with(&base, &mut Vec::new()).is_ok();
         if let Err(e) = bytecode::validate(&base) {
-            // A provably non-boolean branch condition is rejected on every
-            // reachable CFG path, even one the VM does not take at run time.
+            // A definite mismatch is rejected on every reachable CFG path,
+            // even one the VM does not take. The rejection is sound only if
+            // the VM never executes the reported instruction: replacing it
+            // with Crash must leave a runnable program runnable.
             assert!(
-                !directly_runs || e.contains("branch condition cannot be a boolean"),
+                !directly_runs || !executes_reported_instruction(&base, &e),
                 "verifier rejected a runnable program: {e}\n{:?}",
                 base.instructions
             );

@@ -32,7 +32,7 @@ struct State {
     // reference to such a container; Dup forgets the shape.
     aggregate_shapes: Rc<BTreeMap<usize, Rc<Vec<FlowValue>>>>,
     record_shapes: Rc<BTreeMap<usize, Rc<BTreeMap<u32, FlowValue>>>>,
-    local_aggregates: Rc<LocalAggregates>,
+    local_aggregates: LocalAggregates,
     local_values: Rc<BTreeMap<usize, FlowValue>>,
     global_values: Rc<BTreeMap<usize, FlowValue>>,
     capture_values: Option<Rc<Vec<FlowValue>>>,
@@ -47,20 +47,28 @@ struct State {
 /// write, a call argument, a capture, a nested or global store) forgets the
 /// owner's shape. An alias therefore names exactly the owner's container,
 /// and joined paths must agree on every alias or forget its owner.
+///
+/// Each table is shared separately: reloads and reads change only the stack
+/// aliases, so they neither copy nor pay for the owners' shapes. Shapes are
+/// shared `Rc` values, so copying an owner table costs one unit per entry.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct LocalAggregates {
-    tuples: BTreeMap<usize, Rc<Vec<FlowValue>>>,
-    records: BTreeMap<usize, Rc<BTreeMap<u32, FlowValue>>>,
-    stack_aliases: BTreeMap<usize, usize>,
-    local_aliases: BTreeMap<usize, usize>,
+    tuples: Rc<BTreeMap<usize, Rc<Vec<FlowValue>>>>,
+    records: Rc<BTreeMap<usize, Rc<BTreeMap<u32, FlowValue>>>>,
+    stack_aliases: Rc<BTreeMap<usize, usize>>,
+    local_aliases: Rc<BTreeMap<usize, usize>>,
 }
 
 impl LocalAggregates {
-    fn cost(&self) -> usize {
-        aggregate_shape_cost(&self.tuples)
-            .saturating_add(record_shape_cost(&self.records))
-            .saturating_add(self.stack_aliases.len())
-            .saturating_add(self.local_aliases.len())
+    fn entries(&self) -> usize {
+        self.tuples.len() + self.records.len() + self.stack_aliases.len() + self.local_aliases.len()
+    }
+
+    fn shares_tables_with(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.tuples, &other.tuples)
+            && Rc::ptr_eq(&self.records, &other.records)
+            && Rc::ptr_eq(&self.stack_aliases, &other.stack_aliases)
+            && Rc::ptr_eq(&self.local_aliases, &other.local_aliases)
     }
 
     fn is_owner(&self, local: usize) -> bool {
@@ -75,38 +83,87 @@ impl LocalAggregates {
         }
     }
 
-    fn forget(&mut self, owner: usize) {
-        self.tuples.remove(&owner);
-        self.records.remove(&owner);
-        self.stack_aliases.retain(|_, alias| *alias != owner);
-        self.local_aliases.retain(|_, alias| *alias != owner);
+    fn forget(&mut self, owner: usize, pc: usize, fact_work: &mut usize) -> Result<(), String> {
+        charge(fact_work, self.entries().saturating_add(1), pc)?;
+        if self.tuples.contains_key(&owner) {
+            Rc::make_mut(&mut self.tuples).remove(&owner);
+        }
+        if self.records.contains_key(&owner) {
+            Rc::make_mut(&mut self.records).remove(&owner);
+        }
+        for aliases in [&mut self.stack_aliases, &mut self.local_aliases] {
+            if aliases.values().any(|alias| *alias == owner) {
+                Rc::make_mut(aliases).retain(|_, alias| *alias != owner);
+            }
+        }
+        Ok(())
     }
 
     fn has_alias_capacity(&self) -> bool {
         self.stack_aliases.len() + self.local_aliases.len() < MAX_TRACKED_ALIASES
     }
 
-    fn add_stack_alias(&mut self, slot: usize, owner: usize) {
+    fn add_stack_alias(
+        &mut self,
+        slot: usize,
+        owner: usize,
+        pc: usize,
+        fact_work: &mut usize,
+    ) -> Result<(), String> {
         // An untracked alias could write the container unnoticed, so a full
         // alias table forgets the owner instead of dropping the alias.
         if self.has_alias_capacity() {
-            self.stack_aliases.insert(slot, owner);
+            charge(fact_work, self.stack_aliases.len().saturating_add(1), pc)?;
+            Rc::make_mut(&mut self.stack_aliases).insert(slot, owner);
+            Ok(())
         } else {
-            self.forget(owner);
+            self.forget(owner, pc, fact_work)
         }
     }
 
-    fn add_local_alias(&mut self, local: usize, owner: usize) {
+    fn add_local_alias(
+        &mut self,
+        local: usize,
+        owner: usize,
+        pc: usize,
+        fact_work: &mut usize,
+    ) -> Result<(), String> {
         if self.has_alias_capacity() {
-            self.local_aliases.insert(local, owner);
+            charge(fact_work, self.local_aliases.len().saturating_add(1), pc)?;
+            Rc::make_mut(&mut self.local_aliases).insert(local, owner);
+            Ok(())
         } else {
-            self.forget(owner);
+            self.forget(owner, pc, fact_work)
         }
     }
 
-    fn join(&self, other: &Self) -> Self {
-        let mut tuples = join_aggregate_shapes(&self.tuples, &other.tuples);
-        let mut records = join_record_shapes(&self.records, &other.records);
+    fn join(&self, other: &Self, pc: usize, fact_work: &mut usize) -> Result<Self, String> {
+        if self.shares_tables_with(other) {
+            return Ok(self.clone());
+        }
+        charge(
+            fact_work,
+            self.entries()
+                .saturating_add(other.entries())
+                .saturating_add(1),
+            pc,
+        )?;
+        let mut tuples = join_shared_shapes(
+            &self.tuples,
+            &other.tuples,
+            join_tuple_shape,
+            Vec::len,
+            pc,
+            fact_work,
+        )?;
+        let mut records = join_shared_shapes(
+            &self.records,
+            &other.records,
+            join_record_shape,
+            BTreeMap::len,
+            pc,
+            fact_work,
+        )?;
         // A location that aliases an owner on only one path may reference that
         // owner's container after the join, so the owner cannot keep a shape.
         let mut forgotten = BTreeSet::new();
@@ -114,41 +171,92 @@ impl LocalAggregates {
             (&self.stack_aliases, &other.stack_aliases),
             (&self.local_aliases, &other.local_aliases),
         ] {
-            for (location, owner) in left {
+            if Rc::ptr_eq(left, right) {
+                continue;
+            }
+            for (location, owner) in left.iter() {
                 if right.get(location) != Some(owner) {
                     forgotten.insert(*owner);
                 }
             }
-            for (location, owner) in right {
+            for (location, owner) in right.iter() {
                 if left.get(location) != Some(owner) {
                     forgotten.insert(*owner);
                 }
             }
         }
         for owner in &forgotten {
-            tuples.remove(owner);
-            records.remove(owner);
+            if tuples.contains_key(owner) {
+                Rc::make_mut(&mut tuples).remove(owner);
+            }
+            if records.contains_key(owner) {
+                Rc::make_mut(&mut records).remove(owner);
+            }
         }
         let tracked = |owner: &usize| tuples.contains_key(owner) || records.contains_key(owner);
-        let stack_aliases = self
-            .stack_aliases
-            .iter()
-            .filter(|(_, owner)| tracked(owner))
-            .map(|(slot, owner)| (*slot, *owner))
-            .collect();
-        let local_aliases = self
-            .local_aliases
-            .iter()
-            .filter(|(_, owner)| tracked(owner))
-            .map(|(local, owner)| (*local, *owner))
-            .collect();
-        Self {
+        let keep_tracked = |aliases: &Rc<BTreeMap<usize, usize>>| {
+            if aliases.values().all(tracked) {
+                aliases.clone()
+            } else {
+                Rc::new(
+                    aliases
+                        .iter()
+                        .filter(|(_, owner)| tracked(owner))
+                        .map(|(location, owner)| (*location, *owner))
+                        .collect(),
+                )
+            }
+        };
+        let stack_aliases = keep_tracked(&self.stack_aliases);
+        let local_aliases = keep_tracked(&self.local_aliases);
+        Ok(Self {
             tuples,
             records,
             stack_aliases,
             local_aliases,
+        })
+    }
+}
+
+/// Joins owner shape tables. Shapes shared by both paths are kept without
+/// element work; only distinct shapes are joined and charged by size.
+fn join_shared_shapes<S>(
+    left: &Rc<BTreeMap<usize, Rc<S>>>,
+    right: &Rc<BTreeMap<usize, Rc<S>>>,
+    join_one: fn(&S, &S) -> Option<S>,
+    size: fn(&S) -> usize,
+    pc: usize,
+    fact_work: &mut usize,
+) -> Result<Rc<BTreeMap<usize, Rc<S>>>, String> {
+    if Rc::ptr_eq(left, right) {
+        return Ok(left.clone());
+    }
+    let mut joined = BTreeMap::new();
+    let mut unchanged = left.len() == right.len();
+    for (owner, shape) in left.iter() {
+        let Some(other) = right.get(owner) else {
+            unchanged = false;
+            continue;
+        };
+        if Rc::ptr_eq(shape, other) {
+            joined.insert(*owner, shape.clone());
+            continue;
+        }
+        unchanged = false;
+        charge(
+            fact_work,
+            size(shape).saturating_add(size(other)).saturating_add(1),
+            pc,
+        )?;
+        if let Some(shape) = join_one(shape, other) {
+            joined.insert(*owner, Rc::new(shape));
         }
     }
+    Ok(if unchanged {
+        left.clone()
+    } else {
+        Rc::new(joined)
+    })
 }
 
 struct VerifyContext<'a> {
@@ -367,19 +475,23 @@ fn join_aggregate_shapes(
 ) -> BTreeMap<usize, Rc<Vec<FlowValue>>> {
     left.iter()
         .filter_map(|(slot, shape)| {
-            let other = right.get(slot)?;
-            if shape.len() != other.len() {
-                return None;
-            }
-            let joined: Vec<_> = shape
-                .iter()
-                .zip(other.iter())
-                .map(|(left, right)| left.join(*right))
-                .collect();
-            (joined.is_empty() || joined.iter().any(|value| !value.is_unknown()))
-                .then(|| (*slot, Rc::new(joined)))
+            let joined = join_tuple_shape(shape, right.get(slot)?)?;
+            Some((*slot, Rc::new(joined)))
         })
         .collect()
+}
+
+#[allow(clippy::ptr_arg)] // Matches `Rc<Vec<_>>` shapes in `join_shared_shapes`.
+fn join_tuple_shape(left: &Vec<FlowValue>, right: &Vec<FlowValue>) -> Option<Vec<FlowValue>> {
+    if left.len() != right.len() {
+        return None;
+    }
+    let joined: Vec<_> = left
+        .iter()
+        .zip(right.iter())
+        .map(|(left, right)| left.join(*right))
+        .collect();
+    (joined.is_empty() || joined.iter().any(|value| !value.is_unknown())).then_some(joined)
 }
 
 fn record_shape_cost(facts: &BTreeMap<usize, Rc<BTreeMap<u32, FlowValue>>>) -> usize {
@@ -394,22 +506,29 @@ fn join_record_shapes(
 ) -> BTreeMap<usize, Rc<BTreeMap<u32, FlowValue>>> {
     left.iter()
         .filter_map(|(slot, shape)| {
-            let other = right.get(slot)?;
-            let mut joined = BTreeMap::new();
-            for (field, value) in shape.iter() {
-                joined.insert(
-                    *field,
-                    value.join(other.get(field).copied().unwrap_or(FlowValue::ERROR)),
-                );
-            }
-            for (field, value) in other.iter() {
-                if !shape.contains_key(field) {
-                    joined.insert(*field, FlowValue::ERROR.join(*value));
-                }
-            }
-            (joined.len() <= MAX_TRACKED_AGGREGATE_ITEMS).then(|| (*slot, Rc::new(joined)))
+            let joined = join_record_shape(shape, right.get(slot)?)?;
+            Some((*slot, Rc::new(joined)))
         })
         .collect()
+}
+
+fn join_record_shape(
+    left: &BTreeMap<u32, FlowValue>,
+    right: &BTreeMap<u32, FlowValue>,
+) -> Option<BTreeMap<u32, FlowValue>> {
+    let mut joined = BTreeMap::new();
+    for (field, value) in left.iter() {
+        joined.insert(
+            *field,
+            value.join(right.get(field).copied().unwrap_or(FlowValue::ERROR)),
+        );
+    }
+    for (field, value) in right.iter() {
+        if !left.contains_key(field) {
+            joined.insert(*field, FlowValue::ERROR.join(*value));
+        }
+    }
+    (joined.len() <= MAX_TRACKED_AGGREGATE_ITEMS).then_some(joined)
 }
 
 fn failure(pc: usize, message: &str) -> String {
@@ -728,7 +847,7 @@ fn callable_result_summaries(
                 stack_values: Rc::default(),
                 aggregate_shapes: Rc::default(),
                 record_shapes: Rc::default(),
-                local_aggregates: Rc::default(),
+                local_aggregates: LocalAggregates::default(),
                 local_values: Rc::default(),
                 global_values: Rc::default(),
                 capture_values: None,
@@ -859,7 +978,7 @@ fn region(
         stack_values: Rc::default(),
         aggregate_shapes: Rc::default(),
         record_shapes: Rc::default(),
-        local_aggregates: Rc::default(),
+        local_aggregates: LocalAggregates::default(),
         local_values: Rc::default(),
         global_values: Rc::default(),
         capture_values: flow.capture_values.map(|values| Rc::new(values.to_vec())),
@@ -875,20 +994,6 @@ fn region(
             .map_err(|error| failure(pc, &error.to_string()))?;
         if state.height < required {
             return Err(failure(pc, "operand stack underflow"));
-        }
-        if let Instruction::JumpIfFalse(_) | Instruction::JumpIfTrue(_) = instruction {
-            let condition = flow_at(&state.stack_values, state.height - 1);
-            if condition.normal_types & TYPE_BOOL == 0 && !condition.may_error {
-                return Err(failure(pc, "branch condition cannot be a boolean"));
-            }
-        }
-        if let Instruction::CallValue(arity) = instruction
-            && let Some(target) = flow_at(&state.stack_values, state.height - 1).callable
-        {
-            let callable = signature(program, target.entry)?;
-            if callable.parameters != *arity || callable.captures != target.captures {
-                return Err(failure(pc, "indirect call signature mismatch"));
-            }
         }
         let branch_condition = match instruction {
             Instruction::JumpIfFalse(_) | Instruction::JumpIfTrue(_) => {
@@ -1032,19 +1137,18 @@ fn region(
                         changed = true;
                     }
                 }
-                if !Rc::ptr_eq(&previous.local_aggregates, &state.local_aggregates) {
-                    charge(
-                        flow.fact_work,
-                        previous
-                            .local_aggregates
-                            .cost()
-                            .saturating_add(state.local_aggregates.cost())
-                            .saturating_add(1),
+                if !previous
+                    .local_aggregates
+                    .shares_tables_with(&state.local_aggregates)
+                {
+                    // The join charges its entry and distinct-shape work.
+                    let common = previous.local_aggregates.join(
+                        &state.local_aggregates,
                         successor,
+                        flow.fact_work,
                     )?;
-                    let common = previous.local_aggregates.join(&state.local_aggregates);
-                    if &common != previous.local_aggregates.as_ref() {
-                        previous.local_aggregates = Rc::new(common);
+                    if common != previous.local_aggregates {
+                        previous.local_aggregates = common;
                         changed = true;
                     }
                 }
@@ -1059,7 +1163,44 @@ fn region(
             }
         }
     }
+    verify_definite_mismatches(program, start, end, &states, flow.visits)?;
     verify_dead_stack_heights(program, start, end, &states, flow.visits)?;
+    Ok(())
+}
+
+/// Rejects branch conditions and indirect callees that cannot be valid on any
+/// path. These checks read the converged input states: a state seen during
+/// the worklist pass may still lack facts from paths that join later.
+fn verify_definite_mismatches(
+    program: &CompiledProgram,
+    start: usize,
+    end: usize,
+    states: &[Option<State>],
+    visits: &mut usize,
+) -> Result<(), String> {
+    for pc in start..end {
+        let Some(state) = states[pc - start].as_ref() else {
+            continue;
+        };
+        charge(visits, 1, pc)?;
+        match &program.instructions[pc] {
+            Instruction::JumpIfFalse(_) | Instruction::JumpIfTrue(_) => {
+                let condition = flow_at(&state.stack_values, state.height - 1);
+                if condition.normal_types & TYPE_BOOL == 0 && !condition.may_error {
+                    return Err(failure(pc, "branch condition cannot be a boolean"));
+                }
+            }
+            Instruction::CallValue(arity) => {
+                if let Some(target) = flow_at(&state.stack_values, state.height - 1).callable {
+                    let callable = signature(program, target.entry)?;
+                    if callable.parameters != *arity || callable.captures != target.captures {
+                        return Err(failure(pc, "indirect call signature mismatch"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     Ok(())
 }
 
@@ -2448,7 +2589,7 @@ fn update_local_aggregates(
     pc: usize,
     fact_work: &mut usize,
 ) -> Result<(), String> {
-    let facts = state.local_aggregates.as_ref();
+    let facts = &state.local_aggregates;
     let first_operand = match instruction {
         Instruction::StackTruncate(depth) => *depth,
         _ => old_height - required,
@@ -2468,51 +2609,61 @@ fn update_local_aggregates(
     if !affected {
         return Ok(());
     }
-    charge(fact_work, facts.cost().saturating_add(1), pc)?;
-    let facts = Rc::make_mut(&mut state.local_aggregates);
+    // Shapes are shared `Rc` values: every table operation below costs at
+    // most one unit per table entry, never the size of an owner's shape.
+    let facts = &mut state.local_aggregates;
     match instruction {
         Instruction::Load(local) => {
             if let Some(owner) = facts.owner_of_local(*local) {
-                facts.add_stack_alias(old_height, owner);
+                facts.add_stack_alias(old_height, owner, pc, fact_work)?;
             }
         }
         Instruction::Store(local) => {
+            charge(fact_work, facts.entries().saturating_add(1), pc)?;
             let slot = old_height - 1;
-            let incoming = facts.stack_aliases.remove(&slot);
+            let incoming = if facts.stack_aliases.contains_key(&slot) {
+                Rc::make_mut(&mut facts.stack_aliases).remove(&slot)
+            } else {
+                None
+            };
             if incoming == Some(*local) {
                 // Storing a reload back into its owner keeps the shape.
                 return Ok(());
             }
             if facts.is_owner(*local) {
                 // Aliases of the overwritten container stay untracked.
-                facts.forget(*local);
+                facts.forget(*local, pc, fact_work)?;
             }
-            facts.local_aliases.remove(local);
+            if facts.local_aliases.contains_key(local) {
+                Rc::make_mut(&mut facts.local_aliases).remove(local);
+            }
             if let Some(owner) = incoming {
-                facts.add_local_alias(*local, owner);
+                facts.add_local_alias(*local, owner, pc, fact_work)?;
             } else if facts.tuples.len() + facts.records.len() < MAX_TRACKED_AGGREGATES {
                 // A constructor result on the stack has no other reference.
                 if let Some(shape) = state.aggregate_shapes.get(&slot) {
-                    facts.tuples.insert(*local, shape.clone());
+                    Rc::make_mut(&mut facts.tuples).insert(*local, shape.clone());
                 } else if let Some(shape) = state.record_shapes.get(&slot) {
-                    facts.records.insert(*local, shape.clone());
+                    Rc::make_mut(&mut facts.records).insert(*local, shape.clone());
                 }
             }
         }
         Instruction::Dup => {
             if let Some(owner) = facts.stack_aliases.get(&(old_height - 1)).copied() {
-                facts.add_stack_alias(old_height, owner);
+                facts.add_stack_alias(old_height, owner, pc, fact_work)?;
             }
         }
         Instruction::Swap => {
+            charge(fact_work, facts.stack_aliases.len().saturating_add(1), pc)?;
             let (left, right) = (old_height - 2, old_height - 1);
-            let left_owner = facts.stack_aliases.remove(&left);
-            let right_owner = facts.stack_aliases.remove(&right);
+            let aliases = Rc::make_mut(&mut facts.stack_aliases);
+            let left_owner = aliases.remove(&left);
+            let right_owner = aliases.remove(&right);
             if let Some(owner) = right_owner {
-                facts.stack_aliases.insert(left, owner);
+                aliases.insert(left, owner);
             }
             if let Some(owner) = left_owner {
-                facts.stack_aliases.insert(right, owner);
+                aliases.insert(right, owner);
             }
         }
         _ => {
@@ -2539,23 +2690,17 @@ fn update_local_aggregates(
                     | Instruction::JumpIfFalse(_)
                     | Instruction::JumpIfTrue(_)
             );
+            charge(fact_work, facts.stack_aliases.len().saturating_add(1), pc)?;
             let consumed: Vec<usize> = facts
                 .stack_aliases
                 .range(first_operand..)
                 .map(|(_, owner)| *owner)
                 .collect();
-            facts.stack_aliases.retain(|slot, _| *slot < first_operand);
+            Rc::make_mut(&mut facts.stack_aliases).retain(|slot, _| *slot < first_operand);
             if !read_only {
-                // Each forgotten owner rescans the alias tables.
-                charge(
-                    fact_work,
-                    consumed
-                        .len()
-                        .saturating_mul(facts.cost().saturating_add(1)),
-                    pc,
-                )?;
+                // Each forgotten owner charges its own table scan.
                 for owner in consumed {
-                    facts.forget(owner);
+                    facts.forget(owner, pc, fact_work)?;
                 }
             }
         }
@@ -2899,7 +3044,7 @@ mod tests {
             ])),
             aggregate_shapes: Rc::new(BTreeMap::new()),
             record_shapes: Rc::new(BTreeMap::new()),
-            local_aggregates: Rc::default(),
+            local_aggregates: LocalAggregates::default(),
             local_values: Rc::new(BTreeMap::new()),
             global_values: Rc::new(BTreeMap::new()),
             capture_values: None,
@@ -2928,7 +3073,7 @@ mod tests {
             stack_values: Rc::new(BTreeMap::new()),
             aggregate_shapes: Rc::new(BTreeMap::from([(0, shape.clone())])),
             record_shapes: Rc::new(BTreeMap::new()),
-            local_aggregates: Rc::default(),
+            local_aggregates: LocalAggregates::default(),
             local_values: Rc::new(BTreeMap::new()),
             global_values: Rc::new(BTreeMap::new()),
             capture_values: None,
@@ -2950,12 +3095,31 @@ mod tests {
                 .unwrap_err();
         assert!(error.contains("complexity limit"), "{error}");
 
+        // Reloads and reads pay for alias entries, not for shape sizes.
+        let large = Rc::new(vec![FlowValue::boolean(true); MAX_TRACKED_AGGREGATE_ITEMS]);
+        Rc::make_mut(&mut state.local_aggregates.tuples).insert(0, large);
+        let mut budget = 1;
+        update_local_aggregates(&Instruction::Load(0), 0, 0, &mut state, 4, &mut budget).unwrap();
+        let mut budget = 2;
+        update_local_aggregates(&Instruction::Pop, 1, 1, &mut state, 5, &mut budget).unwrap();
+        assert!(state.local_aggregates.stack_aliases.is_empty());
+
         // Joined paths that disagree about an alias forget its owner.
-        let mut aliased = state.local_aggregates.as_ref().clone();
-        aliased.stack_aliases.insert(0, 0);
-        let joined = state.local_aggregates.join(&aliased);
+        let mut budget = MAX_FACT_WORK;
+        let mut aliased = state.local_aggregates.clone();
+        Rc::make_mut(&mut aliased.stack_aliases).insert(0, 0);
+        let joined = state
+            .local_aggregates
+            .join(&aliased, 6, &mut budget)
+            .unwrap();
         assert!(joined.tuples.is_empty() && joined.stack_aliases.is_empty());
-        assert_eq!(aliased.join(&aliased), aliased);
+        assert_eq!(aliased.join(&aliased, 6, &mut budget).unwrap(), aliased);
+        // Distinct copies of equal shapes are joined and charged by size.
+        let mut copy = aliased.clone();
+        Rc::make_mut(&mut copy.tuples).insert(0, Rc::new((*aliased.tuples[&0]).clone()));
+        let mut budget = 2 * MAX_TRACKED_AGGREGATE_ITEMS;
+        let error = aliased.join(&copy, 6, &mut budget).unwrap_err();
+        assert!(error.contains("complexity limit"), "{error}");
     }
 
     #[test]

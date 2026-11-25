@@ -1958,6 +1958,73 @@ fn verifier_does_not_read_a_local_shape_through_a_slot_joined_from_another_value
 }
 
 #[test]
+fn verifier_budget_admits_many_field_reads_of_record_locals() {
+    // Tracked record shapes must not make every reload cost their total size:
+    // 20 records of 10 fields and 9000 field reads stay within the budget.
+    let (records, fields, reads) = (20, 10, 9000);
+    let mut instructions = Vec::new();
+    for record in 0..records {
+        for field in 0..fields {
+            instructions.push(I::Push(Value::Str(format!("k{field}").into())));
+            instructions.push(I::Push(Value::Int(field as i64)));
+        }
+        instructions.extend([I::MakeRecord(fields), I::Store(record)]);
+    }
+    for read in 0..reads {
+        instructions.extend([
+            I::Load(read % records),
+            I::Push(Value::Str(format!("k{}", read % fields).into())),
+            I::Index,
+            I::Pop,
+        ]);
+    }
+    instructions.push(I::Halt);
+    let program = CompiledProgram::new(instructions);
+    bytecode::validate(&program).unwrap();
+    interpreter::run_with(&program, &mut Vec::new()).unwrap();
+}
+
+#[test]
+fn verifier_checks_branch_conditions_against_joined_facts() {
+    // Local 1 is a bool, local 0 a string on one path and that bool on the
+    // other. The worklist reaches the JumpIfFalse at 15 from the string path
+    // first; only the joined fact decides whether it cannot be a boolean.
+    let program = CompiledProgram::new(vec![
+        I::Push(Value::Int(1)),
+        I::Push(Value::Str("".into())),
+        I::Ne,
+        I::Store(2),
+        I::Load(2),
+        I::IsType(ValueType::Bool),
+        I::Not,
+        I::Store(1),
+        I::Push(Value::Str("a".into())),
+        I::Store(0),
+        I::Load(1),
+        I::JumpIfFalse(14),
+        I::Load(0),
+        I::Jump(15),
+        I::Load(1),
+        I::JumpIfFalse(20),
+        I::Load(1),
+        I::Push(Value::Int(0)),
+        I::Div,
+        I::Jump(25),
+        I::Load(1),
+        I::JumpIfFalse(24),
+        I::Push(Value::Int(-1)),
+        I::Jump(25),
+        I::Push(Value::Nil),
+        I::Store(0),
+        I::Halt,
+    ]);
+    interpreter::run_with(&program, &mut Vec::new()).unwrap();
+    bytecode::validate(&program).unwrap();
+    let decoded = bytecode::decode(&bytecode::encode(&program).unwrap()).unwrap();
+    interpreter::run_with(&decoded, &mut Vec::new()).unwrap();
+}
+
+#[test]
 fn verifier_forgets_a_local_shape_when_its_aliases_exceed_the_tracking_cap() {
     // 129 reloads exceed the alias table. The write goes through the last
     // one, so an alias dropped at the cap would leave a stale shape.
