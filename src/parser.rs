@@ -478,6 +478,8 @@ pub fn assemble(source: &str) -> Result<crate::backend::CompiledProgram, ParseEr
                     ValueType::Error
                 } else if let Some(ty) = ValueType::primitive(operand) {
                     ty
+                } else if operand == "bytes" {
+                    ValueType::Bytes
                 } else if let Some(name) = operand
                     .strip_prefix("enum ")
                     .filter(|name| !name.is_empty())

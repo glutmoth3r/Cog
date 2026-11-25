@@ -13,7 +13,7 @@ remaining release acceptance gates, and the next language goals. See the [langua
   source maps, a generational graph heap, iterative cycle collection, and
   optional execution limits. The optional object-count limit is not a byte or
   whole-process memory limit.
-- Portable `.cogb` v41 artifacts (v38 to v40 files are still accepted) with bounded decoding and structural
+- Portable `.cogb` v42 artifacts (v38 to v41 files are still accepted) with bounded decoding and structural
   verification. The VM checks declared callable argument/result types at call
   boundaries; static value-flow verification is still in progress.
 - Packages, KDL configuration, path/archive/user-store dependencies, `cog.lock`,
@@ -181,11 +181,13 @@ thread-safe scheduler wakeups. Detach and async closures remain future work.
    field, so a user-written `Clone` can copy recursive fields. The checker still
    treats `Node?` like `Node` and joins `nil` with a struct to `dynamic`, so
    `if field == nil { nil } else { field.clone() }` is rejected; decide whether
-   to track struct nullability. Struct `==` and `!=` call an explicit
-   `eq::Eq[Self]` implementation, and `cog check` rejects structs without one.
-   Compile-time evaluation still compares structs without that implementation
-   (equal records compare as `false`). Decide whether a built-in struct
-   `.clone()` should exist.
+   to track struct nullability. For the same reason a `match` with only a struct
+   arm is exhaustive just for the few proven non-nil scrutinees listed in
+   [LANGUAGE.md](docs/LANGUAGE.md#patterns-when-and-match). Struct `==` and `!=`
+   call an explicit `eq::Eq[Self]` implementation, and `cog check` rejects structs
+   without one. Compile-time evaluation still compares structs without that
+   implementation (equal records compare as `false`). Decide whether a built-in
+   struct `.clone()` should exist.
 6. Extend the WASI backend only by owner decision. `str::to_int`, `to_uint`,
    `to_bool`, `to_char`, `str::builder`, `build`, `fmt::write` and `replace` have
    VM parity (tests/wasm.rs). Arrays, structs, `Map`, floats and async remain

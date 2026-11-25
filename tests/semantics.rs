@@ -387,6 +387,106 @@ fn comptime_struct_type_tests_match_runtime_identity() {
 }
 
 #[test]
+fn a_struct_pattern_covers_a_non_nil_scrutinee_of_that_struct() {
+    assert_eq!(
+        run(r#"
+        struct Point { x: int }
+        struct Holder { point: Point? }
+        fn origin() -> Point { Point(x: 4) }
+        fn parameter(point: Point) -> int { match point { Point => point.x } }
+        fn optional(point: Point?) -> str {
+            match point { Point => "point", nil => "nil" }
+        }
+        fn reordered(holder: Holder) -> str {
+            match holder.point { nil => "nil", Point => "point" }
+        }
+        fn main() {
+            io::println(parameter(Point(x: 1)));
+            const local = Point(x: 2);
+            const copy = local;
+            io::println(match local { Point => local.x });
+            io::println(match copy { Point => 3 });
+            io::println(match origin() { Point => 4 });
+            io::println(match Point(x: 5) { Point => 5 });
+            const closure = fn(point: Point) -> int { match point { Point => point.x } };
+            io::println((closure)(Point(x: 6)));
+            io::println($"{optional(Point(x: 1))} {optional(nil)}");
+            io::println(reordered(Holder(point: nil)));
+            io::println(reordered(Holder(point: Point(x: 1))));
+        }
+    "#),
+        "1\n2\n3\n4\n5\n6\npoint nil\nnil\npoint\n"
+    );
+}
+
+#[test]
+fn a_struct_pattern_alone_does_not_cover_possible_nil_or_other_types() {
+    let nilable = "the scrutinee may be nil";
+    let missing = "add missing variants or a `_` arm";
+    for (body, expected) in [
+        (
+            "fn f(point: Point?) { match point { Point => 1 }; }",
+            nilable,
+        ),
+        (
+            "fn find() -> Point? { nil } fn f() { match find() { Point => 1 }; }",
+            nilable,
+        ),
+        (
+            "fn find() -> Point? { nil } \
+             fn f() { const point: Point = find(); match point { Point => 1 }; }",
+            nilable,
+        ),
+        (
+            "fn f(holder: Holder) { match holder.point { Point => 1 }; }",
+            nilable,
+        ),
+        (
+            "fn f() { const point: Point? = Point(x: 1); match point { Point => 1 }; }",
+            nilable,
+        ),
+        // A parameter that is written anywhere loses its call contract.
+        (
+            "fn find() -> Point? { nil } \
+             fn f(point: Point) { match point { Point => 1 }; point = find(); }",
+            nilable,
+        ),
+        (
+            "fn find() -> Point? { nil } \
+             fn f(point: Point) { point = find(); match point { Point => 1 }; }",
+            nilable,
+        ),
+        (
+            "fn f(point: Point) { match point { Point if point.x > 0 => 1 }; }",
+            missing,
+        ),
+        (
+            "fn f(point: Point?) { match point { Point => 1, nil if true => 2 }; }",
+            nilable,
+        ),
+        ("fn f(value) { match value { Point => 1 }; }", missing),
+        (
+            "fn f(value) { match value { Point => 1, nil => 2 }; }",
+            missing,
+        ),
+        (
+            "fn f(point: Point) { match point { Other => 1 }; }",
+            missing,
+        ),
+        ("fn f(value: int) { match value { Point => 1 }; }", missing),
+        ("fn f(point: Point) { match point { nil => 1 }; }", missing),
+    ] {
+        let source = format!(
+            "@!include(\"std\") struct Point {{ x: int }} struct Other {{ x: int }} \
+             struct Holder {{ point: Point? }} {body} fn main() {{}}"
+        );
+        let error = project::compile_source("main.cog", &source).expect_err(body);
+        assert!(error.contains("E2003"), "{body}: {error}");
+        assert!(error.contains(expected), "{body}: {error}");
+    }
+}
+
+#[test]
 fn struct_type_tests_reject_generic_struct_templates() {
     let source = r#"
         @!include("std")

@@ -25,6 +25,9 @@ pub enum ValueType {
     /// A declared, non-generic struct identified by its resolved name. It
     /// matches only records constructed by that struct, never nil or Error.
     Struct(Rc<str>),
+    /// The built-in mutable byte buffer. It matches only byte values, never
+    /// other opaque natives such as resource handles, nil, or Error.
+    Bytes,
 }
 
 impl ValueType {
@@ -52,6 +55,7 @@ impl ValueType {
             | (Self::Char, Value::Char(_))
             | (Self::Str, Value::Str(_))
             | (Self::Nil, Value::Nil)
+            | (Self::Bytes, Value::Bytes(_))
             | (Self::Error, Value::Error(_)) => true,
             (Self::Enum(name), Value::Variant(tag, _)) => tag
                 .rsplit_once("::")
@@ -86,6 +90,7 @@ impl std::fmt::Display for ValueType {
             Self::Bool => f.write_str("bool"),
             Self::Char => f.write_str("char"),
             Self::Str => f.write_str("str"),
+            Self::Bytes => f.write_str("bytes"),
             Self::Nil => f.write_str("nil"),
             Self::Error => f.write_str("error"),
         }

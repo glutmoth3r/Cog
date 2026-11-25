@@ -167,11 +167,6 @@ fn bytes_annotations_reject_other_types_statically_and_at_runtime() {
         "fn main() { var buffers: bytes[] = []; buffers << \"text\"; }",
         "type mismatch",
     );
-    rejects(
-        "fn kind(value) -> str { when value is bytes { return \"bytes\"; } \"other\" } \
-         fn main() { kind(bytes::new(1)); }",
-        "type patterns do not support `bytes`",
-    );
     assert_eq!(
         run(r#"
         struct Buffer { data: bytes }
@@ -406,4 +401,166 @@ fn imported_user_type_named_bytes_takes_precedence_over_the_builtin_type() {
         assert_eq!(run_program(round_trip(program)), "8\n", "{import}");
     }
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn bytes_type_tests_narrow_dynamic_values() {
+    assert_eq!(
+        run(r#"
+        struct Point { x: int }
+
+        fn size(data: bytes) -> int { bytes::len(data)!! }
+
+        fn measure(value) -> int {
+            when value is bytes { size(value) } else { -1 }
+        }
+
+        fn describe(value) -> str {
+            match value {
+                bytes if size(value) > 2 => "long",
+                bytes => "short",
+                str => "str",
+                _ => "other",
+            }
+        }
+
+        fn fill(value) -> nil {
+            when value is bytes { bytes::set(value, 0, 65)!!; }
+        }
+
+        fn choose(value) -> bytes {
+            when value is str { bytes::from_str(value) }
+            else if true { when value is bytes { value } else { bytes::new(0) } }
+            else { bytes::new(0) }
+        }
+
+        fn is_bytes(value) -> bool { when value is bytes { true } else { false } }
+
+        fn main() {
+            var data = bytes::new(3);
+            fill(data);
+            fill("ignored");
+            io::println(bytes::get(data, 0)!!)!!;
+            io::println(measure(data))!!;
+            io::println(measure("abc"))!!;
+            io::println(describe(data))!!;
+            io::println(describe(bytes::new(1)))!!;
+            io::println(describe("abc"))!!;
+            io::println(describe(1))!!;
+            io::println(size(choose("four")))!!;
+            io::println(size(choose(data)))!!;
+            io::println(is_bytes(nil))!!;
+            io::println(is_bytes(1 / 0))!!;
+            io::println(is_bytes(io::stdout()))!!;
+            io::println(is_bytes([data]))!!;
+            io::println(is_bytes(Point(x: 1)))!!;
+            io::println(is_bytes(bytes::copy(data)))!!;
+        }
+        "#),
+        "65\n3\n-1\nlong\nshort\nstr\nother\n4\n3\nfalse\nfalse\nfalse\nfalse\nfalse\ntrue\n"
+    );
+}
+
+#[test]
+fn bytes_type_tests_require_writable_arguments_for_narrowed_mutation() {
+    rejects(
+        "fn fill(value) -> nil { when value is bytes { bytes::set(value, 0, 1)!!; } } \
+         fn main() { const buffer = bytes::new(1); fill(buffer); }",
+        "cannot mutate",
+    );
+}
+
+#[test]
+fn bytes_type_tests_evaluate_the_scrutinee_once_and_ignore_value_names() {
+    assert_eq!(
+        run(r#"
+        var evaluations = 0;
+        fn buffer() -> bytes { evaluations += 1; bytes::new(1) }
+        fn main() {
+            const bytes = 7;
+            when buffer() is bytes { io::println(bytes)!!; }
+            io::println(evaluations)!!;
+        }
+        "#),
+        "7\n1\n"
+    );
+    // A function named `bytes` is not a type, so the pattern stays built in.
+    assert_eq!(
+        run_source(&unimported(
+            "use entropy::bytes; \
+             fn kind(value) -> str { when value is bytes { \"bytes\" } else { \"other\" } } \
+             fn main() { io::println(kind(bytes(2)!!))!!; io::println(kind(2))!!; }"
+        )),
+        "bytes\nother\n"
+    );
+}
+
+#[test]
+fn user_types_named_bytes_take_precedence_in_type_tests() {
+    assert_eq!(
+        run_source(&unimported(
+            r#"
+        struct bytes { x: int }
+        fn kind(value) -> str { when value is bytes { "struct" } else { "other" } }
+        fn covered(value: bytes) -> int { match value { bytes => value.x } }
+        fn main() {
+            io::println(kind(bytes(x: 1)))!!;
+            io::println(kind(1))!!;
+            io::println(covered(bytes(x: 2)))!!;
+        }
+        "#
+        )),
+        "struct\nother\n2\n"
+    );
+}
+
+#[test]
+fn compile_time_bytes_type_tests_match_runtime_identity() {
+    assert_eq!(
+        run(r#"
+        @comptime fn is_buffer(value: str) -> bool { when value is bytes { true } else { false } }
+        @comptime const NO: bool = is_buffer("text");
+        fn main() { io::println(NO)!!; }
+        "#),
+        "false\n"
+    );
+}
+
+#[test]
+fn array_contracts_keep_byte_buffers_and_handles_distinct() {
+    rejects(
+        "fn main() { var handles = [io::stdout()]; handles << bytes::new(1); }",
+        "type mismatch",
+    );
+    rejects(
+        "fn main() { var buffers = [bytes::new(1)]; buffers << io::stdout(); }",
+        "type mismatch",
+    );
+    assert_eq!(
+        run(r#"
+        fn append(items, value) {
+            try { items << value; }
+            catch(error) { io::println(error.error_kind())!!; }
+        }
+
+        fn replace(items, value) {
+            try { items[0] = value; }
+            catch(error) { io::println(error.error_kind())!!; }
+        }
+
+        fn main() {
+            var handles = [io::stdout()];
+            append(handles, bytes::new(1));
+            replace(handles, bytes::new(1));
+            append(handles, io::stdout());
+            io::println(len(handles))!!;
+            var buffers = [bytes::new(1)];
+            append(buffers, io::stdout());
+            replace(buffers, io::stdout());
+            append(buffers, bytes::new(2));
+            io::println(len(buffers))!!;
+        }
+        "#),
+        "TypeMismatch\nTypeMismatch\n2\nTypeMismatch\nTypeMismatch\n2\n"
+    );
 }

@@ -266,9 +266,14 @@ array elements, tuples, and generic arguments, and `bytes?` admits nil. A buffer
 reference: a callee that mutates a `bytes` parameter requires a writable argument, like an
 array. The annotation name is distinct from the `bytes` module, so `use bytes;` and
 `fn f(data: bytes)` coexist. Comparing two buffers with `==` returns `TypeMismatch`, as for
-arrays; `as bytes` casts and `is bytes` type patterns are not supported. A generic type
-parameter, or a declared or imported struct, enum, or type alias, named `bytes` takes
-precedence over the built-in type.
+arrays. A dynamic value becomes `bytes` through a type test: inside
+`when value is bytes { ... }`, or a `bytes` arm of `match`, an unannotated binding has type
+`bytes` and can be passed to a `bytes` parameter. `as bytes` casts are not supported. A
+generic type parameter, or a declared or imported struct, enum, or type alias, named `bytes`
+takes precedence over the built-in type.
+
+Arrays keep byte buffers and resource handles apart at run time as the checker does: adding a
+buffer to an array of handles, or a handle to a `bytes[]` array, produces `TypeMismatch`.
 
 A non-nil initializer does not narrow declared `int?` to `int`. Control-flow
 checks can refine nullable values on paths that prove nil is absent, including a
@@ -515,8 +520,8 @@ arms and requires exhaustive coverage under the current checker; use `_` when
 the scrutinee remains dynamic. Both evaluate the scrutinee once and share pattern
 semantics. Arms may contain blocks or expressions and can return a value.
 
-Patterns support `_`, primitive int/uint/bigint/float/bool/char/str/nil types, declared enum
-and non-generic struct types, character and string literals, and variants. A character literal matches
+Patterns support `_`, primitive int/uint/bigint/float/bool/char/str/nil types, the
+byte-buffer type `bytes`, declared enum and non-generic struct types, character and string literals, and variants. A character literal matches
 one exact Unicode scalar. A string literal pattern matches exact text and does
 not make a string match exhaustive; include `_` for other values. A variant without
 `(bindings)` ignores its payload; bindings require
@@ -525,8 +530,23 @@ select payload fields. Alternatives use `|`; guards run after a pattern matches.
 Enums and structs have nominal identities, including package/module identity.
 `when value is Person` matches only a value constructed by `Person`, including
 tuple and empty structs; nil, Error, anonymous records, enum variants, and other
-structs with the same fields do not match. A struct type test never makes a
-`match` exhaustive. Generic struct templates such as `Box` cannot be tested
+structs with the same fields do not match.
+
+An unguarded struct arm makes a `match` exhaustive only when the scrutinee's static type is
+that struct and nil is covered: either by an unguarded `nil` arm, as required for `Person?`,
+or because the scrutinee cannot be nil. Struct types do not yet record nullability, so the
+checker accepts only these proofs without a `nil` arm:
+
+- a constructor call, or a call to a named non-generic function whose result is annotated
+  with a non-nil type;
+- a parameter annotated with a non-nil type that is never assigned or captured mutably;
+- an unannotated or non-nil `const` initialized from one of the above (a `const` copy of a
+  parameter does not count).
+
+Any other scrutinee, such as a field, an element, a `var`, or a method result, needs a `nil`
+or `_` arm. A dynamic scrutinee, or one of another type, still needs `_`. As with exhaustive
+enum matches, an Error scrutinee matches no struct arm and the `match` yields nil; add an
+`Error` or `_` arm to handle it. Generic struct templates such as `Box` cannot be tested
 because a pattern cannot name type arguments. Struct patterns with field bindings
 are not supported.
 

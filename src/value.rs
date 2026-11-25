@@ -1318,12 +1318,9 @@ fn value_matches_runtime_type(expected: &RuntimeType, value: &Value) -> bool {
             RuntimeType::Function,
             Value::Function(_) | Value::BoundFunction(_) | Value::Closure(_, _),
         )
-        // `Other` remains the opaque native category, so existing bytecode
-        // contracts keep accepting byte buffers.
-        | (
-            RuntimeType::Other,
-            Value::Bytes(_) | Value::Handle(_) | Value::Cell(_) | Value::Iterator(_),
-        ) => true,
+        // Byte buffers have their own nominal identity and are not part of
+        // the opaque native category.
+        | (RuntimeType::Other, Value::Handle(_) | Value::Cell(_) | Value::Iterator(_)) => true,
         (RuntimeType::Record, Value::Record(record)) => record.nominal.is_none(),
         (RuntimeType::Nominal(expected), Value::Record(record)) => {
             record.nominal.as_deref() == Some(expected.as_str())
@@ -1699,9 +1696,6 @@ impl RuntimeType {
                 }
                 _ => false,
             },
-            Self::Other => {
-                actual == self || matches!(actual, Self::Nominal(name) if name == BYTES_TYPE)
-            }
             Self::Nominal(name) => {
                 actual == self
                     || matches!(actual, Self::Variant(parent) if parent == name)

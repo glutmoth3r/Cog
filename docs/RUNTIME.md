@@ -119,8 +119,8 @@ same-type comparisons for these numeric types, exact mixed `int`/`uint`
 comparisons, `char` ordering, boolean equality, and boolean branches. Other
 mixed numeric operations, float remainder, and unsupported instructions return
 to the interpreter at their bytecode position. Primitive type tests are lowered
-when their runtime tag is represented directly; struct type tests resume in the
-interpreter. Strings, BigInts, Errors,
+when their runtime tag is represented directly; struct and byte buffer type tests
+resume in the interpreter. Strings, BigInts, Errors,
 aggregates, and other opaque values can remain rooted across OSR. The call bridge
 runs synchronous Cog and native calls through the current execution context and
 can resume machine execution with the returned result. It also covers indexing,

@@ -603,6 +603,7 @@ Use `entropy::bytes` for OS entropy.
 
 The buffer type is spelled `bytes` in annotations, including struct fields and
 `bytes[]` arrays. Buffers share storage through assignment. `bytes::set` requires writable access.
+Narrow a dynamic value with `when value is bytes { ... }` before passing it to a `bytes` parameter.
 Copy, slice, and concat allocate independent storage and obey the runtime buffer
 limit; concat accepts aliases, including the same buffer for both arguments.
 Invalid byte values, negative/out-of-bounds ranges, and invalid UTF-8 produce Error.

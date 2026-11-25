@@ -732,6 +732,29 @@ impl Resolver {
             .is_some_and(|symbol| self.type_symbols.contains(&symbol.bound))
     }
 
+    /// A `bytes` type pattern names the built-in byte buffer under the same
+    /// rules as an annotation: only a type parameter or a declared or imported
+    /// type (or enum variant) with that name takes precedence.
+    fn builtin_bytes_pattern(&self, owner: &ModuleKey, scopes: &[Scope]) -> bool {
+        if self.active_type_parameters.contains("bytes") {
+            return false;
+        }
+        match scopes
+            .iter()
+            .rev()
+            .filter_map(|scope| scope.get("bytes"))
+            .find(|binding| !matches!(binding, Binding::Local))
+        {
+            Some(Binding::Poison) => false,
+            Some(Binding::Symbol(symbol))
+                if self.type_symbols.contains(&symbol.bound) || symbol.bound.contains("::") =>
+            {
+                false
+            }
+            _ => !self.declares_bytes_type(owner),
+        }
+    }
+
     /// `use bytes;` binds the module name, but a bare `bytes` expression still
     /// names the byte-buffer type unless a type parameter, value, declaration,
     /// or imported item shadows it.
@@ -1067,15 +1090,8 @@ impl Resolver {
                 for arm in arms {
                     scopes.push(Scope::new());
                     if let MatchPattern::Type(name) = &mut arm.pattern
-                        && name == "bytes"
-                        && self.bytes_names_type(owner, scopes)
-                    {
-                        self.error(
-                            "type patterns do not support `bytes`; annotate the binding instead",
-                            location.clone(),
-                        );
-                    } else if let MatchPattern::Type(name) = &mut arm.pattern
                         && crate::instruction::ValueType::primitive(name).is_none()
+                        && !(name == "bytes" && self.builtin_bytes_pattern(owner, scopes))
                     {
                         *name = self.name(name, owner, scopes, location.clone());
                     }

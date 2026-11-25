@@ -79,6 +79,9 @@ fn struct_type_tests_require_current_bytecode_and_a_struct_identity() {
     let mut output = Vec::new();
     interpreter::run_with(&decoded, &mut output).unwrap();
 
+    // Version 41 introduced struct type tests, so it still accepts the tag.
+    bytes[4..6].copy_from_slice(&41_u16.to_le_bytes());
+    bytecode::decode(&bytes).unwrap();
     // Version 40 predates struct type tests, so its decoder rejects the tag.
     bytes[4..6].copy_from_slice(&40_u16.to_le_bytes());
     let error = bytecode::decode(&bytes).unwrap_err();
@@ -86,6 +89,36 @@ fn struct_type_tests_require_current_bytecode_and_a_struct_identity() {
 
     rejected(program(""), "struct identity");
     rejected(program("@struct::demo::Point"), "struct identity");
+}
+
+#[test]
+fn bytes_type_tests_require_current_bytecode() {
+    let program = CompiledProgram::new(vec![
+        I::Push(Value::Nil),
+        I::IsType(ValueType::Bytes),
+        I::Pop,
+        I::Halt,
+    ]);
+    let mut bytes = bytecode::encode(&program).unwrap();
+    let decoded = bytecode::decode(&bytes).unwrap();
+    assert!(matches!(
+        decoded.instructions[1],
+        I::IsType(ValueType::Bytes)
+    ));
+    assert_eq!(bytecode::encode(&decoded).unwrap(), bytes);
+    let mut output = Vec::new();
+    interpreter::run_with(&decoded, &mut output).unwrap();
+
+    // Version 41 predates byte buffer type tests, so its decoder rejects the tag.
+    bytes[4..6].copy_from_slice(&41_u16.to_le_bytes());
+    let error = bytecode::decode(&bytes).unwrap_err();
+    assert!(error.contains("unknown type-test tag 12"), "{error}");
+
+    let assembled = cog::parser::assemble("push nil\nis_type bytes\npop\nhalt\n").unwrap();
+    assert!(matches!(
+        assembled.instructions[1],
+        I::IsType(ValueType::Bytes)
+    ));
 }
 
 #[test]
@@ -154,7 +187,7 @@ fn typed_aggregate_metadata_is_bounded_canonical_and_versioned() {
     assert!(
         bytecode::decode(&legacy)
             .unwrap_err()
-            .contains("unsupported bytecode version 10; expected 41")
+            .contains("unsupported bytecode version 10; expected 42")
     );
 }
 

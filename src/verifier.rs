@@ -1763,10 +1763,10 @@ fn normal_type_definitely_matches_runtime_type(
             _ => false,
         },
         RuntimeType::Function => value.normal_types == TYPE_FUNCTION,
-        RuntimeType::Other => value.normal_types == TYPE_OTHER,
         RuntimeType::Nominal(name) if name == "$core::Task" => value.normal_types == TYPE_TASK,
-        // TYPE_OTHER also covers handles, cells, and iterators, so the flow
-        // domain cannot prove that a value is a byte buffer.
+        // TYPE_OTHER covers byte buffers as well as handles, cells, and
+        // iterators, so the flow domain cannot prove either category.
+        RuntimeType::Other => false,
         RuntimeType::Nominal(name) if name == crate::value::BYTES_TYPE => false,
         RuntimeType::Nominal(name) => match value.normal_types {
             TYPE_RECORD => {
@@ -1974,6 +1974,11 @@ fn type_test_flow(
         ValueType::Char => primitive_type_test(value, TYPE_CHAR),
         ValueType::Str => primitive_type_test(value, TYPE_STR),
         ValueType::Nil => primitive_type_test(value, TYPE_NIL),
+        ValueType::Bytes if value.is_type_tag => Some(false),
+        // TYPE_OTHER also covers handles, cells, and iterators, so only its
+        // absence decides the test.
+        ValueType::Bytes if value.normal_types & TYPE_OTHER == 0 => Some(false),
+        ValueType::Bytes => None,
         ValueType::Error if value.normal_types == 0 && value.may_error => Some(true),
         ValueType::Error if !value.may_error => Some(false),
         ValueType::Error => None,
@@ -3254,6 +3259,35 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("complexity limit"));
+    }
+
+    #[test]
+    fn bytes_type_test_facts_agree_with_runtime_matching() {
+        use crate::heap::HeapRef;
+        use crate::instruction::ValueType;
+        use std::cell::RefCell;
+
+        let strings: [Rc<str>; 1] = [Rc::from("demo::A")];
+        let values = [
+            Value::Int(1),
+            Value::Nil,
+            Value::Error(Box::new(crate::error::RuntimeError::DivisionByZero)),
+            Value::TypeTag(strings[0].clone()),
+            Value::Bytes(HeapRef::try_new(RefCell::new(vec![1])).unwrap()),
+            Value::Cell(HeapRef::try_new(RefCell::new(Value::Nil)).unwrap()),
+        ];
+        for value in &values {
+            let flow = value_flow(value, None);
+            let mut budget = MAX_FACT_WORK;
+            let result = type_test_flow(&ValueType::Bytes, flow, &strings, 0, &mut budget).unwrap();
+            let runtime = ValueType::Bytes.matches(value);
+            assert!(
+                result.known_bool.is_none_or(|known| known == runtime),
+                "{value:?}: verifier {:?}, runtime {runtime}",
+                result.known_bool
+            );
+            assert_eq!(result.normal_types, TYPE_BOOL);
+        }
     }
 
     #[test]

@@ -3389,6 +3389,11 @@ impl<'a> Codegen<'a> {
         if self.struct_defs.contains_key(&name) {
             return Ok(ValueType::Struct(name.into()));
         }
+        // The resolver renames declared types, so a bare `bytes` that reaches
+        // this point is the built-in byte buffer.
+        if name == "bytes" {
+            return Ok(ValueType::Bytes);
+        }
         Err(CodegenError::new(format!("unsupported type test `{name}`")))
     }
 

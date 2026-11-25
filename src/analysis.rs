@@ -33,6 +33,9 @@ pub(crate) enum Type {
     Poison,
 }
 
+const NILABLE_STRUCT_MATCH: &str =
+    "non-exhaustive match: the scrutinee may be nil; add a `nil` or `_` arm";
+
 pub(crate) fn type_compatible(expected: &Type, actual: &Type) -> bool {
     match (expected, actual) {
         (Type::Dynamic, _) | (_, Type::Poison | Type::ErrorValue | Type::Never) => true,
@@ -1282,6 +1285,13 @@ struct Checker<'a> {
     in_comptime_initializer: bool,
     result_type: Option<TypeAnnotation>,
     dynamic_bindings: std::collections::HashSet<usize>,
+    // Struct types do not record nullability. These bindings are additionally
+    // known to hold a struct: parameters guarded by a non-nil runtime contract
+    // and constants initialized from a non-nil value.
+    non_nil_bindings: HashSet<usize>,
+    reassigned_bindings: HashSet<usize>,
+    // Matches whose coverage depends on a parameter that is never reassigned.
+    parameter_matches: Vec<(usize, Option<SourceSpan>)>,
     unresolved_empty_arrays: HashMap<usize, (String, SourceSpan)>,
     next_binding: usize,
     diagnostics: Vec<Diagnostic>,
@@ -1416,6 +1426,9 @@ fn check_program(
         in_comptime_initializer: false,
         result_type: None,
         dynamic_bindings: Default::default(),
+        non_nil_bindings: HashSet::new(),
+        reassigned_bindings: HashSet::new(),
+        parameter_matches: Vec::new(),
         unresolved_empty_arrays: HashMap::new(),
         next_binding: 1,
         diagnostics: Vec::new(),
@@ -1732,6 +1745,11 @@ fn check_program(
                 }
             }
             _ => {}
+        }
+    }
+    for (binding, span) in std::mem::take(&mut c.parameter_matches) {
+        if c.reassigned_bindings.contains(&binding) {
+            c.error("E2003", NILABLE_STRUCT_MATCH, span.as_ref());
         }
     }
     if effects {
@@ -3298,6 +3316,7 @@ impl<'a> Checker<'a> {
             self.flow_facts = FlowFacts::default();
             self.unresolved_empty_arrays.clear();
             let diagnostics_start = self.diagnostics.len();
+            let matches_start = self.parameter_matches.len();
             let unresolved = self.dynamic_bindings.len();
             self.scopes.push(Scope::default());
             self.in_comptime = f.comptime;
@@ -3319,6 +3338,7 @@ impl<'a> Checker<'a> {
                     },
                     None,
                 );
+                self.record_non_nil_parameter(parameter);
             }
             self.in_function = true;
             self.result_type = f.result_type.clone();
@@ -3359,6 +3379,7 @@ impl<'a> Checker<'a> {
                 break;
             }
             self.diagnostics.truncate(diagnostics_start);
+            self.parameter_matches.truncate(matches_start);
         }
         self.flow_facts = previous_flow_facts;
         self.current_function = previous_function;
@@ -3778,6 +3799,37 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Record the parameter defined last as holding a value if its annotation
+    /// excludes nil; calls enforce that annotation at runtime.
+    fn record_non_nil_parameter(&mut self, parameter: &Param) {
+        if parameter.ty.as_ref().is_some_and(|ty| !ty.nilable) {
+            self.non_nil_bindings.insert(self.next_binding - 1);
+        }
+    }
+
+    /// Prove that a struct-typed expression is not nil. `Some(Some(binding))`
+    /// holds only while that parameter is never reassigned.
+    fn non_nil_proof(&mut self, value: &Expr) -> Option<Option<usize>> {
+        match value.node() {
+            Expr::Ident(name) => {
+                let binding = self.local(name)?;
+                self.non_nil_bindings
+                    .contains(&binding.id)
+                    .then(|| binding.mutable.then_some(binding.id))
+            }
+            Expr::Call(name, _) if self.local(name).is_none() => {
+                let name = self.resolve(name, value.span())?;
+                let proven = self.constructors.contains_key(&name)
+                    || self.functions.get(&name).is_some_and(|function| {
+                        function.type_params.is_empty()
+                            && function.result_type.as_ref().is_some_and(|ty| !ty.nilable)
+                    });
+                proven.then_some(None)
+            }
+            _ => None,
+        }
+    }
+
     fn binding_for_value(&self, value: &Expr) -> Option<Binding> {
         let Expr::Ident(name) = value.node() else {
             return None;
@@ -3818,14 +3870,15 @@ impl<'a> Checker<'a> {
                 crate::instruction::ValueType::Nil | crate::instruction::ValueType::Error => None,
                 crate::instruction::ValueType::Enum(_)
                 | crate::instruction::ValueType::Variant(_)
-                | crate::instruction::ValueType::Struct(_) => None,
+                | crate::instruction::ValueType::Struct(_)
+                | crate::instruction::ValueType::Bytes => None,
             }
         } else if let Some(id) = self.enums.get(name) {
             Some(Type::Enum(*id, name.to_owned()))
+        } else if let Some((id, _)) = self.constructors.get(name) {
+            Some(Type::Struct(*id, name.to_owned(), Vec::new()))
         } else {
-            self.constructors
-                .get(name)
-                .map(|(id, _)| Type::Struct(*id, name.to_owned(), Vec::new()))
+            (name == "bytes").then_some(Type::Bytes)
         };
 
         if positive {
@@ -3931,7 +3984,9 @@ impl<'a> Checker<'a> {
         {
             return None;
         }
-        let message = if self.constructors.contains_key(&resolved) {
+        let message = if resolved == "bytes" && !self.constructors.contains_key(&resolved) {
+            return Some(resolved);
+        } else if self.constructors.contains_key(&resolved) {
             if self
                 .struct_parameters
                 .get(&resolved)
@@ -4129,6 +4184,12 @@ impl<'a> Checker<'a> {
                     .as_ref()
                     .map(|annotation| self.annotation_type(annotation));
                 let actual = self.expr_with_expected_result(value, expected_result.as_ref());
+                // Decide before the new binding can shadow a name in `value`.
+                let non_nil_constant = matches!(stmt.node(), Stmt::Const { .. })
+                    && matches!(pattern, BindingPattern::Name(_))
+                    && matches!(actual, Type::Struct(..))
+                    && ty.as_ref().is_none_or(|ty| !ty.nilable)
+                    && self.non_nil_proof(value) == Some(None);
                 let valid = ty.clone().is_none_or(|annotation| {
                     self.assignable(annotation, actual.clone(), value.span(), &binding_label)
                 });
@@ -4191,6 +4252,9 @@ impl<'a> Checker<'a> {
                         },
                         span.as_ref(),
                     );
+                    if non_nil_constant {
+                        self.non_nil_bindings.insert(self.next_binding - 1);
+                    }
                 }
                 if actual == Type::Never {
                     return Type::Never;
@@ -4959,6 +5023,7 @@ impl<'a> Checker<'a> {
                     })
                 });
                 if let Some(binding) = binding {
+                    self.reassigned_bindings.insert(binding.id);
                     let expected = binding
                         .inferred
                         .as_ref()
@@ -5711,6 +5776,9 @@ impl<'a> Checker<'a> {
                         );
                         valid = false;
                     }
+                    if capture.mutable {
+                        self.reassigned_bindings.insert(binding.id);
+                    }
                     let ty = if capture.mutable {
                         binding.ty.clone()
                     } else {
@@ -5778,6 +5846,7 @@ impl<'a> Checker<'a> {
                         },
                         expr.span(),
                     );
+                    self.record_non_nil_parameter(parameter);
                 }
                 let saved_function = self.in_function;
                 let saved_async = self.in_async;
@@ -6415,7 +6484,8 @@ impl<'a> Checker<'a> {
                             {
                                 if let Some(id) = self.enums.get(&name) {
                                     covered.extend(self.enum_variants[*id].iter().cloned());
-                                } else if self.variants.contains_key(&name) {
+                                } else {
+                                    // Variants, `nil`, and struct names.
                                     covered.insert(name);
                                 }
                             }
@@ -6554,17 +6624,30 @@ impl<'a> Checker<'a> {
                             .map(|(id, _)| *id),
                         _ => None,
                     };
-                    let complete = enum_id.is_some_and(|id| {
-                        self.enum_variants[id]
-                            .iter()
-                            .all(|name| covered.contains(name))
-                    });
+                    let mut message = "non-exhaustive match: add missing variants or a `_` arm";
+                    let complete = match &actual {
+                        // A pattern of the scrutinee's own struct covers every
+                        // struct value; nil needs an arm unless it is ruled out.
+                        Type::Struct(_, name, _) if covered.contains(name) => {
+                            message = NILABLE_STRUCT_MATCH;
+                            covered.contains("nil")
+                                || match self.non_nil_proof(value) {
+                                    Some(Some(parameter)) => {
+                                        self.parameter_matches
+                                            .push((parameter, expr.span().cloned()));
+                                        true
+                                    }
+                                    proof => proof.is_some(),
+                                }
+                        }
+                        _ => enum_id.is_some_and(|id| {
+                            self.enum_variants[id]
+                                .iter()
+                                .all(|name| covered.contains(name))
+                        }),
+                    };
                     if !complete {
-                        self.error(
-                            "E2003",
-                            "non-exhaustive match: add missing variants or a `_` arm",
-                            expr.span(),
-                        );
+                        self.error("E2003", message, expr.span());
                     } else {
                         unmatched_flow = None;
                     }

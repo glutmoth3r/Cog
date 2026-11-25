@@ -1168,6 +1168,34 @@ fn jit_bytes_annotated_parameters_and_results_match_vm() {
 }
 
 #[test]
+fn jit_bytes_type_tests_fall_back_to_vm_matching() {
+    assert_jit_fallback_matches_vm(
+        r#"
+        @!include("std")
+        use io;
+        use bytes;
+
+        fn count(value, rounds: int) -> int {
+            var matched = 0;
+            var index = 0;
+            while index < rounds {
+                when value is bytes { matched += bytes::len(value)!!; }
+                index += 1;
+            }
+            matched
+        }
+
+        fn main() {
+            io::println(count(bytes::new(1), 6000))!!;
+            io::println(count(io::stdout(), 6000))!!;
+        }
+        "#,
+        "bytes-types",
+        "6000\n0\n",
+    );
+}
+
+#[test]
 fn jit_user_iterator_fallback_matches_vm() {
     assert_jit_fallback_matches_vm(USER_ITERATOR_FALLBACK_SOURCE, "user-iterator", "18003000\n");
 }

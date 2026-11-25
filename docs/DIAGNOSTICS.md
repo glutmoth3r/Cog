@@ -61,8 +61,8 @@ the instruction table, are nested more than 64 deep, contain forward parent
 references, or contain frames that no source map range reaches. Version 39
 artifacts have function names and no inline frames. Version 38 artifacts
 also lack function names and report instruction coordinates only. Both remain
-readable. Version 41 adds struct type tests; older versions reject that
-type-test tag. Instructions without a source span retain their bytecode address in
+readable. Version 41 adds struct type tests and version 42 adds byte buffer
+type tests; each older version rejects the newer type-test tags. Instructions without a source span retain their bytecode address in
 the trace.
 
 VM fallback and synchronous runtime calls from compiled code preserve

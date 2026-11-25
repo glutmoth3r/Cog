@@ -12,7 +12,8 @@ use crate::value::{RuntimeType, Value};
 use std::rc::Rc;
 
 const MAGIC: &[u8; 4] = b"COG\0";
-pub(crate) const VERSION: u16 = 41;
+pub(crate) const VERSION: u16 = 42;
+const VERSION_WITHOUT_BYTES_TYPE_TESTS: u16 = 41;
 const VERSION_WITHOUT_STRUCT_TYPE_TESTS: u16 = 40;
 const VERSION_WITHOUT_INLINE_FRAMES: u16 = 39;
 const VERSION_WITHOUT_FUNCTION_NAMES: u16 = 38;
@@ -221,6 +222,7 @@ pub fn encode(program: &CompiledProgram) -> Result<Vec<u8>> {
                         w.byte(11)?;
                         w.string(name)?;
                     }
+                    ValueType::Bytes => w.byte(12)?,
                 }
             }
             Instruction::ErrorKind => w.byte(21)?,
@@ -449,6 +451,7 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
     if !matches!(
         version,
         VERSION
+            | VERSION_WITHOUT_BYTES_TYPE_TESTS
             | VERSION_WITHOUT_STRUCT_TYPE_TESTS
             | VERSION_WITHOUT_INLINE_FRAMES
             | VERSION_WITHOUT_FUNCTION_NAMES
@@ -597,7 +600,8 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
                 8 => ValueType::Char,
                 9 => ValueType::UInt,
                 10 => ValueType::BigInt,
-                11 if version >= VERSION => ValueType::Struct(r.string()?),
+                11 if version >= VERSION_WITHOUT_BYTES_TYPE_TESTS => ValueType::Struct(r.string()?),
+                12 if version >= VERSION => ValueType::Bytes,
                 tag => return Err(format!("unknown type-test tag {tag}")),
             }),
             21 => Instruction::ErrorKind,
