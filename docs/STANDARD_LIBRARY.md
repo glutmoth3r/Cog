@@ -157,6 +157,36 @@ interior blank lines and omits the empty field after a final newline.
 output buffer. `remove_prefix` and `remove_suffix` remove a single exact
 affix when present. An empty or absent affix leaves the text unchanged.
 
+### Text utilities
+
+| Call | Result / behavior |
+| --- | --- |
+| `str::byte_len(text)` | Number of UTF-8 bytes; `len(text)` counts Unicode scalars |
+| `str::from_bytes(buffer)` | Strict UTF-8 decoding of a whole byte buffer |
+| `str::pad_start(text, width, fill = ' ')` / `str::pad_end(text, width, fill = ' ')` | Add the `char` fill before / after text until it has `width` Unicode scalars |
+| `str::is_blank(text)` | Whether text is empty or only Unicode whitespace, as recognized by `trim` |
+| `str::to_ascii_lowercase(text)` / `str::to_ascii_uppercase(text)` | Change ASCII letters and keep every other scalar |
+| `str::to_int_or(text, fallback)` | Parse a string like `str::to_int`; return `fallback` on ParseFailure |
+
+Padding never truncates: text already at least `width` scalars long is
+returned unchanged. A negative width produces InvalidArgument naming the called
+function. Width counts scalars, not terminal columns or grapheme clusters.
+Padding obeys the runtime buffer limit. `to_int_or` also uses the fallback for
+empty, space-surrounded, and out-of-range numbers. An Error passed as an argument
+still propagates. Case conversion and `byte_len` copy the input into a byte
+buffer, so buffer limits apply.
+
+```cog
+@!include("std")
+use io;
+use str;
+
+fn main() -> nil {
+    const port = str::to_int_or("not a number", 8080)!!;
+    io::println(str::pad_start(str::to_str(port)!!, 6, '0')!!)!!; // 008080
+}
+```
+
 ## Arrays
 
 | Call | Successful result / behavior |
@@ -171,9 +201,23 @@ affix when present. An empty or absent affix leaves the text unchanged.
 | `array::position(items, value)` | Typed equality search; inferred element type `T` must implement `Eq[T]` |
 | `items.swap(left, right)` | Mutates one array, or returns IndexOutOfBounds without changing it |
 | `array::min(items)` / `array::max(items)` | Select the least / greatest element using `Ord`; empty input returns InvalidArgument |
+| `array::sum(items)` / `array::sum_float(items)` | Add an `int[]` / `float[]` from left to right; empty input gives `0` / `0.0` |
+| `array::repeat(value, count)` | Fresh array holding `value` in each of `count` slots |
+| `array::min_by_key(items, key)` / `array::max_by_key(items, key)` | Element with the least / greatest `Ord` key; empty input returns InvalidArgument |
+| `array::frequencies(items)` | `Map[T, int]` of occurrence counts for `Hashable` elements, in first-occurrence order |
 | `array::slice(items, offset, count)` | Fresh outer array for `[offset, offset + count)` |
 | `array::reversed(items)` | Fresh outer array in reverse order |
 | `array::concat(left, right)` | Fresh outer array containing both inputs in order |
+
+`sum` returns Overflow when a running total leaves the int range, even if
+later elements would bring it back; `sum_float` follows ordinary float rounding,
+infinity, and NaN behavior. `repeat` rejects a negative count with
+InvalidArgument and stores the same value in every slot, so repeated arrays or
+records are aliases, not clones. `min_by_key` and `max_by_key` call the
+synchronous key function once per element, return the first of equal keys, and
+propagate key and comparison errors. Key
+functions share the reference access rules of map, so keyed selection over
+reference-valued elements needs a writable source.
 
 All operations except `items.swap` leave their outer input arrays unchanged. A
 nil element is indistinguishable from an empty array through first/last alone; use
@@ -437,7 +481,7 @@ fn main() -> nil {
 
 | Module | Public API |
 | --- | --- |
-| `math` | `abs`, `min`, `max`, `floor`, `ceil`, `round`, `pow`, `sqrt`, `ln`, `log2`, `log10`, `clamp`, `gcd`, `lcm` |
+| `math` | `abs`, `min`, `max`, `floor`, `ceil`, `round`, `pow`, `sqrt`, `ln`, `log2`, `log10`, `clamp`, `gcd`, `lcm`, `sign`, `div_floor`, `mod_floor`, `isqrt`, `is_nan`, `is_finite` |
 | `math` constants | `PI`, `E`, `TAU`, `SQRT_2`, `SQRT_3`, `LN_2`, `LN_10`, `LOG2_E`, `LOG10_E`, `DEG_TO_RAD`, `RAD_TO_DEG` |
 | `sort` | `quick`, `stable`, `sorted`, `is_sorted`; `insertion`, `selection`, and `bubble` remain educational algorithms |
 | `search` | `binary`, `lower_bound`, `upper_bound`, `equal_range`; inferred comptime type `T` must implement `Ord` |
@@ -491,6 +535,10 @@ sorts; custom `Ord` implementations use the Cog fallback algorithms.
 | `math::floor(x)`, `math::ceil(x)` | Integer inputs retain int/uint/bigint; floats produce int rounded toward negative/positive infinity |
 | `math::round(x)` | int/uint/bigint inputs are unchanged; floats round to int, with ties toward positive infinity |
 | `math::pow(base, exponent)` | Checked int, uint, bigint, or floating power; exponent must be a nonnegative int |
+| `math::sign(x)` | int -1, 0, or 1 for any numeric type; NaN produces Unordered |
+| `math::div_floor(a, b)`, `math::mod_floor(a, b)` | int quotient rounded toward negative infinity, and the matching remainder with the divisor's sign |
+| `math::isqrt(x)` | int square root rounded down; negative arguments produce InvalidArgument |
+| `math::is_nan(x)`, `math::is_finite(x)` | bool classification of a float |
 | `math::sqrt(x)` | float square root; negative arguments produce InvalidArgument |
 | `math::ln(x)`, `math::log2(x)`, `math::log10(x)` | float logarithm; zero/negative arguments produce InvalidArgument |
 
@@ -503,6 +551,11 @@ positive infinity. Their finite calculations cover very small and very large inp
 including subnormal floats. Logarithm domain errors identify the `math::ln` operation. Logarithms are
 approximations; even exact powers can differ from an integer by floating-point
 rounding. `abs` normalizes floating negative zero to positive zero.
+
+`div_floor` and `mod_floor` produce DivisionByZero for a zero divisor.
+Dividing the minimum int by -1 overflows in `div_floor`, while `mod_floor`
+returns 0. Use `mod_floor` to wrap negative coordinates:
+`math::mod_floor(-1, 64)` is 63, whereas `-1 % 64` is -1.
 
 Random uses a 31-bit pseudorandom generator seeded once from OS entropy. `next()`
 returns an int in `[0, 2147483648)`; `boolean()` returns bool. `range(lo, hi)` takes

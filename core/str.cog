@@ -2,6 +2,7 @@
 use bytes;
 use fmt;
 use text_order;
+use ascii;
 use err::Error;
 
 // Unicode White_Space, expressed as complete UTF-8 sequences. All whitespace
@@ -372,4 +373,69 @@ public fn remove_prefix(text: str, prefix: str) -> str {
 
 public fn remove_suffix(text: str, suffix: str) -> str {
     remove_affix(text, suffix, false)
+}
+
+// The number of UTF-8 bytes; len(text) counts Unicode scalars instead.
+public fn byte_len(text: str) -> int {
+    bytes::len(bytes::from_str(text)!!)
+}
+
+// Strictly decode a whole buffer as UTF-8.
+public fn from_bytes(data: bytes) -> str {
+    bytes::to_str(data, 0, bytes::len(data)!!)
+}
+
+fn padding(text: str, width: int, fill: char, operation: str) -> str {
+    text!!;
+    width!!;
+    fill!!;
+    if width < 0 { return Error::InvalidArgument(operation); }
+    const missing = width - len(text);
+    if missing <= 0 { return ""; }
+    repeat(str::to_str(fill)!!, missing)
+}
+
+// Widths count Unicode scalars. Longer text is returned whole.
+public fn pad_start(text: str, width: int, fill: char = ' ') -> str {
+    padding(text, width, fill, "str::pad_start")!! + text
+}
+
+public fn pad_end(text: str, width: int, fill: char = ' ') -> str {
+    const added = padding(text, width, fill, "str::pad_end")!!;
+    text + added
+}
+
+// True for empty text and text made only of Unicode whitespace.
+public fn is_blank(text: str) -> bool {
+    trim(text)!! == ""
+}
+
+// Only ASCII bytes change, so multi-byte UTF-8 sequences stay intact.
+fn change_ascii_case(text: str, uppercase: bool) -> str {
+    var data = bytes::from_str(text)!!;
+    const length = bytes::len(data)!!;
+    for index in 0..length {
+        const byte = bytes::get(data, index)!!;
+        const changed =
+            if uppercase { ascii::to_uppercase(byte)!! } else { ascii::to_lowercase(byte)!! };
+        bytes::set(data, index, changed)!!;
+    }
+    bytes::to_str(data, 0, length)
+}
+
+public fn to_ascii_lowercase(text: str) -> str {
+    change_ascii_case(text, false)
+}
+
+public fn to_ascii_uppercase(text: str) -> str {
+    change_ascii_case(text, true)
+}
+
+// The fallback replaces only a ParseFailure; other errors still propagate.
+public fn to_int_or(text: str, fallback: int) -> int {
+    text!!;
+    fallback!!;
+    const parsed = str::to_int(text);
+    when parsed is Error::ParseFailure { return fallback; } else {}
+    parsed
 }

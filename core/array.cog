@@ -104,6 +104,72 @@ public fn max[T: type + Ord](items: T[]) -> T {
     largest
 }
 
+public fn sum(items: int[]) -> int {
+    var total = 0;
+    for item in items { total = (total + item)!!; }
+    total
+}
+
+// Adds from left to right with ordinary floating-point rounding.
+public fn sum_float(items: float[]) -> float {
+    var total = 0.0;
+    for item in items { total = (total + item)!!; }
+    total
+}
+
+// Every slot holds the same value; shared values are not cloned.
+public fn repeat[T: type](value: T, count: int) -> T[] {
+    value!!;
+    count!!;
+    if count < 0 { return Error::InvalidArgument("array::repeat"); }
+    var result: T[] = [];
+    for _ in 0..count { (result << value)!!; }
+    result
+}
+
+// Select by a derived key, calling it once per element. Ties keep the first.
+public fn min_by_key[T: type, K: type + Ord](items: T[], key: fn(T) -> K) -> T {
+    const length = len(items);
+    if length == 0 { return Error::InvalidArgument("array::min_by_key"); }
+    var selected = items[0]!!;
+    var smallest = (key)(selected)!!;
+    // A loop binding keeps the access of the source array for the key call.
+    var first_item = true;
+    for item in items {
+        if first_item {
+            first_item = false;
+            continue;
+        }
+        const candidate = (key)(item)!!;
+        if candidate.compare(smallest)!! < 0 {
+            selected = item;
+            smallest = candidate;
+        }
+    }
+    selected
+}
+
+public fn max_by_key[T: type, K: type + Ord](items: T[], key: fn(T) -> K) -> T {
+    const length = len(items);
+    if length == 0 { return Error::InvalidArgument("array::max_by_key"); }
+    var selected = items[0]!!;
+    var largest = (key)(selected)!!;
+    // A loop binding keeps the access of the source array for the key call.
+    var first_item = true;
+    for item in items {
+        if first_item {
+            first_item = false;
+            continue;
+        }
+        const candidate = (key)(item)!!;
+        if candidate.compare(largest)!! > 0 {
+            selected = item;
+            largest = candidate;
+        }
+    }
+    selected
+}
+
 // A fresh outer array; nested arrays and other shared elements remain aliases.
 public fn slice(items, offset: int, count: int) {
     const length = array_length(items, "array::slice")!!;
@@ -297,6 +363,16 @@ public fn group_by[T: type, K: type + Hashable](items: T[], key: fn(T) -> K) -> 
         var empty: T[] = [];
         var group = result.get_or_insert((key)(item)!!, empty)!!;
         (group << item)!!;
+    }
+    result
+}
+
+// Occurrences of every distinct element, keyed in first-occurrence order.
+public fn frequencies[T: type + Hashable](items: T[]) -> Map[T, int] {
+    var result = Map::new[T, int]();
+    for item in items {
+        const seen = result.get_or(item, 0)!!;
+        result.set(item, seen + 1)!!;
     }
     result
 }

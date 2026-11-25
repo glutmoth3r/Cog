@@ -251,3 +251,59 @@ public fn lcm(left: int, right: int) -> int {
     if multiple < 0 { return -multiple; }
     multiple
 }
+
+// -1, 0, or 1 for any numeric type; both floating zeros give 0.
+public fn sign(x) -> int {
+    const value = number(x, "math::sign")!!;
+    if value != value { return Error::Unordered(); }
+    if value < 0 { return -1; }
+    if value > 0 { return 1; }
+    0
+}
+
+// Division rounded toward negative infinity. Zero divisors and the one
+// unrepresentable quotient use the errors of ordinary division.
+public fn div_floor(left: int, right: int) -> int {
+    left!!;
+    right!!;
+    const quotient = (left / right)!!;
+    const remainder = left - quotient * right;
+    if remainder != 0 && (remainder < 0) != (right < 0) { return quotient - 1; }
+    quotient
+}
+
+// Remainder matching div_floor: zero or the same sign as the divisor.
+public fn mod_floor(left: int, right: int) -> int {
+    left!!;
+    right!!;
+    // Every int is a multiple of -1; avoid overflowing on the minimum int.
+    if right == -1 { return 0; }
+    const remainder = (left % right)!!;
+    if remainder != 0 && (remainder < 0) != (right < 0) { return remainder + right; }
+    remainder
+}
+
+// Largest int whose square does not exceed the value, using integer Newton steps.
+public fn isqrt(value: int) -> int {
+    value!!;
+    if value < 0 { return Error::InvalidArgument("math::isqrt"); }
+    if value < 2 { return value; }
+    var root = value;
+    var next = value / 2 + value % 2;
+    while next < root {
+        root = next;
+        next = (root + value / root) / 2;
+    }
+    root
+}
+
+public fn is_nan(value: float) -> bool {
+    value!!;
+    value != value
+}
+
+// Infinity and NaN both fail to cancel to zero.
+public fn is_finite(value: float) -> bool {
+    value!!;
+    value - value == 0.0
+}
