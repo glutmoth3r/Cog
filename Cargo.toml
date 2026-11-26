@@ -37,8 +37,12 @@ crate-type = ["cdylib"]
 name = "bench_interpreter"
 harness = false
 
+# Line tables keep file and line numbers in backtraces without the size of full debuginfo.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
-debug = true
+debug = "line-tables-only"
 
 [dependencies]
 blake3 = "1.8.7"
