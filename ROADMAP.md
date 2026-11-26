@@ -189,11 +189,11 @@ thread-safe scheduler wakeups. Detach and async closures remain future work.
    implementation (equal records compare as `false`). Decide whether a built-in
    struct `.clone()` should exist.
 6. Extend the WASI backend only by owner decision. `str::to_int`, `to_uint`,
-   `to_bool`, `to_char`, `str::builder`, `build`, `fmt::write` and `replace` have
-   VM parity (tests/wasm.rs). Arrays, structs, `Map`, floats and async remain
-   unsupported; extending them changes the scope documented in
-   [WebAssembly](docs/WEBASSEMBLY.md). A browser-hosted compiler and VM are not
-   implemented.
+   `to_bool`, `to_char`, `str::builder`, `build`, `fmt::write`, `replace`, arrays
+   and structs have VM parity (tests/wasm.rs); the guest has no cycle collector.
+   `Map`, enums, tuples, floats, closures and async remain unsupported; extending
+   them changes the scope documented in [WebAssembly](docs/WEBASSEMBLY.md). A
+   browser-hosted compiler and VM are not implemented.
 
 ## Readiness
 

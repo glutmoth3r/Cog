@@ -13,7 +13,7 @@ const MAX_SLOTS: usize = 256;
 const MAX_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 const RUNTIME: &str = include_str!("wasm_guest.in");
 
-/// Compile a scalar Cog application to a WASI command using the installed Rust
+/// Compile a supported Cog application to a WASI command using the installed Rust
 /// compiler and its wasm32-wasip1 standard library.
 pub fn build_executable(program: &CompiledProgram, destination: &Path) -> Result<(), String> {
     if destination
@@ -77,6 +77,7 @@ fn lower(program: &CompiledProgram) -> Result<String, String> {
     let mut processed = BTreeSet::new();
     let mut sites = BTreeSet::new();
     let mut globals = 0;
+    let mut types = Vec::new();
     while let Some(entry) = called.pop_front() {
         if processed.insert(entry) {
             let function = Function::analyze(program, entry)?;
@@ -90,11 +91,18 @@ fn lower(program: &CompiledProgram) -> Result<String, String> {
                 source: &mut source,
                 called: &mut called,
                 globals: &mut globals,
+                types: &mut types,
             };
             function.emit()?;
         }
     }
     writeln!(source, "const GLOBAL_SLOTS: usize = {globals};").unwrap();
+    writeln!(
+        source,
+        "fn contract_types() -> Vec<Ty> {{ vec![{}] }}",
+        types.join(",\n")
+    )
+    .unwrap();
     writeln!(source, "fn site(pc: usize) -> &'static str {{ match pc {{").unwrap();
     for pc in sites {
         let entry = program
@@ -243,6 +251,8 @@ struct LowerFunction<'a, 'b> {
     source: &'b mut String,
     called: &'b mut VecDeque<usize>,
     globals: &'b mut usize,
+    /// Distinct contract type expressions, indexed by `state.types`.
+    types: &'b mut Vec<String>,
 }
 
 impl LowerFunction<'_, '_> {
@@ -292,6 +302,133 @@ impl LowerFunction<'_, '_> {
         Ok(())
     }
 
+    /// Intern a contract type and return the generated place that holds it.
+    fn contract(&mut self, pc: usize, ty: &RuntimeType) -> Result<String, String> {
+        let literal = type_literal(ty)
+            .ok_or_else(|| unsupported(self.program, pc, format!("type contract {ty:?}")))?;
+        let index = match self.types.iter().position(|known| *known == literal) {
+            Some(index) => index,
+            None => {
+                self.types.push(literal);
+                self.types.len() - 1
+            }
+        };
+        Ok(format!("state.types[{index}]"))
+    }
+
+    /// A condition that holds when a call or return value satisfies `ty`.
+    fn runtime_predicate(
+        &mut self,
+        pc: usize,
+        ty: &RuntimeType,
+        slot: usize,
+    ) -> Result<String, String> {
+        let pattern = match ty {
+            RuntimeType::Nil => "V::Nil",
+            RuntimeType::Int => "V::Int(_)",
+            RuntimeType::UInt => "V::UInt(_)",
+            RuntimeType::Bool => "V::Bool(_)",
+            RuntimeType::Char => "V::Char(_)",
+            RuntimeType::Str => "V::Str(_) | V::StrBuf(_)",
+            _ => {
+                let contract = self.contract(pc, ty)?;
+                return Ok(format!("matches_type(&{contract}, &v{slot})"));
+            }
+        };
+        Ok(format!("matches!(&v{slot}, {pattern} | V::Error(_))"))
+    }
+
+    /// Instructions that name a contract type, which is interned before the
+    /// remaining instructions borrow the output.
+    fn typed_instruction(
+        &mut self,
+        pc: usize,
+        height: usize,
+        a: usize,
+    ) -> Result<Option<bool>, String> {
+        use Instruction::*;
+        let program = self.program;
+        match &program.instructions[pc] {
+            MakeTypedArray(count, element) => {
+                let contract = self.contract(pc, element)?;
+                write!(self.source, "v{a} = make_typed_array(vec![").unwrap();
+                emit_arguments(self.source, a, *count);
+                writeln!(self.source, "], &{contract}, \"array\", {pc});").unwrap();
+            }
+            ConstrainArrayType(element) => {
+                let contract = self.contract(pc, element)?;
+                writeln!(
+                    self.source,
+                    "v{a} = constrain_array_type(take(&mut v{a}), &{contract}, {pc});"
+                )
+                .unwrap();
+            }
+            ConstrainRecordFields(fields) => {
+                let mut contracts = String::new();
+                for (name, ty) in fields {
+                    let contract = self.contract(pc, ty)?;
+                    write!(contracts, "({name:?}, &{contract}),").unwrap();
+                }
+                writeln!(
+                    self.source,
+                    "v{a} = constrain_fields(take(&mut v{a}), &[{contracts}], {pc});"
+                )
+                .unwrap();
+            }
+            Call(target, arity) => {
+                self.called.push_back(*target);
+                let signature = &program.callables[target];
+                let types = signature.parameter_types.as_deref().unwrap_or_default();
+                let mut checks = Vec::new();
+                for (i, ty) in types.iter().enumerate() {
+                    if let Some(ty) = ty {
+                        checks.push(self.runtime_predicate(pc, ty, a + i)?);
+                    }
+                }
+                let out = &mut *self.source;
+                // Rust evaluates arguments left to right. Checks inspect the
+                // slots before the arguments are moved into the callee.
+                if !checks.is_empty() {
+                    writeln!(out, "if {} {{", checks.join(" && ")).unwrap();
+                }
+                writeln!(
+                    out,
+                    "if depth == 64 {{ return Err(Fault::new(\"CallDepthLimit\", {pc})); }}"
+                )
+                .unwrap();
+                write!(out, "let (result, marked) = f_{target}(state, depth + 1, [").unwrap();
+                emit_arguments(out, a, *arity);
+                writeln!(out, "])?; v{a} = result; propagation |= marked;").unwrap();
+                if !checks.is_empty() {
+                    writeln!(out, "}} else {{").unwrap();
+                    for i in a..height {
+                        writeln!(out, "take(&mut v{i});").unwrap();
+                    }
+                    writeln!(out, "v{a} = type_mismatch({pc}, \"call\"); }}").unwrap();
+                }
+            }
+            instruction @ (Return | ReturnPropagate) if self.function.entry != 0 => {
+                let signature = self.function.signature;
+                if let Some(expected) = signature.and_then(|s| s.result_type.as_ref()) {
+                    let check = self.runtime_predicate(pc, expected, a)?;
+                    writeln!(
+                        self.source,
+                        "if !{check} {{ v{a} = type_mismatch({pc}, \"return\"); }}"
+                    )
+                    .unwrap();
+                }
+                let propagates = matches!(instruction, ReturnPropagate);
+                if propagates {
+                    writeln!(self.source, "if !matches!(&v{a}, V::Error(_)) {{ return Err(Fault::new(\"InvalidArgument\", {pc})); }}").unwrap();
+                }
+                writeln!(self.source, "return Ok((v{a}, {propagates}));").unwrap();
+                return Ok(Some(true));
+            }
+            _ => return Ok(None),
+        }
+        Ok(Some(false))
+    }
+
     fn instruction(&mut self, pc: usize, height: usize) -> Result<bool, String> {
         use Instruction::*;
         let instruction = &self.program.instructions[pc];
@@ -300,6 +437,9 @@ impl LowerFunction<'_, '_> {
             .map_err(|e| e.to_string())?;
         let a = height - pops;
         let b = a + 1;
+        if let Some(ends) = self.typed_instruction(pc, height, a)? {
+            return Ok(ends);
+        }
         let out = &mut *self.source;
         match instruction {
             Push(value) => {
@@ -345,33 +485,18 @@ impl LowerFunction<'_, '_> {
             IsType(ty) => writeln!(out, "v{a} = V::Bool({});", type_predicate(ty, a)
                 .ok_or_else(|| unsupported(self.program, pc, format!("type predicate {ty}")))?).unwrap(),
             Len => writeln!(out, "v{a} = length(take(&mut v{a}), {pc});").unwrap(),
-            ConstrainArrayFrom => writeln!(out, "take(&mut v{b});").unwrap(),
+            ConstrainArrayFrom => writeln!(out, "v{a} = constrain_array_from(take(&mut v{a}), take(&mut v{b}), {pc});").unwrap(),
+            ArrayEmptyLike => writeln!(out, "v{a} = empty_like(take(&mut v{a}), {pc});").unwrap(),
+            ArrayPush => writeln!(out, "v{a} = array_push(take(&mut v{a}), take(&mut v{b}), {pc});").unwrap(),
+            ArrayPrepend => writeln!(out, "v{a} = array_prepend(take(&mut v{a}), take(&mut v{b}), {pc});").unwrap(),
+            IndexSet => writeln!(out, "v{a} = index_set(take(&mut v{a}), take(&mut v{b}), take(&mut v{}), {pc});", a + 2).unwrap(),
+            MakeArray(count) => {
+                write!(out, "v{a} = make_array(vec![").unwrap();
+                emit_arguments(out, a, *count);
+                writeln!(out, "], \"array\", {pc});").unwrap();
+            }
             Index => writeln!(out, "v{a} = index(take(&mut v{a}), take(&mut v{b}), {pc});").unwrap(),
             ErrorKind => writeln!(out, "v{a} = V::Str(match &v{a} {{ V::Error(error) => error.kind.as_ref(), _ => \"ok\" }}.into());").unwrap(),
-            Call(target, arity) => {
-                self.called.push_back(*target);
-                let signature = &self.program.callables[target];
-                let types = signature.parameter_types.as_deref().unwrap_or_default();
-                let checks = types.iter().enumerate().filter_map(|(i, ty)| ty.as_ref().map(|ty| {
-                    runtime_predicate(ty, a + i).ok_or_else(|| unsupported(self.program, pc, format!("call parameter type {ty:?}")))
-                })).collect::<Result<Vec<_>, _>>()?;
-                // Rust evaluates arguments left to right. Checks inspect the
-                // slots before the arguments are moved into the callee.
-                if !checks.is_empty() {
-                    writeln!(out, "if {} {{", checks.join(" && ")).unwrap();
-                }
-                writeln!(out, "if depth == 64 {{ return Err(Fault::new(\"CallDepthLimit\", {pc})); }}").unwrap();
-                write!(out, "let (result, marked) = f_{target}(state, depth + 1, [").unwrap();
-                emit_arguments(out, a, *arity);
-                writeln!(out, "])?; v{a} = result; propagation |= marked;").unwrap();
-                if !checks.is_empty() {
-                    writeln!(out, "}} else {{").unwrap();
-                    for i in a..height {
-                        writeln!(out, "take(&mut v{i});").unwrap();
-                    }
-                    writeln!(out, "v{a} = type_mismatch({pc}, \"call\"); }}").unwrap();
-                }
-            }
             CallNative(index) => {
                 let import = &self.program.imports[*index];
                 let function = match import.name() {
@@ -393,6 +518,9 @@ impl LowerFunction<'_, '_> {
                     "str::builder" => "str_builder",
                     "str::build" => "str_build",
                     "fmt::write" => "fmt_write",
+                    "$vm::iterator_new" => "iterator_new",
+                    "$vm::iterator_next" => "iterator_next",
+                    "$vm::iterator_current" => "iterator_current",
                     name => return Err(unsupported(self.program, pc, format!("host operation `{name}`"))),
                 };
                 if import.is_registered() {
@@ -403,10 +531,10 @@ impl LowerFunction<'_, '_> {
                 writeln!(out, "]);").unwrap();
             }
             MakeRecord(count) => {
-                if !constructs_error(self.program, &self.function, pc, a) {
-                    return Err(unsupported(self.program, pc, "records other than Error values"));
+                if *count == 0 || !constructs_supported_record(self.program, &self.function, pc, a) {
+                    return Err(unsupported(self.program, pc, "records other than structs and Error values"));
                 }
-                write!(out, "v{a} = make_error(vec![").unwrap();
+                write!(out, "v{a} = make_record(vec![").unwrap();
                 for i in 0..*count {
                     write!(out, "(take(&mut v{}), take(&mut v{})),", a + 2 * i, a + 2 * i + 1).unwrap();
                 }
@@ -430,19 +558,6 @@ impl LowerFunction<'_, '_> {
                 writeln!(out, "return match {result} {{ V::Error(error) => Err(error), value => Ok((value, false)) }};").unwrap();
                 return Ok(true);
             }
-            Return | ReturnPropagate if self.function.entry != 0 => {
-                let expected = self.function.signature.and_then(|signature| signature.result_type.as_ref());
-                if let Some(expected) = expected {
-                    let check = runtime_predicate(expected, a).ok_or_else(|| unsupported(self.program, pc, format!("return type {expected:?}")))?;
-                    writeln!(out, "if !{check} {{ v{a} = type_mismatch({pc}, \"return\"); }}").unwrap();
-                }
-                let propagates = matches!(instruction, ReturnPropagate);
-                if propagates {
-                    writeln!(out, "if !matches!(&v{a}, V::Error(_)) {{ return Err(Fault::new(\"InvalidArgument\", {pc})); }}").unwrap();
-                }
-                writeln!(out, "return Ok((v{a}, {propagates}));").unwrap();
-                return Ok(true);
-            }
             _ => return Err(unsupported(self.program, pc, format!("{instruction:?}"))),
         }
         Ok(false)
@@ -450,14 +565,15 @@ impl LowerFunction<'_, '_> {
 }
 
 /// The compiler emits the type tag first, as the nearest earlier constant
-/// written to the record's base slot. Only core Error variants are values the
-/// guest can build; structs and other records remain unsupported.
+/// written to the record's base slot. Only structs and core Error variants are
+/// values the guest can build; enums and anonymous records remain unsupported.
 ///
 /// This relies on codegen pushing the record's `TypeTag` before any field
 /// value, and on user types carrying their own module-qualified tags that never
-/// start with the `$core::err::Error::` prefix. If codegen changes the order,
-/// the search finds no tag and the record is rejected (fails closed).
-fn constructs_error(
+/// start with the `$core::err::Error::` prefix. Struct tags carry the
+/// `@struct::` prefix. If codegen changes the order, the search finds no tag
+/// and the record is rejected (fails closed).
+fn constructs_supported_record(
     program: &CompiledProgram,
     function: &Function<'_>,
     pc: usize,
@@ -473,7 +589,8 @@ fn constructs_error(
         .is_some_and(|candidate| {
             matches!(
                 &program.instructions[candidate],
-                Instruction::Push(Value::TypeTag(tag)) if tag.starts_with(&prefix)
+                Instruction::Push(Value::TypeTag(tag))
+                    if tag.starts_with(&prefix) || tag.starts_with("@struct::")
             )
         })
 }
@@ -484,24 +601,23 @@ fn emit_arguments(out: &mut String, start: usize, arity: usize) {
     }
 }
 
-fn runtime_predicate(ty: &RuntimeType, slot: usize) -> Option<String> {
-    let condition = match ty {
-        RuntimeType::Nullable(ty) => format!(
-            "{} || matches!(&v{slot}, V::Nil)",
-            runtime_predicate(ty, slot)?
-        ),
-        RuntimeType::Array(ty) if **ty == RuntimeType::Str => {
-            format!("matches!(&v{slot}, V::Args(_))")
+/// The guest expression for a contract type, or `None` when it names values the
+/// guest cannot hold.
+fn type_literal(ty: &RuntimeType) -> Option<String> {
+    Some(match ty {
+        RuntimeType::Int => "Ty::Int".into(),
+        RuntimeType::UInt => "Ty::UInt".into(),
+        RuntimeType::Bool => "Ty::Bool".into(),
+        RuntimeType::Char => "Ty::Char".into(),
+        RuntimeType::Str => "Ty::Str".into(),
+        RuntimeType::Nil => "Ty::Nil".into(),
+        RuntimeType::Array(inner) => format!("Ty::Array(Rc::new({}))", type_literal(inner)?),
+        RuntimeType::Nullable(inner) => {
+            format!("Ty::Nullable(Rc::new({}))", type_literal(inner)?)
         }
-        RuntimeType::Nil => format!("matches!(&v{slot}, V::Nil)"),
-        RuntimeType::Int => type_predicate(&ValueType::Int, slot)?,
-        RuntimeType::UInt => type_predicate(&ValueType::UInt, slot)?,
-        RuntimeType::Bool => type_predicate(&ValueType::Bool, slot)?,
-        RuntimeType::Char => type_predicate(&ValueType::Char, slot)?,
-        RuntimeType::Str => type_predicate(&ValueType::Str, slot)?,
+        RuntimeType::Nominal(name) => format!("Ty::Nominal({name:?}.into())"),
         _ => return None,
-    };
-    Some(format!("({condition} || matches!(&v{slot}, V::Error(_)))"))
+    })
 }
 
 fn type_predicate(ty: &ValueType, slot: usize) -> Option<String> {
@@ -512,10 +628,17 @@ fn type_predicate(ty: &ValueType, slot: usize) -> Option<String> {
         ValueType::Bool => "V::Bool(_)",
         ValueType::Char => "V::Char(_)",
         ValueType::Str => "V::Str(_)",
+        ValueType::Bytes => "V::Bytes(_)",
         ValueType::Error => "V::Error(_)",
         ValueType::Variant(tag) if tag.starts_with(crate::error::ERROR_TYPE) => {
             return Some(format!(
                 "matches!(&v{slot}, V::Error(error) if error.tag() == {tag:?})"
+            ));
+        }
+        ValueType::Struct(name) => {
+            return Some(format!(
+                "matches!(&v{slot}, V::Record(record) if &*record.name == {:?})",
+                name.as_ref()
             ));
         }
         _ => return None,

@@ -1,8 +1,9 @@
 #![allow(dead_code, unused_assignments, unused_mut, unused_variables)]
 
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::io::Write;
 use std::rc::Rc;
 
@@ -15,7 +16,11 @@ enum V {
     Char(char),
     Str(Rc<str>),
     Tag(Rc<str>),
-    Args(Rc<[Rc<str>]>),
+    // Shared and mutable like VM arrays and structs: aliases observe writes.
+    // Reference cycles are never collected; their memory is released at exit.
+    Array(Rc<ArrayObj>),
+    Record(Rc<RecordObj>),
+    Iterator(Rc<RefCell<Iteration>>),
     // Shared and mutable like the VM's byte buffers: aliases observe writes.
     Bytes(Rc<RefCell<Vec<u8>>>),
     StrBuf(Rc<RefCell<String>>),
@@ -37,7 +42,7 @@ enum Detail {
     Index(i64, usize),
     Parse(&'static str, &'static str),
     Resource(&'static str),
-    Fields(Vec<(Rc<str>, V)>),
+    Fields(Rc<Fields>),
     IoWrite(Rc<str>),
     Missing(Rc<str>),
 }
@@ -69,6 +74,7 @@ impl Fault {
             (Detail::Parse(_, to), "to") => Some(V::Str((*to).into())),
             (Detail::Resource(resource), "resource") => Some(V::Str((*resource).into())),
             (Detail::Fields(fields), name) => fields
+                .0
                 .iter()
                 .find(|(key, _)| &**key == name)
                 .map(|(_, value)| value.clone()),
@@ -87,14 +93,13 @@ impl Fault {
             (Detail::IoWrite(message), _) => format!("failed to write output: {message}"),
             (Detail::Parse(from, to), _) => format!("cannot parse {from} as {to}"),
             (Detail::Resource(resource), _) => format!("runtime resource limit: {resource}"),
-            (Detail::Fields(fields), _) if fields.is_empty() => self.kind.to_string(),
+            (Detail::Fields(fields), _) if fields.0.is_empty() => self.kind.to_string(),
             (Detail::Fields(fields), _) => {
-                let mut fields = fields.iter().collect::<Vec<_>>();
-                fields.sort_by(|a, b| a.0.cmp(&b.0));
-                let fields = fields.into_iter().map(|(key, value)| {
-                    format!("{key}: {}", render_text(value.clone()))
-                });
-                fields.collect::<Vec<_>>().join(", ")
+                let mut text = String::new();
+                match render_fields(&mut text, &fields.0, 0, "str") {
+                    Ok(()) => text,
+                    Err(_) => format!("{} with unrenderable fields", self.kind),
+                }
             }
             (Detail::Missing(field), _) => format!("missing field `{field}`"),
             _ => self.kind.to_string(),
@@ -106,11 +111,14 @@ type Run = Result<(V, bool), Fault>;
 
 struct State {
     globals: [Option<V>; GLOBAL_SLOTS],
+    /// Array and field contracts referenced by the generated code.
+    types: Vec<Ty>,
 }
 
 fn main() {
     let mut state = State {
         globals: std::array::from_fn(|_| None),
+        types: contract_types(),
     };
     if let Err(error) = f_0(&mut state, 0, []) {
         eprintln!(
@@ -184,16 +192,13 @@ arithmetic!(div, checked_div, "div", true);
 arithmetic!(rem, checked_rem, "mod", true);
 
 fn add(a: V, b: V, pc: usize) -> V {
-    let args = match (a, b) {
-        (error @ V::Error(_), _) | (_, error @ V::Error(_)) => return error,
-        (V::Str(a), V::Str(b)) => return V::Str((a.to_string() + &b).into()),
-        (V::Args(a), V::Args(b)) => a.iter().chain(b.iter()).cloned().collect::<Vec<_>>(),
-        (V::Args(a), V::Str(b)) => a.iter().cloned().chain([b]).collect(),
-        (V::Str(a), V::Args(b)) => [a].into_iter().chain(b.iter().cloned()).collect(),
-        (V::Args(_), _) | (_, V::Args(_)) => return type_mismatch(pc, "array_concat"),
-        (a, b) => return add_number(a, b, pc),
-    };
-    V::Args(args.into())
+    match (a, b) {
+        (error @ V::Error(_), _) | (_, error @ V::Error(_)) => error,
+        (V::Str(a), V::Str(b)) => V::Str((a.to_string() + &b).into()),
+        (V::Array(a), b) => append_to_copy(&a, b, pc),
+        (a, V::Array(b)) => prepend_to_copy(a, &b, pc),
+        (a, b) => add_number(a, b, pc),
+    }
 }
 
 enum Order {
@@ -248,28 +253,82 @@ fn compare(a: V, b: V, operation: Order, pc: usize) -> V {
 fn length(value: V, pc: usize) -> V {
     match value {
         V::Str(text) => V::Int(text.chars().count() as i64),
-        V::Args(args) => V::Int(args.len() as i64),
+        V::Array(array) => match array.items.try_borrow() {
+            Ok(items) => V::Int(items.len() as i64),
+            Err(_) => invalid_argument(pc, "len"),
+        },
         V::Error(_) => value,
         _ => type_mismatch(pc, "len"),
     }
 }
 
+fn missing_field(field: Rc<str>, pc: usize) -> V {
+    Fault::value("MissingField", pc, Detail::Missing(field))
+}
+
+fn out_of_bounds(pc: usize, index: i64, len: usize) -> V {
+    Fault::value("IndexOutOfBounds", pc, Detail::Index(index, len))
+}
+
+fn invalid_argument(pc: usize, op: &'static str) -> V {
+    Fault::value("InvalidArgument", pc, Detail::Operation(op))
+}
+
+fn resource_limit(pc: usize, resource: &'static str) -> V {
+    Fault::value("ResourceLimit", pc, Detail::Resource(resource))
+}
+
+/// Struct fields can be addressed by number, as in tuple structs.
+fn field_key(object: &V, key: V) -> V {
+    match (object, key) {
+        (V::Record(_), V::Int(index)) if index >= 0 => V::Str(index.to_string().into()),
+        (_, key) => key,
+    }
+}
+
 fn index(value: V, key: V, pc: usize) -> V {
+    let key = field_key(&value, key);
     match (value, key) {
         (V::Error(error), V::Tag(_)) => V::Tag(error.tag().into()),
         (_, V::Tag(_)) => V::Nil,
         (V::Error(error), V::Str(field)) => error
             .field(&field)
-            .unwrap_or_else(|| Fault::value("MissingField", pc, Detail::Missing(field))),
+            .unwrap_or_else(|| missing_field(field, pc)),
         (error @ V::Error(_), _) | (_, error @ V::Error(_)) => error,
-        (V::Args(args), V::Int(index)) => usize::try_from(index)
-            .ok()
-            .and_then(|index| args.get(index))
-            .map_or_else(
-                || Fault::value("IndexOutOfBounds", pc, Detail::Index(index, args.len())),
-                |s| V::Str(s.clone()),
-            ),
+        (V::Array(array), V::Int(index)) => {
+            let Ok(items) = array.items.try_borrow() else {
+                return invalid_argument(pc, "index");
+            };
+            usize::try_from(index)
+                .ok()
+                .and_then(|index| items.get(index))
+                .cloned()
+                .unwrap_or_else(|| out_of_bounds(pc, index, items.len()))
+        }
+        (V::Record(record), V::Str(field)) => match record.get(&field) {
+            Some(Some(value)) => value,
+            Some(None) => missing_field(field, pc),
+            None => invalid_argument(pc, "index"),
+        },
         _ => type_mismatch(pc, "index"),
+    }
+}
+
+/// `object[key] = value`. An Error receiver or key propagates without a write;
+/// an Error value is stored like any other leaf.
+fn index_set(object: V, key: V, value: V, pc: usize) -> V {
+    let key = field_key(&object, key);
+    match (object, key) {
+        (error @ V::Error(_), _) | (_, error @ V::Error(_)) => error,
+        (V::Array(array), V::Int(index)) => match array_set(&array, index, value, pc) {
+            Ok(()) => V::Array(array),
+            Err(error) => error,
+        },
+        (V::Record(record), V::Str(field)) => match record_set(&record, field, value, pc) {
+            Ok(()) => V::Record(record),
+            Err(error) => error,
+        },
+        _ => type_mismatch(pc, "indexset"),
     }
 }
 
@@ -283,9 +342,9 @@ fn process_args(_: [V; 0], pc: usize) -> V {
         let Some(text) = argument.to_str() else {
             return Fault::value("ParseFailure", pc, Detail::Parse("OS argument", "str"));
         };
-        args.push(Rc::from(text));
+        args.push(V::Str(text.into()));
     }
-    V::Args(args.into())
+    make_typed_array(args, &Ty::Str, "array", pc)
 }
 
 fn stdout(_: [V; 0], _: usize) -> V {
@@ -319,37 +378,97 @@ fn new_bytes(bytes: Vec<u8>) -> V {
     V::Bytes(Rc::new(RefCell::new(bytes)))
 }
 
-fn render_text(value: V) -> String {
+/// Traversal depth is bounded like the VM's renderer, so cyclic and deeply
+/// nested values report `ResourceLimit` instead of exhausting the stack.
+const MAX_DEPTH: usize = 64;
+
+fn push_text(out: &mut String, text: &str, resource: &'static str) -> Result<(), &'static str> {
+    out.try_reserve(text.len()).map_err(|_| resource)?;
+    out.push_str(text);
+    Ok(())
+}
+
+fn render_fields(
+    out: &mut String,
+    fields: &[(Rc<str>, V)],
+    depth: usize,
+    resource: &'static str,
+) -> Result<(), &'static str> {
+    let mut fields = fields.iter().collect::<Vec<_>>();
+    fields.sort_by(|a, b| a.0.cmp(&b.0));
+    for (position, (name, value)) in fields.into_iter().enumerate() {
+        if position > 0 {
+            push_text(out, ", ", resource)?;
+        }
+        push_text(out, name, resource)?;
+        push_text(out, ": ", resource)?;
+        render_value(out, value, depth + 1, resource)?;
+    }
+    Ok(())
+}
+
+/// Append the VM's text form of `value`. The error names the exceeded resource.
+fn render_value(
+    out: &mut String,
+    value: &V,
+    depth: usize,
+    resource: &'static str,
+) -> Result<(), &'static str> {
+    if depth >= MAX_DEPTH {
+        return Err("render depth");
+    }
+    let put = |out: &mut String, text: &str| push_text(out, text, resource);
     match value {
-        V::Int(value) => value.to_string(),
-        V::UInt(value) => value.to_string(),
-        V::Bool(value) => value.to_string(),
-        V::Char(value) => value.to_string(),
-        V::Nil => "nil".into(),
-        V::Str(value) => value.to_string(),
-        V::Tag(value) => format!("<type:{value}>"),
-        V::Bytes(value) => format!("<bytes:{}>", value.borrow().len()),
-        V::StrBuf(value) => value.borrow().clone(),
-        V::Args(values) => format!("[{}]", values.join(", ")),
-        V::Stdout => "<resource>".into(),
+        V::Int(value) => put(out, &value.to_string()),
+        V::UInt(value) => put(out, &value.to_string()),
+        V::Bool(value) => put(out, &value.to_string()),
+        V::Char(value) => put(out, value.encode_utf8(&mut [0; 4])),
+        V::Nil => put(out, "nil"),
+        V::Str(value) => put(out, value),
+        V::Tag(value) => put(out, &format!("<type:{value}>")),
+        V::Bytes(value) => put(out, &format!("<bytes:{}>", value.borrow().len())),
+        V::StrBuf(value) => put(out, &value.borrow()),
+        V::Array(array) => {
+            let items = array.items.try_borrow().map_err(|_| resource)?;
+            put(out, "[")?;
+            for (position, item) in items.iter().enumerate() {
+                if position > 0 {
+                    put(out, ", ")?;
+                }
+                render_value(out, item, depth + 1, resource)?;
+            }
+            put(out, "]")
+        }
+        V::Record(record) => {
+            let fields = record.fields.try_borrow().map_err(|_| resource)?;
+            put(out, "{")?;
+            render_fields(out, &fields, depth, resource)?;
+            put(out, "}")
+        }
+        V::Iterator(_) => put(out, "<iterator>"),
+        V::Stdout => put(out, "<resource>"),
         V::Error(error) => match &error.detail {
             Detail::Fields(fields) => {
-                let mut fields = fields.iter().collect::<Vec<_>>();
-                fields.sort_by(|a, b| a.0.cmp(&b.0));
-                let fields = fields
-                    .into_iter()
-                    .map(|(key, value)| format!("{key}: {}", render_text(value.clone())))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("Error: Error::{}({fields})", error.kind)
+                put(out, "Error: Error::")?;
+                put(out, &error.kind)?;
+                put(out, "(")?;
+                render_fields(out, &fields.0, depth, resource)?;
+                put(out, ")")
             }
-            _ => format!("Error: {}", error.message()),
+            _ => {
+                put(out, "Error: ")?;
+                put(out, &error.message())
+            }
         },
     }
 }
 
-fn render([value]: [V; 1], _: usize) -> V {
-    new_bytes(render_text(value).into_bytes())
+fn render([value]: [V; 1], pc: usize) -> V {
+    let mut text = String::new();
+    match render_value(&mut text, &value, 0, "bytes") {
+        Ok(()) => new_bytes(text.into_bytes()),
+        Err(resource) => resource_limit(pc, resource),
+    }
 }
 
 fn bytes_len([value]: [V; 1], pc: usize) -> V {
@@ -535,11 +654,13 @@ fn fmt_write(arguments: [V; 3], pc: usize) -> V {
     // Only the first `{}` is a placeholder. The value is rendered before the
     // buffer is borrowed, so a builder may be written into itself.
     let (prefix, rendered, suffix) = match template.find("{}") {
-        Some(position) => (
-            &template[..position],
-            render_text(value),
-            &template[position + 2..],
-        ),
+        Some(position) => {
+            let mut rendered = String::new();
+            if let Err(resource) = render_value(&mut rendered, &value, 0, "str") {
+                return resource_limit(pc, resource);
+            }
+            (&template[..position], rendered, &template[position + 2..])
+        }
         None => (&*template, String::new(), ""),
     };
     let mut text = buffer.borrow_mut();
@@ -550,9 +671,9 @@ fn fmt_write(arguments: [V; 3], pc: usize) -> V {
     V::StrBuf(buffer)
 }
 
-/// Build an Error from `MakeRecord` entries. The compiler verified statically
-/// that the record is a core Error variant, never a struct.
-fn make_error(entries: Vec<(V, V)>, pc: usize) -> V {
+/// Build a struct or a core Error from `MakeRecord` entries. The compiler
+/// verified statically that the record is one of the two.
+fn make_record(entries: Vec<(V, V)>, pc: usize) -> V {
     let mut fields: Vec<(Rc<str>, V)> = Vec::new();
     let mut tag = None;
     let mut error = None;
@@ -574,10 +695,17 @@ fn make_error(entries: Vec<(V, V)>, pc: usize) -> V {
     let Some(tag) = tag else {
         return type_mismatch(pc, "record");
     };
+    if let Some(name) = tag.strip_prefix("@struct::") {
+        return V::Record(Rc::new(RecordObj {
+            name: name.into(),
+            fields: RefCell::new(fields),
+            types: RefCell::new(Vec::new()),
+        }));
+    }
     V::Error(Fault {
         kind: Cow::Owned(tag.rsplit("::").next().unwrap_or(&tag).to_owned()),
         pc,
-        detail: Detail::Fields(fields),
+        detail: Detail::Fields(Rc::new(Fields(fields))),
     })
 }
 
@@ -626,5 +754,652 @@ fn flush([handle]: [V; 1], pc: usize) -> V {
     match check_native(handle, |value| matches!(value, V::Stdout), pc, "io::flush") {
         Ok(_) => io_result(std::io::stdout().lock().flush(), pc),
         Err(error) => error,
+    }
+}
+
+/// Runtime array and field contracts, mirroring the VM's runtime types for the
+/// values this guest can hold.
+#[derive(Clone, PartialEq)]
+enum Ty {
+    Int,
+    UInt,
+    Bool,
+    Char,
+    Str,
+    Nil,
+    /// The type of an array whose elements are all Errors.
+    Error,
+    /// Opaque host values, and the unknown element type of an empty array.
+    Other,
+    Array(Rc<Ty>),
+    Nullable(Rc<Ty>),
+    Nominal(Rc<str>),
+}
+
+const BYTES_TYPE: &str = "$core::bytes";
+
+struct ArrayObj {
+    items: RefCell<Vec<V>>,
+    /// `None` until an annotation or the first value fixes the element type.
+    element: RefCell<Option<Ty>>,
+    /// Changes with the length, which invalidates active iteration.
+    version: Cell<u64>,
+}
+
+struct RecordObj {
+    name: Rc<str>,
+    fields: RefCell<Vec<(Rc<str>, V)>>,
+    types: RefCell<Vec<(&'static str, Ty)>>,
+}
+
+impl RecordObj {
+    /// The outer `None` reports a conflicting borrow.
+    fn get(&self, name: &str) -> Option<Option<V>> {
+        let fields = self.fields.try_borrow().ok()?;
+        Some(
+            fields
+                .iter()
+                .find(|(key, _)| &**key == name)
+                .map(|(_, value)| value.clone()),
+        )
+    }
+}
+
+/// Payload of a constructed core Error value.
+struct Fields(Vec<(Rc<str>, V)>);
+
+// Containers release their children through a worklist. Dropping a long linked
+// structure recursively would overflow the Wasm stack.
+fn release(mut pending: Vec<V>) {
+    while let Some(value) = pending.pop() {
+        match value {
+            V::Array(array) => {
+                if let Some(mut array) = Rc::into_inner(array) {
+                    pending.append(array.items.get_mut());
+                }
+            }
+            V::Record(record) => {
+                if let Some(mut record) = Rc::into_inner(record) {
+                    pending.extend(record.fields.get_mut().drain(..).map(|(_, value)| value));
+                }
+            }
+            V::Error(Fault {
+                detail: Detail::Fields(fields),
+                ..
+            }) => {
+                if let Some(mut fields) = Rc::into_inner(fields) {
+                    pending.extend(fields.0.drain(..).map(|(_, value)| value));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Drop for ArrayObj {
+    fn drop(&mut self) {
+        release(std::mem::take(self.items.get_mut()));
+    }
+}
+
+impl Drop for RecordObj {
+    fn drop(&mut self) {
+        let fields = self.fields.get_mut().drain(..);
+        release(fields.map(|(_, value)| value).collect());
+    }
+}
+
+impl Drop for Fields {
+    fn drop(&mut self) {
+        release(self.0.drain(..).map(|(_, value)| value).collect());
+    }
+}
+
+fn type_depth(ty: &Ty) -> usize {
+    match ty {
+        Ty::Array(inner) | Ty::Nullable(inner) => type_depth(inner) + 1,
+        _ => 1,
+    }
+}
+
+/// An array with this element type would exceed the VM's type depth limit.
+fn too_deep(element: &Ty) -> bool {
+    type_depth(element) >= MAX_DEPTH
+}
+
+/// An array holding this value would exceed the VM's type depth limit.
+fn child_too_deep(value: &V) -> bool {
+    match value {
+        V::Array(array) => array
+            .element
+            .try_borrow()
+            .is_ok_and(|element| element.as_ref().map_or(1, type_depth) + 2 > MAX_DEPTH),
+        _ => false,
+    }
+}
+
+fn element_type(array: &ArrayObj) -> Option<Ty> {
+    array
+        .element
+        .try_borrow()
+        .ok()
+        .and_then(|element| element.clone())
+}
+
+fn type_of(value: &V) -> Ty {
+    match value {
+        V::Int(_) => Ty::Int,
+        V::UInt(_) => Ty::UInt,
+        V::Bool(_) => Ty::Bool,
+        V::Char(_) => Ty::Char,
+        V::Nil => Ty::Nil,
+        V::Str(_) | V::StrBuf(_) => Ty::Str,
+        V::Error(_) => Ty::Error,
+        V::Array(array) => Ty::Array(Rc::new(element_type(array).unwrap_or(Ty::Other))),
+        V::Record(record) => Ty::Nominal(record.name.clone()),
+        V::Bytes(_) => Ty::Nominal(BYTES_TYPE.into()),
+        V::Tag(_) | V::Stdout | V::Iterator(_) => Ty::Other,
+    }
+}
+
+fn undetermined(ty: &Ty) -> bool {
+    match ty {
+        Ty::Array(element) => **element == Ty::Other || undetermined(element),
+        Ty::Nullable(inner) => undetermined(inner),
+        _ => false,
+    }
+}
+
+fn needs_type_context(array: &ArrayObj) -> bool {
+    element_type(array).as_ref().is_none_or(undetermined)
+}
+
+/// Parameter and result contracts compare types without inspecting elements.
+fn matches_type(expected: &Ty, value: &V) -> bool {
+    match (expected, value) {
+        (_, V::Error(_)) | (Ty::Nullable(_), V::Nil) => true,
+        (Ty::Nullable(inner), value) => matches_type(inner, value),
+        (Ty::Array(inner), V::Array(array)) => array
+            .element
+            .try_borrow()
+            .is_ok_and(|element| element.as_ref().unwrap_or(&Ty::Other) == &**inner),
+        (Ty::Nominal(name), V::Record(record)) => *name == record.name,
+        (Ty::Nominal(name), V::Bytes(_)) => &**name == BYTES_TYPE,
+        (Ty::Other, V::Stdout | V::Iterator(_))
+        | (Ty::Int, V::Int(_))
+        | (Ty::UInt, V::UInt(_))
+        | (Ty::Bool, V::Bool(_))
+        | (Ty::Char, V::Char(_))
+        | (Ty::Nil, V::Nil)
+        | (Ty::Str, V::Str(_) | V::StrBuf(_)) => true,
+        _ => false,
+    }
+}
+
+/// Element types that one validation has already assigned to arrays.
+type Seen<'a> = HashMap<*const ArrayObj, &'a Ty>;
+
+/// Check without mutation that `value` can satisfy `expected`. Errors are
+/// accepted anywhere. Recursion is bounded by the depth of `expected`.
+fn validate<'a>(expected: &'a Ty, value: &V, seen: &mut Seen<'a>) -> bool {
+    match (expected, value) {
+        (_, V::Error(_)) | (Ty::Nullable(_), V::Nil) => true,
+        (Ty::Nullable(inner), value) => validate(inner, value, seen),
+        (Ty::Array(inner), V::Array(array)) => validate_array(array, inner, seen),
+        (expected, value) => matches_type(expected, value),
+    }
+}
+
+fn validate_array<'a>(array: &ArrayObj, expected: &'a Ty, seen: &mut Seen<'a>) -> bool {
+    let identity: *const ArrayObj = array;
+    let Ok(current) = array.element.try_borrow() else {
+        return false;
+    };
+    if let Some(actual) = seen.get(&identity).copied().or(current.as_ref())
+        && actual != expected
+        && !matches!((expected, actual),
+            (Ty::Array(_), Ty::Array(inner)) if **inner == Ty::Other)
+    {
+        return false;
+    }
+    seen.insert(identity, expected);
+    array
+        .items
+        .try_borrow()
+        .is_ok_and(|items| items.iter().all(|item| validate(expected, item, seen)))
+}
+
+/// Fix the types of nested arrays. `validate` must have succeeded first.
+fn apply(expected: &Ty, value: &V) -> bool {
+    match (expected, value) {
+        (Ty::Nullable(inner), value) => matches!(value, V::Nil) || apply(inner, value),
+        (Ty::Array(inner), V::Array(array)) => apply_array(array, inner),
+        _ => true,
+    }
+}
+
+fn apply_array(array: &ArrayObj, expected: &Ty) -> bool {
+    let Ok(items) = array.items.try_borrow() else {
+        return false;
+    };
+    // Only nested array contracts change anything below this level.
+    if matches!(expected, Ty::Array(_) | Ty::Nullable(_))
+        && !items.iter().all(|item| apply(expected, item))
+    {
+        return false;
+    }
+    let Ok(mut element) = array.element.try_borrow_mut() else {
+        return false;
+    };
+    if element.as_ref() != Some(expected) {
+        *element = Some(expected.clone());
+    }
+    true
+}
+
+fn constrain_array(array: &ArrayObj, expected: &Ty) -> bool {
+    validate_array(array, expected, &mut Seen::new()) && apply_array(array, expected)
+}
+
+/// Validate every value in one session before changing any of them.
+fn constrain_values(expected: &Ty, values: &[V]) -> bool {
+    let mut seen = Seen::new();
+    values
+        .iter()
+        .all(|value| validate(expected, value, &mut seen))
+        && values.iter().all(|value| apply(expected, value))
+}
+
+fn wrap_array(items: Vec<V>, element: Option<Ty>) -> V {
+    V::Array(Rc::new(ArrayObj {
+        items: RefCell::new(items),
+        element: RefCell::new(element),
+        version: Cell::new(0),
+    }))
+}
+
+/// An untyped literal infers its element type from the first normal value.
+fn make_array(items: Vec<V>, op: &'static str, pc: usize) -> V {
+    if items.iter().any(child_too_deep) {
+        return resource_limit(pc, "array type depth");
+    }
+    let infer = |value: &V| Some(type_of(value)).filter(|ty| !undetermined(ty));
+    let element = items
+        .iter()
+        .filter(|value| !matches!(value, V::Error(_)))
+        .find_map(infer)
+        .or_else(|| items.iter().find_map(infer));
+    match &element {
+        None if !items.is_empty() => type_mismatch(pc, op),
+        Some(expected) if !constrain_values(expected, &items) => type_mismatch(pc, op),
+        _ => wrap_array(items, element),
+    }
+}
+
+fn make_typed_array(items: Vec<V>, expected: &Ty, op: &'static str, pc: usize) -> V {
+    if too_deep(expected) {
+        return resource_limit(pc, "array type depth");
+    }
+    if !constrain_values(expected, &items) {
+        return type_mismatch(pc, op);
+    }
+    wrap_array(items, Some(expected.clone()))
+}
+
+fn constrain_array_type(value: V, expected: &Ty, pc: usize) -> V {
+    match value {
+        V::Array(_) if too_deep(expected) => resource_limit(pc, "array type depth"),
+        V::Array(array) if constrain_array(&array, expected) => V::Array(array),
+        V::Error(_) => value,
+        _ => type_mismatch(pc, "array_type"),
+    }
+}
+
+/// Assignment lets an untyped array inherit the type of the replaced one.
+fn constrain_array_from(value: V, template: V, pc: usize) -> V {
+    match (value, template) {
+        (V::Array(array), _) if !needs_type_context(&array) => V::Array(array),
+        (V::Array(array), V::Array(template)) => {
+            if element_type(&template).is_some_and(|ty| constrain_array(&array, &ty)) {
+                V::Array(array)
+            } else {
+                type_mismatch(pc, "array_type")
+            }
+        }
+        (V::Array(_), _) => type_mismatch(pc, "array_type"),
+        (value, _) => value,
+    }
+}
+
+fn empty_like(value: V, pc: usize) -> V {
+    match value {
+        V::Array(array) => match element_type(&array) {
+            Some(element) => make_typed_array(Vec::new(), &element, "array_empty_like", pc),
+            None => type_mismatch(pc, "array_empty_like"),
+        },
+        V::Error(_) => value,
+        _ => type_mismatch(pc, "array_empty_like"),
+    }
+}
+
+/// Insert in place, so every alias observes the new element.
+fn insert(array: &ArrayObj, value: V, front: bool, pc: usize) -> Result<(), V> {
+    let op = if front { "arrprepend" } else { "arrpush" };
+    // `Some` holds the element type that this first value establishes.
+    let first = {
+        let Ok(element) = array.element.try_borrow() else {
+            return Err(invalid_argument(pc, op));
+        };
+        match element.as_ref() {
+            Some(expected) => {
+                if !validate(expected, &value, &mut Seen::new()) {
+                    return Err(type_mismatch(pc, op));
+                }
+                None
+            }
+            None => {
+                if child_too_deep(&value) {
+                    return Err(resource_limit(pc, "array type depth"));
+                }
+                let actual = type_of(&value);
+                if undetermined(&actual) {
+                    return Err(type_mismatch(pc, op));
+                }
+                Some(actual)
+            }
+        }
+    };
+    let Ok(mut items) = array.items.try_borrow_mut() else {
+        return Err(invalid_argument(pc, op));
+    };
+    items
+        .try_reserve(1)
+        .map_err(|_| resource_limit(pc, "array"))?;
+    match first {
+        Some(actual) => match array.element.try_borrow_mut() {
+            Ok(mut element) => *element = Some(actual),
+            Err(_) => return Err(invalid_argument(pc, op)),
+        },
+        None => {
+            let Ok(element) = array.element.try_borrow() else {
+                return Err(invalid_argument(pc, op));
+            };
+            if !element.as_ref().is_none_or(|ty| apply(ty, &value)) {
+                return Err(type_mismatch(pc, op));
+            }
+        }
+    }
+    if front {
+        items.insert(0, value);
+    } else {
+        items.push(value);
+    }
+    array.version.set(array.version.get().wrapping_add(1));
+    Ok(())
+}
+
+/// `array.append(value)`. An Error operand is returned and nothing is inserted.
+fn array_push(array: V, value: V, pc: usize) -> V {
+    match (array, value) {
+        (error @ V::Error(_), _) | (_, error @ V::Error(_)) => error,
+        (V::Array(array), value) => match insert(&array, value, false, pc) {
+            Ok(()) => V::Array(array),
+            Err(error) => error,
+        },
+        _ => type_mismatch(pc, "arrpush"),
+    }
+}
+
+/// `array.prepend(value)`. The value operand is checked for an Error first.
+fn array_prepend(value: V, array: V, pc: usize) -> V {
+    match (value, array) {
+        (error @ V::Error(_), _) | (_, error @ V::Error(_)) => error,
+        (value, V::Array(array)) => match insert(&array, value, true, pc) {
+            Ok(()) => V::Array(array),
+            Err(error) => error,
+        },
+        _ => type_mismatch(pc, "arrprepend"),
+    }
+}
+
+fn array_set(array: &ArrayObj, index: i64, value: V, pc: usize) -> Result<(), V> {
+    let Ok(len) = array.items.try_borrow().map(|items| items.len()) else {
+        return Err(invalid_argument(pc, "indexset"));
+    };
+    let Some(position) = usize::try_from(index).ok().filter(|i| *i < len) else {
+        return Err(out_of_bounds(pc, index, len));
+    };
+    {
+        let Ok(element) = array.element.try_borrow() else {
+            return Err(invalid_argument(pc, "indexset"));
+        };
+        // A non-empty array always has an element type.
+        if let Some(expected) = element.as_ref()
+            && !(validate(expected, &value, &mut Seen::new()) && apply(expected, &value))
+        {
+            return Err(type_mismatch(pc, "indexset"));
+        }
+    }
+    let Ok(mut items) = array.items.try_borrow_mut() else {
+        return Err(invalid_argument(pc, "indexset"));
+    };
+    let previous = std::mem::replace(&mut items[position], value);
+    // The replaced value may be the last reference to a graph that leads back.
+    drop(items);
+    drop(previous);
+    Ok(())
+}
+
+fn copy_into(target: &mut Vec<V>, array: &ArrayObj, pc: usize) -> Result<(), V> {
+    let Ok(items) = array.items.try_borrow() else {
+        return Err(invalid_argument(pc, "array_concat"));
+    };
+    target
+        .try_reserve(items.len())
+        .map_err(|_| resource_limit(pc, "array"))?;
+    target.extend(items.iter().cloned());
+    Ok(())
+}
+
+fn concatenated(items: Vec<V>, element: Option<Ty>, pc: usize) -> V {
+    match element {
+        Some(element) => make_typed_array(items, &element, "array_concat", pc),
+        None => make_array(items, "array_concat", pc),
+    }
+}
+
+/// `array + other` builds a new array from two arrays or one extra element.
+fn append_to_copy(left: &ArrayObj, right: V, pc: usize) -> V {
+    let mut items = Vec::new();
+    if let Err(error) = copy_into(&mut items, left, pc) {
+        return error;
+    }
+    let mut element = element_type(left);
+    if let V::Array(right) = &right {
+        let other = element_type(right);
+        if element
+            .as_ref()
+            .zip(other.as_ref())
+            .is_some_and(|(left, right)| left != right)
+        {
+            return type_mismatch(pc, "array_concat");
+        }
+        if let Err(error) = copy_into(&mut items, right, pc) {
+            return error;
+        }
+        element = element.or(other);
+    } else {
+        if items.try_reserve(1).is_err() {
+            return resource_limit(pc, "array");
+        }
+        items.push(right);
+    }
+    concatenated(items, element, pc)
+}
+
+fn prepend_to_copy(first: V, rest: &ArrayObj, pc: usize) -> V {
+    let mut items = vec![first];
+    if let Err(error) = copy_into(&mut items, rest, pc) {
+        return error;
+    }
+    concatenated(items, element_type(rest), pc)
+}
+
+/// Fix the declared field types of a newly constructed struct.
+fn constrain_fields(value: V, contracts: &[(&'static str, &Ty)], pc: usize) -> V {
+    let record = match value {
+        V::Record(record) => record,
+        V::Error(_) => return value,
+        _ => return type_mismatch(pc, "record_type"),
+    };
+    {
+        let Ok(fields) = record.fields.try_borrow() else {
+            return invalid_argument(pc, "record_type");
+        };
+        let field = |name: &str| fields.iter().find(|(key, _)| &**key == name);
+        let mut seen = Seen::new();
+        for &(name, expected) in contracts {
+            if too_deep(expected) {
+                return resource_limit(pc, "array type depth");
+            }
+            if !field(name).is_some_and(|(_, value)| validate(expected, value, &mut seen)) {
+                return type_mismatch(pc, "record_type");
+            }
+        }
+        for &(name, expected) in contracts {
+            if !field(name).is_some_and(|(_, value)| apply(expected, value)) {
+                return type_mismatch(pc, "record_type");
+            }
+        }
+    }
+    let Ok(mut types) = record.types.try_borrow_mut() else {
+        return invalid_argument(pc, "record_type");
+    };
+    *types = contracts
+        .iter()
+        .map(|&(name, ty)| (name, ty.clone()))
+        .collect();
+    drop(types);
+    V::Record(record)
+}
+
+fn record_set(record: &RecordObj, name: Rc<str>, value: V, pc: usize) -> Result<(), V> {
+    let Some(current) = record.get(&name) else {
+        return Err(invalid_argument(pc, "indexset"));
+    };
+    // A replacement array takes the element type of the array it replaces.
+    if let V::Array(replacement) = &value {
+        let accepted = match &current {
+            Some(V::Array(current)) => {
+                element_type(current).is_some_and(|ty| constrain_array(replacement, &ty))
+            }
+            _ => !needs_type_context(replacement),
+        };
+        if !accepted {
+            return Err(type_mismatch(pc, "indexset"));
+        }
+    }
+    drop(current);
+    {
+        let Ok(types) = record.types.try_borrow() else {
+            return Err(invalid_argument(pc, "indexset"));
+        };
+        if let Some((_, expected)) = types.iter().find(|(field, _)| *field == &*name)
+            && !(validate(expected, &value, &mut Seen::new()) && apply(expected, &value))
+        {
+            return Err(type_mismatch(pc, "indexset"));
+        }
+    }
+    let Ok(mut fields) = record.fields.try_borrow_mut() else {
+        return Err(invalid_argument(pc, "indexset"));
+    };
+    let previous = match fields.iter_mut().find(|(key, _)| *key == name) {
+        Some(slot) => Some(std::mem::replace(&mut slot.1, value)),
+        None => {
+            fields.push((name, value));
+            None
+        }
+    };
+    // The replaced value may be the last reference to a graph that leads back.
+    drop(fields);
+    drop(previous);
+    Ok(())
+}
+
+/// State of a `for` loop over an array or the characters of a string.
+struct Iteration {
+    source: V,
+    /// Element index of an array, or byte offset of a string.
+    position: usize,
+    version: u64,
+    current: Option<V>,
+}
+
+impl Iteration {
+    fn advance(&mut self, pc: usize) -> V {
+        self.current = None;
+        match &self.source {
+            V::Array(array) => {
+                if array.version.get() != self.version {
+                    return invalid_argument(pc, "array iteration invalidated");
+                }
+                let Ok(items) = array.items.try_borrow() else {
+                    return invalid_argument(pc, "array iteration");
+                };
+                self.current = items.get(self.position).cloned();
+                self.position += usize::from(self.current.is_some());
+            }
+            V::Str(text) => {
+                let Some(rest) = text.get(self.position..) else {
+                    return invalid_argument(pc, "string iteration");
+                };
+                if let Some(character) = rest.chars().next() {
+                    self.position += character.len_utf8();
+                    self.current = Some(V::Char(character));
+                }
+            }
+            _ => return type_mismatch(pc, "for iteration"),
+        }
+        V::Bool(self.current.is_some())
+    }
+}
+
+fn iterator_new([source]: [V; 1], pc: usize) -> V {
+    let version = match &source {
+        V::Array(array) => array.version.get(),
+        V::Str(_) => 0,
+        V::Error(_) => return source,
+        _ => return type_mismatch(pc, "for iteration"),
+    };
+    V::Iterator(Rc::new(RefCell::new(Iteration {
+        source,
+        position: 0,
+        version,
+        current: None,
+    })))
+}
+
+fn iterator_next([iterator]: [V; 1], pc: usize) -> V {
+    match &iterator {
+        V::Iterator(state) => match state.try_borrow_mut() {
+            Ok(mut state) => state.advance(pc),
+            Err(_) => invalid_argument(pc, "iterator borrow"),
+        },
+        V::Error(_) => iterator,
+        _ => type_mismatch(pc, "iterator next"),
+    }
+}
+
+fn iterator_current([iterator]: [V; 1], pc: usize) -> V {
+    match &iterator {
+        V::Iterator(state) => match state.try_borrow() {
+            Ok(state) => state
+                .current
+                .clone()
+                .unwrap_or_else(|| invalid_argument(pc, "iterator has no current value")),
+            Err(_) => invalid_argument(pc, "iterator borrow"),
+        },
+        V::Error(_) => iterator,
+        _ => type_mismatch(pc, "iterator current"),
     }
 }
