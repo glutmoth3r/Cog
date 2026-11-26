@@ -4094,12 +4094,8 @@ fn numeric_binop(
     float_op: impl Fn(f64, f64) -> f64,
 ) -> Result<Value, RuntimeError> {
     match (a, b) {
-        (Value::Int(x), Value::Int(y)) => {
-            int_op(x, y).map(Value::Int).ok_or(RuntimeError::Overflow)
-        }
-        (Value::UInt(x), Value::UInt(y)) => {
-            uint_op(x, y).map(Value::UInt).ok_or(RuntimeError::Overflow)
-        }
+        (Value::Int(x), Value::Int(y)) => int_op(x, y).map(Value::Int).ok_or_else(overflow),
+        (Value::UInt(x), Value::UInt(y)) => uint_op(x, y).map(Value::UInt).ok_or_else(overflow),
         (Value::BigInt(x), Value::BigInt(y)) => {
             check_bigint_limit(&x, numeric_digit_limit)?;
             check_bigint_limit(&y, numeric_digit_limit)?;
@@ -4185,16 +4181,13 @@ fn compare_binop(
 
 #[inline]
 fn pop2(stack: &mut Vec<Value>) -> Result<(Value, Value), RuntimeError> {
-    let b = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
-    let a = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
+    let b = stack.pop().ok_or_else(stack_underflow)?;
+    let a = stack.pop().ok_or_else(stack_underflow)?;
     Ok((a, b))
 }
 
 fn take_stack_tail(stack: &mut Vec<Value>, count: usize) -> Result<Vec<Value>, RuntimeError> {
-    let begin = stack
-        .len()
-        .checked_sub(count)
-        .ok_or(RuntimeError::StackUnderflow)?;
+    let begin = stack.len().checked_sub(count).ok_or_else(stack_underflow)?;
     let mut values = Vec::new();
     values
         .try_reserve_exact(count)
@@ -4207,19 +4200,42 @@ fn take_stack_tail(stack: &mut Vec<Value>, count: usize) -> Result<Vec<Value>, R
 
 #[inline]
 fn pop3(stack: &mut Vec<Value>) -> Result<(Value, Value, Value), RuntimeError> {
-    let c = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
-    let b = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
-    let a = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
+    let c = stack.pop().ok_or_else(stack_underflow)?;
+    let b = stack.pop().ok_or_else(stack_underflow)?;
+    let a = stack.pop().ok_or_else(stack_underflow)?;
     Ok((a, b, c))
 }
 
+#[inline]
 fn local_address(base: usize, index: usize) -> Result<usize, RuntimeError> {
     // Match the portable slot contract even when an embedder bypasses decode.
     if index >= crate::bytecode::LIMIT {
-        return Err(RuntimeError::InvalidLocal(index));
+        return Err(invalid_local(index));
     }
-    base.checked_add(index)
-        .ok_or(RuntimeError::InvalidLocal(index))
+    base.checked_add(index).ok_or_else(|| invalid_local(index))
+}
+
+// Error constructors used on dispatch-loop success paths. Passing them lazily
+// keeps the hot path from materializing an error and calling its out-of-line
+// drop glue when the operation succeeds.
+#[cold]
+fn stack_underflow() -> RuntimeError {
+    RuntimeError::StackUnderflow
+}
+
+#[cold]
+fn invalid_local(index: usize) -> RuntimeError {
+    RuntimeError::InvalidLocal(index)
+}
+
+#[cold]
+fn invalid_call(entry: usize) -> RuntimeError {
+    RuntimeError::InvalidCall(entry)
+}
+
+#[cold]
+fn overflow() -> RuntimeError {
+    RuntimeError::Overflow
 }
 
 #[inline]
@@ -4241,7 +4257,7 @@ fn store_slot(
     if address >= slots.len() {
         let length = address
             .checked_add(1)
-            .ok_or(RuntimeError::InvalidLocal(address))?;
+            .ok_or_else(|| invalid_local(address))?;
         slots
             .try_reserve(length - slots.len())
             .map_err(|_| RuntimeError::ResourceLimit {
@@ -4250,6 +4266,140 @@ fn store_slot(
         slots.resize(length, None);
     }
     slots[address] = Some(value);
+    Ok(())
+}
+
+// The dispatch match has so many arms that LLVM's static profile treats every
+// arm as a cold call site and declines to inline even `Vec::push` there. The
+// most frequent operand-stack operations therefore live in small out-of-line
+// helpers, where the standard-library calls are inlined and values are written
+// straight into the operand stack instead of through spilled temporaries.
+#[inline(never)]
+fn push_slot_copy(
+    stack: &mut Vec<Value>,
+    slots: &[Option<Value>],
+    address: usize,
+    index: usize,
+) -> Result<(), RuntimeError> {
+    let Some(Some(value)) = slots.get(address) else {
+        return Err(invalid_local(index));
+    };
+    push_clone(stack, value);
+    Ok(())
+}
+
+// Constructing a scalar after the capacity check lets LLVM store it straight
+// into the operand stack. A pre-built enum would be spilled with narrow stores
+// and reloaded with wide ones, which stalls store-to-load forwarding.
+// Separate per-type functions also keep LLVM from merging the pushes back into
+// one shared tail that receives the value through memory.
+#[inline(always)]
+fn push_clone(stack: &mut Vec<Value>, value: &Value) {
+    match value {
+        Value::Int(value) => push_int(stack, *value),
+        Value::UInt(value) => push_uint(stack, *value),
+        Value::Float(value) => push_float(stack, *value),
+        Value::Bool(value) => push_bool(stack, *value),
+        value => stack.push(value.clone()),
+    }
+}
+
+/// Reserve before constructing the value: `Vec::push` keeps an argument that
+/// needs drop glue alive across its growth call, so it spills the whole enum
+/// and copies it back with wide loads that stall store-to-load forwarding.
+#[inline(always)]
+fn push_constructed(stack: &mut Vec<Value>, value: impl FnOnce() -> Value) {
+    stack.extend(std::iter::once_with(value));
+}
+
+#[inline(never)]
+fn push_int(stack: &mut Vec<Value>, value: i64) {
+    push_constructed(stack, || Value::Int(value));
+}
+
+#[inline(never)]
+fn push_uint(stack: &mut Vec<Value>, value: u64) {
+    push_constructed(stack, || Value::UInt(value));
+}
+
+#[inline(never)]
+fn push_float(stack: &mut Vec<Value>, value: f64) {
+    push_constructed(stack, || Value::Float(value));
+}
+
+#[inline(never)]
+fn push_bool(stack: &mut Vec<Value>, value: bool) {
+    push_constructed(stack, || Value::Bool(value));
+}
+
+#[inline(never)]
+fn store_top(
+    stack: &mut Vec<Value>,
+    slots: &mut Vec<Option<Value>>,
+    base: usize,
+    index: usize,
+    limit: Option<usize>,
+) -> Result<(), RuntimeError> {
+    let value = stack.pop().ok_or_else(stack_underflow)?;
+    let address = local_address(base, index)?;
+    if limit.is_none_or(|limit| address < limit)
+        && let Some(slot) = slots.get_mut(address)
+    {
+        let previous = slot.replace(value);
+        if previous.is_none() || is_scalar(previous.as_ref()) {
+            // Nothing to release; skip the out-of-line drop glue.
+            std::mem::forget(previous);
+        }
+        return Ok(());
+    }
+    store_slot(slots, address, value, limit)
+}
+
+#[inline(always)]
+fn is_scalar(value: Option<&Value>) -> bool {
+    matches!(
+        value,
+        Some(
+            Value::Int(_)
+                | Value::UInt(_)
+                | Value::Float(_)
+                | Value::Bool(_)
+                | Value::Char(_)
+                | Value::Nil
+        )
+    )
+}
+
+#[inline(never)]
+fn push_constant(stack: &mut Vec<Value>, value: &Value, owner: &Rc<()>) {
+    match value {
+        Value::Function(_) => stack.push(instantiate_scalar(value, owner)),
+        value => push_clone(stack, value),
+    }
+}
+
+#[inline(never)]
+fn push_top_copy(stack: &mut Vec<Value>) -> Result<(), RuntimeError> {
+    match *stack.last().ok_or_else(stack_underflow)? {
+        Value::Int(value) => push_int(stack, value),
+        Value::UInt(value) => push_uint(stack, value),
+        Value::Float(value) => push_float(stack, value),
+        Value::Bool(value) => push_bool(stack, value),
+        ref top => {
+            let top = top.clone();
+            stack.push(top);
+        }
+    }
+    Ok(())
+}
+
+#[inline(never)]
+fn replace_top_with_type_test(
+    stack: &mut [Value],
+    ty: &crate::instruction::ValueType,
+) -> Result<(), RuntimeError> {
+    let top = stack.last_mut().ok_or_else(stack_underflow)?;
+    *top = Value::Bool(ty.matches(top));
     Ok(())
 }
 
@@ -4447,13 +4597,31 @@ fn int_binop(
         return Ok(false);
     };
 
-    stack.truncate(len - 2);
-    stack.push(match op(left, right) {
-        Ok(value) => Value::Int(value),
-        Err(error) if error.is_recoverable() => Value::Error(Box::new(error)),
-        Err(error) => return Err(error),
-    });
+    match op(left, right) {
+        Ok(value) => {
+            // Reuse the left operand's slot for the result.
+            discard_scalar(stack);
+            if let Some(Value::Int(slot)) = stack.last_mut() {
+                *slot = value;
+            }
+        }
+        Err(error) => {
+            stack.truncate(len - 2);
+            if !error.is_recoverable() {
+                return Err(error);
+            }
+            stack.push(Value::Error(Box::new(error)));
+        }
+    }
     Ok(true)
+}
+
+/// Remove a top operand that the caller already matched as a scalar. Scalars
+/// own no resources, so skipping the out-of-line drop glue loses nothing.
+#[inline(always)]
+fn discard_scalar(stack: &mut Vec<Value>) {
+    debug_assert!(is_scalar(stack.last()));
+    std::mem::forget(stack.pop());
 }
 
 pub fn run(program: &CompiledProgram) -> Result<(), RuntimeError> {
@@ -4728,7 +4896,7 @@ pub(crate) fn array_index(array: &ArrayValue, index: i64) -> Result<Value, Runti
     items
         .get(usize::try_from(index).unwrap_or(usize::MAX))
         .cloned()
-        .ok_or(RuntimeError::IndexOutOfBounds {
+        .ok_or_else(|| RuntimeError::IndexOutOfBounds {
             index,
             len: items.len(),
         })
@@ -4945,7 +5113,7 @@ fn execute_vm(
         if let Some(entry) = start_entry {
             let signature = execution_plan
                 .callable_signature(artifact, entry)
-                .ok_or(RuntimeError::InvalidCall(entry))?;
+                .ok_or_else(|| invalid_call(entry))?;
             if signature.asynchronous != async_task.is_some()
                 || signature.captures != 0
                 || !call_arguments_match(signature, &stack)
@@ -4982,7 +5150,7 @@ fn execute_vm(
                 && pc == entry.pc + 1
                 && call_stack.is_empty()
             {
-                return stack.pop().ok_or(RuntimeError::StackUnderflow);
+                return stack.pop().ok_or_else(stack_underflow);
             }
             if bridge.is_none() {
                 scheduler.reap_abandoned_tasks();
@@ -5004,9 +5172,11 @@ fn execute_vm(
                 });
             }
             if let Some(steps) = remaining_steps {
-                *steps = steps.checked_sub(1).ok_or(RuntimeError::ResourceLimit {
-                    resource: "instruction steps",
-                })?;
+                *steps = steps
+                    .checked_sub(1)
+                    .ok_or_else(|| RuntimeError::ResourceLimit {
+                        resource: "instruction steps",
+                    })?;
             }
             let (required, produced) = if let Some(cache) = &execution_plan.stack_effect_cache {
                 cache[pc]
@@ -5016,7 +5186,7 @@ fn execute_vm(
             let available = stack
                 .len()
                 .checked_sub(operand_base)
-                .ok_or(RuntimeError::StackUnderflow)?;
+                .ok_or_else(stack_underflow)?;
             if available < required {
                 return Err(RuntimeError::StackUnderflow);
             }
@@ -5042,7 +5212,7 @@ fn execute_vm(
                     if let Value::BigInt(value) = value {
                         check_bigint_limit(value, context.limits.max_numeric_digits)?;
                     }
-                    stack.push(instantiate_scalar(value, owner));
+                    push_constant(&mut stack, value, owner);
                 }
                 Instruction::PushArray(template) => {
                     check_array_template_resources(template, context)?;
@@ -5060,9 +5230,7 @@ fn execute_vm(
                     return Ok(stack[operand_base..].last().cloned().unwrap_or(Value::Nil));
                 }
                 Instruction::Add => {
-                    if !int_binop(&mut stack, |x, y| {
-                        x.checked_add(y).ok_or(RuntimeError::Overflow)
-                    })? {
+                    if !int_binop(&mut stack, |x, y| x.checked_add(y).ok_or_else(overflow))? {
                         binop(&mut stack, |a, b| {
                             if let (Value::Str(x), Value::Str(y)) = (&a, &b) {
                                 let length = x
@@ -5197,9 +5365,7 @@ fn execute_vm(
                     })?;
                 }
                 Instruction::Sub => {
-                    if !int_binop(&mut stack, |x, y| {
-                        x.checked_sub(y).ok_or(RuntimeError::Overflow)
-                    })? {
+                    if !int_binop(&mut stack, |x, y| x.checked_sub(y).ok_or_else(overflow))? {
                         binop(&mut stack, |a, b| {
                             numeric_binop(
                                 a,
@@ -5215,9 +5381,7 @@ fn execute_vm(
                     }
                 }
                 Instruction::Mul => {
-                    if !int_binop(&mut stack, |x, y| {
-                        x.checked_mul(y).ok_or(RuntimeError::Overflow)
-                    })? {
+                    if !int_binop(&mut stack, |x, y| x.checked_mul(y).ok_or_else(overflow))? {
                         binop(&mut stack, |a, b| {
                             numeric_binop(
                                 a,
@@ -5237,20 +5401,18 @@ fn execute_vm(
                         if y == 0 {
                             Err(RuntimeError::DivisionByZero)
                         } else {
-                            x.checked_div(y).ok_or(RuntimeError::Overflow)
+                            x.checked_div(y).ok_or_else(overflow)
                         }
                     })? {
                         binop(&mut stack, |a, b| match (a, b) {
                             (Value::Int(_), Value::Int(0)) => Err(RuntimeError::DivisionByZero),
-                            (Value::Int(x), Value::Int(y)) => x
-                                .checked_div(y)
-                                .map(Value::Int)
-                                .ok_or(RuntimeError::Overflow),
+                            (Value::Int(x), Value::Int(y)) => {
+                                x.checked_div(y).map(Value::Int).ok_or_else(overflow)
+                            }
                             (Value::UInt(_), Value::UInt(0)) => Err(RuntimeError::DivisionByZero),
-                            (Value::UInt(x), Value::UInt(y)) => x
-                                .checked_div(y)
-                                .map(Value::UInt)
-                                .ok_or(RuntimeError::Overflow),
+                            (Value::UInt(x), Value::UInt(y)) => {
+                                x.checked_div(y).map(Value::UInt).ok_or_else(overflow)
+                            }
                             (Value::BigInt(_), Value::BigInt(y)) if y == BigInt::from(0) => {
                                 Err(RuntimeError::DivisionByZero)
                             }
@@ -5278,20 +5440,18 @@ fn execute_vm(
                         if y == 0 {
                             Err(RuntimeError::DivisionByZero)
                         } else {
-                            x.checked_rem(y).ok_or(RuntimeError::Overflow)
+                            x.checked_rem(y).ok_or_else(overflow)
                         }
                     })? {
                         binop(&mut stack, |a, b| match (a, b) {
                             (Value::Int(_), Value::Int(0)) => Err(RuntimeError::DivisionByZero),
-                            (Value::Int(x), Value::Int(y)) => x
-                                .checked_rem(y)
-                                .map(Value::Int)
-                                .ok_or(RuntimeError::Overflow),
+                            (Value::Int(x), Value::Int(y)) => {
+                                x.checked_rem(y).map(Value::Int).ok_or_else(overflow)
+                            }
                             (Value::UInt(_), Value::UInt(0)) => Err(RuntimeError::DivisionByZero),
-                            (Value::UInt(x), Value::UInt(y)) => x
-                                .checked_rem(y)
-                                .map(Value::UInt)
-                                .ok_or(RuntimeError::Overflow),
+                            (Value::UInt(x), Value::UInt(y)) => {
+                                x.checked_rem(y).map(Value::UInt).ok_or_else(overflow)
+                            }
                             (Value::BigInt(_), Value::BigInt(y)) if y == BigInt::from(0) => {
                                 Err(RuntimeError::DivisionByZero)
                             }
@@ -5400,13 +5560,13 @@ fn execute_vm(
                     let import = artifact
                         .imports
                         .get(*index)
-                        .ok_or(RuntimeError::InvalidNativeCall)?;
+                        .ok_or_else(|| RuntimeError::InvalidNativeCall)?;
                     let count = import.parameters().len();
                     let base = stack
                         .len()
                         .checked_sub(count)
                         .filter(|base| *base >= operand_base)
-                        .ok_or(RuntimeError::StackUnderflow)?;
+                        .ok_or_else(stack_underflow)?;
                     let arguments = &stack[base..];
                     let result =
                         if import.is_async() {
@@ -5443,11 +5603,11 @@ fn execute_vm(
                     stack.push(recover_native_result(result)?);
                 }
                 Instruction::Store(index) => {
-                    let value = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
-                    store_slot(
+                    store_top(
+                        &mut stack,
                         &mut locals,
-                        local_address(bp, *index)?,
-                        value,
+                        bp,
+                        *index,
                         context
                             .limits
                             .max_slots
@@ -5455,16 +5615,10 @@ fn execute_vm(
                     )?;
                 }
                 Instruction::Load(index) => {
-                    let abs = local_address(bp, *index)?;
-                    let value = locals
-                        .get(abs)
-                        .cloned()
-                        .flatten()
-                        .ok_or(RuntimeError::InvalidLocal(*index))?;
-                    stack.push(value);
+                    push_slot_copy(&mut stack, &locals, local_address(bp, *index)?, *index)?;
                 }
                 Instruction::StoreGlobal(index) => {
-                    let value = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
+                    let value = stack.pop().ok_or_else(stack_underflow)?;
                     store_slot(
                         globals,
                         local_address(0, *index)?,
@@ -5476,13 +5630,7 @@ fn execute_vm(
                     )?;
                 }
                 Instruction::LoadGlobal(index) => {
-                    local_address(0, *index)?;
-                    let value = globals
-                        .get(*index)
-                        .cloned()
-                        .flatten()
-                        .ok_or(RuntimeError::InvalidLocal(*index))?;
-                    stack.push(value);
+                    push_slot_copy(&mut stack, globals, local_address(0, *index)?, *index)?;
                 }
                 Instruction::Jump(index) => {
                     let target = check_branch(program, pc, *index, callable_start, callable_end)?;
@@ -5520,7 +5668,7 @@ fn execute_vm(
                     continue;
                 }
                 Instruction::JumpIfFalse(index) => {
-                    let condition = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
+                    let condition = stack.pop().ok_or_else(stack_underflow)?;
                     match condition {
                         Value::Bool(false) => {
                             let target =
@@ -5569,7 +5717,7 @@ fn execute_vm(
                     }
                 }
                 Instruction::JumpIfTrue(index) => {
-                    let condition = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
+                    let condition = stack.pop().ok_or_else(stack_underflow)?;
                     match condition {
                         Value::Bool(true) => {
                             let target =
@@ -5621,13 +5769,9 @@ fn execute_vm(
                         continue;
                     }
                 }
-                Instruction::IsType(ty) => {
-                    let value = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
-                    let is_match = ty.matches(&value);
-                    stack.push(Value::Bool(is_match));
-                }
+                Instruction::IsType(ty) => replace_top_with_type_test(&mut stack, ty)?,
                 Instruction::ErrorKind => {
-                    let value = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
+                    let value = stack.pop().ok_or_else(stack_underflow)?;
                     let name = match &value {
                         Value::Error(err) => err.kind(),
                         _ => "ok",
@@ -5635,11 +5779,11 @@ fn execute_vm(
                     stack.push(Value::Str(Rc::from(name)));
                 }
                 Instruction::Len => {
-                    let value = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
+                    let value = stack.pop().ok_or_else(stack_underflow)?;
                     stack.push(length_value(value));
                 }
                 Instruction::Exclusive => {
-                    let value = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
+                    let value = stack.pop().ok_or_else(stack_underflow)?;
                     let result = match value {
                         Value::Error(_) => value,
                         Value::Array(arr) => Value::Bool(arr.strong_count() == 1),
@@ -5655,7 +5799,7 @@ fn execute_vm(
                 Instruction::CallAsync(index, arity) => {
                     let signature = execution_plan
                         .callable_signature(artifact, *index)
-                        .ok_or(RuntimeError::InvalidCall(*index))?;
+                        .ok_or_else(|| invalid_call(*index))?;
                     check_call(artifact, *index, signature, *arity, 0)?;
                     if !signature.asynchronous {
                         return Err(RuntimeError::InvalidCall(*index));
@@ -5665,7 +5809,7 @@ fn execute_vm(
                         .len()
                         .checked_sub(*arity)
                         .filter(|base| *base >= operand_base)
-                        .ok_or(RuntimeError::StackUnderflow)?;
+                        .ok_or_else(stack_underflow)?;
                     if !call_arguments_match(signature, &stack[next_base..]) {
                         stack.truncate(next_base);
                         stack.push(Value::Error(Box::new(RuntimeError::TypeMismatch {
@@ -5686,7 +5830,7 @@ fn execute_vm(
                     let allowed = execution_plan
                         .callable_signature(artifact, callable_start)
                         .is_none_or(|signature| signature.asynchronous);
-                    let value = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
+                    let value = stack.pop().ok_or_else(stack_underflow)?;
                     if !allowed {
                         stack.push(Value::Error(Box::new(RuntimeError::InvalidArgument {
                             op: "await outside async function",
@@ -5738,7 +5882,7 @@ fn execute_vm(
                     let allowed = execution_plan
                         .callable_signature(artifact, callable_start)
                         .is_some_and(|signature| signature.asynchronous);
-                    let value = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
+                    let value = stack.pop().ok_or_else(stack_underflow)?;
                     if !allowed {
                         stack.push(Value::Error(Box::new(RuntimeError::InvalidArgument {
                             op: "spawn outside async function",
@@ -5762,7 +5906,7 @@ fn execute_vm(
                     }
                 }
                 Instruction::Cancel => {
-                    let value = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
+                    let value = stack.pop().ok_or_else(stack_underflow)?;
                     match value {
                         Value::Error(_) => stack.push(value),
                         Value::Task(task) => match scheduler
@@ -5791,7 +5935,7 @@ fn execute_vm(
                     }
                 }
                 Instruction::SleepAsync => {
-                    let argument = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
+                    let argument = stack.pop().ok_or_else(stack_underflow)?;
                     if matches!(argument, Value::Error(_)) {
                         stack.push(argument);
                     } else {
@@ -5820,8 +5964,8 @@ fn execute_vm(
                         stack.push(Value::Error(error.clone()));
                     } else {
                         let mut arguments = arguments.into_iter();
-                        let task = arguments.next().ok_or(RuntimeError::StackUnderflow)?;
-                        let seconds = arguments.next().ok_or(RuntimeError::StackUnderflow)?;
+                        let task = arguments.next().ok_or_else(stack_underflow)?;
+                        let seconds = arguments.next().ok_or_else(stack_underflow)?;
                         match scheduler.create_target(AsyncTaskTarget::Timeout { task, seconds }) {
                             Ok(task) => stack.push(Value::Task(task)),
                             Err(error) if error.is_recoverable() => {
@@ -5840,8 +5984,8 @@ fn execute_vm(
                         stack.push(Value::Error(error.clone()));
                     } else {
                         let mut arguments = arguments.into_iter();
-                        let first = arguments.next().ok_or(RuntimeError::StackUnderflow)?;
-                        let second = arguments.next().ok_or(RuntimeError::StackUnderflow)?;
+                        let first = arguments.next().ok_or_else(stack_underflow)?;
+                        let second = arguments.next().ok_or_else(stack_underflow)?;
                         match scheduler.create_target(AsyncTaskTarget::Select2 { first, second }) {
                             Ok(task) => stack.push(Value::Task(task)),
                             Err(error) if error.is_recoverable() => {
@@ -5852,7 +5996,7 @@ fn execute_vm(
                     }
                 }
                 Instruction::Select => {
-                    let tasks = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
+                    let tasks = stack.pop().ok_or_else(stack_underflow)?;
                     if let Value::Error(error) = tasks {
                         stack.push(Value::Error(error));
                     } else {
@@ -5866,7 +6010,7 @@ fn execute_vm(
                     }
                 }
                 Instruction::ReadBytesAsync => {
-                    let arguments = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
+                    let arguments = stack.pop().ok_or_else(stack_underflow)?;
                     if matches!(arguments, Value::Error(_)) {
                         stack.push(arguments);
                     } else {
@@ -5995,9 +6139,8 @@ fn execute_vm(
                         stack.push(error.clone());
                     } else {
                         let mut arguments = arguments.into_iter();
-                        let program = arguments.next().ok_or(RuntimeError::StackUnderflow)?;
-                        let process_arguments =
-                            arguments.next().ok_or(RuntimeError::StackUnderflow)?;
+                        let program = arguments.next().ok_or_else(stack_underflow)?;
+                        let process_arguments = arguments.next().ok_or_else(stack_underflow)?;
                         let (input, timeout, output_limit) = match arity {
                             2 => (None, None, None),
                             3 if matches!(
@@ -6113,7 +6256,7 @@ fn execute_vm(
                 Instruction::Call(index, arity) => {
                     let signature = execution_plan
                         .callable_signature(artifact, *index)
-                        .ok_or(RuntimeError::InvalidCall(*index))?;
+                        .ok_or_else(|| invalid_call(*index))?;
                     check_call(artifact, *index, signature, *arity, 0)?;
                     if signature.asynchronous {
                         return Err(RuntimeError::InvalidCall(*index));
@@ -6122,7 +6265,7 @@ fn execute_vm(
                     let next_base = stack
                         .len()
                         .checked_sub(*arity)
-                        .ok_or(RuntimeError::StackUnderflow)?;
+                        .ok_or_else(stack_underflow)?;
                     if !call_arguments_match(signature, &stack[next_base..]) {
                         stack.truncate(next_base);
                         stack.push(Value::Error(Box::new(RuntimeError::TypeMismatch {
@@ -6174,7 +6317,7 @@ fn execute_vm(
                     if stack.len() <= operand_base {
                         return Err(RuntimeError::StackUnderflow);
                     }
-                    let result = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
+                    let result = stack.pop().ok_or_else(stack_underflow)?;
                     let mut result = execution_plan
                         .callable_signature(artifact, callable_start)
                         .and_then(|signature| signature.result_type.as_ref())
@@ -6240,7 +6383,9 @@ fn execute_vm(
                         saved_operand_base,
                         saved_callable_start,
                         saved_callable_end,
-                    ) = call_stack.pop().ok_or(RuntimeError::CallStackUnderflow)?;
+                    ) = call_stack
+                        .pop()
+                        .ok_or_else(|| RuntimeError::CallStackUnderflow)?;
                     stack.truncate(operand_base);
                     stack.push(result);
                     propagation_pending |= propagates;
@@ -6271,12 +6416,9 @@ fn execute_vm(
                         _ => Err(RuntimeError::TypeMismatch { op: "xor" }),
                     })?;
                 }
-                Instruction::Dup => {
-                    let top = stack.last().ok_or(RuntimeError::StackUnderflow)?.clone();
-                    stack.push(top);
-                }
+                Instruction::Dup => push_top_copy(&mut stack)?,
                 Instruction::Pop => {
-                    stack.pop().ok_or(RuntimeError::StackUnderflow)?;
+                    stack.pop().ok_or_else(stack_underflow)?;
                 }
                 Instruction::Swap => {
                     let (a, b) = pop2(&mut stack)?;
@@ -6287,15 +6429,15 @@ fn execute_vm(
                     let target = operand_base
                         .checked_add(*depth)
                         .filter(|target| *target <= stack.len())
-                        .ok_or(RuntimeError::StackUnderflow)?;
+                        .ok_or_else(stack_underflow)?;
                     stack.truncate(target);
                 }
                 Instruction::CallValue(arity) => {
-                    let target = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
+                    let target = stack.pop().ok_or_else(stack_underflow)?;
                     let next_base = stack
                         .len()
                         .checked_sub(*arity)
-                        .ok_or(RuntimeError::StackUnderflow)?;
+                        .ok_or_else(stack_underflow)?;
                     let foreign = match &target {
                         Value::Function(_) => true,
                         Value::BoundFunction(function) => !Rc::ptr_eq(&function.owner, owner),
@@ -6313,7 +6455,7 @@ fn execute_vm(
                                 let addr = function.entry;
                                 let signature = execution_plan
                                     .callable_signature(artifact, addr)
-                                    .ok_or(RuntimeError::InvalidCall(addr))?;
+                                    .ok_or_else(|| invalid_call(addr))?;
                                 check_call(artifact, addr, signature, *arity, 0)?;
                                 check_branch(program, pc, pc + 1, callable_start, callable_end)?;
                                 if signature.asynchronous {
@@ -6351,7 +6493,7 @@ fn execute_vm(
                             Value::Closure(addr, closure_captures) => {
                                 let signature = execution_plan
                                     .callable_signature(artifact, addr)
-                                    .ok_or(RuntimeError::InvalidCall(addr))?;
+                                    .ok_or_else(|| invalid_call(addr))?;
                                 check_call(
                                     artifact,
                                     addr,
@@ -6414,11 +6556,11 @@ fn execute_vm(
                     stack.push(index_set_value(object, key, value));
                 }
                 Instruction::MakeCell => {
-                    let value = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
+                    let value = stack.pop().ok_or_else(stack_underflow)?;
                     stack.push(Value::Cell(HeapRef::try_new(RefCell::new(value))?));
                 }
                 Instruction::CellGet => {
-                    let value = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
+                    let value = stack.pop().ok_or_else(stack_underflow)?;
                     let result = match value {
                         Value::Error(_) => value,
                         Value::Cell(ref c) => match c.try_borrow() {
@@ -6458,7 +6600,7 @@ fn execute_vm(
                     });
                 }
                 Instruction::ConstrainArrayType(expected) => {
-                    let value = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
+                    let value = stack.pop().ok_or_else(stack_underflow)?;
                     let result = match value {
                         Value::Array(array) => match array.try_constrain(expected.clone()) {
                             Ok(()) => Value::Array(array),
@@ -6472,7 +6614,7 @@ fn execute_vm(
                     stack.push(result);
                 }
                 Instruction::ConstrainRecordFields(contracts) => {
-                    let value = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
+                    let value = stack.pop().ok_or_else(stack_underflow)?;
                     let result = match value {
                         Value::Record(record) => match record.try_constrain_fields(contracts) {
                             Ok(()) => Value::Record(record),
@@ -6486,24 +6628,34 @@ fn execute_vm(
                     stack.push(result);
                 }
                 Instruction::ConstrainArrayFrom => {
-                    let (value, template) = pop2(&mut stack)?;
-                    let result = match value {
-                        Value::Array(array) if !array.needs_type_context() => Value::Array(array),
-                        Value::Array(array) => match template {
-                            Value::Array(template) => match array.try_constrain_from(&template) {
-                                Ok(()) => Value::Array(array),
-                                Err(error) => Value::Error(Box::new(error)),
+                    // Only arrays consult the template; other values, including
+                    // errors, stay in place and the template is discarded.
+                    if stack.len() >= 2 && !matches!(stack[stack.len() - 2], Value::Array(_)) {
+                        stack.pop();
+                    } else {
+                        let (value, template) = pop2(&mut stack)?;
+                        let result = match value {
+                            Value::Array(array) if !array.needs_type_context() => {
+                                Value::Array(array)
+                            }
+                            Value::Array(array) => match template {
+                                Value::Array(template) => {
+                                    match array.try_constrain_from(&template) {
+                                        Ok(()) => Value::Array(array),
+                                        Err(error) => Value::Error(Box::new(error)),
+                                    }
+                                }
+                                _ => Value::Error(Box::new(RuntimeError::TypeMismatch {
+                                    op: "array_type",
+                                })),
                             },
-                            _ => Value::Error(Box::new(RuntimeError::TypeMismatch {
-                                op: "array_type",
-                            })),
-                        },
-                        value => value,
-                    };
-                    stack.push(result);
+                            value => value,
+                        };
+                        stack.push(result);
+                    }
                 }
                 Instruction::ArrayEmptyLike => {
-                    let value = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
+                    let value = stack.pop().ok_or_else(stack_underflow)?;
                     let result = match value {
                         Value::Array(array) => match array.element_type() {
                             Some(element_type) => match ArrayValue::typed(Vec::new(), element_type)
@@ -6525,15 +6677,15 @@ fn execute_vm(
                     stack.push(result);
                 }
                 Instruction::MakeRecord(count) => {
-                    let slots = count.checked_mul(2).ok_or(RuntimeError::StackUnderflow)?;
+                    let slots = count.checked_mul(2).ok_or_else(stack_underflow)?;
                     let entries = take_stack_tail(&mut stack, slots)?;
                     let mut entries = entries.into_iter();
                     let mut fields = std::collections::HashMap::new();
                     let mut tag = None;
                     let mut error = None;
                     for _ in 0..*count {
-                        let key = entries.next().ok_or(RuntimeError::StackUnderflow)?;
-                        let value = entries.next().ok_or(RuntimeError::StackUnderflow)?;
+                        let key = entries.next().ok_or_else(stack_underflow)?;
+                        let value = entries.next().ok_or_else(stack_underflow)?;
                         match key {
                             Value::TypeTag(name) if tag.is_none() => tag = Some(name),
                             Value::Str(key) => {
@@ -6623,29 +6775,24 @@ fn execute_vm(
                 Instruction::LoadCapture(index) => {
                     let value = captures
                         .get(*index)
-                        .ok_or(RuntimeError::InvalidCapture(*index))?;
+                        .ok_or_else(|| RuntimeError::InvalidCapture(*index))?;
                     stack.push(value);
                 }
                 Instruction::Crash(context) => {
-                    let value = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
+                    let value = stack.pop().ok_or_else(stack_underflow)?;
                     return Err(RuntimeError::Crashed {
                         context: context.clone(),
                         value,
                     });
                 }
-                Instruction::Not => {
-                    let value = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
-                    if let Value::Error(_) = value {
-                        stack.push(value);
-                    } else {
-                        match value {
-                            Value::Bool(x) => stack.push(Value::Bool(!x)),
-                            _ => stack.push(Value::Error(Box::new(RuntimeError::TypeMismatch {
-                                op: "not",
-                            }))),
-                        }
+                Instruction::Not => match stack.last_mut() {
+                    Some(Value::Bool(value)) => *value = !*value,
+                    Some(Value::Error(_)) => {}
+                    Some(value) => {
+                        *value = Value::Error(Box::new(RuntimeError::TypeMismatch { op: "not" }))
                     }
-                }
+                    None => return Err(stack_underflow()),
+                },
             }
             if produced != 0 {
                 let output_start = stack.len().saturating_sub(produced);
@@ -6811,6 +6958,57 @@ mod tests {
             assert_eq!(values.len(), 1);
             assert!(matches!(values[0], Value::Int(7)));
         }
+    }
+
+    #[test]
+    fn operand_stack_helpers_preserve_errors_and_values() {
+        let mut stack = Vec::new();
+        let mut slots = Vec::new();
+        assert!(matches!(
+            push_top_copy(&mut stack),
+            Err(RuntimeError::StackUnderflow)
+        ));
+        assert!(matches!(
+            store_top(&mut stack, &mut slots, 0, 0, None),
+            Err(RuntimeError::StackUnderflow)
+        ));
+        assert!(matches!(
+            push_slot_copy(&mut stack, &slots, 3, 1),
+            Err(RuntimeError::InvalidLocal(1))
+        ));
+
+        // Growing, in-place and over-limit stores, including a heap value
+        // that the in-place store must release.
+        let text: Rc<str> = Rc::from("text");
+        for value in [Value::Str(text.clone()), Value::Int(1)] {
+            stack.push(value);
+            store_top(&mut stack, &mut slots, 0, 1, Some(2)).unwrap();
+        }
+        assert_eq!(Rc::strong_count(&text), 1);
+        stack.push(Value::Int(2));
+        assert!(matches!(
+            store_top(&mut stack, &mut slots, 0, 1, Some(1)),
+            Err(RuntimeError::ResourceLimit {
+                resource: "VM slots"
+            })
+        ));
+        assert!(stack.is_empty());
+
+        push_slot_copy(&mut stack, &slots, 1, 1).unwrap();
+        push_top_copy(&mut stack).unwrap();
+        assert!(matches!(stack[..], [Value::Int(1), Value::Int(1)]));
+
+        // A recoverable overflow replaces both operands with an error value; a
+        // fatal error consumes them.
+        let overflowing = |x: i64, _| x.checked_add(i64::MAX).ok_or_else(overflow);
+        assert!(int_binop(&mut stack, overflowing).unwrap());
+        assert!(matches!(stack[..], [Value::Error(_)]));
+        stack = vec![Value::Int(1), Value::Int(2)];
+        assert!(matches!(
+            int_binop(&mut stack, |_, _| Err(stack_underflow())),
+            Err(RuntimeError::StackUnderflow)
+        ));
+        assert!(stack.is_empty());
     }
 
     #[derive(Default)]
