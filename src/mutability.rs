@@ -267,6 +267,18 @@ struct Local {
     span: Option<SourceSpan>,
     valid: bool,
 }
+impl Local {
+    /// Source identity shared by a generic template and its instances.
+    fn declaration(&self) -> Option<(String, usize, usize, String)> {
+        let span = self.span.as_ref()?;
+        Some((
+            span.source.name.clone(),
+            span.range.start,
+            span.range.end,
+            self.name.clone(),
+        ))
+    }
+}
 struct Loop<'a> {
     cleanup: usize,
     breaks: Vec<State<'a>>,
@@ -400,25 +412,37 @@ pub(crate) fn check(program: &Program, facts: &Facts) -> Vec<Diagnostic> {
     let mut all_locals = BTreeMap::new();
     let mut mutated = BTreeSet::new();
     let mut attempted = BTreeSet::new();
+    // Source declarations of local `var`s which some analysis found necessary.
+    let mut justified = BTreeSet::new();
     let mut diagnostics = vec![];
     for function in functions.values() {
         // Generic templates need concrete type-checker facts before their
         // method effects are validated. Their summaries still participate in
         // interprocedural analysis, but diagnostics are emitted for concrete
         // declarations after their effects can be resolved.
-        if !function.type_params.is_empty() {
-            continue;
-        }
+        let template = !function.type_params.is_empty();
         let mut p = Pass::new(
             facts,
             &functions,
             &constructors,
             &summaries,
             &generic_mutating_targets,
-            true,
+            !template,
         );
         p.globals(program);
         p.function(function);
+        if template {
+            // A template treats every type-parameter value as a possible
+            // reference. A `var` it needs must stay valid in instances where
+            // the value is a scalar, because all of them share one source.
+            justified.extend(
+                p.locals
+                    .iter()
+                    .filter(|(id, _)| p.mutated.contains(id) || p.attempted.contains(id))
+                    .filter_map(|(_, local)| local.declaration()),
+            );
+            continue;
+        }
         diagnostics.extend(p.diagnostics);
         all_locals.extend(p.locals);
         mutated.extend(p.mutated);
@@ -447,15 +471,28 @@ pub(crate) fn check(program: &Program, facts: &Facts) -> Vec<Diagnostic> {
         }
     }
     diagnostics.extend(p.diagnostics);
-    for (id, local) in all_locals {
-        if local.valid && !mutated.contains(&id) && !attempted.contains(&id) {
+    // One instance needing a `var` is enough for the declaration they share.
+    justified.extend(
+        all_locals
+            .iter()
+            .filter(|(id, _)| mutated.contains(id) || attempted.contains(id))
+            .filter_map(|(_, local)| local.declaration()),
+    );
+    for (id, local) in &all_locals {
+        if local.valid
+            && !mutated.contains(id)
+            && !attempted.contains(id)
+            && local
+                .declaration()
+                .is_none_or(|declaration| !justified.contains(&declaration))
+        {
             diagnostics.push(Diagnostic::new(
                 "E1006",
                 format!(
                     "local var `{}` requires a reachable mutation; use const",
                     local.name
                 ),
-                local.span,
+                local.span.clone(),
             ));
         }
     }

@@ -82,6 +82,10 @@ mutating use: reading it or writing only after a return/in a constant-false bran
 does not justify `var`. Mutating helper calls count; the compiler infers transitive
 parameter/global effects.
 
+All instantiations of a generic function share this rule. A type-parameter value
+may be a reference, so a `var` that is needed on that assumption, or by any one
+instantiation, is also accepted where the type argument is a scalar.
+
 Scalar assignment copies a value. Array/record assignment shares an object without
 moving or invalidating the original binding. A const alias observes changes through
 an existing mutable alias; creating it does not freeze the object globally.

@@ -1168,3 +1168,99 @@ fn local_mutated_only_through_generic_callee_needs_no_later_mutation() {
         "3\n"
     );
 }
+
+const PICK: &str = "struct P { n: int } fn one(v: int) -> int { v } \
+    fn read_n(p: P) -> int { p.n } fn bump(p: P) -> int { p.n += 1; p.n } \
+    fn pick[T: type](items: T[], f: fn(T) -> int) -> int { \
+        var item = items[0]!!; (f)(item)!! }";
+
+#[test]
+fn generic_var_passed_to_a_function_value_is_valid_for_every_instantiation() {
+    for (call, expected) in [
+        ("const xs = [1]; io::println(pick(xs, one));", "1\n"),
+        ("var ps = [P(n: 2)]; io::println(pick(ps, read_n));", "2\n"),
+        (
+            "const xs = [1]; var ps = [P(n: 2)]; io::println(pick(xs, one)); \
+             io::println(pick(ps, bump)); io::println(ps[0].n);",
+            "1\n3\n3\n",
+        ),
+    ] {
+        assert_eq!(
+            run(&format!("{PICK} fn main() {{ {call} }}")),
+            expected,
+            "{call}"
+        );
+    }
+}
+
+#[test]
+fn generic_var_is_valid_in_methods_closures_and_nested_generics_over_scalars() {
+    assert_eq!(
+        run(r#"
+        fn one(v: int) -> int { v }
+        struct Slot[T: type] { value: T }
+        extend[T: type] Slot[T] {
+            fn apply(self, f: fn(T) -> int) -> int { var item = self.value; (f)(item)!! }
+        }
+        fn inner[T: type](x: T, f: fn(T) -> int) -> int { var y = x; (f)(y)!! }
+        fn outer[U: type](x: U, f: fn(U) -> int) -> int {
+            const g = fn[x, f]() -> int { var z = x; inner(z, f)!! };
+            (g)()!!
+        }
+        fn main() {
+            const slot = Slot[int](value: 4);
+            io::println(slot.apply(one));
+            io::println(outer(5, one));
+        }
+    "#),
+        "4\n5\n"
+    );
+}
+
+#[test]
+fn generic_bodies_still_reject_mutation_through_const_access() {
+    // A const binding cannot reach a function value once T is a reference.
+    rejects(
+        &format!(
+            "{PICK} fn peek[T: type](items: T[], f: fn(T) -> int) -> int {{ \
+                 const item = items[0]!!; (f)(item)!! }} \
+             fn main() {{ var ps = [P(n: 1)]; peek(ps, bump); }}"
+        ),
+        "cannot mutate through const/read-only access from `item`",
+    );
+    // A generic var must not launder the caller's const array.
+    for call in ["pick(ps, bump)", "pick(ps, read_n)"] {
+        rejects(
+            &format!("{PICK} fn main() {{ const ps = [P(n: 1)]; {call}; }}"),
+            "cannot mutate",
+        );
+    }
+    rejects(
+        "fn grow[T: type](items: T[]) { var other = items; other << items[0]!!; } \
+         fn main() { const xs = [1]; grow(xs); }",
+        "cannot mutate",
+    );
+    rejects(
+        "fn grow[T: type](items: T[]) { const other = items; other << items[0]!!; } \
+         fn main() { const xs = [1]; grow(xs); }",
+        "cannot mutate through const/read-only access from `other`",
+    );
+}
+
+#[test]
+fn unneeded_var_in_a_generic_body_is_still_reported() {
+    for body in [
+        "var y = x; y",
+        "var count = 0; count; x",
+        "var v = [1]; noop(v); x",
+        "var y = x; if false { y = x; } y",
+    ] {
+        rejects(
+            &format!(
+                "fn noop[T: type](a: T) -> nil {{ nil }} \
+                 fn go[T: type](x: T) -> T {{ {body} }} fn main() {{ io::println(go(1)); }}"
+            ),
+            "requires a reachable mutation",
+        );
+    }
+}
