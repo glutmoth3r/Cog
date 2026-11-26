@@ -459,6 +459,98 @@ fn typed_globals_keep_same_named_structs_from_different_modules_distinct() {
 }
 
 #[test]
+fn global_initializers_construct_variants_of_imported_enums() {
+    let f = Fixture::new();
+    f.write("model.cog", "public enum Mode { On, Off, Level(int) }");
+    f.write(
+        "main.cog",
+        r#"
+        use io; use model; use model::Mode; use model::Mode as M;
+        struct Local { x: int }
+        const PAIR: (Local, Mode) = (Local(1), Mode::On());
+        const LIST = [model::Mode::Off(), M::On()];
+        const ALIASED: M = M::Off();
+        const LEVEL: Mode = Mode::Level(7);
+        var current: Mode = model::Mode::On();
+        fn name(mode: Mode) -> str {
+            match mode {
+                Mode::On => "on",
+                Mode::Off => "off",
+                Mode::Level(level) => $"level {level}",
+            }
+        }
+        fn main() {
+            io::println(PAIR.0.x);
+            io::println(name(PAIR.1));
+            io::println(name(LIST[0]) + name(LIST[1]));
+            io::println(name(ALIASED) + name(LEVEL) + name(current));
+        }
+        "#,
+    );
+    assert_eq!(f.run(), "1\non\noffon\nofflevel 7on\n");
+}
+
+#[test]
+fn bare_variants_of_imported_enums_suggest_construction() {
+    let f = Fixture::new();
+    f.write("model.cog", "public enum Mode { On, Level(int) }");
+    for (value, expected) in [
+        ("model::Mode::On", "Mode::On()`"),
+        ("model::Mode::Level", "Mode::Level(...)`"),
+    ] {
+        f.write(
+            "main.cog",
+            &format!(
+                "use model; struct Local {{ x: int }}
+                 const PAIR: (Local, model::Mode) = (Local(1), {value});
+                 fn main() {{}}"
+            ),
+        );
+        let error = f.compile().unwrap_err();
+        assert!(error.contains(expected), "{error}");
+        assert!(!error.contains("$symbol"), "{error}");
+    }
+}
+
+#[test]
+fn type_diagnostics_name_structs_and_enums_and_qualify_only_duplicates() {
+    let f = Fixture::new();
+    f.write(
+        "model.cog",
+        "public struct Point { x: int }
+         public struct Only { x: int }
+         public enum Mode { On }",
+    );
+    f.write(
+        "main.cog",
+        "use model;
+         struct Point { x: int }
+         struct Box[T: type] { item: T }
+         fn want(value: int) {}
+         fn main() {
+             want(model::Only(1));
+             want(model::Mode::On());
+             want([Box(model::Only(2))]);
+             want(model::Point(3));
+             want(Point(4));
+         }",
+    );
+    let error = f.compile().unwrap_err();
+    for expected in [
+        "given Only",
+        "given Mode",
+        "given Box[Only][]",
+        "given model::Point",
+        "given main::Point",
+    ] {
+        assert!(error.contains(expected), "{expected}: {error}");
+    }
+    for internal in ["$symbol", "got record", "got enum", "main::Only"] {
+        assert!(!error.contains(internal), "{internal}: {error}");
+    }
+}
+
+#[test]
 fn selective_core_constant_alias_works_in_interpolation() {
     let f = Fixture::new();
     f.write("package.kdl", "package \"app\" version=\"1\"\n");

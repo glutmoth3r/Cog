@@ -33,6 +33,9 @@ pub(crate) enum Type {
     Poison,
 }
 
+/// Marks the bound symbols printed by `Type::display` for `name_nominal_types`.
+const NOMINAL_MARK: char = '\u{e000}';
+
 const NILABLE_STRUCT_MATCH: &str =
     "non-exhaustive match: the scrutinee may be nil; add a `nil` or `_` arm";
 
@@ -990,7 +993,7 @@ impl Type {
             Self::Handle => "resource".into(),
             Self::Record => "record".into(),
             Self::Struct(_, name, arguments) if !arguments.is_empty() => format!(
-                "{}[{}]",
+                "{NOMINAL_MARK}{}[{}]",
                 name,
                 arguments
                     .iter()
@@ -998,8 +1001,20 @@ impl Type {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            Self::Struct(_, _, _) => "record".into(),
-            Self::Enum(_, _) => "enum".into(),
+            Self::Struct(_, name, _) => format!("{NOMINAL_MARK}{name}"),
+            // A value typed by one variant is still reported as its enum.
+            Self::Enum(_, name) => {
+                let name = match name.rsplit_once("::") {
+                    Some((parent, _))
+                        if parent == crate::error::ERROR_TYPE
+                            || (parent.starts_with('$') && !parent.contains("::")) =>
+                    {
+                        parent
+                    }
+                    _ => name,
+                };
+                format!("{NOMINAL_MARK}{name}")
+            }
             Self::Named(name) => name.clone(),
             Self::Generic(name) => name.clone(),
             Self::Dynamic => "dynamic".into(),
@@ -1794,6 +1809,7 @@ fn check_program(
         c.diagnostics
             .extend(crate::mutability::check(program, &c.access_facts));
     }
+    name_nominal_types(program, names, &mut c.diagnostics);
     let deferred_effects = (effects == Effects::Defer).then_some(c.access_facts);
     CheckResult {
         diagnostics: c.diagnostics,
@@ -1807,6 +1823,65 @@ fn check_program(
         uint_expressions: c.uint_expressions,
         bigint_literals: c.bigint_literals,
         deferred_effects,
+    }
+}
+
+/// Spells the structs and enums printed by `Type::display` with their source
+/// names, keeping the module path only where two types share a name.
+fn name_nominal_types(
+    program: &Program,
+    names: &BTreeMap<String, String>,
+    diagnostics: &mut [Diagnostic],
+) {
+    if diagnostics.is_empty() {
+        return;
+    }
+    let short = |name: &str| name.rsplit("::").next().unwrap_or(name).to_owned();
+    let types: Vec<_> = program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::StructDecl { name, .. } | Item::EnumDecl { name, .. } => {
+                names.get_key_value(name)
+            }
+            _ => None,
+        })
+        .collect();
+    let mut declared = HashMap::<String, usize>::new();
+    for (_, source) in &types {
+        *declared.entry(short(source)).or_default() += 1;
+    }
+    let mut replacements: Vec<_> = types
+        .into_iter()
+        .map(|(symbol, source)| {
+            let name = short(source);
+            let name = if declared[&name] == 1 {
+                name
+            } else {
+                source.clone()
+            };
+            (format!("{NOMINAL_MARK}{symbol}"), name)
+        })
+        .collect();
+    // Longest first, so that `$symbol1` never rewrites part of `$symbol10`.
+    replacements.sort_by_key(|(symbol, _)| std::cmp::Reverse(symbol.len()));
+    let rename = |text: &mut String| {
+        if !text.contains(NOMINAL_MARK) {
+            return;
+        }
+        for (symbol, name) in &replacements {
+            *text = text.replace(symbol, name);
+        }
+        // Types without a resolved source name already read as written.
+        text.retain(|character| character != NOMINAL_MARK);
+    };
+    for diagnostic in diagnostics {
+        rename(&mut diagnostic.message);
+        diagnostic
+            .notes
+            .iter_mut()
+            .chain(&mut diagnostic.helps)
+            .for_each(rename);
     }
 }
 
@@ -5763,7 +5838,18 @@ impl<'a> Checker<'a> {
                         .insert(crate::mutability::expr_id(expr), function_name);
                     return callable;
                 }
-                self.error("E1002", format!("undefined variable `{name}`"), expr.span());
+                if let Some((_, fields)) = self.variants.get(&resolved) {
+                    let payload = if fields.is_empty() { "" } else { "..." };
+                    self.error(
+                        "E1002",
+                        format!(
+                            "variant `{name}` is not a value; construct it with `{name}({payload})`"
+                        ),
+                        expr.span(),
+                    );
+                } else {
+                    self.error("E1002", format!("undefined variable `{name}`"), expr.span());
+                }
                 Type::Poison
             }
             Expr::Closure {
