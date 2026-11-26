@@ -1740,16 +1740,6 @@ impl<'a> Pass<'a> {
                     return self.equality_call(expr, a, b);
                 }
                 match op {
-                    BinOp::Append => {
-                        self.mutate(&a, left);
-                        self.store(&a, Key::AnyIndex, b, false);
-                        a
-                    }
-                    BinOp::Prepend => {
-                        self.mutate(&b, right);
-                        self.store(&b, Key::AnyIndex, a, false);
-                        b
-                    }
                     // Array addition allocates a new outer container, retaining
                     // capabilities of reference-like elements.
                     BinOp::Add => {

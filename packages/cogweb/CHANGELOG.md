@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.0
+
+- Requires a Cog compiler with integer shift operators. Library sources add array
+  elements with `.append(value)` instead of the removed `<<` array operator. The
+  public API is unchanged.
+
 ## 0.4.0
 
 - Added `static_files::serve_file` for bounded binary assets and

@@ -13,7 +13,7 @@ remaining release acceptance gates, and the next language goals. See the [langua
   source maps, a generational graph heap, iterative cycle collection, and
   optional execution limits. The optional object-count limit is not a byte or
   whole-process memory limit.
-- Portable `.cogb` v42 artifacts (v38 to v41 files are still accepted) with bounded decoding and structural
+- Portable `.cogb` v43 artifacts (v38 to v42 files are still accepted) with bounded decoding and structural
   verification. The VM checks declared callable argument/result types at call
   boundaries; static value-flow verification is still in progress.
 - Packages, KDL configuration, path/archive/user-store dependencies, `cog.lock`,
@@ -27,6 +27,10 @@ remaining release acceptance gates, and the next language goals. See the [langua
   libraries for Linux x86_64, Windows x86_64, and macOS arm64. Packages may
   carry a selected target subset; `cog package build --target <triple>` selects
   one native variant, while runtime loading has no fallback.
+- Checked `<<`, `>>`, `<<=`, and `>>=` bit shifts for `int`, `uint`, and
+  `bigint` in the VM, compile-time evaluation, the JIT (`int`/`uint` lowered,
+  other cases resumed in the VM), and, for `int`/`uint`, the WASI backend.
+  Arrays grow with `.append` and `.prepend`.
 - Structs, enums, typed arrays/tuples, generic functions and structs, trait
   bounds, generic receiver methods, nullable/Error flow analysis, and compile-
   time functions with error handling.
@@ -68,7 +72,7 @@ remaining release acceptance gates, and the next language goals. See the [langua
   re-run, and scalar-typed constructor fields no longer carry references. `cog check`
   of `packages/cogweb` dropped from 14 s to under 2 s, and of `web/tutorial` from
   over 10 minutes to about 5 s.
-- `cogweb` 0.4.0 in `packages/cogweb` with `static_files::serve_file` and
+- `cogweb` 0.5.0 in `packages/cogweb` with `static_files::serve_file` and
   `http::binary_response`. The tutorial server is a Cog program (`web/tutorial`)
   on it, launched by `web/server.mts`, with 22 tests in `web/server.test.mts`.
 

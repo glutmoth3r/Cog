@@ -137,7 +137,7 @@ fn restricted_run_stops_endless_string_doubling_and_array_growth() {
     );
     assert_resource_limit(&output, "runtime resource limit: instruction steps");
     let output = run_source(
-        "fn main() { var a: int[] = []; while true { a << 1; } }",
+        "fn main() { var a: int[] = []; while true { a.append(1); } }",
         true,
     );
     assert_resource_limit(&output, "runtime resource limit: instruction steps");

@@ -8,7 +8,7 @@ fn add(sum: int, x: int) -> int { sum + x }
 
 fn work(n: int) -> int {
     var data: int[] = [];
-    for i in 0..n { data << i; }
+    for i in 0..n { data.append(i); }
     const mapped = array::map(data, twice)!!;
     const filtered = array::filter(data, selected)!!;
     var checksum = mapped.len();

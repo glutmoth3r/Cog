@@ -10,7 +10,7 @@ fn visit(edges: int[][], start: int) -> int[] {
     visited.insert(start)!!;
     while !tasks.is_empty() {
         const node = tasks.pop()!!;
-        (order << node)!!;
+        order.append(node)!!;
         for neighbor in edges[node]!! {
             if visited.insert(neighbor)!! { tasks.push(neighbor)!!; }
         }

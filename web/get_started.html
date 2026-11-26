@@ -146,15 +146,15 @@ fn main() -&gt; nil {
 <div class="actions"><button class="run" type="button" disabled>Run</button><button class="reset" type="button">Reset</button><span class="run-status" role="status" aria-live="polite"></span></div>
 <div class="result" hidden><div class="output-group"><h3>Output</h3><pre class="output" tabindex="0"></pre></div><div class="diagnostic-group" hidden><h3>Diagnostics</h3><pre class="diagnostics" tabindex="0"></pre></div></div>
 <p class="exercise"><strong>Try it:</strong> Change the end of the range and predict the sum before running.</p></section>
-<section id="arrays" class="lesson"><h2>6. Arrays and shared values</h2><p>Arrays use zero-based indexing. array &lt;&lt; value appends, value &gt;&gt; array prepends, and both mutate the array. Assignment shares the array: a const view observes changes made through an existing mutable binding.</p>
+<section id="arrays" class="lesson"><h2>6. Arrays and shared values</h2><p>Arrays use zero-based indexing. array.append(value) adds at the end, array.prepend(value) adds at the front, and both mutate the array. Assignment shares the array: a const view observes changes made through an existing mutable binding.</p>
 <label class="editor-label" for="code-arrays">Cog example</label><textarea class="source" id="code-arrays" rows="12" spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off">@!include("std")
 use io;
 
 fn main() -&gt; nil {
     var values = [1, 2];
     const view = values;
-    values &lt;&lt; 3;
-    0 &gt;&gt; values;
+    values.append(3);
+    values.prepend(0);
     values[1] = 9;
     io::println(view)!!;
     io::println(len(values))!!;

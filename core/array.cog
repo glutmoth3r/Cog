@@ -44,7 +44,7 @@ public fn contains(items, value) -> bool {
 public fn map[T: type, U: type](items: T[], transform: fn(T) -> U) -> U[] {
     var result: U[] = [];
     for item in items {
-        result << (transform)(item)!!;
+        result.append((transform)(item)!!);
     }
     result
 }
@@ -52,7 +52,7 @@ public fn map[T: type, U: type](items: T[], transform: fn(T) -> U) -> U[] {
 public fn filter[T: type](items: T[], predicate: fn(T) -> bool) -> T[] {
     var result: T[] = [];
     for item in items {
-        if (predicate)(item)!! { result << item; }
+        if (predicate)(item)!! { result.append(item); }
     }
     result
 }
@@ -123,7 +123,7 @@ public fn repeat[T: type](value: T, count: int) -> T[] {
     count!!;
     if count < 0 { return Error::InvalidArgument("array::repeat"); }
     var result: T[] = [];
-    for _ in 0..count { (result << value)!!; }
+    for _ in 0..count { result.append(value)!!; }
     result
 }
 
@@ -179,7 +179,7 @@ public fn slice(items, offset: int, count: int) {
         return Error::InvalidArgument("array::slice");
     }
     var result = items.empty_like()!!;
-    for index in offset..(offset + count) { result << items[index]!!; }
+    for index in offset..(offset + count) { result.append(items[index]!!); }
     result
 }
 
@@ -189,7 +189,7 @@ public fn reversed(items) {
     var index = length;
     while index > 0 {
         index -= 1;
-        result << items[index]!!;
+        result.append(items[index]!!);
     }
     result
 }
@@ -198,8 +198,8 @@ public fn concat(left, right) {
     const left_length = array_length(left, "array::concat")!!;
     const right_length = array_length(right, "array::concat")!!;
     var result = left.empty_like()!!;
-    for index in 0..left_length { result << left[index]!!; }
-    for index in 0..right_length { result << right[index]!!; }
+    for index in 0..left_length { result.append(left[index]!!); }
+    for index in 0..right_length { result.append(right[index]!!); }
     const compatible = left.empty_like()!! + right.empty_like()!!;
     compatible!!;
     result
@@ -246,7 +246,7 @@ public fn count_if[T: type](items: T[], predicate: fn(T) -> bool) -> int {
 
 fn copy_range[T: type](items: T[], start: int, end: int) -> T[] {
     var result: T[] = [];
-    for index in start..end { (result << items[index]!!)!!; }
+    for index in start..end { result.append(items[index]!!)!!; }
     result
 }
 
@@ -266,8 +266,8 @@ public fn partition[T: type](items: T[], predicate: fn(T) -> bool) -> (T[], T[])
     var selected: T[] = [];
     var rejected: T[] = [];
     for item in items {
-        if (predicate)(item)!! { (selected << item)!!; }
-        else { (rejected << item)!!; }
+        if (predicate)(item)!! { selected.append(item)!!; }
+        else { rejected.append(item)!!; }
     }
     (selected, rejected)
 }
@@ -275,7 +275,7 @@ public fn partition[T: type](items: T[], predicate: fn(T) -> bool) -> (T[], T[])
 public fn flatten[T: type](items: T[][]) -> T[] {
     var result: T[] = [];
     for part in items {
-        for item in part { (result << item)!!; }
+        for item in part { result.append(item)!!; }
     }
     result
 }
@@ -284,7 +284,7 @@ public fn flat_map[T: type, U: type](items: T[], transform: fn(T) -> U[]) -> U[]
     var result: U[] = [];
     for item in items {
         const part = (transform)(item)!!;
-        for mapped in part { (result << mapped)!!; }
+        for mapped in part { result.append(mapped)!!; }
     }
     result
 }
@@ -292,13 +292,13 @@ public fn flat_map[T: type, U: type](items: T[], transform: fn(T) -> U[]) -> U[]
 public fn zip[T: type, U: type](left: T[], right: U[]) -> (T, U)[] {
     var result: (T, U)[] = [];
     const end = if left.len() < right.len() { left.len() } else { right.len() };
-    for index in 0..end { (result << (left[index]!!, right[index]!!))!!; }
+    for index in 0..end { result.append((left[index]!!, right[index]!!))!!; }
     result
 }
 
 public fn enumerate[T: type](items: T[]) -> (int, T)[] {
     var result: (int, T)[] = [];
-    for index in 0..items.len() { (result << (index, items[index]!!))!!; }
+    for index in 0..items.len() { result.append((index, items[index]!!))!!; }
     result
 }
 
@@ -310,7 +310,7 @@ public fn chunks[T: type](items: T[], size: int) -> T[][] {
         const remaining = items.len() - start;
         const count = if size < remaining { size } else { remaining };
         const end = start + count;
-        (result << copy_range(items, start, end)!!)!!;
+        result.append(copy_range(items, start, end)!!)!!;
         start = end;
     }
     result
@@ -321,7 +321,7 @@ public fn windows[T: type](items: T[], size: int) -> T[][] {
     var result: T[][] = [];
     if size > items.len() { return result; }
     for start in 0..(items.len() - size + 1) {
-        (result << copy_range(items, start, start + size)!!)!!;
+        result.append(copy_range(items, start, start + size)!!)!!;
     }
     result
 }
@@ -331,7 +331,7 @@ public fn dedup[T: type + Eq[T]](items: T[]) -> T[] {
     for index in 0..items.len() {
         const item = items[index]!!;
         if result.len() == 0 || !item.equals(result[result.len() - 1]!!)!! {
-            (result << item)!!;
+            result.append(item)!!;
         }
     }
     result
@@ -342,7 +342,7 @@ public fn scan[T: type, U: type](items: T[], initial: U, combine: fn(U, T) -> U)
     var accumulator = initial;
     for item in items {
         accumulator = (combine)(accumulator, item)!!;
-        (result << accumulator)!!;
+        result.append(accumulator)!!;
     }
     result
 }
@@ -352,7 +352,7 @@ public fn unique[T: type + Hashable](items: T[]) -> T[] {
     var seen = Set::new[T]();
     var result: T[] = [];
     for item in items {
-        if seen.insert(item)!! { (result << item)!!; }
+        if seen.insert(item)!! { result.append(item)!!; }
     }
     result
 }
@@ -362,7 +362,7 @@ public fn group_by[T: type, K: type + Hashable](items: T[], key: fn(T) -> K) -> 
     for item in items {
         var empty: T[] = [];
         var group = result.get_or_insert((key)(item)!!, empty)!!;
-        (group << item)!!;
+        group.append(item)!!;
     }
     result
 }

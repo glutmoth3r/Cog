@@ -281,7 +281,7 @@ fn invalid_argument_lists_report_duplicates_names_arity_and_order() {
 #[test]
 fn mixed_arguments_preserve_mutation_capabilities_and_effect_mapping() {
     run(r#"
-        fn push(tag: int, items, value: int) { items << value; }
+        fn push(tag: int, items, value: int) { items.append(value); }
         fn main() {
             var values: int[] = [];
             push(0, value: 7, items: values);
@@ -291,7 +291,7 @@ fn mixed_arguments_preserve_mutation_capabilities_and_effect_mapping() {
     let error = project::compile_source(
         "readonly.cog",
         r#"
-        fn push(tag: int, items, value: int) { items << value; }
+        fn push(tag: int, items, value: int) { items.append(value); }
         fn main() { const values: int[] = []; push(0, value: 7, items: values); }
     "#,
     )

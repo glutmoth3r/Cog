@@ -2297,6 +2297,10 @@ fn produced_flow(
         | Instruction::Mul
         | Instruction::Div
         | Instruction::Mod => Some(FlowValue::UNKNOWN),
+        // Shifts yield the left operand's integer kind or a recoverable Error.
+        Instruction::Shl | Instruction::Shr => {
+            Some(recoverable(TYPE_INT | TYPE_UINT | TYPE_BIGINT))
+        }
         Instruction::Dup
         | Instruction::Pop
         | Instruction::Swap

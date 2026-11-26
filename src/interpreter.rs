@@ -5168,11 +5168,9 @@ fn execute_vm(
                     }
                 }
                 Instruction::ArrayPush => {
-                    // `arr << x`: left operand must be the array, mutated in place so
-                    // every alias of it (another variable, a captured closure, a field
-                    // on some other value) observes the push — unlike the old
-                    // "reuse Add" approach, which built a brand-new array and left the
-                    // original untouched, silently doing nothing for a bare `arr << x;`.
+                    // `array.append(x)`: the array is mutated in place so every
+                    // alias of it (another variable, a captured closure, a field
+                    // on some other value) observes the push.
                     binop(&mut stack, |a, b| match a {
                         Value::Array(arr) => {
                             arr.try_push(b, false)?;
@@ -5182,16 +5180,20 @@ fn execute_vm(
                     })?;
                 }
                 Instruction::ArrayPrepend => {
-                    // `x >> arr`: right operand must be the array (see hlparser's
-                    // `parse_shift` / the `prepend_operator_parses` test — Prepend's
-                    // AST is `Binary(Prepend, elem, arr)`), mutated in place for the
-                    // same aliasing reason as ArrayPush above.
+                    // `array.prepend(x)` leaves `x` below the array on the stack,
+                    // so the array is the right operand; it is mutated in place.
                     binop(&mut stack, |a, b| match b {
                         Value::Array(arr) => {
                             arr.try_push(a, true)?;
                             Ok(Value::Array(arr))
                         }
                         _ => Err(RuntimeError::TypeMismatch { op: "arrprepend" }),
+                    })?;
+                }
+                instruction @ (Instruction::Shl | Instruction::Shr) => {
+                    let left = matches!(instruction, Instruction::Shl);
+                    binop(&mut stack, |a, b| {
+                        crate::value::shift_values(a, b, left, context.limits.max_numeric_digits)
                     })?;
                 }
                 Instruction::Sub => {
@@ -7026,18 +7028,15 @@ mod tests {
 
     #[test]
     fn array_push_mutates_in_place_through_alias() {
-        // `arr << 3;` as a bare statement (result popped/discarded, exactly like
-        // codegen emits for `Stmt::Expr`) must still be visible through any other
-        // handle to the same array — that's the whole point of it being
-        // `Rc<RefCell<..>>` rather than a plain Vec. The old "reuse Add" codegen
-        // built a brand-new array and left `arr` untouched, so a bare `arr << x;`
-        // silently did nothing.
+        // `arr.append(3);` as a bare statement (result popped/discarded, exactly
+        // like codegen emits for `Stmt::Expr`) must still be visible through any
+        // other handle to the same array.
         let arr = HeapRef::new(ArrayValue::new(vec![Value::Int(1), Value::Int(2)]).unwrap());
         let program = CompiledProgram::new(vec![
             Instruction::Push(Value::Array(arr.clone())),
             Instruction::Push(Value::Int(3)),
             Instruction::ArrayPush,
-            Instruction::Pop, // as if `arr << 3;` were a statement, not assigned
+            Instruction::Pop, // as if `arr.append(3);` were a statement
             Instruction::Halt,
         ]);
         let mut out = Vec::new();
@@ -7056,7 +7055,7 @@ mod tests {
             Instruction::Push(Value::Int(1)),
             Instruction::Push(Value::Array(arr.clone())),
             Instruction::ArrayPrepend,
-            Instruction::Pop, // as if `1 >> arr;` were a statement
+            Instruction::Pop, // as if `arr.prepend(1);` were a statement
             Instruction::Halt,
         ]);
         let mut out = Vec::new();
@@ -7071,7 +7070,7 @@ mod tests {
     #[test]
     fn array_push_on_non_array_is_type_mismatch() {
         let program = compile(
-            "fn bad() { return 1; } fn main() { when bad() << 2 is Error { io::print(true); } }",
+            "fn bad() { return 1; } fn main() { when bad().append(2) is Error { io::print(true); } }",
         );
         let mut out = Vec::new();
         run_with(&program, &mut out).unwrap();

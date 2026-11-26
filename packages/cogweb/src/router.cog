@@ -269,15 +269,15 @@ extend Router {
     public fn route(mut self, method: str, path: str, id: str) -> nil {
         var kind = "exact";
         if contains_parameters(path)!! { kind = "pattern"; }
-        self.routes << make_route(method, path, id, kind)!!;
+        self.routes.append(make_route(method, path, id, kind)!!);
     }
 
     public fn exact(mut self, method: str, path: str, id: str) -> nil {
-        self.routes << make_route(method, path, id, "exact")!!;
+        self.routes.append(make_route(method, path, id, "exact")!!);
     }
 
     public fn prefix(mut self, method: str, path: str, id: str) -> nil {
-        self.routes << make_route(method, path, id, "prefix")!!;
+        self.routes.append(make_route(method, path, id, "prefix")!!);
     }
 
     public fn get(mut self, path: str, id: str) -> nil { self.route("GET", path, id)!!; }
@@ -315,11 +315,11 @@ extend Router {
             const candidate = route_match(route, path)!!;
             if candidate != nil {
                 if !seen.contains(route.method) {
-                    methods << route.method;
+                    methods.append(route.method);
                     seen.set(route.method, true);
                 }
                 if route.method == "GET" && !seen.contains("HEAD") {
-                    methods << "HEAD";
+                    methods.append("HEAD");
                     seen.set("HEAD", true);
                 }
             }

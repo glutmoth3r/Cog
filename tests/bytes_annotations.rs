@@ -127,8 +127,8 @@ fn bytes_annotations_compose_with_arrays_nullable_defaults_and_generics() {
 
         fn main() {
             var buffers: bytes[] = [];
-            buffers << bytes::new(3);
-            buffers << bytes::from_str("hello");
+            buffers.append(bytes::new(3));
+            buffers.append(bytes::from_str("hello"));
             io::println(total(buffers))!!;
             io::println(size(nil))!!;
             io::println(size(bytes::new(4)))!!;
@@ -164,7 +164,7 @@ fn bytes_annotations_reject_other_types_statically_and_at_runtime() {
         "type mismatch",
     );
     rejects(
-        "fn main() { var buffers: bytes[] = []; buffers << \"text\"; }",
+        "fn main() { var buffers: bytes[] = []; buffers.append(\"text\"); }",
         "type mismatch",
     );
     assert_eq!(
@@ -177,7 +177,7 @@ fn bytes_annotations_reject_other_types_statically_and_at_runtime() {
         }
 
         fn append(items, value) {
-            try { items << value; }
+            try { items.append(value); }
             catch(error) { io::println(error.error_kind())!!; }
         }
 
@@ -336,7 +336,7 @@ fn builtin_bytes_type_works_with_and_without_the_module_import() {
 
         fn main() {
             var all: bytes[] = [];
-            all << id[bytes](same(buffers::from_str("abc")));
+            all.append(id[bytes](same(buffers::from_str("abc"))));
             io::println(buffers::len(all[0])!!)!!;
         }
         "#;
@@ -529,17 +529,17 @@ fn compile_time_bytes_type_tests_match_runtime_identity() {
 #[test]
 fn array_contracts_keep_byte_buffers_and_handles_distinct() {
     rejects(
-        "fn main() { var handles = [io::stdout()]; handles << bytes::new(1); }",
+        "fn main() { var handles = [io::stdout()]; handles.append(bytes::new(1)); }",
         "type mismatch",
     );
     rejects(
-        "fn main() { var buffers = [bytes::new(1)]; buffers << io::stdout(); }",
+        "fn main() { var buffers = [bytes::new(1)]; buffers.append(io::stdout()); }",
         "type mismatch",
     );
     assert_eq!(
         run(r#"
         fn append(items, value) {
-            try { items << value; }
+            try { items.append(value); }
             catch(error) { io::println(error.error_kind())!!; }
         }
 

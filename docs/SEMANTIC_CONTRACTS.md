@@ -30,7 +30,7 @@ not automatically planned.
 | poison_07..09 | Lazy nil/Error fallbacks are distinct; a selected RHS Error uses the surrounding lexical handler |
 | propagate_01..06 | !! evaluates once, passes normal/nil unchanged, bypasses catches in its function, relays through synchronous callers to the nearest caller handler or host, restores caller operands, and performs cleanup; async tasks report propagation through await |
 | nil_01..02, tail_01..08 | Singleton nil, unified tails/discard, every normal result exit checked, cleanup snapshots, no loop/defer result collection |
-| binding_01..05, sequence_01 | Reachable mutating use for local var, available static inference, const access restrictions, transitive mutating calls, operator/method capability checks |
+| binding_01..05, sequence_01 | Reachable mutating use for local var, available static inference, const access restrictions, transitive mutating calls, method capability checks |
 | flow_01 | Excluding Error does not remove nullable from the declared normal type |
 | nullable_01/04/05/07/08 | Nullable boundaries remain declared; nonterminal arms/writes do not exclude nil; Error exclusion and !! do not unwrap nil; ?? can produce a nonnullable normal result |
 | phase_01..07, phase_10..17, comptime_01..03 | Scalar values and nominal struct construction evaluate before runtime lowering; type-valued bindings substitute recursively into annotations and are erased; arithmetic Error values can be inspected by patterns or diagnosed at the comptime root; `try`/`catch`, `!!`, and lazy `??`/`?!` preserve computational error boundaries; runtime inputs/calls and forbidden runtime effects are rejected, and comptime callables are omitted from runtime artifacts |
@@ -443,5 +443,5 @@ are not current prerequisites.
 **Open design questions:** move-style captures, mutable closure receivers, closure
 equality, and a closure-specific resource quota. Reference-valued and nested captures
 use the ordinary value, cell, and cycle-collection rules. Raw-string
-delimiters/extended escapes, additional collection mutation protocols, sequence
-chaining changes, and the existing when-var redesign also remain open.
+delimiters/extended escapes, additional collection mutation protocols, and the
+existing when-var redesign also remain open.

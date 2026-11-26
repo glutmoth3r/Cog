@@ -199,7 +199,7 @@ public fn quick[T: type + Ord](items: T[]) -> nil {
 // Returns an independently cloned and sorted array; requires cloneable elements.
 public fn sorted[T: type + Ord + Clone](items: T[]) -> T[] {
     var result: T[] = [];
-    for item in items { result << value(item); }
+    for item in items { result.append(value(item)); }
     quick(result)!!;
     result
 }

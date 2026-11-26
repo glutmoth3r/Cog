@@ -54,7 +54,7 @@ fn postfix_preserves_normal_values_reference_aliases_and_prefix_not() {
         fn main() {
             var original = [1];
             var alias = original!!;
-            alias << 2;
+            alias.append(2);
             io::println(original); io::println(empty());
             io::println(7!!!!); io::println(!false!!); io::println(!!false);
             io::println([42][0]!!);

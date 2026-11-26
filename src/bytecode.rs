@@ -12,7 +12,8 @@ use crate::value::{RuntimeType, Value};
 use std::rc::Rc;
 
 const MAGIC: &[u8; 4] = b"COG\0";
-pub(crate) const VERSION: u16 = 42;
+pub(crate) const VERSION: u16 = 43;
+const VERSION_WITHOUT_SHIFTS: u16 = 42;
 const VERSION_WITHOUT_BYTES_TYPE_TESTS: u16 = 41;
 const VERSION_WITHOUT_STRUCT_TYPE_TESTS: u16 = 40;
 const VERSION_WITHOUT_INLINE_FRAMES: u16 = 39;
@@ -242,6 +243,8 @@ pub fn encode(program: &CompiledProgram) -> Result<Vec<u8>> {
             Instruction::CellSet => w.byte(42)?,
             Instruction::ArrayPush => w.byte(43)?,
             Instruction::ArrayPrepend => w.byte(44)?,
+            Instruction::Shl => w.byte(122)?,
+            Instruction::Shr => w.byte(123)?,
             Instruction::Push(value) => {
                 w.byte(46)?;
                 w.value(value)?;
@@ -451,6 +454,7 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
     if !matches!(
         version,
         VERSION
+            | VERSION_WITHOUT_SHIFTS
             | VERSION_WITHOUT_BYTES_TYPE_TESTS
             | VERSION_WITHOUT_STRUCT_TYPE_TESTS
             | VERSION_WITHOUT_INLINE_FRAMES
@@ -601,7 +605,7 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
                 9 => ValueType::UInt,
                 10 => ValueType::BigInt,
                 11 if version >= VERSION_WITHOUT_BYTES_TYPE_TESTS => ValueType::Struct(r.string()?),
-                12 if version >= VERSION => ValueType::Bytes,
+                12 if version >= VERSION_WITHOUT_SHIFTS => ValueType::Bytes,
                 tag => return Err(format!("unknown type-test tag {tag}")),
             }),
             21 => Instruction::ErrorKind,
@@ -621,6 +625,8 @@ pub fn decode(bytes: &[u8]) -> Result<CompiledProgram> {
             42 => Instruction::CellSet,
             43 => Instruction::ArrayPush,
             44 => Instruction::ArrayPrepend,
+            122 if version >= VERSION => Instruction::Shl,
+            123 if version >= VERSION => Instruction::Shr,
             46 => Instruction::Push(r.value()?),
             47 => Instruction::PushArray(r.template(0)?),
             48 => Instruction::Load(r.index()?),

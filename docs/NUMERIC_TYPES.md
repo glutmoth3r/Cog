@@ -60,6 +60,9 @@ expressions. Non-literal `int` and `uint` values require an explicit cast.
   operands are `bigint`. Division truncates toward zero; remainder follows the
   dividend's sign. Division by zero produces the ordinary recoverable Error.
   BigInt arithmetic does not mix implicitly with `int`, `uint`, or `float`.
+- `<<` and `>>` shift an `int`, `uint`, or `bigint` by an `int` or `uint` amount.
+  They are checked like other integer operations; see
+  [bit shifts](LANGUAGE.md#bit-shifts).
 - Equality and ordering compare `int`, `uint`, and `bigint` exactly, without
   converting integer operands through `float`. Integer/float comparisons also
   compare the exact integer against the binary floating value.
@@ -162,8 +165,8 @@ its separate compiler allocation budget.
 Decimal will require bytecode tags and a format-version change. C ABI v3 remains
 unchanged; exposing BigInt or decimal values to native plugins requires a later ABI
 contract with owned canonical representations. BigInt is the foundation for future
-decimal coefficient arithmetic. Bitwise operations and shifts remain deferred until
-their negative-value semantics are specified.
+decimal coefficient arithmetic. Bitwise and/or/xor/not on integers remain deferred
+until their negative-value semantics are specified.
 
 Fixed-width `iN`/`uN` types remain deferred. If they are later justified, their
 relationship to checked arithmetic, casts, generic traits, ABI payloads, and

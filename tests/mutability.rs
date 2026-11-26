@@ -56,25 +56,25 @@ fn when_without_else_keeps_the_unmatched_path_reachable_for_mutability() {
 #[test]
 fn shared_aliases_keep_independent_access_paths_without_moves() {
     assert_eq!(
-        run("fn main() { var a = [1]; const b = a; a << 2; io::println(a); io::println(b); }"),
+        run("fn main() { var a = [1]; const b = a; a.append(2); io::println(a); io::println(b); }"),
         "[1, 2]\n[1, 2]\n"
     );
     rejects(
-        "fn main() { var a = [1]; const b = a; a << 2; b << 3; }",
+        "fn main() { var a = [1]; const b = a; a.append(2); b.append(3); }",
         "cannot mutate",
     );
     rejects(
-        "fn main() { const a = [1]; var b = a; b << 2; }",
+        "fn main() { const a = [1]; var b = a; b.append(2); }",
         "cannot mutate",
     );
     assert_eq!(
         run(
-            "fn main() { const a = [1]; var b = a; b = [10, 20]; b << 30; io::println(a); io::println(b); }"
+            "fn main() { const a = [1]; var b = a; b = [10, 20]; b.append(30); io::println(a); io::println(b); }"
         ),
         "[1]\n[10, 20, 30]\n"
     );
     assert_eq!(
-        run("fn main() { var a = [1]; var b = a; b << 2; io::println(a); }"),
+        run("fn main() { var a = [1]; var b = a; b.append(2); io::println(a); }"),
         "[1, 2]\n"
     );
 }
@@ -82,43 +82,46 @@ fn shared_aliases_keep_independent_access_paths_without_moves() {
 #[test]
 fn capabilities_follow_alias_reassignment_and_control_flow_joins() {
     rejects(
-        "fn main() { var a = [1]; const b = [2]; a = b; a << 3; }",
+        "fn main() { var a = [1]; const b = [2]; a = b; a.append(3); }",
         "cannot mutate",
     );
     rejects(
-        "fn f(flag: bool) { const a = [1]; var b = [2]; if flag { b = a; } b << 3; } fn main() { f(false); }",
+        "fn f(flag: bool) { const a = [1]; var b = [2]; if flag { b = a; } b.append(3); } fn main() { f(false); }",
         "cannot mutate",
     );
     assert_eq!(
         run(
-            "fn f(flag: bool) { const a = [1]; var b = a; if flag { b = [2]; } else { b = [3]; } b << 4; io::println(b); } fn main() { f(true); f(false); }"
+            "fn f(flag: bool) { const a = [1]; var b = a; if flag { b = [2]; } else { b = [3]; } b.append(4); io::println(b); } fn main() { f(true); f(false); }"
         ),
         "[2, 4]\n[3, 4]\n"
     );
     rejects(
-        "fn main() { const a = [1]; var b = [2]; if false { b << 3; } }",
+        "fn main() { const a = [1]; var b = [2]; if false { b.append(3); } }",
         "requires a reachable mutation",
     );
 }
 
 #[test]
 fn nested_paths_and_heap_stores_do_not_launder_readonly_capabilities() {
-    rejects("fn main() { const a = [[1]]; a[0] << 2; }", "cannot mutate");
     rejects(
-        "fn main() { const a = [1]; var holder = { item: [2] }; holder.item = a; holder.item << 3; }",
+        "fn main() { const a = [[1]]; a[0].append(2); }",
         "cannot mutate",
     );
     rejects(
-        "fn main() { const a = [1]; var holder = { item: a }; holder.item << 3; }",
+        "fn main() { const a = [1]; var holder = { item: [2] }; holder.item = a; holder.item.append(3); }",
         "cannot mutate",
     );
     rejects(
-        "fn main() { var holder = { item: [2] }; var other = holder; const a = [1]; holder.item = a; other.item << 3; }",
+        "fn main() { const a = [1]; var holder = { item: a }; holder.item.append(3); }",
+        "cannot mutate",
+    );
+    rejects(
+        "fn main() { var holder = { item: [2] }; var other = holder; const a = [1]; holder.item = a; other.item.append(3); }",
         "cannot mutate",
     );
     assert_eq!(
         run(
-            "fn main() { var holder = { item: [2] }; const other = holder; holder.item << 3; io::println(other.item); }"
+            "fn main() { var holder = { item: [2] }; const other = holder; holder.item.append(3); io::println(other.item); }"
         ),
         "[2, 3]\n"
     );
@@ -127,31 +130,31 @@ fn nested_paths_and_heap_stores_do_not_launder_readonly_capabilities() {
 #[test]
 fn effects_cross_helpers_aliases_returns_and_recursive_cycles() {
     rejects(
-        "fn change(a) { a << 2; } fn wrap(a) { var alias = a; change(alias); } fn main() { const a = [1]; wrap(a); }",
+        "fn change(a) { a.append(2); } fn wrap(a) { var alias = a; change(alias); } fn main() { const a = [1]; wrap(a); }",
         "cannot mutate",
     );
     rejects(
-        "fn identity(a) { a } fn main() { const a = [1]; identity(a) << 2; }",
+        "fn identity(a) { a } fn main() { const a = [1]; identity(a).append(2); }",
         "cannot mutate",
     );
     rejects(
-        "fn boxed(a) { { item: a } } fn main() { const a = [1]; var b = boxed(a); b.item << 2; }",
+        "fn boxed(a) { { item: a } } fn main() { const a = [1]; var b = boxed(a); b.item.append(2); }",
         "cannot mutate",
     );
     rejects(
-        "fn one(a, n: int) { if n > 0 { two(a, n - 1); } } fn two(a, n: int) { a << 2; one(a, n); } fn main() { const a = [1]; one(a, 1); }",
+        "fn one(a, n: int) { if n > 0 { two(a, n - 1); } } fn two(a, n: int) { a.append(2); one(a, n); } fn main() { const a = [1]; one(a, 1); }",
         "cannot mutate",
     );
     assert_eq!(
         run(
-            "fn change(a) { a << 2; } fn identity(a) { a } fn main() { var a = [1]; change(identity(a)); io::println(a); }"
+            "fn change(a) { a.append(2); } fn identity(a) { a } fn main() { var a = [1]; change(identity(a)); io::println(a); }"
         ),
         "[1, 2]\n"
     );
     // Rebinding a parameter changes its slot, not the caller's object.
     assert_eq!(
         run(
-            "fn replace(a) { a = [2]; a << 3; a } fn main() { const a = [1]; io::println(replace(a)); io::println(a); }"
+            "fn replace(a) { a = [2]; a.append(3); a } fn main() { const a = [1]; io::println(replace(a)); io::println(a); }"
         ),
         "[2, 3]\n[1]\n"
     );
@@ -161,7 +164,7 @@ fn effects_cross_helpers_aliases_returns_and_recursive_cycles() {
 fn effects_reach_callers_through_helper_chains_settled_in_later_iterations() {
     // Each level only learns its callee's effect after the previous fixed-point
     // iteration, while unrelated helpers have already settled.
-    let chain = "fn level0(a) { a << 2; } fn level1(a) { level0(a); } \
+    let chain = "fn level0(a) { a.append(2); } fn level1(a) { level0(a); } \
                  fn level2(a) { level1(a); } fn level3(a) { level2(a); } \
                  fn level4(a) { level3(a); } fn settled(a) { a }";
     rejects(
@@ -171,13 +174,13 @@ fn effects_reach_callers_through_helper_chains_settled_in_later_iterations() {
     rejects(
         &format!(
             "{chain} fn pick(a, b) {{ settled(a); level4(b); }} \
-             fn main() {{ var a = [1]; const b = [2]; pick(a, b); a << 3; }}"
+             fn main() {{ var a = [1]; const b = [2]; pick(a, b); a.append(3); }}"
         ),
         "cannot mutate",
     );
     rejects(
         "fn bottom(a) { a } fn middle(a) { bottom(a) } fn top(a) { middle(a) } \
-         fn main() { const a = [1]; top(a) << 2; }",
+         fn main() { const a = [1]; top(a).append(2); }",
         "cannot mutate",
     );
     // The local is mutated only through the deepest helper; it must not be
@@ -226,7 +229,7 @@ fn chained_helpers_over_map_records_keep_effects_and_check_quickly() {
         fn with_header(response: Response, name: str, value: str) -> Response { \
             var headers = response.headers.clone(); \
             var old: str[] = []; \
-            for entry in headers.entries() { if entry.0 == name { old << entry.0; } } \
+            for entry in headers.entries() { if entry.0 == name { old.append(entry.0); } } \
             for key in old { headers.remove(key)!!; } \
             headers.set(name, value)!!; \
             Response(status: response.status, headers: headers, body: response.body) } \
@@ -270,19 +273,19 @@ fn chained_helpers_over_map_records_keep_effects_and_check_quickly() {
 #[test]
 fn local_constants_and_default_arguments_are_checked_in_declaration_context() {
     rejects(
-        "fn mutate(a) { const b = a; b << 2; } fn main() { var a = [1]; mutate(a); }",
+        "fn mutate(a) { const b = a; b.append(2); } fn main() { var a = [1]; mutate(a); }",
         "cannot mutate",
     );
     rejects(
-        "const DEFAULT = [1]; fn mutate(a = DEFAULT) { a << 2; } fn main() { mutate(); }",
+        "const DEFAULT = [1]; fn mutate(a = DEFAULT) { a.append(2); } fn main() { mutate(); }",
         "cannot mutate",
     );
     rejects(
-        "fn mutate(a) { a << 2; } fn main() { const a = [1]; mutate(a: a); }",
+        "fn mutate(a) { a.append(2); } fn main() { const a = [1]; mutate(a: a); }",
         "cannot mutate",
     );
     assert_eq!(
-        run("fn mutate(a = [1]) { a << 2; a } fn main() { io::println(mutate()); }"),
+        run("fn mutate(a = [1]) { a.append(2); a } fn main() { io::println(mutate()); }"),
         "[1, 2]\n"
     );
 }
@@ -290,28 +293,28 @@ fn local_constants_and_default_arguments_are_checked_in_declaration_context() {
 #[test]
 fn method_default_arguments_preserve_mutation_and_return_capabilities() {
     rejects(
-        "const DEFAULT = [1]; struct Box { value: int } extend Box { fn change(self, values: int[] = DEFAULT) { values << 2; } } fn main() { const box = Box(1); box.change(); }",
+        "const DEFAULT = [1]; struct Box { value: int } extend Box { fn change(self, values: int[] = DEFAULT) { values.append(2); } } fn main() { const box = Box(1); box.change(); }",
         "cannot mutate",
     );
     rejects(
-        "const DEFAULT = [1]; struct Box { value: int } extend Box { fn identity(self, values: int[] = DEFAULT) -> int[] { values } } fn main() { const box = Box(1); box.identity() << 2; }",
+        "const DEFAULT = [1]; struct Box { value: int } extend Box { fn identity(self, values: int[] = DEFAULT) -> int[] { values } } fn main() { const box = Box(1); box.identity().append(2); }",
         "cannot mutate",
     );
     rejects(
-        "const DEFAULT = [1]; fn change(values: int[]) -> int[] { values << 2; values } struct Box { value: int } extend Box { fn consume(self, values: int[] = change(DEFAULT)) {} } fn main() { const box = Box(1); box.consume(); }",
+        "const DEFAULT = [1]; fn change(values: int[]) -> int[] { values.append(2); values } struct Box { value: int } extend Box { fn consume(self, values: int[] = change(DEFAULT)) {} } fn main() { const box = Box(1); box.consume(); }",
         "cannot mutate",
     );
     rejects(
-        "const DEFAULT = [1]; struct Box[T: type] { value: T } extend[T: type] Box[T] { fn change(self, values: int[] = DEFAULT) { values << 2; } } fn main() { const box = Box(1); box.change(); }",
+        "const DEFAULT = [1]; struct Box[T: type] { value: T } extend[T: type] Box[T] { fn change(self, values: int[] = DEFAULT) { values.append(2); } } fn main() { const box = Box(1); box.change(); }",
         "cannot mutate",
     );
     rejects(
-        "const DEFAULT = [1]; struct Box { value: int } extend Box { @async fn change(self, values: int[] = DEFAULT) { values << 2; } } @async fn main() { const box = Box(1); await box.change(); }",
+        "const DEFAULT = [1]; struct Box { value: int } extend Box { @async fn change(self, values: int[] = DEFAULT) { values.append(2); } } @async fn main() { const box = Box(1); await box.change(); }",
         "cannot mutate",
     );
     assert_eq!(
         run(
-            "struct Box { value: int } extend Box { fn change(self, values: int[] = [1]) -> int[] { values << 2; values } } fn main() { const box = Box(1); io::println(box.change()); }"
+            "struct Box { value: int } extend Box { fn change(self, values: int[] = [1]) -> int[] { values.append(2); values } } fn main() { const box = Box(1); io::println(box.change()); }"
         ),
         "[1, 2]\n"
     );
@@ -337,8 +340,8 @@ fn custom_iterator_items_preserve_capabilities_in_single_and_zip_loops() {
         }
     "#;
     for loop_body in [
-        "for value in Source(protected) { value << 99; }",
-        "for index in 0..1, value in Source(protected) { value << index; }",
+        "for value in Source(protected) { value.append(99); }",
+        "for index in 0..1, value in Source(protected) { value.append(index); }",
     ] {
         rejects(
             &format!("{declarations} fn main() {{ {loop_body} }}"),
@@ -347,7 +350,7 @@ fn custom_iterator_items_preserve_capabilities_in_single_and_zip_loops() {
     }
     assert_eq!(
         run(&format!(
-            "{declarations} fn main() {{ for value in Source([10]) {{ value << 99; io::println(value); }} }}"
+            "{declarations} fn main() {{ for value in Source([10]) {{ value.append(99); io::println(value); }} }}"
         )),
         "[10, 99]\n"
     );
@@ -374,12 +377,12 @@ fn custom_iterator_protocol_effects_are_checked_before_loop_body() {
         }
     "#;
     rejects(
-        &format!("{declarations} fn main() {{ for value in Source([1]) {{ value << 99; }} }}"),
+        &format!("{declarations} fn main() {{ for value in Source([1]) {{ value.append(99); }} }}"),
         "cannot mutate",
     );
     rejects(
         &format!(
-            "{declarations} fn main() {{ for index in 0..1, value in Source([1]) {{ value << index; }} }}"
+            "{declarations} fn main() {{ for index in 0..1, value in Source([1]) {{ value.append(index); }} }}"
         ),
         "cannot mutate",
     );
@@ -404,7 +407,7 @@ fn custom_iterator_current_cannot_launder_a_global_const() {
             }
             fn current(self) -> int[] { protected }
         }
-        fn main() { for value in Source(0) { value << 99; } }
+        fn main() { for value in Source(0) { value.append(99); } }
         "#,
         "cannot mutate",
     );
@@ -413,9 +416,9 @@ fn custom_iterator_current_cannot_launder_a_global_const() {
 #[test]
 fn custom_iterator_protocol_mutations_respect_captured_capabilities() {
     for (into_iter, next, current) in [
-        ("self.values << 2;", "", ""),
-        ("", "self.values << 2;", ""),
-        ("", "", "self.values << 2;"),
+        ("self.values.append(2);", "", ""),
+        ("", "self.values.append(2);", ""),
+        ("", "", "self.values.append(2);"),
     ] {
         let program = format!(
             r#"
@@ -463,13 +466,13 @@ fn generic_iterator_specialization_retains_item_capabilities() {
     "#;
     rejects(
         &format!(
-            "{declarations} fn main() {{ for value in Source(protected) {{ value << 99; }} }}"
+            "{declarations} fn main() {{ for value in Source(protected) {{ value.append(99); }} }}"
         ),
         "cannot mutate",
     );
     assert_eq!(
         run(&format!(
-            "{declarations} fn main() {{ for value in Source([10]) {{ value << 99; io::println(value); }} }}"
+            "{declarations} fn main() {{ for value in Source([10]) {{ value.append(99); io::println(value); }} }}"
         )),
         "[10, 99]\n"
     );
@@ -491,7 +494,7 @@ fn iterator_effects_remain_visible_after_break() {
             fn next(mut self) -> bool { self.position += 1; true }
             fn current(self) -> int { shared = protected; self.position }
         }
-        fn main() { for value in Source(0) { break; } shared << 99; }
+        fn main() { for value in Source(0) { break; } shared.append(99); }
         "#,
         "cannot mutate",
     );
@@ -508,7 +511,7 @@ fn zip_skips_iterator_steps_after_a_known_empty_range() {
             fn into_iter(self) -> Cursor { Cursor(self.values) }
         }
         extend Cursor with iter::Iterator[int] {
-            fn next(mut self) -> bool { self.values << 99; self.values = [1]; false }
+            fn next(mut self) -> bool { self.values.append(99); self.values = [1]; false }
             fn current(self) -> int { 0 }
         }
     "#;
@@ -526,8 +529,8 @@ fn zip_skips_iterator_steps_after_a_known_empty_range() {
 #[test]
 fn iteration_rechecks_elements_after_the_collection_changes() {
     for loop_body in [
-        "for value in arrays { value << 99; arrays[1] = protected; }",
-        "for index in 0..2, value in arrays { value << index; arrays[1] = protected; }",
+        "for value in arrays { value.append(99); arrays[1] = protected; }",
+        "for index in 0..2, value in arrays { value.append(index); arrays[1] = protected; }",
     ] {
         rejects(
             &format!(
@@ -538,7 +541,7 @@ fn iteration_rechecks_elements_after_the_collection_changes() {
     }
     assert_eq!(
         run(
-            "fn main() { var arrays = [[1], [2]]; for value in arrays { value << 3; } io::println(arrays); }"
+            "fn main() { var arrays = [[1], [2]]; for value in arrays { value.append(3); } io::println(arrays); }"
         ),
         "[[1, 3], [2, 3]]\n"
     );
@@ -569,18 +572,18 @@ fn native_heap_mutations_are_distinct_from_resource_operations() {
 #[test]
 fn reachable_mutations_are_counted_with_shadowing_lazy_paths_and_terminal_calls() {
     for body in [
-        "fn main() { var a = [1]; while false { a << 2; } }",
-        "fn main() { var a = [1]; for i in 0..0 { a << i; } }",
-        "fn main() { var a = [1]; crash(\"stop\"); a << 2; }",
+        "fn main() { var a = [1]; while false { a.append(2); } }",
+        "fn main() { var a = [1]; for i in 0..0 { a.append(i); } }",
+        "fn main() { var a = [1]; crash(\"stop\"); a.append(2); }",
         "fn main() { var a = 1; if true { var a = 2; a = 3; } io::println(a); }",
-        "fn main() { var a = [1]; false && (if true { a << 2; true } else { false }); }",
-        "fn main() { var a = [1]; 1 ?? (if true { a << 2; 2 } else { 2 }); }",
-        "fn main() { var a = [1]; const x: int = 2; x ?? (if true { a << 2; 2 } else { 2 }); }",
+        "fn main() { var a = [1]; false && (if true { a.append(2); true } else { false }); }",
+        "fn main() { var a = [1]; 1 ?? (if true { a.append(2); 2 } else { 2 }); }",
+        "fn main() { var a = [1]; const x: int = 2; x ?? (if true { a.append(2); 2 } else { 2 }); }",
     ] {
         rejects(body, "requires a reachable mutation");
     }
     assert_eq!(
-        run("fn main() { var a = [1]; defer { a << 2; io::println(a); } }"),
+        run("fn main() { var a = [1]; defer { a.append(2); io::println(a); } }"),
         "[1, 2]\n"
     );
 }
@@ -588,12 +591,12 @@ fn reachable_mutations_are_counted_with_shadowing_lazy_paths_and_terminal_calls(
 #[test]
 fn defer_uses_capability_at_exit_and_retains_lexical_capture() {
     rejects(
-        "fn main() { var a = [1]; const b = [2]; defer { a << 3; } a = b; }",
+        "fn main() { var a = [1]; const b = [2]; defer { a.append(3); } a = b; }",
         "cannot mutate",
     );
     assert_eq!(
         run(
-            "fn main() { var a = [1]; defer { a << 3; io::println(a); } if true { const a = [2]; io::println(a); } }"
+            "fn main() { var a = [1]; defer { a.append(3); io::println(a); } if true { const a = [2]; io::println(a); } }"
         ),
         "[2]\n[1, 3]\n"
     );
@@ -617,16 +620,16 @@ fn named_sequence_methods_evaluate_once_and_return_the_mutated_array() {
 #[test]
 fn capabilities_follow_global_reassignment_across_calls() {
     rejects(
-        "var global = [1]; fn set(a) { global = a; } fn change() { global << 2; } fn main() { const a = [3]; set(a); change(); }",
+        "var global = [1]; fn set(a) { global = a; } fn change() { global.append(2); } fn main() { const a = [3]; set(a); change(); }",
         "cannot mutate",
     );
     rejects(
-        "const a = [1]; var global = a; fn main() { global << 2; }",
+        "const a = [1]; var global = a; fn main() { global.append(2); }",
         "cannot mutate",
     );
     assert_eq!(
         run(
-            "var global = [1]; fn change() { global << 2; } fn main() { const view = global; change(); io::println(view); }"
+            "var global = [1]; fn change() { global.append(2); } fn main() { const view = global; change(); io::println(view); }"
         ),
         "[1, 2]\n"
     );
@@ -641,7 +644,7 @@ fn closure_heap_and_global_stores_preserve_readonly_aliases() {
             var holder = {item: [1]};
             const install = fn[var holder, protected]() -> nil { holder.item = protected; };
             (install)();
-            holder.item << 99;
+            holder.item.append(99);
         }
         "#,
         r#"
@@ -655,7 +658,7 @@ fn closure_heap_and_global_stores_preserve_readonly_aliases() {
             var holder = {item: [1]};
             const install = make(holder, protected);
             (install)();
-            holder.item << 99;
+            holder.item.append(99);
         }
         "#,
         r#"
@@ -664,7 +667,7 @@ fn closure_heap_and_global_stores_preserve_readonly_aliases() {
             const protected = [10];
             const install = fn[protected]() -> nil { shared = protected; };
             (install)();
-            shared << 99;
+            shared.append(99);
         }
         "#,
         r#"
@@ -675,7 +678,7 @@ fn closure_heap_and_global_stores_preserve_readonly_aliases() {
                 if flag { holder.item = protected; return; }
             };
             (install)(true);
-            holder.item << 99;
+            holder.item.append(99);
         }
         "#,
     ] {
@@ -688,7 +691,7 @@ fn closure_heap_and_global_stores_preserve_readonly_aliases() {
             var value = [10];
             const install = fn[var holder, var value]() -> nil { holder.item = value; };
             (install)();
-            holder.item << 99;
+            holder.item.append(99);
             io::println(value);
         }
         "#),
@@ -713,7 +716,7 @@ fn named_function_values_preserve_global_effects_through_indirect_calls() {
                 fn change() -> nil {{ shared = protected; }}
                 fn invoke(callback: fn() -> nil) -> nil {{ (callback)(); }}
                 fn select() -> fn() -> nil {{ change }}
-                fn main() {{ {invocation} shared << 99; }}
+                fn main() {{ {invocation} shared.append(99); }}
                 "#
             ),
             "cannot mutate",
@@ -727,16 +730,16 @@ fn named_function_values_preserve_global_effects_through_indirect_calls() {
     );
     assert_eq!(
         run(
-            "const protected = [10]; var shared = [1]; fn change() -> nil { shared = protected; } fn noop() -> nil {} fn main() { const unused: fn() -> nil = change; const callback: fn() -> nil = noop; (callback)(); shared << 2; io::println(shared); }"
+            "const protected = [10]; var shared = [1]; fn change() -> nil { shared = protected; } fn noop() -> nil {} fn main() { const unused: fn() -> nil = change; const callback: fn() -> nil = noop; (callback)(); shared.append(2); io::println(shared); }"
         ),
         "[1, 2]\n"
     );
     rejects(
-        "const protected = [10]; var shared = [1]; struct Holder { item: int[] } fn change(holder: Holder) -> nil { shared = holder.item; } fn main() { const callback: fn(Holder) -> nil = change; (callback)(Holder(protected)); shared << 99; }",
+        "const protected = [10]; var shared = [1]; struct Holder { item: int[] } fn change(holder: Holder) -> nil { shared = holder.item; } fn main() { const callback: fn(Holder) -> nil = change; (callback)(Holder(protected)); shared.append(99); }",
         "cannot mutate",
     );
     rejects(
-        "const protected = [10]; var shared = [1]; struct Holder { item: int[] } fn change(holder: Holder) -> nil { shared = holder.item; } fn invoke(callback: fn(Holder) -> nil, holder: Holder) -> nil { (callback)(holder); } fn main() { invoke(change, Holder(protected)); shared << 99; }",
+        "const protected = [10]; var shared = [1]; struct Holder { item: int[] } fn change(holder: Holder) -> nil { shared = holder.item; } fn invoke(callback: fn(Holder) -> nil, holder: Holder) -> nil { (callback)(holder); } fn main() { invoke(change, Holder(protected)); shared.append(99); }",
         "cannot mutate",
     );
 }
@@ -765,7 +768,7 @@ fn closures_cannot_mutate_readonly_aliases_stored_after_creation() {
         r#"
         var shared = [1];
         fn main() {
-            const callback = fn[]() -> nil { shared << 99; };
+            const callback = fn[]() -> nil { shared.append(99); };
             const protected = [10];
             shared = protected;
             (callback)();
@@ -774,7 +777,7 @@ fn closures_cannot_mutate_readonly_aliases_stored_after_creation() {
         r#"
         var shared = [1];
         fn make() -> fn() -> nil {
-            const callback = fn[]() -> nil { shared << 99; };
+            const callback = fn[]() -> nil { shared.append(99); };
             callback
         }
         fn main() {
@@ -787,7 +790,7 @@ fn closures_cannot_mutate_readonly_aliases_stored_after_creation() {
         r#"
         fn main() {
             var holder = {item: [1]};
-            const callback = fn[var holder]() -> nil { holder.item << 99; };
+            const callback = fn[var holder]() -> nil { holder.item.append(99); };
             const protected = [10];
             holder.item = protected;
             (callback)();
@@ -800,13 +803,13 @@ fn closures_cannot_mutate_readonly_aliases_stored_after_creation() {
             const callback = fn[protected]() -> nil { shared = protected; };
             shared = [2];
             (callback)();
-            shared << 99;
+            shared.append(99);
         }
         "#,
         r#"
         fn make(holder) -> fn() -> nil {
             var current = holder;
-            const callback = fn[var current]() -> nil { current.item << 99; };
+            const callback = fn[var current]() -> nil { current.item.append(99); };
             callback
         }
         fn main() {
@@ -822,7 +825,7 @@ fn closures_cannot_mutate_readonly_aliases_stored_after_creation() {
     }
     assert_eq!(
         run(
-            "fn main() { var holder = {item: [1]}; const callback = fn[var holder]() -> nil { holder.item << 99; }; holder.item = [2]; (callback)(); io::println(holder.item); }"
+            "fn main() { var holder = {item: [1]}; const callback = fn[var holder]() -> nil { holder.item.append(99); }; holder.item = [2]; (callback)(); io::println(holder.item); }"
         ),
         "[2, 99]\n"
     );
@@ -831,19 +834,19 @@ fn closures_cannot_mutate_readonly_aliases_stored_after_creation() {
 #[test]
 fn terminal_helpers_and_infinite_loops_do_not_justify_unreachable_writes() {
     rejects(
-        "fn stop() { crash(\"stop\"); } fn main() { var a = [1]; stop(); a << 2; }",
+        "fn stop() { crash(\"stop\"); } fn main() { var a = [1]; stop(); a.append(2); }",
         "requires a reachable mutation",
     );
     rejects(
-        "fn main() { var a = [1]; while true {} a << 2; }",
+        "fn main() { var a = [1]; while true {} a.append(2); }",
         "requires a reachable mutation",
     );
     rejects(
-        "fn main() { var a = [1]; defer { a << 2; } while true {} }",
+        "fn main() { var a = [1]; defer { a.append(2); } while true {} }",
         "requires a reachable mutation",
     );
     assert_eq!(
-        run("fn main() { var a = [1]; while true { a << 2; break; } io::println(a); }"),
+        run("fn main() { var a = [1]; while true { a.append(2); break; } io::println(a); }"),
         "[1, 2]\n"
     );
 }
@@ -851,15 +854,15 @@ fn terminal_helpers_and_infinite_loops_do_not_justify_unreachable_writes() {
 #[test]
 fn aliases_stored_by_helpers_keep_capabilities_and_parameter_aliasing_is_checked() {
     rejects(
-        "fn save(holder, value) { holder.item = value; } fn main() { var holder = { item: [1] }; const value = [2]; save(holder, value); holder.item << 3; }",
+        "fn save(holder, value) { holder.item = value; } fn main() { var holder = { item: [1] }; const value = [2]; save(holder, value); holder.item.append(3); }",
         "cannot mutate",
     );
     rejects(
-        "fn save_and_change(p, q, value) { p.item = value; q.item << 3; } fn main() { var holder = { item: [1] }; const value = [2]; save_and_change(holder, holder, value); }",
+        "fn save_and_change(p, q, value) { p.item = value; q.item.append(3); } fn main() { var holder = { item: [1] }; const value = [2]; save_and_change(holder, holder, value); }",
         "cannot mutate",
     );
     rejects(
-        "fn boxed(a, flag: bool) { if flag { return { item: a }; } { item: [1] } } fn main() { const a = [2]; var b = boxed(a, true); b.item << 3; }",
+        "fn boxed(a, flag: bool) { if flag { return { item: a }; } { item: [1] } } fn main() { const a = [2]; var b = boxed(a, true); b.item.append(3); }",
         "cannot mutate",
     );
 }
@@ -867,7 +870,7 @@ fn aliases_stored_by_helpers_keep_capabilities_and_parameter_aliasing_is_checked
 #[test]
 fn catch_entry_keeps_capabilities_from_interrupted_prefixes() {
     rejects(
-        "fn fail() { 1 / 0 } fn main() { var b = [1]; const a = [2]; try { b = a; fail(); b = [3]; } catch(e) { b << 4; } }",
+        "fn fail() { 1 / 0 } fn main() { var b = [1]; const a = [2]; try { b = a; fail(); b = [3]; } catch(e) { b.append(4); } }",
         "cannot mutate",
     );
 }
@@ -885,27 +888,28 @@ fn scalar_copies_do_not_inherit_readonly_reference_capability() {
 #[test]
 fn recursive_projection_widening_keeps_nested_readonly_access() {
     rejects(
-        "fn walk(node, depth: int) { if depth > 0 { walk(node.next, depth - 1); } else { node.item << 2; } } fn main() { const a = [1]; var node = { next: { next: { next: { next: { next: { item: a } } } } } }; walk(node, 5); }",
+        "fn walk(node, depth: int) { if depth > 0 { walk(node.next, depth - 1); } else { node.item.append(2); } } fn main() { const a = [1]; var node = { next: { next: { next: { next: { next: { item: a } } } } } }; walk(node, 5); }",
         "cannot mutate",
     );
 }
 
 #[test]
-fn sequence_compound_assignments_are_removed_and_array_addition_retains_child_capabilities() {
-    for op in ["<<=", ">>="] {
+fn shift_compound_assignments_reject_arrays_and_array_addition_retains_child_capabilities() {
+    for (op, method) in [("<<=", "append"), (">>=", "prepend")] {
         let body = format!("fn main() {{ var values = [1]; values {op} 2; }}");
         let error = project::compile_source("mutability.cog", &source(&body))
-            .expect_err("removed compound syntax")
+            .expect_err("shifts do not mutate arrays")
             .to_string();
-        assert!(error.contains("E0002"), "{error}");
+        assert!(error.contains("E2002"), "{error}");
+        assert!(error.contains(&format!("array.{method}(value)")), "{error}");
     }
     rejects(
-        "fn main() { const a = [[1]]; var b = a; b += []; b[0] << 2; }",
+        "fn main() { const a = [[1]]; var b = a; b += []; b[0].append(2); }",
         "cannot mutate",
     );
     assert_eq!(
         run(
-            "fn main() { const a = [1]; var b = a; b += [2]; b << 3; io::println(a); io::println(b); }"
+            "fn main() { const a = [1]; var b = a; b += [2]; b.append(3); io::println(a); io::println(b); }"
         ),
         "[1]\n[1, 2, 3]\n"
     );
@@ -915,7 +919,7 @@ fn sequence_compound_assignments_are_removed_and_array_addition_retains_child_ca
 fn invalid_initializers_do_not_cascade_into_required_mutation_errors() {
     let error = project::compile_source(
         "mutability.cog",
-        &source("fn main() { var bad: int = \"text\"; const a = [1]; a << 2; missing(); }"),
+        &source("fn main() { var bad: int = \"text\"; const a = [1]; a.append(2); missing(); }"),
     )
     .expect_err("independent semantic errors")
     .to_string();
@@ -927,7 +931,7 @@ fn invalid_initializers_do_not_cascade_into_required_mutation_errors() {
         "invalid binding must not cascade: {error}"
     );
     rejects(
-        "fn main() { const a = [1]; if false { var b = [2]; b = a; b << 3; } }",
+        "fn main() { const a = [1]; if false { var b = [2]; b = a; b.append(3); } }",
         "cannot mutate",
     );
 }
@@ -936,16 +940,16 @@ fn invalid_initializers_do_not_cascade_into_required_mutation_errors() {
 fn returns_in_loop_conditions_and_known_nonempty_ranges_stop_successor_mutations() {
     assert_eq!(
         run(
-            "fn main() { var a = [1]; for i in 0..1 { const a = [2]; io::println(a); break; } a << 3; io::println(a); }"
+            "fn main() { var a = [1]; for i in 0..1 { const a = [2]; io::println(a); break; } a.append(3); io::println(a); }"
         ),
         "[2]\n[1, 3]\n"
     );
     rejects(
-        "fn main() { var a = [1]; while (if true { return; } else { true }) {} a << 2; }",
+        "fn main() { var a = [1]; while (if true { return; } else { true }) {} a.append(2); }",
         "requires a reachable mutation",
     );
     rejects(
-        "fn main() { var a = [1]; for i in 0..1 { return; } a << 2; }",
+        "fn main() { var a = [1]; for i in 0..1 { return; } a.append(2); }",
         "requires a reachable mutation",
     );
 }
@@ -953,11 +957,11 @@ fn returns_in_loop_conditions_and_known_nonempty_ranges_stop_successor_mutations
 #[test]
 fn repeated_allocations_do_not_clear_capabilities_of_escaped_older_objects() {
     rejects(
-        "fn main() { var saved = { item: [0] }; const a = [1]; for i in 0..2 { var fresh = { item: [2] }; if i == 0 { fresh.item = a; saved = fresh; } else { saved.item << 3; } } }",
+        "fn main() { var saved = { item: [0] }; const a = [1]; for i in 0..2 { var fresh = { item: [2] }; if i == 0 { fresh.item = a; saved = fresh; } else { saved.item.append(3); } } }",
         "cannot mutate",
     );
     rejects(
-        "fn make() { { item: [2] } } fn main() { var saved = { item: [0] }; const a = [1]; for i in 0..2 { var fresh = make(); if i == 0 { fresh.item = a; saved = fresh; } else { saved.item << 3; } } }",
+        "fn make() { { item: [2] } } fn main() { var saved = { item: [0] }; const a = [1]; for i in 0..2 { var fresh = make(); if i == 0 { fresh.item = a; saved = fresh; } else { saved.item.append(3); } } }",
         "cannot mutate",
     );
 }
@@ -965,7 +969,7 @@ fn repeated_allocations_do_not_clear_capabilities_of_escaped_older_objects() {
 /// Helpers whose mutation effect on the first parameter becomes visible only
 /// after several fixed-point iterations; every level needs one more iteration
 /// than its callee.
-const LATE_CHAIN: &str = "fn level0(a: int[]) { a << 2; } fn level1(a: int[]) { level0(a); } \
+const LATE_CHAIN: &str = "fn level0(a: int[]) { a.append(2); } fn level1(a: int[]) { level0(a); } \
      fn level2(a: int[]) { level1(a); } fn level3(a: int[]) { level2(a); } \
      fn level4(a: int[]) { level3(a); }";
 
@@ -994,14 +998,14 @@ fn indirect_calls_depend_on_late_settling_function_value_candidates() {
     ] {
         rejects(
             &format!(
-                "{} {apply} fn main() {{ {call} shared << 99; }}",
+                "{} {apply} fn main() {{ {call} shared.append(99); }}",
                 chain.replace("SET", "shared = protected;")
             ),
             "cannot mutate",
         );
         assert_eq!(
             run(&format!(
-                "{} {apply} fn main() {{ {call} shared << 99; io::println(shared); }}",
+                "{} {apply} fn main() {{ {call} shared.append(99); io::println(shared); }}",
                 chain.replace("SET", "shared = [5];")
             )),
             "[5, 99]\n",
@@ -1096,7 +1100,7 @@ fn global_initializers_depend_on_late_settling_alias_helpers() {
     rejects(
         &format!(
             "{LATE_ALIAS} const protected = [1]; var shared: int[] = top(protected); \
-             fn reader() -> int[] {{ shared }} fn main() {{ reader() << 2; }}"
+             fn reader() -> int[] {{ shared }} fn main() {{ reader().append(2); }}"
         ),
         "cannot mutate",
     );
@@ -1104,7 +1108,7 @@ fn global_initializers_depend_on_late_settling_alias_helpers() {
         run(&format!(
             "{LATE_ALIAS} var base: int[] = [1]; var shared: int[] = top(base); \
              fn reader() -> int[] {{ shared }} \
-             fn main() {{ reader() << 2; io::println(base); }}"
+             fn main() {{ reader().append(2); io::println(base); }}"
         )),
         "[1, 2]\n"
     );
@@ -1114,13 +1118,13 @@ fn global_initializers_depend_on_late_settling_alias_helpers() {
 fn cloned_array_from_generic_clone_is_a_valid_mutation_target() {
     assert_eq!(
         run("use clone; fn main() { const arr: int[] = [1, 2, 3]; \
-             var x = clone::value(arr)!!; x << 4; io::println(x.len()); }"),
+             var x = clone::value(arr)!!; x.append(4); io::println(x.len()); }"),
         "4\n"
     );
     assert_eq!(
         run(
             "use clone; fn dup[T: type + clone::Clone](a: T) -> T { a.clone() } \
-             fn main() { const arr: int[] = [1]; var x = dup(arr); x << 2; io::println(x); }"
+             fn main() { const arr: int[] = [1]; var x = dup(arr); x.append(2); io::println(x); }"
         ),
         "[1, 2]\n"
     );
@@ -1130,7 +1134,7 @@ fn cloned_array_from_generic_clone_is_a_valid_mutation_target() {
 fn mutating_generic_clone_leaves_the_original_unchanged() {
     assert_eq!(
         run("use clone; fn main() { const arr: int[] = [1, 2, 3]; \
-             var x = clone::value(arr)!!; x << 4; \
+             var x = clone::value(arr)!!; x.append(4); \
              io::println(arr); io::println(x); }"),
         "[1, 2, 3]\n[1, 2, 3, 4]\n"
     );
@@ -1140,12 +1144,12 @@ fn mutating_generic_clone_leaves_the_original_unchanged() {
 fn generic_alias_of_const_array_is_still_rejected_for_mutation() {
     rejects(
         "fn id[T: type](a: T) -> T { a } \
-         fn main() { const arr: int[] = [1]; var x = id(arr); x << 2; }",
+         fn main() { const arr: int[] = [1]; var x = id(arr); x.append(2); }",
         "cannot mutate",
     );
     rejects(
         "use clone; fn main() { const arr: int[] = [1]; \
-         const x = clone::value(arr)!!; x << 2; }",
+         const x = clone::value(arr)!!; x.append(2); }",
         "cannot mutate",
     );
 }
@@ -1236,12 +1240,12 @@ fn generic_bodies_still_reject_mutation_through_const_access() {
         );
     }
     rejects(
-        "fn grow[T: type](items: T[]) { var other = items; other << items[0]!!; } \
+        "fn grow[T: type](items: T[]) { var other = items; other.append(items[0]!!); } \
          fn main() { const xs = [1]; grow(xs); }",
         "cannot mutate",
     );
     rejects(
-        "fn grow[T: type](items: T[]) { const other = items; other << items[0]!!; } \
+        "fn grow[T: type](items: T[]) { const other = items; other.append(items[0]!!); } \
          fn main() { const xs = [1]; grow(xs); }",
         "cannot mutate through const/read-only access from `other`",
     );

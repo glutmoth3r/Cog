@@ -84,7 +84,7 @@ fn with_header(response: http::Response, name: str, value: str) -> http::Respons
     for entry in headers.entries() {
         const current_name = entry.0 as str;
         if normalized(current_name)!! == normalized(name)!! {
-            old_names << current_name;
+            old_names.append(current_name);
         }
     }
     for old_name in old_names { headers.remove(old_name as str)!!; }
@@ -168,7 +168,7 @@ fn add_origin_headers(response: http::Response, origin: str, policy: Policy) -> 
                 denied = append_vary(denied, "Access-Control-Request-Method")!!;
                 return append_vary(denied, "Access-Control-Request-Headers")!!;
             }
-            requested_headers << name;
+            requested_headers.append(name);
         }
     }
 

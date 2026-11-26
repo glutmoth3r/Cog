@@ -144,7 +144,7 @@ use io;
 fn work(n: int) -> int {{
     var values: int[] = [];
     var i = 0;
-    while i < n {{ values << i; i += 1; }}
+    while i < n {{ values.append(i); i += 1; }}
     i = 0;
     var checksum = 0;
     while i < n {{

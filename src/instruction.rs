@@ -206,14 +206,17 @@ pub enum Instruction {
     MakeClosure(usize, usize),
     LoadCapture(usize),
     Crash(Option<Rc<str>>),
-    // `<<` — mutate the array in place (push to the end), unlike Add/Sub/etc this
-    // does NOT allocate a new array: it must preserve Rc<RefCell<..>> aliasing
-    // (see docs/LANGUAGE.md on shared-mutation semantics). Returns the same array
-    // value so `arr << x` can be chained/used as an expression.
+    /// `array.append(value)`: push to the end in place, preserving aliasing
+    /// (see docs/LANGUAGE.md on shared mutation), and return the same array.
     ArrayPush,
-    // `>>` — mutate the array in place (insert at the front). Same aliasing
-    // requirement as ArrayPush.
+    /// `array.prepend(value)`: insert at the front in place, like ArrayPush.
     ArrayPrepend,
+    /// Checked integer left shift of `int`, `uint` or `bigint` by an
+    /// `int`/`uint` amount.
+    Shl,
+    /// Integer right shift: arithmetic for `int`, logical for `uint`, floor
+    /// for `bigint`.
+    Shr,
 }
 
 impl Instruction {
@@ -245,6 +248,8 @@ impl Instruction {
             | Self::Mul
             | Self::Div
             | Self::Mod
+            | Self::Shl
+            | Self::Shr
             | Self::Eq
             | Self::Ne
             | Self::Lt

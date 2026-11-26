@@ -711,8 +711,10 @@ pub enum BinOp {
     And,
     Or,
     Xor,
-    Append,
-    Prepend,
+    /// Checked integer left shift.
+    Shl,
+    /// Integer right shift: arithmetic for `int`, logical for `uint`, floor for `bigint`.
+    Shr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

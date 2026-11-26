@@ -274,6 +274,11 @@ fn constant_foldable(expr: &Expr, nodes: &mut usize, allow_bigint: bool) -> bool
         | Expr::Nil => true,
         Expr::BigInt(_) => allow_bigint,
         Expr::Unary(UnOp::Neg | UnOp::Not, value) => constant_foldable(value, nodes, allow_bigint),
+        // A `bigint` left shift can exceed the runtime digit limit from small
+        // operands, so the VM performs it and reports a recoverable Error.
+        Expr::Binary(BinOp::Shl, left, right) => {
+            constant_foldable(left, nodes, false) && constant_foldable(right, nodes, false)
+        }
         Expr::Binary(
             BinOp::Add
             | BinOp::Sub
@@ -288,7 +293,8 @@ fn constant_foldable(expr: &Expr, nodes: &mut usize, allow_bigint: bool) -> bool
             | BinOp::GtEq
             | BinOp::And
             | BinOp::Or
-            | BinOp::Xor,
+            | BinOp::Xor
+            | BinOp::Shr,
             left,
             right,
         ) => {
@@ -2733,9 +2739,30 @@ fn eval_binary(
         (BinOp::GtEq, a, b) => compare(a, b, |order| {
             matches!(order, Some(Ordering::Greater | Ordering::Equal))
         }),
-        (BinOp::Append | BinOp::Prepend | BinOp::Xor, _, _) => {
-            Err("operator is not supported for these comptime values".into())
+        (BinOp::Shl | BinOp::Shr, value, amount) => {
+            let left = op == BinOp::Shl;
+            let amount = match amount {
+                Int(amount) => i128::from(amount),
+                UInt(amount) => i128::from(amount),
+                _ => return Err("operator has incompatible comptime operand types".into()),
+            };
+            let shifted = match value {
+                Int(value) => crate::value::shift_int(value, amount, left).map(Int),
+                UInt(value) => crate::value::shift_uint(value, amount, left).map(UInt),
+                Big(value) => {
+                    let bits = if left && amount >= 0 {
+                        crate::value::bigint_left_shift_bits(&value, amount)
+                    } else {
+                        value.bits()
+                    };
+                    budget.allocate(bigint_storage_cost_from_bits(bits))?;
+                    crate::value::shift_bigint(&value, amount, left, None).map(Big)
+                }
+                _ => return Err("operator has incompatible comptime operand types".into()),
+            };
+            Ok(shifted.unwrap_or_else(ComptimeValue::Error))
         }
+        (BinOp::Xor, _, _) => Err("operator is not supported for these comptime values".into()),
         (_, Nil, _) | (_, _, Nil) => Err("operator is not supported for nil at comptime".into()),
         _ => Err("operator has incompatible comptime operand types".into()),
     }
@@ -2977,6 +3004,64 @@ mod tests {
             budget,
         };
         eval_expr(expr, values, &mut context, 0, 0)
+    }
+
+    #[test]
+    fn comptime_shifts_match_runtime_shift_values() {
+        use crate::value::Value;
+        let values = [
+            (ComptimeValue::Int(-5), Value::Int(-5)),
+            (ComptimeValue::Int(3), Value::Int(3)),
+            (ComptimeValue::Int(i64::MIN), Value::Int(i64::MIN)),
+            (ComptimeValue::UInt(u64::MAX), Value::UInt(u64::MAX)),
+            (ComptimeValue::UInt(3), Value::UInt(3)),
+            (
+                ComptimeValue::BigInt(BigInt::from(-5)),
+                Value::BigInt(BigInt::from(-5)),
+            ),
+        ];
+        let amounts = [
+            (ComptimeValue::Int(-1), Value::Int(-1)),
+            (ComptimeValue::Int(0), Value::Int(0)),
+            (ComptimeValue::Int(1), Value::Int(1)),
+            (ComptimeValue::Int(62), Value::Int(62)),
+            (ComptimeValue::UInt(63), Value::UInt(63)),
+            (ComptimeValue::Int(64), Value::Int(64)),
+            (ComptimeValue::UInt(200), Value::UInt(200)),
+        ];
+        for (op, left) in [(BinOp::Shl, true), (BinOp::Shr, false)] {
+            for (comptime_value, runtime_value) in &values {
+                for (comptime_amount, runtime_amount) in &amounts {
+                    let folded = eval_binary(
+                        op,
+                        comptime_value.clone(),
+                        comptime_amount.clone(),
+                        &mut Budget::default(),
+                    )
+                    .unwrap();
+                    let runtime = crate::value::shift_values(
+                        runtime_value.clone(),
+                        runtime_amount.clone(),
+                        left,
+                        None,
+                    );
+                    let context = format!("{op:?} {runtime_value:?} {runtime_amount:?}");
+                    match (folded, runtime) {
+                        (ComptimeValue::Int(a), Ok(Value::Int(b))) => assert_eq!(a, b, "{context}"),
+                        (ComptimeValue::UInt(a), Ok(Value::UInt(b))) => {
+                            assert_eq!(a, b, "{context}")
+                        }
+                        (ComptimeValue::BigInt(a), Ok(Value::BigInt(b))) => {
+                            assert_eq!(a, b, "{context}")
+                        }
+                        (ComptimeValue::Error(a), Err(b)) => {
+                            assert_eq!(a.kind(), b.kind(), "{context}")
+                        }
+                        (folded, runtime) => panic!("{context}: {folded:?} != {runtime:?}"),
+                    }
+                }
+            }
+        }
     }
 
     #[test]

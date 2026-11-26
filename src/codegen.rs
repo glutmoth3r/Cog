@@ -388,7 +388,9 @@ fn is_inlineable_body(expr: &Expr, parameters: &[String], nodes: &mut usize) -> 
             | BinOp::GtEq
             | BinOp::And
             | BinOp::Or
-            | BinOp::Xor,
+            | BinOp::Xor
+            | BinOp::Shl
+            | BinOp::Shr,
             left,
             right,
         ) => {
@@ -480,6 +482,8 @@ fn substitute_constant_parameters(
                     | BinOp::And
                     | BinOp::Or
                     | BinOp::Xor
+                    | BinOp::Shl
+                    | BinOp::Shr
             ) =>
         {
             Expr::Binary(
@@ -3616,6 +3620,8 @@ impl<'a> Codegen<'a> {
                         | BinOp::And
                         | BinOp::Or
                         | BinOp::Xor
+                        | BinOp::Shl
+                        | BinOp::Shr
                 ) =>
             {
                 let left = self.constant_expression(left, scopes, nodes, allow_constant_calls)?;
@@ -4559,19 +4565,11 @@ impl<'a> Codegen<'a> {
     }
 }
 
-// resolved: `<<`/`>>` now compile to their own arrpush/arrprepend mnemonics
-// (see interpreter.rs) instead of reusing `add`, so array mutation is actually
-// visible through aliases and a bare `arr << x;` has an effect.
 fn binop_instruction(op: BinOp) -> Instruction {
     match op {
         BinOp::Add => Instruction::Add,
-        // `arr << x` / `x >> arr`: these mutate the array in place (see
-        // Instruction::ArrayPush/ArrayPrepend in interpreter.rs) rather than
-        // reusing `add`'s allocate-a-new-array behavior — a bare `arr << x;`
-        // statement needs the original `arr` to actually change, not just the
-        // (immediately discarded) expression result.
-        BinOp::Append => Instruction::ArrayPush,
-        BinOp::Prepend => Instruction::ArrayPrepend,
+        BinOp::Shl => Instruction::Shl,
+        BinOp::Shr => Instruction::Shr,
         BinOp::Sub => Instruction::Sub,
         BinOp::Mul => Instruction::Mul,
         BinOp::Div => Instruction::Div,
@@ -5145,52 +5143,6 @@ mod tests {
         let out = compile(&program).expect("should compile");
         assert!(out.contains("is_type error\n"));
         assert!(out.contains("store "));
-    }
-
-    #[test]
-    fn append_and_prepend_compile_to_dedicated_mnemonics() {
-        // arr << 1; 2 >> arr;
-        // must NOT compile to `add` (see interpreter.rs's ArrayPush/ArrayPrepend
-        // for why: `add` allocates a new array and leaves the original untouched,
-        // so a bare `arr << x;` statement would silently do nothing).
-        let program = Program {
-            items: vec![Item::Function(FunctionDecl {
-                owner: None,
-                comptime: false,
-                asynchronous: false,
-                propagate: false,
-                inline: InlineMode::Auto,
-                type_params: vec![],
-                result_type: None,
-                result_span: None,
-                name: "main".to_string(),
-                visibility: Visibility::Private,
-                params: vec![],
-                body: Block {
-                    tail: None,
-                    stmts: vec![
-                        Stmt::VarDecl {
-                            ty: None,
-                            pattern: BindingPattern::Name("arr".to_string()),
-                            value: Expr::Array(vec![]),
-                        },
-                        Stmt::Expr(Expr::Binary(
-                            BinOp::Append,
-                            Box::new(Expr::Ident("arr".to_string())),
-                            Box::new(Expr::Int(1)),
-                        )),
-                        Stmt::Expr(Expr::Binary(
-                            BinOp::Prepend,
-                            Box::new(Expr::Int(2)),
-                            Box::new(Expr::Ident("arr".to_string())),
-                        )),
-                    ],
-                },
-            })],
-        };
-        let out = compile(&program).expect("should compile");
-        assert!(out.contains("arrpush\n"));
-        assert!(out.contains("arrprepend\n"));
     }
 
     #[test]

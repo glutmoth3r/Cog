@@ -315,6 +315,10 @@ pub enum Token {
     PipePipeEq,
     #[token("^=")]
     CaretEq,
+    #[token("<<=")]
+    ShlEq,
+    #[token(">>=")]
+    ShrEq,
 
     #[token("=")]
     Eq,
@@ -718,24 +722,33 @@ mod tests {
     }
 
     #[test]
-    fn array_append_and_prepend_operators() {
-        let src = "arr << 3; 0 >> arr; a + b;";
+    fn shift_operators_and_compound_assignments() {
+        let src = "a << 3; b >> 1; a <<= 2; b >>= c; x >= y;";
         let tokens = tokenize(src).expect("should tokenize");
         let kinds: Vec<Token> = tokens.into_iter().map(|t| t.token).collect();
+        let ident = |name: &str| Token::Ident(name.to_string());
         assert_eq!(
             kinds,
             vec![
-                Token::Ident("arr".to_string()),
+                ident("a"),
                 Token::Shl,
                 Token::Int(3),
                 Token::Semi,
-                Token::Int(0),
+                ident("b"),
                 Token::Shr,
-                Token::Ident("arr".to_string()),
+                Token::Int(1),
                 Token::Semi,
-                Token::Ident("a".to_string()),
-                Token::Plus,
-                Token::Ident("b".to_string()),
+                ident("a"),
+                Token::ShlEq,
+                Token::Int(2),
+                Token::Semi,
+                ident("b"),
+                Token::ShrEq,
+                ident("c"),
+                Token::Semi,
+                ident("x"),
+                Token::GtEq,
+                ident("y"),
                 Token::Semi,
             ]
         );

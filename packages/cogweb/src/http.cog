@@ -136,7 +136,7 @@ fn values_from_encoded_fields(encoded: str, name: str) -> str[] {
             )!!;
         }
         if decode_query_component(raw_name)!! == name {
-            values << decode_query_component(raw_value)!!;
+            values.append(decode_query_component(raw_value)!!);
         }
     }
     values
@@ -612,7 +612,7 @@ extend Cookie {
 
 extend Response {
     public fn add_cookie(mut self, cookie: Cookie) -> nil {
-        self.set_cookies << serialize_cookie(cookie)!!;
+        self.set_cookies.append(serialize_cookie(cookie)!!);
     }
 
     public fn header(self, name: str) -> str? {
@@ -777,7 +777,7 @@ extend Response {
         var previous_names: str[] = [];
         for entry in self.headers.entries() {
             const previous = entry.0 as str;
-            if lower_ascii(previous)!! == key { previous_names << previous; }
+            if lower_ascii(previous)!! == key { previous_names.append(previous); }
         }
         for previous in previous_names { self.headers.remove(previous as str)!!; }
         self.headers.set(key, value);

@@ -46,7 +46,7 @@ fn literal(text: &str) -> String {
 #[test]
 fn array_queries_and_slices_cover_empty_values_and_checked_ranges() {
     run(r#"
-        fn add_wrong(items) { items << "wrong" }
+        fn add_wrong(items) { items.append("wrong") }
         fn type_error(value) {
             when value is Error::TypeMismatch {} else { crash("expected TypeMismatch"); }
         }
@@ -96,11 +96,11 @@ fn array_results_have_fresh_outer_storage_and_preserve_nested_aliases() {
             const input = [1, 2, 3];
             var selected = array::slice(input, 1, 2)!!;
             selected[0] = 20;
-            selected << 4;
+            selected.append(4);
             var backward = array::reversed(input)!!;
             backward[0] = 30;
             var combined = array::concat(input, [4])!!;
-            combined << 5;
+            combined.append(5);
             require(input[1] == 2 && input[2] == 3 && len(input) == 3);
             require(selected[0] == 20 && selected[1] == 3 && selected[2] == 4);
             require(backward[0] == 30 && backward[2] == 1);
@@ -111,7 +111,7 @@ fn array_results_have_fresh_outer_storage_and_preserve_nested_aliases() {
             const reversed_nested = array::reversed(nested)!!;
             const empty_nested: int[][] = [];
             const combined_nested = array::concat(empty_nested, nested)!!;
-            nested[0] << 9;
+            nested[0].append(9);
             require(selected_nested[0][1] == 9);
             require(reversed_nested[1][1] == 9);
             require(combined_nested[0][1] == 9);
@@ -123,7 +123,7 @@ fn array_results_have_fresh_outer_storage_and_preserve_nested_aliases() {
         r#"@!include("std") use array; fn main() {
             const original = [[1]];
             var result = array::slice(original, 0, 1);
-            result[0] << 2;
+            result[0].append(2);
         }"#,
     )
     .unwrap_err()
@@ -327,7 +327,7 @@ fn string_search_split_and_join_match_utf8_text_without_normalization() {
             require(str::join(["a"], "---") == "a");
             var fields = str::split("a,b", ",")!!;
             fields[0] = "x";
-            fields << "c";
+            fields.append("c");
             require(str::join(fields, "/") == "x/b/c");
             when str::split("Cog", "") is Error::InvalidArgument(op) {
                 require(op == "str::split");

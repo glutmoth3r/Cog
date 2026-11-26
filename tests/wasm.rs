@@ -341,6 +341,47 @@ fn wasi_string_builders_append_and_snapshot_like_the_vm() {
     assert_eq!(lines[3], "true");
 }
 
+const SHIFT_PROGRAM: &str = r#"@!include("std")
+use io;
+use str;
+use err::Error;
+fn show(value) -> nil {
+    when value is Error { io::println(value.error_kind())!!; } else { io::println(value)!!; }
+}
+@propagate
+fn main(args: str[]) -> nil {
+    const value = str::to_int(args[0])!!;
+    const amount = str::to_int(args[1])!!;
+    const unsigned = str::to_uint(args[2])!!;
+    const unsigned_amount = str::to_uint(args[3])!!;
+    show(value << amount);
+    show(value >> amount);
+    show(value << unsigned_amount);
+    show(unsigned << amount);
+    show(unsigned >> unsigned_amount);
+    var compound = value;
+    compound <<= amount;
+    show(compound);
+}
+"#;
+
+#[test]
+#[ignore = "requires rustc's wasm32-wasip1 target and Node with WASI Preview 1"]
+fn wasi_integer_shifts_match_the_vm() {
+    for args in [
+        ["1", "62", "1", "63"],
+        ["1", "63", "3", "63"],
+        ["-5", "1", "18446744073709551615", "1"],
+        ["-1", "63", "9223372036854775808", "64"],
+        ["7", "64", "7", "0"],
+        ["7", "-1", "7", "18446744073709551615"],
+    ] {
+        assert_vm_parity("shift", SHIFT_PROGRAM, &args);
+    }
+    let output = assert_vm_parity("shift", SHIFT_PROGRAM, &["-5", "1", "8", "2"]);
+    assert_eq!(output, "-10\n-3\n-20\n16\n2\n-10\n");
+}
+
 const REPLACE_PROGRAM: &str = r#"@!include("std")
 use io;
 use str;

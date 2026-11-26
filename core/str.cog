@@ -198,14 +198,14 @@ public fn split(text: str, separator: str) {
     var offset = 0;
     while offset <= end - length {
         if bytes_match(data, offset, needle, length)!! {
-            result << bytes::to_str(data, start, offset - start)!!;
+            result.append(bytes::to_str(data, start, offset - start)!!);
             offset += length;
             start = offset;
         } else {
             offset += 1;
         }
     }
-    result << bytes::to_str(data, start, end - start)!!;
+    result.append(bytes::to_str(data, start, end - start)!!);
     result
 }
 
@@ -239,7 +239,7 @@ fn match_offsets(data, needle, first_only: bool, non_overlapping: bool) -> (int,
             matched = prefix[matched - 1]!!;
         }
         if symbol == bytes::get(needle, matched)!! { matched += 1; }
-        (prefix << matched)!!;
+        prefix.append(matched)!!;
     }
 
     var last = -1;
@@ -326,11 +326,11 @@ public fn lines(text: str) -> str[] {
     for i in 0..length {
         if bytes::get(data, i)!! == 10 {
             const end = if i > start && bytes::get(data, i - 1)!! == 13 { i - 1 } else { i };
-            (result << bytes::to_str(data, start, end - start)!!)!!;
+            result.append(bytes::to_str(data, start, end - start)!!)!!;
             start = i + 1;
         }
     }
-    if start < length { (result << bytes::to_str(data, start, length - start)!!)!!; }
+    if start < length { result.append(bytes::to_str(data, start, length - start)!!)!!; }
     result
 }
 

@@ -145,6 +145,142 @@ pub(crate) fn compare_bigint_float(integer: &BigInt, float: f64) -> Option<Order
     }
 }
 
+/// Bit width of `int` and `uint`; fixed-width shift amounts must be below it.
+const FIXED_SHIFT_BITS: i128 = 64;
+/// Absolute `bigint` left-shift result size when no digit limit is configured,
+/// so a single shift cannot request an unbounded allocation.
+const MAX_UNLIMITED_BIGINT_SHIFT_BITS: u64 = 1 << 32;
+
+fn shift_operation(left: bool) -> &'static str {
+    if left { "shl" } else { "shr" }
+}
+
+fn fixed_shift_amount(amount: i128, left: bool) -> Result<u32, RuntimeError> {
+    if (0..FIXED_SHIFT_BITS).contains(&amount) {
+        Ok(amount as u32)
+    } else {
+        Err(RuntimeError::InvalidArgument {
+            op: shift_operation(left),
+        })
+    }
+}
+
+/// Checked `int` shift. Left shifts that lose significant bits, including a
+/// sign change, overflow; right shifts are arithmetic. Amounts outside
+/// `0..64` are invalid arguments.
+pub(crate) fn shift_int(value: i64, amount: i128, left: bool) -> Result<i64, RuntimeError> {
+    let amount = fixed_shift_amount(amount, left)?;
+    if !left {
+        return Ok(value >> amount);
+    }
+    let result = value << amount;
+    if result >> amount == value {
+        Ok(result)
+    } else {
+        Err(RuntimeError::Overflow)
+    }
+}
+
+/// Checked `uint` shift. Left shifts that lose set bits overflow; right
+/// shifts are logical. Amounts outside `0..64` are invalid arguments.
+pub(crate) fn shift_uint(value: u64, amount: i128, left: bool) -> Result<u64, RuntimeError> {
+    let amount = fixed_shift_amount(amount, left)?;
+    if !left {
+        return Ok(value >> amount);
+    }
+    let result = value << amount;
+    if result >> amount == value {
+        Ok(result)
+    } else {
+        Err(RuntimeError::Overflow)
+    }
+}
+
+/// Significant bits of `value << amount` for a nonnegative amount, saturated.
+pub(crate) fn bigint_left_shift_bits(value: &BigInt, amount: i128) -> u64 {
+    let bits = value.bits();
+    if bits == 0 {
+        0
+    } else {
+        bits.saturating_add(u64::try_from(amount).unwrap_or(u64::MAX))
+    }
+}
+
+/// `bigint` shift. Left shifts multiply by a power of two within the numeric
+/// digit limit (a ResourceLimit Error beyond it); right shifts round toward
+/// negative infinity. Negative amounts are invalid arguments.
+pub(crate) fn shift_bigint(
+    value: &BigInt,
+    amount: i128,
+    left: bool,
+    digit_limit: Option<usize>,
+) -> Result<BigInt, RuntimeError> {
+    if amount < 0 {
+        return Err(RuntimeError::InvalidArgument {
+            op: shift_operation(left),
+        });
+    }
+    let resource = || RuntimeError::ResourceLimit {
+        resource: "numeric digits",
+    };
+    if digit_limit_exceeded(value, digit_limit) {
+        return Err(resource());
+    }
+    if !left {
+        // Shifting past every significant bit leaves only the sign: 0 or -1.
+        return Ok(match usize::try_from(amount) {
+            Ok(amount) if (amount as u64) <= value.bits() => value >> amount,
+            _ if value.sign() == num_bigint::Sign::Minus => BigInt::from(-1),
+            _ => BigInt::default(),
+        });
+    }
+    let bits = bigint_left_shift_bits(value, amount);
+    if bits == 0 {
+        return Ok(BigInt::default());
+    }
+    let minimum_digits = bits.saturating_sub(1).saturating_mul(30_102) / 100_000 + 1;
+    let too_large = match digit_limit {
+        Some(limit) => minimum_digits > u64::try_from(limit).unwrap_or(u64::MAX),
+        None => bits > MAX_UNLIMITED_BIGINT_SHIFT_BITS,
+    };
+    let amount = usize::try_from(amount).map_err(|_| resource())?;
+    if too_large {
+        return Err(resource());
+    }
+    let result = value << amount;
+    if digit_limit_exceeded(&result, digit_limit) {
+        return Err(resource());
+    }
+    Ok(result)
+}
+
+fn digit_limit_exceeded(value: &BigInt, digit_limit: Option<usize>) -> bool {
+    digit_limit.is_some_and(|limit| bigint_exceeds_decimal_digits(value, limit))
+}
+
+/// Integer shift on runtime values. The amount is an `int` or `uint`.
+pub(crate) fn shift_values(
+    value: Value,
+    amount: Value,
+    left: bool,
+    digit_limit: Option<usize>,
+) -> Result<Value, RuntimeError> {
+    let mismatch = RuntimeError::TypeMismatch {
+        op: shift_operation(left),
+    };
+    let amount = match amount {
+        Value::Int(amount) => i128::from(amount),
+        Value::UInt(amount) => i128::from(amount),
+        _ => return Err(mismatch),
+    };
+    match value {
+        Value::Int(value) => shift_int(value, amount, left).map(Value::Int),
+        Value::UInt(value) => shift_uint(value, amount, left).map(Value::UInt),
+        Value::BigInt(value) => shift_bigint(&value, amount, left, digit_limit).map(Value::BigInt),
+        _ => Err(mismatch),
+    }
+}
+
 pub(crate) fn bigint_exceeds_decimal_digits(value: &BigInt, limit: usize) -> bool {
     let bits = value.bits();
     if bits == 0 {

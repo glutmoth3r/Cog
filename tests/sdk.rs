@@ -148,7 +148,7 @@ fn native_reference_result_cannot_make_a_const_alias_writable() {
         fn main() {
             const protected = [10];
             var alias = host::identity(protected);
-            alias << 99;
+            alias.append(99);
         }
     "#;
     let error = engine.compile("native-alias.cog", source).err().unwrap();

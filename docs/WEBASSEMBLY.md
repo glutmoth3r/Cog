@@ -26,7 +26,8 @@ select a different Rust compiler executable when building.
 
 Supported values include `int`, `uint`, `bool`, `char`, `str`, and `nil`,
 arrays and structs of supported values, and shared mutable byte buffers and
-string builders. Integer overflow and division by zero produce Error values.
+string builders. Integer overflow, division by zero, and invalid shift amounts
+produce Error values.
 Branches, loops, recursion, direct calls, assignments, Error tests, and `!!` use
 the existing verified control flow. `main(args: str[])` and `process::args()`
 provide the host arguments as an ordinary `str[]`.

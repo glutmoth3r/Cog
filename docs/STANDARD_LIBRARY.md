@@ -268,7 +268,7 @@ use array;
 fn main() -> nil {
     const original = [1, 2, 3];
     var result = array::reversed(original)!!;
-    result << 4;
+    result.append(4);
     io::println(original)!!; // [1, 2, 3]
     io::println(result)!!;   // [3, 2, 1, 4]
 }

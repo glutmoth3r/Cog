@@ -191,6 +191,35 @@ arithmetic!(mul, checked_mul, "mul", false);
 arithmetic!(div, checked_div, "div", true);
 arithmetic!(rem, checked_rem, "mod", true);
 
+// Mirrors the VM's checked shifts: amounts outside 0..64 are invalid
+// arguments, and left shifts that lose significant bits overflow.
+fn shift(a: V, b: V, left: bool, pc: usize) -> V {
+    let op = if left { "shl" } else { "shr" };
+    let amount = match &b {
+        V::Int(amount) => i128::from(*amount),
+        V::UInt(amount) => i128::from(*amount),
+        _ => i128::MIN,
+    };
+    match (a, b) {
+        (error @ V::Error(_), _) | (_, error @ V::Error(_)) => error,
+        (V::Int(_) | V::UInt(_), _) if amount == i128::MIN => type_mismatch(pc, op),
+        (V::Int(_) | V::UInt(_), _) if !(0..64).contains(&amount) => {
+            Fault::value("InvalidArgument", pc, Detail::Operation(op))
+        }
+        (V::Int(value), _) if left => {
+            let result = value << amount;
+            if result >> amount == value { V::Int(result) } else { V::Error(Fault::new("Overflow", pc)) }
+        }
+        (V::UInt(value), _) if left => {
+            let result = value << amount;
+            if result >> amount == value { V::UInt(result) } else { V::Error(Fault::new("Overflow", pc)) }
+        }
+        (V::Int(value), _) => V::Int(value >> amount),
+        (V::UInt(value), _) => V::UInt(value >> amount),
+        _ => type_mismatch(pc, op),
+    }
+}
+
 fn add(a: V, b: V, pc: usize) -> V {
     match (a, b) {
         (error @ V::Error(_), _) | (_, error @ V::Error(_)) => error,

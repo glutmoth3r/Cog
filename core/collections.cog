@@ -62,7 +62,7 @@ fn bucket_index(hash_code: int, capacity: int) -> int {
 
 fn empty_buckets(capacity: int) -> int[] {
     var buckets: int[] = [];
-    for _ in 0..capacity { (buckets << -1)!!; }
+    for _ in 0..capacity { buckets.append(-1)!!; }
     buckets
 }
 
@@ -85,7 +85,7 @@ fn rebuild[K: type + Hashable, V: type](items: Map[K, V], capacity: int) {
     for old in items.slots {
         if old.live {
             const bucket = bucket_index(old.hash, capacity);
-            (slots << Slot(
+            slots.append(Slot(
                 key: old.key,
                 value: old.value,
                 hash: old.hash,
@@ -110,7 +110,7 @@ fn insert_new[K: type + Hashable, V: type](items: Map[K, V], key: K, value: V, h
     }
 
     const bucket = bucket_index(hash_code, items.buckets.len());
-    (items.slots << Slot(
+    items.slots.append(Slot(
         key: key,
         value: value,
         hash: hash_code,
@@ -240,7 +240,7 @@ extend[K: type + Hashable, V: type] Map[K, V] {
     public fn entries(self) -> (K, V)[] {
         var result: (K, V)[] = [];
         for slot in self.slots {
-            if slot.live { (result << (slot.key, slot.value))!!; }
+            if slot.live { result.append((slot.key, slot.value))!!; }
         }
         result
     }
@@ -248,7 +248,7 @@ extend[K: type + Hashable, V: type] Map[K, V] {
     public fn keys(self) -> K[] {
         var result: K[] = [];
         for slot in self.slots {
-            if slot.live { (result << slot.key)!!; }
+            if slot.live { result.append(slot.key)!!; }
         }
         result
     }
@@ -256,7 +256,7 @@ extend[K: type + Hashable, V: type] Map[K, V] {
     public fn values(self) -> V[] {
         var result: V[] = [];
         for slot in self.slots {
-            if slot.live { (result << slot.value)!!; }
+            if slot.live { result.append(slot.value)!!; }
         }
         result
     }
@@ -273,13 +273,13 @@ extend[K: type + Hashable + Clone, V: type + Clone] Map[K, V] with Clone {
                     rebuild(copied, next_capacity);
                 }
                 const bucket = bucket_index(slot.hash, copied.buckets.len());
-                copied.slots << Slot(
+                copied.slots.append(Slot(
                     key: slot.key.clone(),
                     value: slot.value.clone(),
                     hash: slot.hash,
                     next: copied.buckets[bucket]!!,
                     live: true
-                );
+                ));
                 copied.buckets[bucket] = copied.slots.len() - 1;
                 copied.length += 1;
             }
@@ -394,10 +394,10 @@ fn reserve_queue[T: type](queue: Queue[T]) {
     if queue.length == queue.slots.len() {
         var slots: T[][] = [];
         for index in 0..queue.length {
-            (slots << queue.slots[(queue.head + index) % queue.length]!!)!!;
+            slots.append(queue.slots[(queue.head + index) % queue.length]!!)!!;
         }
         const extra = if queue.length == 0 { 8 } else { queue.length };
-        for _ in 0..extra { (slots << queue.empty)!!; }
+        for _ in 0..extra { slots.append(queue.empty)!!; }
         queue.slots = slots;
         queue.head = 0;
     }

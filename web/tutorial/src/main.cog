@@ -287,7 +287,7 @@ fn scrub_paths(text: str, directory: str) -> str {
     const count = pieces.len();
     for index in 0..count {
         const piece = pieces[index]!! as str;
-        if index + 1 < count { kept << strip_path_prefix(piece); } else { kept << piece; }
+        if index + 1 < count { kept.append(strip_path_prefix(piece)); } else { kept.append(piece); }
     }
     cleaned = join(kept, "")!!;
     when working is str {
@@ -426,7 +426,7 @@ fn tutorial_cors_policy(host: str) -> cors::Policy {
         || starts_with(request.path, "/examples/")!!
         || starts_with(request.path, "/web/")!! {
         var extensions = ["md", "html", "cog", "kdl"];
-        if starts_with(request.path, "/web/")!! { extensions << "mjs"; }
+        if starts_with(request.path, "/web/")!! { extensions.append("mjs"); }
         const response = await static_files::serve_text(
             ".",
             request.path,
@@ -588,25 +588,25 @@ fn tutorial_cors_policy(host: str) -> cors::Policy {
         const event = await tasks[selected]!!;
         var remaining = tasks.empty_like()!!;
         for index in 0..tasks.len() {
-            if index != selected { remaining << tasks[index]!!; }
+            if index != selected { remaining.append(tasks[index]!!); }
         }
         tasks = remaining;
         if event.kind == "accept" {
-            tasks << spawn(client_event(event.socket, port, compiler, routes));
+            tasks.append(spawn(client_event(event.socket, port, compiler, routes)));
             active_handlers += 1;
             accept_pending = false;
             if active_handlers < 2 {
-                tasks << spawn(accept_event(listener));
+                tasks.append(spawn(accept_event(listener)));
                 accept_pending = true;
             }
         } else if event.kind == "done" {
             active_handlers -= 1;
             if !accept_pending && active_handlers < 2 {
-                tasks << spawn(accept_event(listener));
+                tasks.append(spawn(accept_event(listener)));
                 accept_pending = true;
             }
         } else {
-            tasks << spawn(accept_event(listener));
+            tasks.append(spawn(accept_event(listener)));
             accept_pending = true;
         }
     }

@@ -109,6 +109,9 @@ fn bytes_type_tests_require_current_bytecode() {
     let mut output = Vec::new();
     interpreter::run_with(&decoded, &mut output).unwrap();
 
+    // Version 42 introduced byte buffer type tests, so it still accepts the tag.
+    bytes[4..6].copy_from_slice(&42_u16.to_le_bytes());
+    bytecode::decode(&bytes).unwrap();
     // Version 41 predates byte buffer type tests, so its decoder rejects the tag.
     bytes[4..6].copy_from_slice(&41_u16.to_le_bytes());
     let error = bytecode::decode(&bytes).unwrap_err();
@@ -119,6 +122,45 @@ fn bytes_type_tests_require_current_bytecode() {
         assembled.instructions[1],
         I::IsType(ValueType::Bytes)
     ));
+}
+
+#[test]
+fn shift_instructions_require_current_bytecode() {
+    for (shift, opcode) in [(I::Shl, 122), (I::Shr, 123)] {
+        let program = CompiledProgram::new(vec![
+            I::Push(Value::Int(-8)),
+            I::Push(Value::UInt(1)),
+            shift.clone(),
+            I::Pop,
+            I::Halt,
+        ]);
+        let mut bytes = bytecode::encode(&program).unwrap();
+        let decoded = bytecode::decode(&bytes).unwrap();
+        assert_eq!(
+            std::mem::discriminant(&decoded.instructions[2]),
+            std::mem::discriminant(&shift)
+        );
+        assert_eq!(bytecode::encode(&decoded).unwrap(), bytes);
+        interpreter::run_with(&decoded, &mut Vec::new()).unwrap();
+
+        // Older versions predate integer shifts, so their decoders reject the opcodes.
+        for version in [38_u16, 39, 40, 41, 42] {
+            bytes[4..6].copy_from_slice(&version.to_le_bytes());
+            let error = bytecode::decode(&bytes).unwrap_err();
+            assert!(
+                error.contains(&format!("unknown bytecode opcode {opcode}")),
+                "{version}: {error}"
+            );
+        }
+
+        let mnemonic = if opcode == 122 { "shl" } else { "shr" };
+        let assembled =
+            cog::parser::assemble(&format!("push 1\npush 1\n{mnemonic}\npop\nhalt\n")).unwrap();
+        assert_eq!(
+            std::mem::discriminant(&assembled.instructions[2]),
+            std::mem::discriminant(&shift)
+        );
+    }
 }
 
 #[test]
@@ -187,7 +229,7 @@ fn typed_aggregate_metadata_is_bounded_canonical_and_versioned() {
     assert!(
         bytecode::decode(&legacy)
             .unwrap_err()
-            .contains("unsupported bytecode version 10; expected 42")
+            .contains("unsupported bytecode version 10; expected 43")
     );
 }
 

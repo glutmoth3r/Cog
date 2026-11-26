@@ -8,7 +8,7 @@ fn main() -> nil {
     var cleaned = [];
     for index in 0..len(fields) {
         const field = str::trim(fields[index] as str)!!;
-        if field != "" { cleaned << field; }
+        if field != "" { cleaned.append(field); }
     }
 
     io::println(str::join(cleaned, " | ")!!)!!;

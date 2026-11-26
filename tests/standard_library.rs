@@ -268,12 +268,12 @@ fn in_place_sorts_return_nil_and_sorted_returns_an_independent_copy() {
                     const view = values;
                     const result: nil = sort::{algorithm}(values);
                     if result != nil || !sort::is_sorted(values) {{ crash("sort result or order incorrect"); }}
-                    values << 9;
+                    values.append(9);
                     io::println(view)!!;
 
                     const copy = sort::sorted(values);
                     if !sort::is_sorted(copy) {{ crash("sorted copy is not ordered"); }}
-                    values << 10;
+                    values.append(10);
                     io::println(values)!!;
                     io::println(copy)!!;
 
@@ -320,9 +320,9 @@ fn quick_sort_handles_ordered_reverse_duplicate_and_large_inputs() {
                 var descending: int[] = [];
                 var equal: int[] = [];
                 for index in 0..4096 {
-                    ascending << index;
-                    descending << (4095 - index);
-                    equal << 8;
+                    ascending.append(index);
+                    descending.append(4095 - index);
+                    equal.append(8);
                 }
                 sort::quick(ascending);
                 sort::quick(descending);
@@ -371,7 +371,7 @@ fn comparison_errors_propagate_and_leave_sort_inputs_as_permutations() {
                     for failing in 1..21 {{
                         fail_value = failing;
                         var items: Item[] = [];
-                        for index in 0..20 {{ items << Item(value: 20 - index); }}
+                        for index in 0..20 {{ items.append(Item(value: 20 - index)); }}
                         const caught = try {{ sort::{algorithm}(items); false }} catch(error) {{
                             when error is Error::MissingField(field) {{ field == "compare marker" }}
                             else {{ false }}
@@ -407,7 +407,7 @@ fn quick_sort_propagates_errors_from_its_recursive_partition_ranges() {
             fn require(condition: bool) { if !condition { crash("quick recursion check failed"); } }
             fn main() {
                 var items: Item[] = [];
-                for index in 0..20 { items << Item(value: 20 - index); }
+                for index in 0..20 { items.append(Item(value: 20 - index)); }
                 try { sort::quick(items); crash("recursive compare error was lost"); }
                 catch(error) {
                     when error is Error::MissingField(field) {
@@ -442,8 +442,8 @@ fn quick_sort_custom_ordering_handles_large_and_all_equal_arrays() {
                 var descending: Number[] = [];
                 var equal: Number[] = [];
                 for index in 0..1024 {
-                    descending << Number(value: 1023 - index);
-                    equal << Number(value: 5);
+                    descending.append(Number(value: 1023 - index));
+                    equal.append(Number(value: 5));
                 }
                 sort::quick(descending);
                 sort::quick(equal);
@@ -506,7 +506,7 @@ fn sorted_clones_user_defined_ordered_elements_and_the_outer_array() {
                 var result = sort::sorted(scores);
                 io::println(result[0]!!.value)!!;
                 io::println(scores[0]!!.value)!!;
-                result << Score(value: 0);
+                result.append(Score(value: 0));
                 io::println(result.len())!!;
                 io::println(scores.len())!!;
             }
@@ -731,7 +731,7 @@ fn maps_use_hashing_preserve_order_and_handle_tombstones_and_errors() {
                 require(words.get("é🦀") == 0);
                 require(words.set("other", 7));
                 var snapshot = words.entries();
-                snapshot << ("outside", 8);
+                snapshot.append(("outside", 8));
                 require(words.len() == 2);
                 require(len(words.keys()) == 2);
                 require(len(words.values()) == 2);
@@ -877,7 +877,7 @@ fn collection_iteration_evaluates_once_uses_unicode_scalars_and_detects_structur
                 try {
                     for value in values {
                         io::println(value)!!;
-                        values << 3;
+                        values.append(3);
                     }
                     crash("array mutation did not invalidate iteration");
                 } catch(error) {
@@ -1139,7 +1139,7 @@ fn json_decoded_arrays_remain_heterogeneous_and_mutable() {
             use json;
             fn main() {
                 var value = json::parse("[1,\"two\",null]")!!;
-                value << false;
+                value.append(false);
                 value[0] = "one";
                 io::println(json::stringify(value)!!)!!;
             }

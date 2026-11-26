@@ -87,7 +87,7 @@ fn queues() {
         rng = (rng * 97 + 11) % 251;
         if q.is_empty() || rng % 5 > 1 {
             q.push(index)!!;
-            reference << index;
+            reference.append(index);
         } else {
             require(q.peek()!! == reference[head]!!, "queue peek");
             require(q.pop()!! == reference[head]!!, "queue order");
@@ -114,7 +114,7 @@ fn queues() {
 
 fn heaps() {
     var data: int[] = [];
-    for i in 0..200 { data << (i * 23 % 71); }
+    for i in 0..200 { data.append(i * 23 % 71); }
     var heap = collections::PriorityQueue::from(data)!!;
     const sorted = sort::sorted(data)!!;
     for expected in sorted {

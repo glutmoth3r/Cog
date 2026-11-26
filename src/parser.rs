@@ -511,6 +511,8 @@ pub fn assemble(source: &str) -> Result<crate::backend::CompiledProgram, ParseEr
             "mul" => require_no_operand(&r, Instruction::Mul)?,
             "div" => require_no_operand(&r, Instruction::Div)?,
             "mod" => require_no_operand(&r, Instruction::Mod)?,
+            "shl" => require_no_operand(&r, Instruction::Shl)?,
+            "shr" => require_no_operand(&r, Instruction::Shr)?,
             "eq" => require_no_operand(&r, Instruction::Eq)?,
             "ne" => require_no_operand(&r, Instruction::Ne)?,
             "lt" => require_no_operand(&r, Instruction::Lt)?,

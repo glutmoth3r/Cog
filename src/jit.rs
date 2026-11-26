@@ -1846,6 +1846,8 @@ fn analyze_function(
                 | Instruction::Mul
                 | Instruction::Div
                 | Instruction::Mod
+                | Instruction::Shl
+                | Instruction::Shr
                 | Instruction::Eq
                 | Instruction::Ne
                 | Instruction::Lt
@@ -3320,6 +3322,8 @@ fn jit_reachable_pcs(
             | Instruction::Mul
             | Instruction::Div
             | Instruction::Mod
+            | Instruction::Shl
+            | Instruction::Shr
             | Instruction::Eq
             | Instruction::Ne
             | Instruction::Lt
@@ -3521,6 +3525,8 @@ fn jit_instruction_preserves_type_facts(instruction: &Instruction, state: &JitTy
             | Instruction::Mul
             | Instruction::Div
             | Instruction::Mod
+            | Instruction::Shl
+            | Instruction::Shr
             | Instruction::Eq
             | Instruction::Ne
             | Instruction::Lt
@@ -3639,6 +3645,16 @@ fn jit_type_state_after(
             let right = popped.last().copied().flatten();
             next.stack
                 .push(known_numeric_result_tag(left, right, instruction));
+        }
+        // JIT code continues only after a successful fixed-width shift, which
+        // keeps the left operand's tag; every other case resumes in the VM.
+        Instruction::Shl | Instruction::Shr => {
+            let left = popped.get(popped.len().checked_sub(2)?).copied().flatten();
+            let right = popped.last().copied().flatten();
+            next.stack.push(
+                left.filter(|tag| matches!(*tag, TAG_INT | TAG_UINT))
+                    .filter(|_| matches!(right, Some(TAG_INT | TAG_UINT))),
+            );
         }
         Instruction::Eq
         | Instruction::Ne
@@ -4176,6 +4192,15 @@ fn lower_function(
                     helpers,
                 );
             }
+            Instruction::Shl | Instruction::Shr => emit_shift_binary(
+                &mut builder,
+                frame,
+                &local_state,
+                pc,
+                depth,
+                next.ok_or("shift fallthrough is missing")?,
+                matches!(artifact.instructions[pc], Instruction::Shl),
+            ),
             Instruction::Eq
             | Instruction::Ne
             | Instruction::Lt
@@ -5748,6 +5773,87 @@ fn emit_integer_binary_kind(
     );
     store_stack_field(builder, local_state, depth - 2, 8, result);
     builder.ins().jump(next, &[]);
+}
+
+/// Lower `int`/`uint` shifts whose amount is an `int` or `uint` in `0..64`
+/// and whose left shift keeps every significant bit. Every other case,
+/// including BigInt operands and recoverable Errors, resumes in the VM at
+/// this instruction, which keeps one implementation of the error semantics.
+#[allow(clippy::too_many_arguments)]
+fn emit_shift_binary(
+    builder: &mut FunctionBuilder<'_>,
+    frame: cranelift_codegen::ir::Value,
+    local_state: &JitLocalState,
+    pc: usize,
+    depth: usize,
+    next: cranelift_codegen::ir::Block,
+    left_shift: bool,
+) {
+    let left_tag = load_stack_field(builder, local_state, depth - 2, 0);
+    let right_tag = load_stack_field(builder, local_state, depth - 1, 0);
+    let left_is_int = builder
+        .ins()
+        .icmp_imm_s(IntCC::Equal, left_tag, TAG_INT as i64);
+    let left_is_uint = builder
+        .ins()
+        .icmp_imm_s(IntCC::Equal, left_tag, TAG_UINT as i64);
+    let left_integer = builder.ins().bor(left_is_int, left_is_uint);
+    let right_is_int = builder
+        .ins()
+        .icmp_imm_s(IntCC::Equal, right_tag, TAG_INT as i64);
+    let right_is_uint = builder
+        .ins()
+        .icmp_imm_s(IntCC::Equal, right_tag, TAG_UINT as i64);
+    let right_integer = builder.ins().bor(right_is_int, right_is_uint);
+    let amount = load_stack_field(builder, local_state, depth - 1, 8);
+    // A negative `int` amount is a large unsigned value, so one unsigned
+    // comparison checks both the sign and the upper bound.
+    let in_range = builder
+        .ins()
+        .icmp_imm_u(IntCC::UnsignedLessThan, amount, 64);
+    let operands = builder.ins().band(left_integer, right_integer);
+    let valid = builder.ins().band(operands, in_range);
+    let fallback = builder.create_block();
+    let signed = builder.create_block();
+    let unsigned = builder.create_block();
+    let dispatch = builder.create_block();
+    builder.ins().brif(valid, dispatch, &[], fallback, &[]);
+    builder.switch_to_block(fallback);
+    emit_exit(
+        builder,
+        frame,
+        local_state,
+        pc,
+        depth,
+        EXIT_RESUME,
+        REASON_NORMAL,
+    );
+    builder.switch_to_block(dispatch);
+    builder.ins().brif(left_is_int, signed, &[], unsigned, &[]);
+    for (block, tag, is_signed) in [(signed, TAG_INT, true), (unsigned, TAG_UINT, false)] {
+        builder.switch_to_block(block);
+        let value = load_stack_field(builder, local_state, depth - 2, 8);
+        let result = if left_shift {
+            let result = builder.ins().ishl(value, amount);
+            let restored = if is_signed {
+                builder.ins().sshr(result, amount)
+            } else {
+                builder.ins().ushr(result, amount)
+            };
+            let lossless = builder.ins().icmp(IntCC::Equal, restored, value);
+            let store = builder.create_block();
+            builder.ins().brif(lossless, store, &[], fallback, &[]);
+            builder.switch_to_block(store);
+            result
+        } else if is_signed {
+            builder.ins().sshr(value, amount)
+        } else {
+            builder.ins().ushr(value, amount)
+        };
+        store_stack_const(builder, local_state, depth - 2, JitSlot { tag, payload: 0 });
+        store_stack_field(builder, local_state, depth - 2, 8, result);
+        builder.ins().jump(next, &[]);
+    }
 }
 
 fn tag_range_test(

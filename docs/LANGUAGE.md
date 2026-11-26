@@ -378,14 +378,14 @@ for cancellation, resumable awaits, scheduling, and current limits.
 
 Arithmetic uses `+`, `-`, `*`, `/`, `%`; comparisons use `==`, `!=`, `<`, `<=`, `>`,
 `>=`. `!` is boolean negation, `^` boolean XOR. `&&` and `||` short-circuit.
-Integer overflow produces Error. `<<` and `>>` are sequence mutations, not bit shifts.
+Integer overflow produces Error. `<<` and `>>` are integer bit shifts (see below).
 
-Supported compound assignments are `+=`, `-=`, `*=`, `/=`, `%=`, `&&=`, `||=`, and
-`^=`. An assignment receiver/index evaluates once, including compound assignments.
-`<<=` and `>>=` are not supported.
+Supported compound assignments are `+=`, `-=`, `*=`, `/=`, `%=`, `<<=`, `>>=`,
+`&&=`, `||=`, and `^=`. An assignment receiver/index evaluates once, including
+compound assignments.
 
-Arithmetic binds more tightly than sequence operations, which bind more tightly
-than comparisons. `&&` binds more tightly than `||`. `??` and `?!` have equal
+Arithmetic binds more tightly than shifts, which bind more tightly than
+comparisons, so `1 << 2 + 1` is `1 << (2 + 1)`. Shifts associate left to right. `&&` binds more tightly than `||`. `??` and `?!` have equal
 precedence below `||` and associate to the right. Use parentheses for mixed
 expressions and for composing control-block expressions:
 
@@ -393,6 +393,32 @@ expressions and for composing control-block expressions:
 a ?? b ?! c   = a ?? (b ?! c)
 a ?! b ?? c   = a ?! (b ?? c)
 a ?? b || c  = a ?? (b || c)
+```
+
+### Bit shifts
+
+`value << amount` and `value >> amount` accept an `int`, `uint`, or `bigint` value
+and an `int` or `uint` amount. The result has the type of `value`. Arrays are not
+shift operands: using `<<` or `>>` on one is a compile error, and elements are added
+with `.append(value)` or `.prepend(value)`.
+
+- For `int` and `uint`, the amount must be in `0..64`. Any other amount produces
+  `Error::InvalidArgument` with operation `shl` or `shr`.
+- A left shift that loses significant bits, or changes the sign of an `int`,
+  produces `Error::Overflow`.
+- A right shift is arithmetic for `int` and logical for `uint`.
+- A `bigint` accepts any nonnegative amount; a negative amount produces
+  `InvalidArgument`. A right shift rounds toward negative infinity. A left shift
+  whose result exceeds the optional numeric digit limit produces
+  `Error::ResourceLimit`. Without a configured limit, a result is still capped at
+  2^32 bits.
+
+An expected type does not reach through a shift to type its literals. Give the
+value operand its type first:
+
+```text
+const one: uint = 1;
+const high_bit: uint = one << 63;
 ```
 
 ### Struct equality
@@ -642,8 +668,8 @@ enum Status { Ready, Failed(code: int) }
 
 fn main() -> nil {
     var values: int[] = [1, 2];
-    values << 3;
-    0 >> values;
+    values.append(3);
+    values.prepend(0);
     values[1] = 9;
     io::println(values)!!;
 
@@ -674,11 +700,10 @@ is distinct from `int` and from other tuple structs with the same field types.
 
 
 Arrays use zero-based indexing and share mutable storage. Out-of-bounds access
-produces Error. `array << value`, `value >> array`, `.append(value)`, and
-`.prepend(value)` mutate and return the same array. Each adds one element; an array
-argument becomes a nested element rather than concatenation. Both sequence
-operators currently associate left to right; write `x >> (y >> array)` for a
-prepend chain. Receiver methods take positional arguments. Assigning an Error to an
+produces Error. `.append(value)` and `.prepend(value)` mutate and return the same
+array, so calls can be chained. Each adds one element; an array argument becomes a
+nested element rather than concatenation. Receiver methods take positional
+arguments. Assigning an Error to an
 array element, tuple position, or record field stores it at that leaf; the aggregate
 keeps its normal type. An Error in the assignment receiver or index propagates
 without mutation.

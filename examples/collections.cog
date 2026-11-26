@@ -11,9 +11,9 @@ fn main() -> nil {
 
     const original = [1];
     var current = original; // reassignable, currently read-only access
-    // current << 2;       // semantic error: aliasing cannot raise capability
+    // current.append(2);       // semantic error: aliasing cannot raise capability
     current = [10, 20];
-    current << 30;
+    current.append(30);
     io::println(original)!!;
     io::println(current)!!;
 }

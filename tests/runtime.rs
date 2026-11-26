@@ -1193,7 +1193,7 @@ fn process_capture_preserves_binary_output_signal_status_and_host_stdin() {
 fn dynamic_array_alias_mutation_is_rejected_without_mutation() {
     let program = compile(
         r#"
-        fn corrupt(values) { values << 1 }
+        fn corrupt(values) { values.append(1) }
         fn main() {
             var arguments = ["-c", "echo unexpected"];
             var alias = arguments;

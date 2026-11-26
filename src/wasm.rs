@@ -475,6 +475,7 @@ impl LowerFunction<'_, '_> {
                 let op = match instruction { Add => "add", Sub => "sub", Mul => "mul", Div => "div", _ => "rem" };
                 writeln!(out, "v{a} = {op}(take(&mut v{a}), take(&mut v{b}), {pc});").unwrap();
             }
+            Shl | Shr => writeln!(out, "v{a} = shift(take(&mut v{a}), take(&mut v{b}), {}, {pc});", matches!(instruction, Shl)).unwrap(),
             Eq | Ne | Lt | Le | Gt | Ge => {
                 writeln!(out, "v{a} = compare(take(&mut v{a}), take(&mut v{b}), Order::{instruction:?}, {pc});").unwrap();
             }

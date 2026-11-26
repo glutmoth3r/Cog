@@ -126,11 +126,11 @@ public fn sample[T: type](rng: Seeded, items: T[], count: int) -> T[] {
     var result: T[] = [];
     if count == 0 { return result; }
     var pool: T[] = [];
-    for item in items { (pool << item)!!; }
+    for item in items { pool.append(item)!!; }
     for index in 0..count {
         const selected = rng.range(index, pool.len())!!;
         pool.swap(index, selected)!!;
-        (result << pool[index]!!)!!;
+        result.append(pool[index]!!)!!;
     }
     result
 }

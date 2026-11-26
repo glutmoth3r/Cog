@@ -240,7 +240,7 @@ fn rendering_failure_is_observed_before_later_holes_and_runs_cleanup() {
         struct Link { children: Link[] }
         fn main() {
             var cycle = Link(children: []);
-            cycle.children << cycle;
+            cycle.children.append(cycle);
             try {
                 defer { io::println("cleanup"); }
                 io::println($"cycle={cycle}; later={side()}");

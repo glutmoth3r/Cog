@@ -1499,3 +1499,168 @@ fn a_mutating_equals_requires_writable_operands() {
     assert!(error.contains("const/read-only"), "{error}");
     assert_eq!(run(&source("var")), "1\n");
 }
+
+const SHIFT_CASES: &str = r#"
+fn shl(value, amount) { value << amount }
+fn shr(value, amount) { value >> amount }
+fn show(value) { io::println($"{value.error_kind()} {value ?! 0}"); }
+fn main() {
+    show(shl(1, 0));
+    show(shl(1, 62));
+    show(shl(1, 63));
+    show(shl(-1, 63));
+    show(shl(3, 62));
+    show(shl(-3, 62));
+    show(shr(-5, 1));
+    show(shr(-1, 63));
+    show(shr(-9223372036854775807 - 1, 63));
+    show(shl(5, -1));
+    show(shr(5, -1));
+    show(shl(5, 64));
+    show(shr(5, 64));
+    show(shl(1, 3 as uint));
+    show(shr(1, 18446744073709551615));
+    show(shl(1 as uint, 63));
+    show(shl(3 as uint, 63));
+    show(shr(18446744073709551615, 63));
+    show(shr(1 as uint, -1));
+    show(shl(1 as bigint, 100));
+    show(shl(-3 as bigint, 2 as uint));
+    show(shr(-5 as bigint, 1));
+    show(shr(-5 as bigint, 1000));
+    show(shr(5 as bigint, 18446744073709551615));
+    show(shl(0 as bigint, 9223372036854775807));
+    show(shl(1 as bigint, -1));
+    show(shr(1 as bigint, -1));
+    show(shl(1 as bigint, 9223372036854775807));
+    show(shl(1.5, 1));
+    show(shl(1, 1.5));
+    show(shl(1, 1 as bigint));
+}
+"#;
+
+const SHIFT_RESULTS: &str = "ok 1\nok 4611686018427387904\nOverflow 0\n\
+ok -9223372036854775808\nOverflow 0\nOverflow 0\nok -3\nok -1\nok -1\n\
+InvalidArgument 0\nInvalidArgument 0\nInvalidArgument 0\nInvalidArgument 0\nok 8\n\
+InvalidArgument 0\nok 9223372036854775808\nOverflow 0\nok 1\nInvalidArgument 0\n\
+ok 1267650600228229401496703205376\nok -12\nok -3\nok -1\nok 0\nok 0\n\
+InvalidArgument 0\nInvalidArgument 0\nResourceLimit 0\n\
+TypeMismatch 0\nTypeMismatch 0\nTypeMismatch 0\n";
+
+#[test]
+fn integer_shifts_check_amounts_and_lost_bits_for_every_integer_type() {
+    assert_eq!(run(SHIFT_CASES), SHIFT_RESULTS);
+}
+
+#[test]
+fn bigint_shifts_respect_the_numeric_digit_limit() {
+    let program = compile(
+        "fn shl(value, amount) { value << amount } \
+         fn main() { io::println(shl(1 as bigint, 40).error_kind()); \
+         io::println(shl(1 as bigint, 400).error_kind()); \
+         const wide = 18446744073709551616; \
+         io::println((wide << 40).error_kind()); \
+         io::println((wide << 400).error_kind()); }",
+    );
+    let mut output = Vec::new();
+    let mut context =
+        cog::runtime::RuntimeContext::new(&mut output, cog::runtime::VmCapabilities::default());
+    context.limits.max_numeric_digits = Some(50);
+    interpreter::run_with_context(&program, &mut context).unwrap();
+    drop(context);
+    assert_eq!(
+        String::from_utf8(output).unwrap(),
+        "ok\nResourceLimit\nok\nResourceLimit\n"
+    );
+}
+
+#[test]
+fn shifts_bind_between_additive_and_comparison_operators() {
+    assert_eq!(
+        run(r#"
+        fn main() {
+            io::println(1 << 2 + 1);
+            io::println(64 >> 1 * 2);
+            io::println(1 << 3 > 7);
+            io::println(256 >> 2 >> 1);
+        }
+    "#),
+        "8\n16\ntrue\n32\n"
+    );
+}
+
+#[test]
+fn shift_compound_assignment_evaluates_target_once_and_preserves_errors() {
+    assert_eq!(
+        run(r#"
+        var values = [10, -9];
+        fn receiver() { io::println("receiver"); return values; }
+        fn index(at: int) { io::println("index"); return at; }
+        fn rhs(amount: int) { io::println("rhs"); return amount; }
+        fn main() {
+            receiver()[index(0)] <<= rhs(3);
+            receiver()[index(1)] >>= rhs(1);
+            io::println(values);
+            var unsigned: uint = 1;
+            unsigned <<= 63;
+            io::println(unsigned);
+            unsigned >>= 62;
+            io::println(unsigned);
+            var value = 1;
+            value <<= 64;
+            io::println(value.error_kind());
+            value <<= 1;
+            io::println(value.error_kind());
+        }
+    "#),
+        "receiver\nindex\nrhs\nreceiver\nindex\nrhs\n[80, -5]\n\
+         9223372036854775808\n2\nInvalidArgument\nInvalidArgument\n"
+    );
+}
+
+#[test]
+fn comptime_shifts_match_runtime_shifts() {
+    assert_eq!(
+        run(r#"
+        fn table(seed: int, amount: int) -> int {
+            if amount == 50 { return 0; }
+            (seed << amount) % 1000003 + (seed >> amount) % 1000003 + table(seed, amount + 1)
+        }
+        @comptime fn comptime_table(seed: int, amount: int) -> int {
+            if amount == 50 { return 0; }
+            (seed << amount) % 1000003 + (seed >> amount) % 1000003 + comptime_table(seed, amount + 1)
+        }
+        @comptime const POSITIVE: int = comptime_table(12345, 40);
+        @comptime const NEGATIVE: int = comptime_table(-777, 40);
+        fn main() {
+            io::println(POSITIVE == table(12345, 40));
+            io::println(NEGATIVE == table(-777, 40));
+            io::println((1 << 64).error_kind());
+            io::println((1 << 63).error_kind());
+        }
+    "#),
+        "true\ntrue\nInvalidArgument\nOverflow\n"
+    );
+}
+
+#[test]
+fn shift_operators_reject_arrays_and_name_the_array_methods() {
+    for (body, method) in [
+        ("var values = [1]; values << 2;", "array.append(value)"),
+        ("var values = [1]; 0 >> values;", "array.prepend(value)"),
+        (
+            "var values: int[] = []; values >> 1;",
+            "array.prepend(value)",
+        ),
+    ] {
+        let error = compile_error(&format!("fn main() {{ {body} }}"));
+        assert!(error.contains("E2002"), "{error}");
+        assert!(error.contains(method), "{error}");
+    }
+    let error = compile_error("fn main() { io::println(1.5 << 1); }");
+    assert!(error.contains("invalid operands float and int"), "{error}");
+    let error = compile_error("fn main() { io::println(1 << (1 as bigint)); }");
+    assert!(error.contains("invalid operands int and bigint"), "{error}");
+    let error = compile_error("fn main() { const value = 1; value <<= 1; }");
+    assert!(error.contains("cannot assign to const"), "{error}");
+}

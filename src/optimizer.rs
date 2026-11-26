@@ -868,6 +868,8 @@ fn execute(
         | Instruction::Mul
         | Instruction::Div
         | Instruction::Mod
+        | Instruction::Shl
+        | Instruction::Shr
         | Instruction::Eq
         | Instruction::Ne
         | Instruction::Lt
@@ -917,6 +919,8 @@ fn fold_binary(instruction: &Instruction, left: Fact, right: Fact) -> Option<Fac
         Instruction::Mul => BinOp::Mul,
         Instruction::Div => BinOp::Div,
         Instruction::Mod => BinOp::Mod,
+        Instruction::Shl => BinOp::Shl,
+        Instruction::Shr => BinOp::Shr,
         Instruction::Eq => BinOp::Eq,
         Instruction::Ne => BinOp::NotEq,
         Instruction::Lt => BinOp::Lt,

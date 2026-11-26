@@ -96,7 +96,7 @@ fn awaited_reference_cannot_make_a_const_alias_writable() {
             const protected = [10];
             var alias = [1];
             alias = await identity(protected);
-            alias << 99;
+            alias.append(99);
         }
         "#,
         &["read-only"],
@@ -114,7 +114,7 @@ fn deferred_async_writes_cannot_be_erased_by_a_later_store() {
             const pending = save(holder, protected);
             holder.item = [2];
             await pending;
-            holder.item << 99;
+            holder.item.append(99);
         }
         "#,
         &["read-only"],
@@ -166,7 +166,7 @@ fn deferred_async_global_rebinding_retains_const_aliases() {
             const pending = save(protected);
             shared = [2];
             await pending;
-            shared << 99;
+            shared.append(99);
         }
         "#,
         &["read-only"],
@@ -178,7 +178,7 @@ fn deferred_async_global_mutation_rejects_rebinding_through_helpers() {
     rejects_semantically(
         r#"
         var shared = [1];
-        @async fn change() -> nil { shared << 99; }
+        @async fn change() -> nil { shared.append(99); }
         fn replace(value: int[]) -> nil { shared = value; }
         fn forward(value: int[]) -> nil { replace(value); }
         @async fn main() {
@@ -198,7 +198,7 @@ fn helper_cannot_hide_deferred_global_mutation_and_rebinding() {
     rejects_semantically(
         r#"
         var shared = [1];
-        @async fn change() -> nil { shared << 99; }
+        @async fn change() -> nil { shared.append(99); }
         fn replace(value: int[]) -> nil { shared = value; }
         fn setup(value: int[]) -> Task[nil] {
             const pending = change();
@@ -228,7 +228,7 @@ fn helper_cannot_hide_deferred_heap_stores() {
             const pending = start(holder, protected);
             holder.item = [2];
             await pending;
-            holder.item << 99;
+            holder.item.append(99);
         }
         "#,
         &["read-only"],
@@ -241,7 +241,7 @@ fn named_callback_cannot_rebind_a_global_used_by_a_pending_task() {
         r#"
         var shared = [1];
         const protected = [10];
-        @async fn change() -> nil { shared << 99; }
+        @async fn change() -> nil { shared.append(99); }
         fn install() -> nil { shared = protected; }
         @async fn main() {
             const pending = change();
@@ -259,7 +259,7 @@ fn unrelated_async_mutation_does_not_block_global_rebinding() {
     output(
         r#"
         var shared = [1];
-        @async fn change(value: int[]) -> nil { value << 99; }
+        @async fn change(value: int[]) -> nil { value.append(99); }
         fn replace(value: int[]) -> nil { shared = value; }
         @async fn main() {
             const protected = [10];
@@ -500,7 +500,7 @@ fn closure_can_clone_a_readonly_reference_without_mutating_its_source() {
         fn make_copy(values: int[]) -> fn() -> int[] {
             const copy = fn[values]() -> int[] {
                 var duplicate = values.clone();
-                duplicate << 2;
+                duplicate.append(2);
                 duplicate
             };
             copy
@@ -568,7 +568,7 @@ fn closure_value_capture_cannot_mutate_a_readonly_reference() {
         r#"
         fn make_bad(values: int[]) {
             const append = fn[values]() -> nil {
-                values << 2;
+                values.append(2);
                 nil
             };
         }
@@ -595,7 +595,7 @@ fn closure_return_cannot_escalate_a_readonly_capture() {
             const values = [1];
             const read = make_reader(values);
             const returned = (read)();
-            returned << 2;
+            returned.append(2);
         }
         "#,
         &["cannot mutate", "read-only access"],
@@ -607,7 +607,7 @@ fn closure_value_capture_cannot_call_a_mutating_helper() {
     rejects_semantically(
         r#"
         fn append(values: int[]) -> nil {
-            values << 2;
+            values.append(2);
             nil
         }
 
@@ -634,7 +634,7 @@ fn nested_mutable_capture_requires_mutable_forwarding() {
         fn make_bad(values: int[]) {
             const outer = fn[values]() -> fn() -> nil {
                 const inner = fn[var values]() -> nil {
-                    values << 2;
+                    values.append(2);
                     nil
                 };
                 inner
@@ -2322,7 +2322,7 @@ fn phase_15_comptime_binding_requires_attribute_and_const() {
 #[test]
 fn binding_01_object_mutation_justifies_var_but_reading_alone_does_not() {
     output(
-        "fn main() { var values = [1]; values << 2; 0 >> values; io::println(values); }",
+        "fn main() { var values = [1]; values.append(2); values.prepend(0); io::println(values); }",
         "[0, 1, 2]\n",
     );
     for body in [
@@ -2338,7 +2338,7 @@ fn binding_02_unreachable_write_does_not_justify_var() {
     for body in [
         "fn main() { var value = 1; return; value = 2; }",
         "fn main() { var value = 1; if false { value = 2; } io::println(value); }",
-        "fn main() { var values = [1]; return; values << 2; }",
+        "fn main() { var values = [1]; return; values.append(2); }",
         "fn main() { var values = [1]; if false { values[0] = 2; } io::println(values); }",
     ] {
         rejects_semantically(body, &["var", "mutat"]);
@@ -2360,8 +2360,8 @@ fn binding_03_var_infers_the_same_static_initializer_type_as_const() {
 #[test]
 fn binding_04_const_forbids_sequence_index_and_field_mutation() {
     for body in [
-        "fn main() { const values = [1]; values << 2; }",
-        "fn main() { const values = [1]; 0 >> values; }",
+        "fn main() { const values = [1]; values.append(2); }",
+        "fn main() { const values = [1]; values.prepend(0); }",
         "fn main() { const values = [1]; values[0] = 2; }",
         "fn main() { const record = { value: 1 }; record.value = 2; }",
     ] {
@@ -2377,7 +2377,7 @@ fn binding_05_mutating_calls_require_mutable_arguments() {
     );
     for body in [
         "use sort; fn main() { const values = [3, 1, 2]; sort::quick(values); }",
-        "fn mutate(values) { values << 2; } fn main() { const values = [1]; mutate(values); }",
+        "fn mutate(values) { values.append(2); } fn main() { const values = [1]; mutate(values); }",
         "fn mutate(values) { values[0] = 2; } fn wrapper(values) { mutate(values); } fn main() { const values = [1]; wrapper(values); }",
     ] {
         rejects_semantically(body, &["const", "mutat"]);
@@ -2385,15 +2385,15 @@ fn binding_05_mutating_calls_require_mutable_arguments() {
 }
 
 #[test]
-fn sequence_01_named_and_operator_mutation_require_var() {
+fn sequence_01_append_and_prepend_require_var() {
     output(
         r#"
         fn main() {
             var values = [2];
             values.append(3);
             values.prepend(1);
-            values << 4;
-            0 >> values;
+            values.append(4);
+            values.prepend(0);
             io::println(values);
         }
         "#,
@@ -2410,7 +2410,7 @@ fn sequence_01_named_and_operator_mutation_require_var() {
 #[test]
 fn clone_01_independent_copy_from_readonly_path() {
     output(
-        "fn main() { const original = [1, 2]; var copy = original.clone(); copy << 3; io::println(original); io::println(copy); }",
+        "fn main() { const original = [1, 2]; var copy = original.clone(); copy.append(3); io::println(original); io::println(copy); }",
         "[1, 2]\n[1, 2, 3]\n",
     );
 }
@@ -2418,7 +2418,7 @@ fn clone_01_independent_copy_from_readonly_path() {
 #[test]
 fn clone_02_nested_containers_are_independent_in_both_directions() {
     output(
-        "fn main() { var original = [[1]]; var copy = original.clone(); copy[0] << 2; original[0] << 3; io::println(original); io::println(copy); }",
+        "fn main() { var original = [[1]]; var copy = original.clone(); copy[0].append(2); original[0].append(3); io::println(original); io::println(copy); }",
         "[[1, 3]]\n[[1, 2]]\n",
     );
 }
@@ -2430,10 +2430,10 @@ fn collection_01_typed_empty_dynamic_arrays_accept_matching_elements() {
         struct Player { id: int }
         enum Status { Ready, Done }
         fn main() {
-            var values: int[] = []; values << 1; values << 2;
-            var nullable: int?[] = [1, nil]; nullable << nil; nullable << 2;
-            var names: str[] = []; names << "Cog";
-            var players: Player[] = []; players << Player(id: 7);
+            var values: int[] = []; values.append(1); values.append(2);
+            var nullable: int?[] = [1, nil]; nullable.append(nil); nullable.append(2);
+            var names: str[] = []; names.append("Cog");
+            var players: Player[] = []; players.append(Player(id: 7));
             const statuses: Status[] = [Status::Ready(), Status::Done()];
             io::println(values); io::println(len(nullable)); io::println(names[0]); io::println(players[0].id);
             io::println(len(statuses));
@@ -2446,7 +2446,7 @@ fn collection_01_typed_empty_dynamic_arrays_accept_matching_elements() {
 #[test]
 fn collection_02_inferred_arrays_reject_incompatible_mutation() {
     for body in [
-        "fn main() { var values = [1, 2, 3]; values << \"text\"; }",
+        "fn main() { var values = [1, 2, 3]; values.append(\"text\"); }",
         "fn main() { var values = [1, 2, 3]; values[0] = \"text\"; }",
     ] {
         rejects_semantically(body, &["type mismatch"]);
@@ -2456,9 +2456,9 @@ fn collection_02_inferred_arrays_reject_incompatible_mutation() {
 #[test]
 fn collection_03_annotated_array_mutation_checks_type_and_mutability() {
     for body in [
-        "fn main() { const values: int[] = [1]; values << 2; }",
-        "fn main() { var values: int[] = []; values << \"text\"; }",
-        "fn main() { var values: int[] = [1]; var other = values; other[0] = \"text\"; values << 2; }",
+        "fn main() { const values: int[] = [1]; values.append(2); }",
+        "fn main() { var values: int[] = []; values.append(\"text\"); }",
+        "fn main() { var values: int[] = [1]; var other = values; other[0] = \"text\"; values.append(2); }",
         "fn main() { var values: int[] = [1]; const nullable: int?[] = values; }",
     ] {
         rejects_semantically(
@@ -2561,11 +2561,11 @@ fn tuple_03_mutation_reassignment_aliasing_and_const_contracts() {
 fn collection_05_recursive_types_are_checked_across_typed_function_boundaries() {
     output(
         r#"
-        fn add_one(values: int[]) { values << 3; }
+        fn add_one(values: int[]) { values.append(3); }
         fn first(values: int[]) -> int { values[0] }
         fn main() {
             var nested: int[][] = [[1], [2]];
-            nested << [3];
+            nested.append([3]);
             add_one(nested[0]);
             io::println(first(nested[0]));
         }
@@ -2574,7 +2574,7 @@ fn collection_05_recursive_types_are_checked_across_typed_function_boundaries() 
     );
     for body in [
         "fn take(values: int[]) {} fn main() { take([1, \"wrong\"]); }",
-        "fn add(values: int[]) { values << \"wrong\"; } fn main() { add([1]); }",
+        "fn add(values: int[]) { values.append(\"wrong\"); } fn main() { add([1]); }",
         "fn take(pair: (int, str)) {} fn main() { take((1, \"ok\", true)); }",
     ] {
         rejects_semantically(body, &["type mismatch"]);
@@ -2585,7 +2585,7 @@ fn collection_05_recursive_types_are_checked_across_typed_function_boundaries() 
 fn collection_06_dynamic_alias_cannot_change_the_arrays_runtime_element_type() {
     output(
         r#"
-        fn maybe_corrupt(values) { values << "wrong" }
+        fn maybe_corrupt(values) { values.append("wrong") }
         fn main() {
             var values = [7];
             const error = maybe_corrupt(values);
@@ -2601,12 +2601,12 @@ fn collection_06_dynamic_alias_cannot_change_the_arrays_runtime_element_type() {
 fn collection_07_explicit_empty_type_is_installed_before_dynamic_mutation() {
     output(
         r#"
-        fn maybe_corrupt(values) { values << "wrong" }
+        fn maybe_corrupt(values) { values.append("wrong") }
         fn main() {
             var values: int[] = [];
             const error = maybe_corrupt(values);
             io::println(error.error_kind());
-            values << 9;
+            values.append(9);
             io::println(values);
         }
         "#,
@@ -2620,11 +2620,11 @@ fn collection_08_nested_empty_literals_and_nominal_elements_keep_recursive_types
         r#"
         struct Player { id: int }
         struct Enemy { id: int }
-        fn add_wrong(items) { items << [Enemy(id: 9)] }
-        fn add_scalar_wrong(items) { items << "wrong" }
+        fn add_wrong(items) { items.append([Enemy(id: 9)]) }
+        fn add_scalar_wrong(items) { items.append("wrong") }
         fn main() {
             var rows: int[][] = [[], []];
-            rows[0] << 4;
+            rows[0].append(4);
             io::println(rows[0][0]);
             var inferred_rows = [[], [8]];
             io::println(add_scalar_wrong(inferred_rows[0]).error_kind());
@@ -2647,7 +2647,7 @@ fn collection_09_empty_array_function_results_keep_their_declared_type() {
         fn empty_return() -> int[] { return []; }
         fn empty_nested() -> int[][] { [[], []] }
         fn empty_branch() -> int[] { if true { [] } else { [] } }
-        fn add_wrong(values) { values << "wrong" }
+        fn add_wrong(values) { values.append("wrong") }
         fn main() {
             var from_tail = empty_tail();
             var from_return = empty_return();
@@ -2657,8 +2657,8 @@ fn collection_09_empty_array_function_results_keep_their_declared_type() {
             io::println(add_wrong(from_return).error_kind());
             io::println(add_wrong(from_nested[0]).error_kind());
             io::println(add_wrong(from_branch).error_kind());
-            from_tail << 7;
-            from_nested[1] << 9;
+            from_tail.append(7);
+            from_nested[1].append(9);
             io::println(from_tail[0]);
             io::println(from_nested[1][0]);
         }
@@ -2671,15 +2671,15 @@ fn collection_09_empty_array_function_results_keep_their_declared_type() {
 fn collection_10_empty_array_rebinding_and_nested_mutations_keep_context() {
     output(
         r#"
-        fn add_wrong(values) { values << "wrong" }
-        fn assign_empty_then_push(values) { values = []; values << "ok" }
+        fn add_wrong(values) { values.append("wrong") }
+        fn assign_empty_then_push(values) { values = []; values.append("ok") }
         fn main() {
             var values: int[] = [1];
             var old_values = values;
             values = [];
             io::println(add_wrong(values).error_kind());
-            values << 2;
-            old_values << 3;
+            values.append(2);
+            old_values.append(3);
             io::println(values);
             io::println(old_values);
 
@@ -2689,20 +2689,20 @@ fn collection_10_empty_array_rebinding_and_nested_mutations_keep_context() {
 
             var numbers = [1];
             var words = ["old"];
-            numbers << 2;
-            words << "more";
+            numbers.append(2);
+            words.append("more");
             io::println(assign_empty_then_push(numbers).error_kind());
             io::println(assign_empty_then_push(words));
             io::println(numbers);
             io::println(words);
 
             var rows: int[][] = [];
-            rows << [];
+            rows.append([]);
             io::println(add_wrong(rows[0]).error_kind());
-            rows[0] << 4;
+            rows[0].append(4);
             rows[0] = [];
             io::println(add_wrong(rows[0]).error_kind());
-            rows[0] << 5;
+            rows[0].append(5);
             io::println(rows[0][0]);
         }
         "#,
@@ -2715,18 +2715,18 @@ fn collection_11_empty_array_context_survives_struct_fields_and_tuple_positions(
     output(
         r#"
         struct Box { values: int[] }
-        fn add_wrong(values) { values << "wrong" }
+        fn add_wrong(values) { values.append("wrong") }
         fn main() {
             var box = Box(values: [1]);
             box.values = [];
             io::println(add_wrong(box.values).error_kind());
-            box.values << 6;
+            box.values.append(6);
             io::println(box.values[0]);
 
             var pair: (int[], str) = ([2], "ok");
             pair.0 = [];
             io::println(add_wrong(pair.0).error_kind());
-            pair.0 << 7;
+            pair.0.append(7);
             io::println(pair.0[0]);
         }
         "#,
@@ -2738,18 +2738,18 @@ fn collection_11_empty_array_context_survives_struct_fields_and_tuple_positions(
 fn collection_12_arrays_of_tuples_keep_recursive_element_types() {
     output(
         r#"
-        fn add_wrong(values) { values << "wrong" }
+        fn add_wrong(values) { values.append("wrong") }
         fn main() {
             var pair: (int[], str) = ([], "single");
             io::println(add_wrong(pair.0).error_kind());
-            pair.0 << 3;
+            pair.0.append(3);
             io::println(pair.0[0]);
 
             var pairs: (int[], str)[] = [([], "first")];
-            pairs << ([], "second");
+            pairs.append(([], "second"));
             io::println(add_wrong(pairs[0].0).error_kind());
-            pairs[0].0 << 5;
-            pairs[1].0 << 7;
+            pairs[0].0.append(5);
+            pairs[1].0.append(7);
             io::println(pairs[0].0[0]);
             io::println(pairs[1].0[0]);
         }

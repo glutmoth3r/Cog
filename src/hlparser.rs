@@ -1575,6 +1575,26 @@ impl<'a> Parser<'a> {
                             value,
                         })
                     }
+                    Some(Token::ShlEq) => {
+                        self.advance();
+                        let value = self.parse_expr()?;
+                        self.expect(&Token::Semi)?;
+                        Ok(Stmt::CompoundAssign {
+                            target: expr,
+                            op: BinOp::Shl,
+                            value,
+                        })
+                    }
+                    Some(Token::ShrEq) => {
+                        self.advance();
+                        let value = self.parse_expr()?;
+                        self.expect(&Token::Semi)?;
+                        Ok(Stmt::CompoundAssign {
+                            target: expr,
+                            op: BinOp::Shr,
+                            value,
+                        })
+                    }
                     Some(Token::RBrace) => Ok(Stmt::Expr(expr)),
                     _ if matches!(
                         expr.node(),
@@ -2475,15 +2495,14 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
-    //<< (append) / >> (prepend) — one tier looser than +/-, so
-    //arr << 1 + 2 groups as arr << (1 + 2).
-    //can be seen as unexpected behaviour, might be fixed THOUGHT
+    // `<<` / `>>` bit shifts bind one tier looser than `+`/`-`, so
+    // `x << 1 + 2` groups as `x << (1 + 2)`, as in C and Rust.
     fn parse_shift(&mut self) -> Result<Expr, HlParseError> {
         let mut left = self.parse_additive()?;
         loop {
             let op = match self.peek() {
-                Some(Token::Shl) => BinOp::Append,
-                Some(Token::Shr) => BinOp::Prepend,
+                Some(Token::Shl) => BinOp::Shl,
+                Some(Token::Shr) => BinOp::Shr,
                 _ => break,
             };
             self.advance();
@@ -3059,6 +3078,8 @@ fn token_lexeme(token: &Token) -> &'static str {
         Token::AmpAmpEq => "&&=",
         Token::PipePipeEq => "||=",
         Token::CaretEq => "^=",
+        Token::ShlEq => "<<=",
+        Token::ShrEq => ">>=",
         Token::Eq => "=",
         Token::Dot => ".",
         Token::DotDot => "..",
@@ -3629,14 +3650,14 @@ mod tests {
     }
 
     #[test]
-    fn append_binds_looser_than_additive() {
-        // arr << 1 + 2  ==  arr << (1 + 2)
-        let expr = single_expr("arr << 1 + 2");
+    fn shift_binds_looser_than_additive() {
+        // x << 1 + 2  ==  x << (1 + 2)
+        let expr = single_expr("x << 1 + 2");
         assert_eq!(
             expr,
             Expr::Binary(
-                BinOp::Append,
-                Box::new(Expr::Ident("arr".to_string())),
+                BinOp::Shl,
+                Box::new(Expr::Ident("x".to_string())),
                 Box::new(Expr::Binary(
                     BinOp::Add,
                     Box::new(Expr::Int(1)),
@@ -3647,15 +3668,19 @@ mod tests {
     }
 
     #[test]
-    fn prepend_operator_parses() {
-        // 0 >> arr
-        let expr = single_expr("0 >> arr");
+    fn right_shift_binds_tighter_than_comparison() {
+        // 8 >> 1 < x  ==  (8 >> 1) < x
+        let expr = single_expr("8 >> 1 < x");
         assert_eq!(
             expr,
             Expr::Binary(
-                BinOp::Prepend,
-                Box::new(Expr::Int(0)),
-                Box::new(Expr::Ident("arr".to_string()))
+                BinOp::Lt,
+                Box::new(Expr::Binary(
+                    BinOp::Shr,
+                    Box::new(Expr::Int(8)),
+                    Box::new(Expr::Int(1))
+                )),
+                Box::new(Expr::Ident("x".to_string()))
             )
         );
     }
@@ -3712,6 +3737,8 @@ mod tests {
                 x &&= true;
                 x ||= false;
                 x ^= true;
+                x <<= 1;
+                x >>= 2;
                 return x;
             }
         "#;
@@ -3728,6 +3755,14 @@ mod tests {
         assert!(matches!(&f.body.stmts[6], Stmt::CompoundAssign { .. }));
         assert!(matches!(&f.body.stmts[7], Stmt::CompoundAssign { .. }));
         assert!(matches!(&f.body.stmts[8], Stmt::CompoundAssign { .. }));
+        assert!(matches!(
+            &f.body.stmts[9],
+            Stmt::CompoundAssign { op: BinOp::Shl, .. }
+        ));
+        assert!(matches!(
+            &f.body.stmts[10],
+            Stmt::CompoundAssign { op: BinOp::Shr, .. }
+        ));
     }
 
     #[test]

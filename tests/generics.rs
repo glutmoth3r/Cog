@@ -162,7 +162,7 @@ fn generic_struct_arrays_keep_their_full_type_arguments() {
             struct Box[T: type] { value: T }
             fn main() {
                 var numbers: Box[int][] = [Box(1)];
-                numbers << Box(2);
+                numbers.append(Box(2));
                 io::println(numbers[1].value)!!;
             }
             "#)
@@ -174,7 +174,7 @@ fn generic_struct_arrays_keep_their_full_type_arguments() {
         struct Box[T: type] { value: T }
         fn main() {
             var numbers: Box[int][] = [Box(1)];
-            numbers << Box("wrong");
+            numbers.append(Box("wrong"));
         }
         "#)
     .unwrap_err();
@@ -281,7 +281,7 @@ fn generic_array_helpers_preserve_mutability_effects() {
     assert_eq!(
         run(r#"
             use io;
-            fn append[T: type](items: T[], value: T) { items << value; }
+            fn append[T: type](items: T[], value: T) { items.append(value); }
             fn main() {
                 var values = [1];
                 append(values, 2);
@@ -293,7 +293,7 @@ fn generic_array_helpers_preserve_mutability_effects() {
     );
 
     let error = run(r#"
-        fn append[T: type](items: T[], value: T) { items << value; }
+        fn append[T: type](items: T[], value: T) { items.append(value); }
         fn main() {
             const values = [1];
             append(values, 2);
@@ -663,21 +663,21 @@ fn clone_supports_nested_arrays_tuples_and_generic_trait_calls() {
             fn main() {
                 const source: int[][] = [[1, 2], [3]];
                 var copied = source.clone();
-                copied[0] << 9;
+                copied[0].append(9);
                 io::println(source)!!;
                 io::println(copied)!!;
 
                 const pair = (4, [5, 6]);
                 io::println(clone::value(pair))!!;
                 var pair_copy = pair.clone();
-                pair_copy[1] << 8;
+                pair_copy[1].append(8);
                 io::println(pair)!!;
                 io::println(pair_copy)!!;
 
                 const row = [10];
                 const graph = [row, row];
                 var graph_copy = graph.clone();
-                graph_copy[0] << 11;
+                graph_copy[0].append(11);
                 io::println(graph)!!;
                 io::println(graph_copy)!!;
             }

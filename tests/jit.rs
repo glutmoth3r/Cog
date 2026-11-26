@@ -219,6 +219,72 @@ fn main() -> nil {
 }
 "#;
 
+const SHIFT_SOURCE: &str = r#"
+@!include("std")
+use io;
+
+fn mix(n: int) -> int {
+    var total = 0;
+    var index = 0;
+    while index < n {
+        const amount = index % 64;
+        total = (total + ((index % 1024) << (amount % 53)) % 1000003) % 1000003;
+        total = (total + ((index * 7919 - 20000) >> amount) % 1000003) % 1000003;
+        index += 1;
+    }
+    return total;
+}
+
+fn unsigned_mix(n: uint) -> uint {
+    const zero: uint = 0;
+    const one: uint = 1;
+    const width: uint = 64;
+    const modulus: uint = 1000003;
+    const maximum: uint = 18446744073709551615;
+    var total: uint = zero;
+    var index: uint = zero;
+    while index < n {
+        const amount = index % width;
+        total = (total + (maximum >> amount) % modulus) % modulus;
+        total = (total + (one << amount) % modulus) % modulus;
+        index += one;
+    }
+    return total;
+}
+
+fn main() -> nil {
+    const n: uint = 6000;
+    io::println(mix(6000))!!;
+    io::println(unsigned_mix(n))!!;
+}
+"#;
+
+const SHIFT_ERROR_SOURCE: &str = r#"
+@!include("std")
+use io;
+use err::Error;
+
+fn classify(n: int) -> int {
+    var total = 0;
+    var index = 0;
+    while index < n {
+        const amount = index % 70 - 3;
+        const value = index * 7919 - 20000;
+        const left = value << amount;
+        const right = value >> amount;
+        when left is Error::Overflow { total += 1000000; }
+        when left is Error::InvalidArgument { total += 1000; }
+        when right is Error::InvalidArgument { total += 1; }
+        index += 1;
+    }
+    return total;
+}
+
+fn main() -> nil {
+    io::println(classify(6000))!!;
+}
+"#;
+
 const FLOAT_SOURCE: &str = r#"
 @!include("std")
 use io;
@@ -810,6 +876,11 @@ fn assert_jit_fallback_matches_vm(source: &str, suffix: &str, expected: &str) {
     let _ = std::fs::remove_file(profile_path);
 }
 
+fn assert_jit_fallback_matches_vm_computed(source: &str, suffix: &str) {
+    let expected = execute(source, false, None);
+    assert_jit_fallback_matches_vm(source, suffix, &expected);
+}
+
 #[test]
 fn jit_conditional_jumps_match_vm_for_true_and_false_paths() {
     assert_jit_matches_vm(ASCENDING_SOURCE, "ascending", "17997000\n");
@@ -1121,7 +1192,7 @@ fn jit_higher_order_array_callback_fallback_matches_vm() {
             var values: int[] = [];
             var index = 0;
             while index < 6000 {
-                values << index;
+                values.append(index);
                 index += 1;
             }
             const bias = 7;
@@ -1233,6 +1304,16 @@ fn jit_uint_overflow_fault_resumes_in_vm_with_the_same_error() {
     );
 
     let _ = std::fs::remove_file(profile_path);
+}
+
+#[test]
+fn jit_integer_shifts_match_vm() {
+    assert_jit_matches_vm_computed(SHIFT_SOURCE, "shift");
+}
+
+#[test]
+fn jit_shift_errors_resume_in_vm_with_the_same_results() {
+    assert_jit_fallback_matches_vm_computed(SHIFT_ERROR_SOURCE, "shift-error");
 }
 
 #[test]

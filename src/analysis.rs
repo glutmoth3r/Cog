@@ -4321,15 +4321,9 @@ impl<'a> Checker<'a> {
                 }
             }
             Stmt::CompoundAssign { target, op, value } => {
-                if matches!(op, BinOp::Append | BinOp::Prepend) {
-                    self.error(
-                        "E1004",
-                        "sequence mutation is not a compound assignment; use << / >> or append/prepend",
-                        stmt.span(),
-                    );
-                }
                 let left = self.expr(target);
-                if left == Type::concrete(VarType::UInt) {
+                // A shift amount keeps its own `int`/`uint` type.
+                if left == Type::concrete(VarType::UInt) && !matches!(op, BinOp::Shl | BinOp::Shr) {
                     self.contextualize_integer_literals(value, &left);
                 }
                 let right = self.expr(value);
@@ -4744,39 +4738,32 @@ impl<'a> Checker<'a> {
         if matches!(op, BinOp::Eq | BinOp::NotEq) {
             return Type::concrete(VarType::Bool);
         }
+        let array = |ty: &Type| matches!(ty, Type::Array(_) | Type::EmptyArray);
+        if matches!(op, BinOp::Shl | BinOp::Shr) && (array(&a) || array(&b)) {
+            let (shift, method) = if op == BinOp::Shl {
+                ("<<", "array.append(value)")
+            } else {
+                (">>", "array.prepend(value)")
+            };
+            self.error(
+                "E2002",
+                format!(
+                    "`{shift}` is an integer bit shift, not array mutation; use `{method}` to add an element"
+                ),
+                span,
+            );
+            return Type::Poison;
+        }
         if a == Type::Dynamic || b == Type::Dynamic {
             return Type::Dynamic;
         }
         match (op, a.clone(), b.clone()) {
-            (BinOp::Append, Type::EmptyArray, element) => Type::Array(Box::new(element)),
-            (BinOp::Prepend, element, Type::EmptyArray) => Type::Array(Box::new(element)),
-            (BinOp::Append, Type::Array(a), b) if type_compatible(&a, &b) => Type::Array(a),
-            (BinOp::Prepend, a, Type::Array(b)) if type_compatible(&b, &a) => Type::Array(b),
             (BinOp::Add, Type::Array(a), Type::Array(b)) if a == b => Type::Array(a),
-            (BinOp::Append, Type::Array(element), actual) if *element != Type::Dynamic => {
-                self.error(
-                    "E2001",
-                    format!(
-                        "type mismatch: array element is {} but appended value is {}",
-                        element.display(),
-                        actual.display()
-                    ),
-                    span,
-                );
-                Type::Poison
-            }
-            (BinOp::Prepend, actual, Type::Array(element)) if *element != Type::Dynamic => {
-                self.error(
-                    "E2001",
-                    format!(
-                        "type mismatch: array element is {} but prepended value is {}",
-                        element.display(),
-                        actual.display()
-                    ),
-                    span,
-                );
-                Type::Poison
-            }
+            (
+                BinOp::Shl | BinOp::Shr,
+                Type::Primitive(x @ (VarType::Int | VarType::UInt | VarType::BigInt), false),
+                Type::Primitive(VarType::Int | VarType::UInt, false),
+            ) => Type::concrete(x),
             (
                 BinOp::Add,
                 Type::Primitive(VarType::Str, false),
@@ -6038,12 +6025,6 @@ impl<'a> Checker<'a> {
                         self.contextualize_integer_literals(a, &right);
                         left = Type::concrete(VarType::UInt);
                     }
-                }
-                if matches!(op, BinOp::Append) {
-                    self.refine_empty_array(a, &right);
-                }
-                if matches!(op, BinOp::Prepend) {
-                    self.refine_empty_array(b, &left);
                 }
                 if matches!(op, BinOp::Eq | BinOp::NotEq) {
                     self.forget_equality_call(expr);

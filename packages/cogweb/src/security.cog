@@ -20,7 +20,7 @@ fn with_header(response: http::Response, name: str, value: str) -> http::Respons
     for entry in headers.entries() {
         const current_name = entry.0 as str;
         if lower_ascii(current_name)!! == lower_ascii(name)!! {
-            old_names << current_name;
+            old_names.append(current_name);
         }
     }
     for old_name in old_names { headers.remove(old_name as str)!!; }

@@ -171,7 +171,7 @@ fn quadratic_and_stable_sorts_agree_with_sorted_on_edge_inputs() {
             check([7, 7, 7, 7]);
             check([-5, 0, 5, -5, 0, 5, -9223372036854775807]);
             var long: int[] = [];
-            for index in 0..100 { long << (index * 37) % 101 - 50; }
+            for index in 0..100 { long.append((index * 37) % 101 - 50); }
             check(long);
             io::println("ok")!!;
         }
@@ -194,7 +194,7 @@ fn stable_insertion_and_bubble_sorts_keep_equal_key_order() {
         fn require(ok: bool, label: str) { if !ok { crash(label); } }
         fn make() -> Item[] {
             var items: Item[] = [];
-            for index in 0..40 { items << Item(key: (index * 7) % 4, tag: index); }
+            for index in 0..40 { items.append(Item(key: (index * 7) % 4, tag: index)); }
             items
         }
         fn verify(items: Item[], label: str) {
@@ -277,7 +277,7 @@ fn text_order_and_clone_follow_documented_contracts() {
             require(text_order::compare("z", "é")!! == -1, "byte order for non-ascii");
             var original = [1, 2, 3];
             const duplicate = clone::value(original)!!;
-            original << 4;
+            original.append(4);
             require(original.len() == 4 && duplicate.len() == 3, "clone independent");
             require(clone::value(5)!! == 5, "clone scalar");
             io::println("ok")!!;
@@ -365,7 +365,7 @@ fn array_sums_repeats_and_keyed_selection_handle_edges() {
             else { crash("negative repeat"); }
             var shared = [0];
             const rows = array::repeat(shared, 2)!!;
-            shared << 1;
+            shared.append(1);
             require(rows[0]!!.len() == 2 && rows[1]!!.len() == 2, "repeat aliases");
 
             var calls = 0;
