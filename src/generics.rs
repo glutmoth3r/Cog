@@ -1,8 +1,10 @@
 //! Bounded monomorphization of generic functions after semantic inference.
 //!
 //! Each expansion round checks the current AST, uses call-site facts to discover
-//! specializations, and rechecks the expanded program. The work and instance caps
-//! bound compiler cost; the final check result is passed on to codegen.
+//! specializations, and rechecks the expanded program. The interprocedural
+//! mutability pass runs only on the final round (or a failing one). The work and
+//! instance caps bound compiler cost; the final check result is passed on to
+//! codegen.
 use crate::analysis::{self, CheckResult};
 use crate::ast::{
     Block, Expr, ForClause, FunctionDecl, Item, Program, Stmt, StringPart, TypeAnnotation, TypeKind,
@@ -57,119 +59,163 @@ fn expand_with_analysis_limit_and_names(
     analysis_limit: usize,
 ) -> Result<(Program, CheckResult), Vec<Diagnostic>> {
     let mut allocation_cost = crate::ast_budget::program(source).map_err(budget_error)?;
-    let mut analysis_cost = 0usize;
+    let mut analysis_cost = check_analysis_cost(0, allocation_cost, analysis_limit)?;
     let mut program = source.clone();
     let mut generated = HashSet::new();
-    for _ in 0..MAX_SPECIALIZATIONS {
-        analysis_cost = check_analysis_cost(analysis_cost, allocation_cost, analysis_limit)?;
-        let checked = analysis::check_with_methods_and_names(&program, function_modules, names);
+    for round in 0..MAX_SPECIALIZATIONS {
+        // Intermediate rounds only discover specializations. The mutability pass
+        // runs once on the final program, whose call sites all resolve to
+        // generated instances, or on a round that ends with an error, where its
+        // diagnostics take precedence as they did when every round ran it.
+        let mut checked = analysis::check_deferring_effects(&program, function_modules, names);
         if !checked.diagnostics.is_empty() {
+            analysis::check_deferred_effects(&program, &mut checked);
             return Err(checked.diagnostics);
         }
-
-        let mut additions = Vec::new();
-        for specialization in &checked.specializations {
-            if !generated.insert(specialization.name.clone()) {
-                continue;
+        let additions =
+            specialization_additions(&program, &checked, &mut generated, &mut allocation_cost)
+                .and_then(|additions| {
+                    if additions.is_empty() {
+                        return Ok(additions);
+                    }
+                    if round + 1 == MAX_SPECIALIZATIONS {
+                        return Err(vec![Diagnostic::new(
+                            "E4003",
+                            format!(
+                                "generic specialization limit ({MAX_SPECIALIZATIONS}) exceeded"
+                            ),
+                            None,
+                        )]);
+                    }
+                    analysis_cost =
+                        check_analysis_cost(analysis_cost, allocation_cost, analysis_limit)?;
+                    Ok(additions)
+                });
+        let additions = match additions {
+            Ok(additions) => additions,
+            Err(diagnostics) => {
+                analysis::check_deferred_effects(&program, &mut checked);
+                return Err(if checked.diagnostics.is_empty() {
+                    diagnostics
+                } else {
+                    checked.diagnostics
+                });
             }
-            let Some(template) = function_template(&program, &specialization.template) else {
-                return Err(vec![Diagnostic::new(
-                    "E4003",
-                    format!(
-                        "generic function template `{}` is unavailable",
-                        specialization.template
-                    ),
-                    None,
-                )]);
-            };
-            check_allocation(
-                allocation_cost,
-                crate::ast_budget::function(template).map_err(budget_error)?,
-            )?;
-            let mut instance = template.clone();
-            specialize_function(&mut instance, &specialization.arguments);
-            instance.name.clone_from(&specialization.name);
-            instance.type_params.clear();
-            let instance = Item::Function(instance);
-            allocation_cost = check_allocation(
-                allocation_cost,
-                crate::ast_budget::item(&instance).map_err(budget_error)?,
-            )?;
-            additions.push(instance);
-            if generated.len() > MAX_SPECIALIZATIONS {
-                return Err(vec![Diagnostic::new(
-                    "E4003",
-                    format!("generic specialization limit ({MAX_SPECIALIZATIONS}) exceeded"),
-                    None,
-                )]);
-            }
-        }
-        for specialization in &checked.struct_specializations {
-            if !generated.insert(specialization.name.clone()) {
-                continue;
-            }
-            let Some(Item::StructDecl {
-                visibility,
-                fields,
-                owner,
-                ..
-            }) = program.items.iter().find(|item| {
-                matches!(item, Item::StructDecl { name, type_params, .. }
-                    if name == &specialization.template && !type_params.is_empty())
-            })
-            else {
-                return Err(vec![Diagnostic::new(
-                    "E4003",
-                    format!(
-                        "generic struct template `{}` is unavailable",
-                        specialization.template
-                    ),
-                    None,
-                )]);
-            };
-            check_allocation(
-                allocation_cost,
-                crate::ast_budget::fields(fields).map_err(budget_error)?,
-            )?;
-            let mut instance_fields = fields.clone();
-            for field in &mut instance_fields {
-                if let Some(ty) = &mut field.ty {
-                    substitute_type(ty, &specialization.arguments);
-                }
-                if let Some(default) = &mut field.default {
-                    substitute_expr(default, &specialization.arguments);
-                }
-            }
-            let instance = Item::StructDecl {
-                name: specialization.name.clone(),
-                visibility: *visibility,
-                type_params: Vec::new(),
-                fields: instance_fields,
-                owner: owner.clone(),
-            };
-            allocation_cost = check_allocation(
-                allocation_cost,
-                crate::ast_budget::item(&instance).map_err(budget_error)?,
-            )?;
-            additions.push(instance);
-            if generated.len() > MAX_SPECIALIZATIONS {
-                return Err(vec![Diagnostic::new(
-                    "E4003",
-                    format!("generic specialization limit ({MAX_SPECIALIZATIONS}) exceeded"),
-                    None,
-                )]);
-            }
-        }
+        };
         if additions.is_empty() {
+            analysis::check_deferred_effects(&program, &mut checked);
+            if !checked.diagnostics.is_empty() {
+                return Err(checked.diagnostics);
+            }
             return Ok((program, checked));
         }
         program.items.extend(additions);
     }
-    Err(vec![Diagnostic::new(
-        "E4003",
-        format!("generic specialization limit ({MAX_SPECIALIZATIONS}) exceeded"),
-        None,
-    )])
+    unreachable!("the last specialization round returns")
+}
+
+/// Builds the instances requested by one checked round that have not been
+/// generated yet.
+fn specialization_additions(
+    program: &Program,
+    checked: &CheckResult,
+    generated: &mut HashSet<String>,
+    allocation_cost: &mut usize,
+) -> Result<Vec<Item>, Vec<Diagnostic>> {
+    let mut additions = Vec::new();
+    for specialization in &checked.specializations {
+        if !generated.insert(specialization.name.clone()) {
+            continue;
+        }
+        let Some(template) = function_template(program, &specialization.template) else {
+            return Err(vec![Diagnostic::new(
+                "E4003",
+                format!(
+                    "generic function template `{}` is unavailable",
+                    specialization.template
+                ),
+                None,
+            )]);
+        };
+        check_allocation(
+            *allocation_cost,
+            crate::ast_budget::function(template).map_err(budget_error)?,
+        )?;
+        let mut instance = template.clone();
+        specialize_function(&mut instance, &specialization.arguments);
+        instance.name.clone_from(&specialization.name);
+        instance.type_params.clear();
+        let instance = Item::Function(instance);
+        *allocation_cost = check_allocation(
+            *allocation_cost,
+            crate::ast_budget::item(&instance).map_err(budget_error)?,
+        )?;
+        additions.push(instance);
+        if generated.len() > MAX_SPECIALIZATIONS {
+            return Err(vec![Diagnostic::new(
+                "E4003",
+                format!("generic specialization limit ({MAX_SPECIALIZATIONS}) exceeded"),
+                None,
+            )]);
+        }
+    }
+    for specialization in &checked.struct_specializations {
+        if !generated.insert(specialization.name.clone()) {
+            continue;
+        }
+        let Some(Item::StructDecl {
+            visibility,
+            fields,
+            owner,
+            ..
+        }) = program.items.iter().find(|item| {
+            matches!(item, Item::StructDecl { name, type_params, .. }
+                if name == &specialization.template && !type_params.is_empty())
+        })
+        else {
+            return Err(vec![Diagnostic::new(
+                "E4003",
+                format!(
+                    "generic struct template `{}` is unavailable",
+                    specialization.template
+                ),
+                None,
+            )]);
+        };
+        check_allocation(
+            *allocation_cost,
+            crate::ast_budget::fields(fields).map_err(budget_error)?,
+        )?;
+        let mut instance_fields = fields.clone();
+        for field in &mut instance_fields {
+            if let Some(ty) = &mut field.ty {
+                substitute_type(ty, &specialization.arguments);
+            }
+            if let Some(default) = &mut field.default {
+                substitute_expr(default, &specialization.arguments);
+            }
+        }
+        let instance = Item::StructDecl {
+            name: specialization.name.clone(),
+            visibility: *visibility,
+            type_params: Vec::new(),
+            fields: instance_fields,
+            owner: owner.clone(),
+        };
+        *allocation_cost = check_allocation(
+            *allocation_cost,
+            crate::ast_budget::item(&instance).map_err(budget_error)?,
+        )?;
+        additions.push(instance);
+        if generated.len() > MAX_SPECIALIZATIONS {
+            return Err(vec![Diagnostic::new(
+                "E4003",
+                format!("generic specialization limit ({MAX_SPECIALIZATIONS}) exceeded"),
+                None,
+            )]);
+        }
+    }
+    Ok(additions)
 }
 
 fn function_template<'a>(program: &'a Program, name: &str) -> Option<&'a FunctionDecl> {
@@ -530,6 +576,34 @@ mod tests {
             "{}",
             errors[0].message
         );
+    }
+
+    #[test]
+    fn mutation_errors_take_precedence_over_a_later_specialization_budget_error() {
+        let parsed = crate::frontend::parse(
+            "generic-budget-mutation.cog",
+            "fn identity[T: type](value: T) -> T { value }\
+             fn main() { const values = [1]; values.append(2); identity(1); }",
+        );
+        assert!(parsed.diagnostics.is_empty());
+        let source_cost = ast_budget::program(&parsed.program).unwrap();
+
+        let errors = match expand_with_analysis_limit(&parsed.program, &HashMap::new(), source_cost)
+        {
+            Err(errors) => errors,
+            Ok(_) => panic!("the const mutation was accepted"),
+        };
+        assert!(
+            errors
+                .iter()
+                .all(|error| error.message.contains("cannot mutate")),
+            "{:?}",
+            errors
+                .iter()
+                .map(|error| &error.message)
+                .collect::<Vec<_>>()
+        );
+        assert!(!errors.is_empty());
     }
 
     #[test]

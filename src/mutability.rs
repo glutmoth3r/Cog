@@ -2231,10 +2231,12 @@ impl<'a> Pass<'a> {
 
     /// A call to a generic instance that does not exist yet is analyzed through
     /// its template summary, where unresolved trait methods such as `clone`
-    /// contribute no result. The instance is checked again once generated, so
-    /// the placeholder only needs to stay writable: an independent value must
-    /// not be reported as an unmutated `var`. Aliases to read-only arguments
-    /// remain in the result and are still rejected.
+    /// contribute no result. Generic expansion runs this pass on such a program
+    /// only when the round already failed with other diagnostics; the accepted
+    /// final program has every instance. The placeholder therefore only keeps
+    /// those diagnostics free of noise: an independent value must not be
+    /// reported as an unmutated `var`. Aliases to read-only arguments remain in
+    /// the result and are still rejected.
     fn add_pending_result(&mut self, expr: &Expr, result: &mut Access) {
         let fresh = self.allocate(Root::Fresh(expr_id(expr), 0));
         result.union(&fresh);

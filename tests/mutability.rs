@@ -1268,3 +1268,85 @@ fn unneeded_var_in_a_generic_body_is_still_reported() {
         );
     }
 }
+
+#[test]
+fn mutation_through_nested_generic_instances_is_checked_on_the_final_program() {
+    let chain = "fn h[T: type](xs: T[], x: T) -> nil { xs.append(x); } \
+                 fn g[T: type](xs: T[], x: T) -> nil { h(xs, x); } \
+                 fn f[T: type](xs: T[], x: T) -> nil { g(xs, x); }";
+    rejects(
+        &format!("{chain} fn main() {{ const a = [1]; f(a, 2); }}"),
+        "cannot mutate",
+    );
+    assert_eq!(
+        run(&format!(
+            "{chain} fn main() {{ var a = [1]; f(a, 2); io::println(a); }}"
+        )),
+        "[1, 2]\n"
+    );
+    rejects(
+        "fn h[T: type](xs: T[]) -> int { xs.len() } fn g[T: type](xs: T[]) -> int { h(xs) } \
+         fn main() { var a = [1]; io::println(g(a)); }",
+        "E1006",
+    );
+    rejects(
+        "trait Touch { fn touch(self) -> nil; } struct Bag { items: int[] } \
+         extend Bag with Touch { fn touch(self) -> nil { self.items.append(1); } } \
+         fn apply[T: type + Touch](x: T) -> nil { x.touch(); } \
+         fn outer[T: type + Touch](x: T) -> nil { apply(x); } \
+         fn main() { const b = Bag([1]); outer(b); }",
+        "cannot mutate",
+    );
+}
+
+#[test]
+fn mutation_errors_are_reported_with_errors_from_later_specialization_rounds() {
+    let error = project::compile_source(
+        "mutability.cog",
+        &source(
+            "fn h[T: type](x: T) -> int { x + \"s\" } fn g[T: type](x: T) -> int { h(x) } \
+             fn main() { const a = [1]; a.append(2); io::println(g(1)); }",
+        ),
+    )
+    .expect_err("must fail semantic checking")
+    .to_string();
+    assert!(error.contains("cannot mutate"), "{error}");
+    assert!(error.contains("invalid operands int and str"), "{error}");
+}
+
+#[test]
+fn var_mutated_only_by_a_late_generic_instance_is_accepted() {
+    let chain = "struct P { n: int } extend P { fn bump(self) -> nil { self.n += 1; } } \
+                 fn inner[T: type](x: T) -> nil { x.bump(); } \
+                 fn outer[T: type](x: T) -> nil { inner(x); }";
+    assert_eq!(
+        run(&format!(
+            "{chain} fn main() {{ var v = P(n: 1); outer(v); io::println(v.n); }}"
+        )),
+        "2\n"
+    );
+    rejects(
+        &format!("{chain} fn main() {{ const v = P(n: 1); outer(v); }}"),
+        "cannot mutate through const/read-only access from `v`",
+    );
+}
+
+#[test]
+fn pending_clone_results_add_no_noise_to_a_failing_round() {
+    // The clone instances do not exist yet when the first round fails, so
+    // their results must still count as writable independent values.
+    for body in [
+        "const a = [1]; var c = clone::value(a); c.append(2);",
+        "const a = [[1]]; var c = clone::value(a); c[0]!!.append(2);",
+    ] {
+        let error = project::compile_source(
+            "mutability.cog",
+            &source(&format!("use clone; fn main() {{ {body} 1 + \"s\"; }}")),
+        )
+        .expect_err("must fail semantic checking")
+        .to_string();
+        assert!(error.contains("invalid operands int and str"), "{error}");
+        assert!(!error.contains("E1006"), "{error}");
+        assert!(!error.contains("E1003"), "{error}");
+    }
+}

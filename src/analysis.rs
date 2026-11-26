@@ -1345,6 +1345,16 @@ pub(crate) struct CheckResult {
     pub uint_literals: HashSet<usize>,
     pub uint_expressions: HashSet<usize>,
     pub bigint_literals: HashSet<usize>,
+    /// Access facts kept by [`check_deferring_effects`] for a later
+    /// [`check_deferred_effects`] call.
+    deferred_effects: Option<crate::mutability::Facts>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Effects {
+    Check,
+    Skip,
+    Defer,
 }
 
 #[derive(Clone, Debug)]
@@ -1381,7 +1391,30 @@ pub(crate) fn check_with_methods_and_names(
     function_modules: &HashMap<String, String>,
     names: &BTreeMap<String, String>,
 ) -> CheckResult {
-    check_program(program, function_modules, names, true)
+    check_program(program, function_modules, names, Effects::Check)
+}
+
+/// Checks the program without the interprocedural mutability pass and keeps its
+/// access facts. Generic specialization uses this for every expansion round and
+/// runs the mutability pass with [`check_deferred_effects`] only on the final
+/// program or on a round that already failed, so the whole-program fixed point
+/// does not repeat for each round.
+pub(crate) fn check_deferring_effects(
+    program: &Program,
+    function_modules: &HashMap<String, String>,
+    names: &BTreeMap<String, String>,
+) -> CheckResult {
+    check_program(program, function_modules, names, Effects::Defer)
+}
+
+/// Runs the mutability pass deferred by [`check_deferring_effects`] for the
+/// same program and appends its diagnostics.
+pub(crate) fn check_deferred_effects(program: &Program, result: &mut CheckResult) {
+    if let Some(facts) = result.deferred_effects.take() {
+        result
+            .diagnostics
+            .extend(crate::mutability::check(program, &facts));
+    }
 }
 
 /// Resolves calls and specializations for clients that discard diagnostics.
@@ -1392,14 +1425,14 @@ pub(crate) fn resolve_methods_and_names(
     function_modules: &HashMap<String, String>,
     names: &BTreeMap<String, String>,
 ) -> CheckResult {
-    check_program(program, function_modules, names, false)
+    check_program(program, function_modules, names, Effects::Skip)
 }
 
 fn check_program(
     program: &Program,
     function_modules: &HashMap<String, String>,
     names: &BTreeMap<String, String>,
-    effects: bool,
+    effects: Effects,
 ) -> CheckResult {
     let mut c = Checker {
         functions: HashMap::new(),
@@ -1752,10 +1785,11 @@ fn check_program(
             c.error("E2003", NILABLE_STRUCT_MATCH, span.as_ref());
         }
     }
-    if effects {
+    if effects == Effects::Check {
         c.diagnostics
             .extend(crate::mutability::check(program, &c.access_facts));
     }
+    let deferred_effects = (effects == Effects::Defer).then_some(c.access_facts);
     CheckResult {
         diagnostics: c.diagnostics,
         method_calls: c.method_calls,
@@ -1767,6 +1801,7 @@ fn check_program(
         uint_literals: c.uint_literals,
         uint_expressions: c.uint_expressions,
         bigint_literals: c.bigint_literals,
+        deferred_effects,
     }
 }
 
