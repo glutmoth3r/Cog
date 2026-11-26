@@ -1561,25 +1561,30 @@ fn check_program(
                         .insert(format!("{name}::{}", v.name), (id, &v.payload));
                 }
             }
-            Item::GlobalConst { name, ty, .. }
-            | Item::GlobalVar { name, ty, .. }
-            | Item::Comptime { name, ty, .. } => {
-                // Predeclare globals so forward references can be checked without execution.
-                let ty = ty.as_ref().map_or(Type::Dynamic, |t| c.annotation_type(t));
-                let id = c.next_binding;
-                c.next_binding += 1;
-                c.globals.insert(
-                    name.clone(),
-                    Binding {
-                        id,
-                        error_only: false,
-                        inferred: None,
-                        ty,
-                        mutable: matches!(item, Item::GlobalVar { .. }),
-                    },
-                );
-            }
             _ => {}
+        }
+    }
+    // Predeclare globals so forward references can be checked without execution.
+    // This runs after every struct and enum is registered: an annotation resolved
+    // earlier would stay an unresolved name, which does not match the nominal type.
+    for item in &program.items {
+        if let Item::GlobalConst { name, ty, .. }
+        | Item::GlobalVar { name, ty, .. }
+        | Item::Comptime { name, ty, .. } = item
+        {
+            let ty = ty.as_ref().map_or(Type::Dynamic, |t| c.annotation_type(t));
+            let id = c.next_binding;
+            c.next_binding += 1;
+            c.globals.insert(
+                name.clone(),
+                Binding {
+                    id,
+                    error_only: false,
+                    inferred: None,
+                    ty,
+                    mutable: matches!(item, Item::GlobalVar { .. }),
+                },
+            );
         }
     }
     for item in &program.items {

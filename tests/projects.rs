@@ -386,6 +386,79 @@ fn struct_type_tests_respect_module_identity_aliases_and_visibility() {
 }
 
 #[test]
+fn typed_globals_share_nominal_identity_with_values_across_modules() {
+    let f = Fixture::new();
+    f.write(
+        "model.cog",
+        "public struct Point { x: int }
+         public const ORIGIN: Point = Point(10);
+         public const PATH: Point[] = [Point(20)];",
+    );
+    f.write(
+        "main.cog",
+        r#"
+        use io; use model; use model::Point as P;
+        struct Local { x: int }
+        const ONE: P = model::Point(1);
+        const MANY: P[] = [P(2)];
+        const GET: fn(P) -> int = get;
+        const PAIR: (Local, int) = (Local(3), 0);
+        const LOCALS: Local[] = [Local(4)];
+        fn get(p: P) -> int { p.x }
+        fn first(items: model::Point[]) -> int { items[0].x }
+        fn local(items: Local[]) -> int { items[0].x }
+        fn apply[T: type](item: T) -> int {
+            const one: T = ONE;
+            const many: T[] = MANY;
+            const f: fn(T) -> int = GET;
+            (GET)(item) + (f)(item) + get(one) + first(many) - first(MANY) + get(item)
+        }
+        fn main() {
+            const pair: (Local, int) = PAIR;
+            const locals: Local[] = LOCALS;
+            io::println(apply(P(5)));
+            io::println(local(LOCALS) + local(locals) + pair.0.x);
+            io::println(apply(model::Point(10)) + first(model::PATH) + model::ORIGIN.x);
+        }
+        "#,
+    );
+    assert_eq!(f.run(), "16\n11\n61\n");
+}
+
+#[test]
+fn typed_globals_keep_same_named_structs_from_different_modules_distinct() {
+    let f = Fixture::new();
+    f.write("model.cog", "public struct Point { x: int }");
+    f.write("other.cog", "public struct Point { x: int }");
+    for body in [
+        "const value: model::Point = ITEM;",
+        "const values: model::Point[] = ITEMS;",
+        "take(ITEMS);",
+        "apply(model::Point(2));",
+    ] {
+        f.write(
+            "main.cog",
+            &format!(
+                r#"
+                use model; use other;
+                const ITEM: other::Point = other::Point(1);
+                const ITEMS: other::Point[] = [other::Point(1)];
+                fn take(items: model::Point[]) {{}}
+                fn apply[T: type](item: T) {{ const values: T[] = ITEMS; }}
+                fn main() {{ {body} }}
+                "#
+            ),
+        );
+        let error = f.compile().unwrap_err();
+        assert!(error.contains("E2001"), "{body}: {error}");
+        assert!(
+            error.contains("declared as model::Point"),
+            "{body}: {error}"
+        );
+    }
+}
+
+#[test]
 fn selective_core_constant_alias_works_in_interpolation() {
     let f = Fixture::new();
     f.write("package.kdl", "package \"app\" version=\"1\"\n");
