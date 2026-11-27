@@ -2152,13 +2152,13 @@ fn bytes_render(context: &mut RuntimeContext<'_>, args: &[Value]) -> Result<Valu
         rendered.into_bytes(),
     ))?))
 }
-/// The diagnostic text of an Error, as `bytes::render` shows it. Any other
-/// value yields `"ok"`, like `err::kind`.
+/// The rendered text of an Error without the leading `Error: ` label. Any other
+/// value yields the empty string.
 fn err_message(context: &mut RuntimeContext<'_>, args: &[Value]) -> Result<Value, RuntimeError> {
-    if !matches!(args[0], Value::Error(_)) {
-        return Ok(Value::Str(Rc::from("ok")));
-    }
-    let message = text::render(&args[0], context.limits.buffer_limit(), "str")?;
+    let Value::Error(error) = &args[0] else {
+        return Ok(Value::Str(Rc::from("")));
+    };
+    let message = text::render_error_message(error, context.limits.buffer_limit(), "str")?;
     Ok(Value::Str(Rc::from(message)))
 }
 fn bytes_len(_: &mut RuntimeContext<'_>, args: &[Value]) -> Result<Value, RuntimeError> {

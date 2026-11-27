@@ -1,4 +1,5 @@
-//! `err::message` returns the rendered text of an Error without propagating it.
+//! `err::message` returns an Error's text without the `Error: ` label and
+//! without propagating it.
 use cog::runtime::{RuntimeContext, VmCapabilities};
 use cog::{bytecode, interpreter, project};
 
@@ -31,13 +32,15 @@ fn run(source: &str) -> String {
 }
 
 #[test]
-fn message_matches_the_rendered_text_of_runtime_and_constructed_errors() {
+fn message_is_the_rendered_text_without_the_error_label() {
     let output = run(r#"
         use bytes;
         fn show(error) {
             const text = err::message(error);
             const rendered = bytes::render(error);
-            if text != bytes::to_str(rendered, 0, bytes::len(rendered)) { crash("text differs"); }
+            if "Error: " + text != bytes::to_str(rendered, 0, bytes::len(rendered)) {
+                crash("text differs");
+            }
             io::println(text)!!;
             io::println(error)!!;
         }
@@ -46,11 +49,32 @@ fn message_matches_the_rendered_text_of_runtime_and_constructed_errors() {
             show(Error::InvalidArgument("next"));
         }
         "#);
-    let lines: Vec<_> = output.lines().collect();
-    assert_eq!(lines[0], "Error: division by zero");
-    assert!(lines[2].contains("InvalidArgument(op: next)"), "{output}");
-    assert_eq!(lines[0], lines[1]);
-    assert_eq!(lines[2], lines[3]);
+    assert_eq!(
+        output,
+        "division by zero\nError: division by zero\n\
+         Error::InvalidArgument(op: next)\nError: Error::InvalidArgument(op: next)\n"
+    );
+}
+
+#[test]
+fn only_the_leading_label_is_removed_from_payload_text() {
+    let output = run(r#"
+        
+        fn risky() -> int { 1 / 0 }
+        fn main() {
+            io::println(err::message(Error::InvalidArgument("Error: inner")))!!;
+            io::println(err::message(Error::IoFailure("Error: read", "Error: gone")))!!;
+            // An Error stored in a payload is nested text and keeps its label.
+            try { risky(); }
+            catch(cause) { io::println(err::message(Error::InvalidArgument(cause)))!!; }
+        }
+        "#);
+    assert_eq!(
+        output,
+        "Error::InvalidArgument(op: Error: inner)\n\
+         Error::IoFailure(message: Error: gone, op: Error: read)\n\
+         Error::InvalidArgument(op: Error: division by zero)\n"
+    );
 }
 
 #[test]
@@ -78,13 +102,13 @@ fn message_inspects_without_triggering_catch_and_keeps_the_binding() {
         "#);
     assert_eq!(
         output,
-        "Error: division by zero\nError: division by zero\ncaught: Error: division by zero\n\
-         DivisionByZero\nError: division by zero\nDivisionByZero\n4\n"
+        "division by zero\ndivision by zero\ncaught: division by zero\n\
+         DivisionByZero\ndivision by zero\nDivisionByZero\n4\n"
     );
 }
 
 #[test]
-fn message_of_a_normal_value_is_ok_like_kind() {
+fn message_of_a_normal_value_is_empty() {
     let output = run(r#"
         fn main() {
             io::println(err::message(7))!!;
@@ -93,7 +117,7 @@ fn message_of_a_normal_value_is_ok_like_kind() {
             io::println(err::message([1 / 0]))!!;
         }
         "#);
-    assert_eq!(output, "ok\nok\nok\nok\n");
+    assert_eq!(output, "\n\n\n\n");
 }
 
 #[test]
@@ -103,7 +127,7 @@ fn message_stays_stable_in_a_hot_loop() {
             var same = 0;
             for _i in 0..5000 {
                 try {
-                    if err::message(1 / 0) == "Error: division by zero" { same += 1; }
+                    if err::message(1 / 0) == "division by zero" { same += 1; }
                 } catch(error) { crash("inspection triggered catch"); }
             }
             io::println(same)!!;
@@ -129,6 +153,17 @@ fn oversized_message_is_a_recoverable_resource_limit() {
 }
 
 #[test]
+fn the_buffer_limit_counts_only_the_message() {
+    let output = run_limited(
+        r#"
+        fn main() { io::print(err::message(1 / 0))!!; }
+        "#,
+        Some("division by zero".len()),
+    );
+    assert_eq!(output, "division by zero");
+}
+
+#[test]
 fn a_user_function_named_message_keeps_working_beside_the_module() {
     let output = run(r#"
         fn message() -> str { "mine" }
@@ -137,7 +172,7 @@ fn a_user_function_named_message_keeps_working_beside_the_module() {
             io::println(err::message(1 / 0))!!;
         }
         "#);
-    assert_eq!(output, "mine\nError: division by zero\n");
+    assert_eq!(output, "mine\ndivision by zero\n");
 }
 
 #[test]

@@ -478,19 +478,33 @@ fn render_value(
         }
         V::Iterator(_) => put(out, "<iterator>"),
         V::Stdout => put(out, "<resource>"),
-        V::Error(error) => match &error.detail {
-            Detail::Fields(fields) => {
-                put(out, "Error: Error::")?;
-                put(out, &error.kind)?;
-                put(out, "(")?;
-                render_fields(out, &fields.0, depth, resource)?;
-                put(out, ")")
-            }
-            _ => {
-                put(out, "Error: ")?;
-                put(out, &error.message())
-            }
-        },
+        V::Error(_) => {
+            put(out, "Error: ")?;
+            render_error_message(out, value, depth, resource)
+        }
+    }
+}
+
+/// Append an Error's text without the leading `Error: ` label. Other values
+/// append nothing.
+fn render_error_message(
+    out: &mut String,
+    value: &V,
+    depth: usize,
+    resource: &'static str,
+) -> Result<(), &'static str> {
+    let V::Error(error) = value else {
+        return Ok(());
+    };
+    match &error.detail {
+        Detail::Fields(fields) => {
+            push_text(out, "Error::", resource)?;
+            push_text(out, &error.kind, resource)?;
+            push_text(out, "(", resource)?;
+            render_fields(out, &fields.0, depth, resource)?;
+            push_text(out, ")", resource)
+        }
+        _ => push_text(out, &error.message(), resource),
     }
 }
 
@@ -503,11 +517,8 @@ fn render([value]: [V; 1], pc: usize) -> V {
 }
 
 fn error_message([value]: [V; 1], pc: usize) -> V {
-    if !matches!(value, V::Error(_)) {
-        return V::Str("ok".into());
-    }
     let mut text = String::new();
-    match render_value(&mut text, &value, 0, "str") {
+    match render_error_message(&mut text, &value, 0, "str") {
         Ok(()) => V::Str(text.into()),
         Err(resource) => resource_limit(pc, resource),
     }

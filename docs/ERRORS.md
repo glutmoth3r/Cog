@@ -271,18 +271,25 @@ fn main() -> nil {
     catch(error) {
         io::println($"Save failed: {error.error_kind()}")!!;
         io::println($"Save failed: {err::message(error)}")!!;
-        io::println(error)!!; // The same message text on its own line.
+        io::println(error)!!; // The message after an `Error: ` label.
     }
 }
 ```
 
 `err::message` returns the text that `io::println(error)` and
-`bytes::render(error)` show, including the `Error: ` prefix. It adds no source
-trace or suppressed cleanup causes. Like `err::kind`, it inspects its argument:
-the call receives an Error even inside try, does not propagate it, and leaves
-the binding unchanged. Any value that is not an Error yields `"ok"`. Text that
-exceeds the buffer or rendering depth limit produces a `ResourceLimit` Error
-instead.
+`bytes::render(error)` show, without the leading `Error: ` label:
+`division by zero` for a runtime failure, or
+`Error::InvalidArgument(op: next)` for a constructed variant, whose payload
+fields are listed by name in sorted order. Only that one leading label is
+removed; the same characters inside a payload are kept, including the label of
+an Error stored in a payload. It adds no source trace
+or suppressed cleanup causes. Printing an Error itself is unchanged and still
+shows the label.
+
+Like `err::kind`, `err::message` inspects its argument: the call receives an
+Error even inside try, does not propagate it, and leaves the binding unchanged.
+Any value that is not an Error yields the empty string. Text that exceeds the
+buffer or rendering depth limit produces a `ResourceLimit` Error instead.
 
 Compiler warning `W0008` reports an interpolation hole that is certainly an Error:
 a `catch` binding, a parameter declared as `err::Error`, a binding inside an Error

@@ -179,6 +179,6 @@ fn error_interpolation_warning_suggests_working_replacements_without_changing_be
     cog::interpreter::run_with(&decoded, &mut output).unwrap();
     assert_eq!(
         String::from_utf8(output).unwrap(),
-        "DivisionByZero\nkept: DivisionByZero\nError: division by zero\ntext: Error: division by zero\n"
+        "DivisionByZero\nkept: DivisionByZero\nError: division by zero\ntext: division by zero\n"
     );
 }

@@ -372,7 +372,10 @@ use io;
 use str;
 use err;
 use err::Error;
+fn risky() -> int { 1 / 0 }
 fn main(args: str[]) -> nil {
+    try { risky(); }
+    catch(cause) { io::println(err::message(Error::InvalidArgument(cause)))!!; }
     try {
         io::println(err::message(str::to_int(args[0])))!!;
         io::println(err::message(Error::InvalidArgument("next")))!!;
@@ -387,7 +390,7 @@ fn main(args: str[]) -> nil {
 fn wasi_error_messages_match_the_vm() {
     let output = assert_vm_parity("error_message", ERROR_MESSAGE_PROGRAM, &["invalid"]);
     assert!(
-        output.ends_with("Error: division by zero\nok\n"),
+        output.ends_with("Error::InvalidArgument(op: next)\ndivision by zero\n\n"),
         "{output}"
     );
 }

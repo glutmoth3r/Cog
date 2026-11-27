@@ -331,6 +331,24 @@ pub(crate) fn render(
     Ok(output.text)
 }
 
+/// The rendered text of an Error without the leading `Error: ` label. Errors
+/// nested inside its payload keep their label; the limit counts only the result.
+pub(crate) fn render_error_message(
+    error: &RuntimeError,
+    limit: usize,
+    resource: &'static str,
+) -> Result<String, RuntimeError> {
+    let mut output = RenderBuffer {
+        text: String::new(),
+        limit,
+        failure: None,
+    };
+    if output.error_message(error, 0).is_err() {
+        return Err(output.failure.unwrap_or_else(|| self::limit(resource)));
+    }
+    Ok(output.text)
+}
+
 struct RenderBuffer {
     text: String,
     limit: usize,
@@ -424,29 +442,33 @@ impl RenderBuffer {
             }
             Value::Error(error) => {
                 self.write_str("Error: ")?;
-                match error.primary() {
-                    RuntimeError::LanguageError { tag, fields } => {
-                        if let Some(tail) = tag.strip_prefix(crate::error::ERROR_TYPE) {
-                            write!(self, "Error{tail}(")?;
-                        } else {
-                            write!(self, "{tag}(")?;
-                        }
-                        let fields = fields.try_borrow().map_err(|_| self.borrow_error())?;
-                        self.fields(&fields, depth)?;
-                        self.write_str(")")
-                    }
-                    RuntimeError::Crashed { context, value } => {
-                        self.write_str("crash: ")?;
-                        if let Some(context) = context {
-                            write!(self, "{context}: ")?;
-                        }
-                        self.value(value, depth + 1)
-                    }
-                    _ => write!(self, "{error}"),
-                }
+                self.error_message(error, depth)
             }
             // These variants cannot recursively visit a user-controlled graph.
             _ => write!(self, "{value}"),
+        }
+    }
+
+    fn error_message(&mut self, error: &RuntimeError, depth: usize) -> std::fmt::Result {
+        match error.primary() {
+            RuntimeError::LanguageError { tag, fields } => {
+                if let Some(tail) = tag.strip_prefix(crate::error::ERROR_TYPE) {
+                    write!(self, "Error{tail}(")?;
+                } else {
+                    write!(self, "{tag}(")?;
+                }
+                let fields = fields.try_borrow().map_err(|_| self.borrow_error())?;
+                self.fields(&fields, depth)?;
+                self.write_str(")")
+            }
+            RuntimeError::Crashed { context, value } => {
+                self.write_str("crash: ")?;
+                if let Some(context) = context {
+                    write!(self, "{context}: ")?;
+                }
+                self.value(value, depth + 1)
+            }
+            _ => write!(self, "{error}"),
         }
     }
 }
