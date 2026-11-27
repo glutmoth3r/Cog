@@ -1051,6 +1051,12 @@ static FUNCTIONS: &[NativeFunction] = &[
         invoke: bytes_render,
     },
     NativeFunction {
+        name: "err::message",
+        parameters: &[Any],
+        result: Str,
+        invoke: err_message,
+    },
+    NativeFunction {
         name: "bytes::len",
         parameters: &[Bytes],
         result: Int,
@@ -2145,6 +2151,15 @@ fn bytes_render(context: &mut RuntimeContext<'_>, args: &[Value]) -> Result<Valu
     Ok(Value::Bytes(HeapRef::try_new(RefCell::new(
         rendered.into_bytes(),
     ))?))
+}
+/// The diagnostic text of an Error, as `bytes::render` shows it. Any other
+/// value yields `"ok"`, like `err::kind`.
+fn err_message(context: &mut RuntimeContext<'_>, args: &[Value]) -> Result<Value, RuntimeError> {
+    if !matches!(args[0], Value::Error(_)) {
+        return Ok(Value::Str(Rc::from("ok")));
+    }
+    let message = text::render(&args[0], context.limits.buffer_limit(), "str")?;
+    Ok(Value::Str(Rc::from(message)))
 }
 fn bytes_len(_: &mut RuntimeContext<'_>, args: &[Value]) -> Result<Value, RuntimeError> {
     Ok(Value::Int(

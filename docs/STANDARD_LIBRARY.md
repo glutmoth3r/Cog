@@ -1024,6 +1024,10 @@ ProcessFailed, IoReadFailed, IoWriteFailed, EntropyUnavailable, InvalidRangeStep
 InvalidResource, InvalidArgument, Cancelled, ResourceLimit, and IoFailure. Their
 payload declarations are in
 [core/err.cog](../core/err.cog). `err::kind(value)` and `value.error_kind()` return
-the primary error kind as str, or `"ok"` for a normal value. `.unwrap()`
+the primary error kind as str, or `"ok"` for a normal value.
+`err::message(value)` returns the diagnostic text of an Error as str, for example
+`"Error: division by zero"`, which is the text `bytes::render` shows; it also
+returns `"ok"` for a normal value. Both calls inspect an Error argument without
+propagating it. Neither is available at comptime. `.unwrap()`
 and `.expect(message)` crash on Error. Prefer patterns and explicit recovery or
 propagation when failure is recoverable.

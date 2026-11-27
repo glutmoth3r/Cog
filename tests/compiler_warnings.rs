@@ -158,7 +158,7 @@ fn does_not_warn_when_error_handling_in_an_interpolation_is_visible() {
 
 #[test]
 fn error_interpolation_warning_suggests_working_replacements_without_changing_behavior() {
-    let source = "@!include(\"std\")\nuse io;\nuse bytes;\nfn main() {\n    try { io::println(1 / 0); } catch(failure) {\n        const lost = $\"failed: {failure}\";\n        io::println(lost.error_kind())!!;\n        io::println($\"kept: {failure.error_kind()}\")!!;\n        io::println(failure)!!;\n        const text = bytes::render(failure);\n        io::println($\"text: {bytes::to_str(text, 0, bytes::len(text))}\")!!;\n    }\n}\n";
+    let source = "@!include(\"std\")\nuse io;\nuse err;\nfn main() {\n    try { io::println(1 / 0); } catch(failure) {\n        const lost = $\"failed: {failure}\";\n        io::println(lost.error_kind())!!;\n        io::println($\"kept: {failure.error_kind()}\")!!;\n        io::println(failure)!!;\n        io::println($\"text: {err::message(failure)}\")!!;\n    }\n}\n";
     let (program, warnings) =
         project::compile_source_with_warnings("warnings.cog", source).unwrap();
 
@@ -170,7 +170,8 @@ fn error_interpolation_warning_suggests_working_replacements_without_changing_be
         "{warnings:?}"
     );
     assert!(
-        warnings[0].helps[1].contains("bytes::to_str(text, 0, bytes::len(text))"),
+        warnings[0].helps[1].contains("{err::message(failure)}")
+            && warnings[0].helps[1].contains("use err;"),
         "{warnings:?}"
     );
     let decoded = cog::bytecode::decode(&cog::bytecode::encode(&program).unwrap()).unwrap();

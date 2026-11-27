@@ -2909,8 +2909,14 @@ impl<'a> Codegen<'a> {
                 args.len()
             )));
         }
+        // Error inspection receives the value before the surrounding handler.
+        let inspects_error = match &builtin {
+            Builtin::ErrorKind => true,
+            Builtin::Native(import) => import.name() == "err::message",
+            _ => false,
+        };
         for arg in args {
-            if matches!(builtin, Builtin::ErrorKind) {
+            if inspects_error {
                 self.compile_handled_expr(&arg.value, scopes)?;
             } else {
                 self.compile_expr(&arg.value, scopes)?;

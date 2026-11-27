@@ -707,7 +707,7 @@ impl Linter {
             "use `{{{name}.error_kind()}}` for the kind name, read a payload with a `when` pattern on `{name}`, or pass `{name}` alone to `io::println` to print its message"
         ))
         .help(format!(
-            "for the message as str, store `bytes::render({name})` in `text` and decode it with `bytes::to_str(text, 0, bytes::len(text))`"
+            "for the message as str, interpolate `{{err::message({name})}}` after `use err;`"
         ))
         .help("if the Error should propagate, make that visible with `!!`");
         self.warnings.push(warning);

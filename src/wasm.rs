@@ -512,6 +512,7 @@ impl LowerFunction<'_, '_> {
                     "bytes::get" => "bytes_get",
                     "bytes::set" => "bytes_set",
                     "bytes::to_str" => "bytes_to_str",
+                    "err::message" => "error_message",
                     "str::to_int" => "to_int",
                     "str::to_uint" => "to_uint",
                     "str::to_bool" => "to_bool",

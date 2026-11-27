@@ -502,6 +502,17 @@ fn render([value]: [V; 1], pc: usize) -> V {
     }
 }
 
+fn error_message([value]: [V; 1], pc: usize) -> V {
+    if !matches!(value, V::Error(_)) {
+        return V::Str("ok".into());
+    }
+    let mut text = String::new();
+    match render_value(&mut text, &value, 0, "str") {
+        Ok(()) => V::Str(text.into()),
+        Err(resource) => resource_limit(pc, resource),
+    }
+}
+
 fn bytes_len([value]: [V; 1], pc: usize) -> V {
     match value {
         V::Bytes(bytes) => V::Int(bytes.borrow().len() as i64),

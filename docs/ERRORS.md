@@ -128,7 +128,7 @@ operations. An unmarked Error returned from the callee remains a value and is
 observed at the caller's call site. A marked Error from `!!` reaches the caller's
 call site as propagation control: a lexical handler covering that call catches it;
 without one, the caller relays it through cleanup. Explicit inspection with
-`when`, `match`, `err::kind()`, or `.error_kind()` receives an Error value before
+`when`, `match`, `err::kind()`, `err::message()`, or `.error_kind()` receives an Error value before
 the surrounding handler; inspection does not clear an Error stored in a binding.
 
 Catch is not protected by its own try. Errors in catch or a selected fallback can
@@ -259,29 +259,30 @@ value explicitly when choosing a diagnostic path.
 A caught Error therefore cannot be embedded in a message directly:
 `$"Save failed: {error}"` is itself an Error. Interpolate `error.error_kind()`,
 which is the kind name as str, or read a variant payload with `when`. For the
-whole message text as str, decode the buffer returned by `bytes::render`:
+whole message text as str, call `err::message(error)`:
 
 ```cog
 @!include("std")
 use io;
-use bytes;
-use err::Error;
-
-fn message(error: Error) -> str {
-    const text = bytes::render(error);
-    bytes::to_str(text, 0, bytes::len(text))
-}
+use err;
 
 fn main() -> nil {
     try { io::println("invalid" as int); }
     catch(error) {
         io::println($"Save failed: {error.error_kind()}")!!;
-        io::println($"Save failed: {message(error)}")!!;
-        io::println(error)!!; // The runtime message on its own line.
+        io::println($"Save failed: {err::message(error)}")!!;
+        io::println(error)!!; // The same message text on its own line.
     }
 }
 ```
 
+`err::message` returns the text that `io::println(error)` and
+`bytes::render(error)` show, including the `Error: ` prefix. It adds no source
+trace or suppressed cleanup causes. Like `err::kind`, it inspects its argument:
+the call receives an Error even inside try, does not propagate it, and leaves
+the binding unchanged. Any value that is not an Error yields `"ok"`. Text that
+exceeds the buffer or rendering depth limit produces a `ResourceLimit` Error
+instead.
 
 Compiler warning `W0008` reports an interpolation hole that is certainly an Error:
 a `catch` binding, a parameter declared as `err::Error`, a binding inside an Error

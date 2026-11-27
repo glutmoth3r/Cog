@@ -326,8 +326,9 @@ indexing (both the indexed value and the index), calling a function value, itera
 bounds and steps, `await`, `len`, arithmetic, conditions, passing it to a non-nullable
 parameter, field, or result, and passing it to a builtin or native parameter that requires a
 value, such as `str::to_int` or `hash::of`. `==`, `!=`, string interpolation, `??`, the Error
-inspection methods `unwrap`, `expect`, and `error_kind`, natives that render any value such
-as `str::to_str` and `json::stringify`, and `dynamic` destinations accept it. An `as`
+inspection methods `unwrap`, `expect`, and `error_kind`, the inspection functions `err::kind`
+and `err::message`, natives that render any value such as `str::to_str` and
+`json::stringify`, and `dynamic` destinations accept it. An `as`
 conversion stays checked at run time and produces Error when it cannot convert `nil`. Dynamic
 values keep their runtime checks.
 

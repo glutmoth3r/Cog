@@ -80,6 +80,7 @@ the VM's semantics, including Error kinds and payload fields:
   from `str` to the target type on empty text, overflow, or any other
   character. Converting between `int` and `uint` reports `Overflow` when the
   value does not fit.
+- `err::message`, with the VM's text.
 - `str::builder`, `str::build`, and `fmt::write`. Only the first `{}` in a
   template is replaced. `str::build` returns a snapshot.
 

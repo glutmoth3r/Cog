@@ -367,6 +367,31 @@ fn wasi_field_reads_of_an_error_keep_the_cause_like_the_vm() {
     );
 }
 
+const ERROR_MESSAGE_PROGRAM: &str = r#"@!include("std")
+use io;
+use str;
+use err;
+use err::Error;
+fn main(args: str[]) -> nil {
+    try {
+        io::println(err::message(str::to_int(args[0])))!!;
+        io::println(err::message(Error::InvalidArgument("next")))!!;
+        io::println(err::message(1 / 0))!!;
+        io::println(err::message(args.len()))!!;
+    } catch(error) { crash("inspection triggered catch"); }
+}
+"#;
+
+#[test]
+#[ignore = "requires rustc's wasm32-wasip1 target and Node with WASI Preview 1"]
+fn wasi_error_messages_match_the_vm() {
+    let output = assert_vm_parity("error_message", ERROR_MESSAGE_PROGRAM, &["invalid"]);
+    assert!(
+        output.ends_with("Error: division by zero\nok\n"),
+        "{output}"
+    );
+}
+
 const SHIFT_PROGRAM: &str = r#"@!include("std")
 use io;
 use str;
