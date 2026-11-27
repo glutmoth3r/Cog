@@ -178,14 +178,33 @@ fn main() {
 
 The current evaluator supports scalar literals, earlier `comptime` values,
 arithmetic, comparisons, boolean operators, unary operators, and string
-concatenation. It can also evaluate struct constructors, including nested
-constructors and field defaults, and read named or positional struct fields
-such as `settings.limit` or `point.0`. Private fields are accessible only in
-their defining module. An `@comptime fn` can call other `@comptime fn`s and
-can use scalar or struct parameters, named/default arguments, local `const`/`var`
-bindings, `return`, and `if` blocks. Calls are evaluated before runtime lowering;
-their scalar or struct results are materialized for runtime use, and the function
-itself is omitted from the runtime artifact.
+concatenation. It also evaluates array and tuple literals, struct and enum
+constructors, array indices, field and tuple position reads, and enum matches
+with payload bindings and guards. The built-in `len(array)` and `array.len()`
+return the element count. Struct constructors support field defaults and
+enforce the defining module's private fields. An `@comptime fn` can call other
+`@comptime fn`s and use aggregate parameters and results, named/default arguments,
+local `const`/`var` bindings, `return`, and `if` blocks.
+
+```cog
+enum Mode { Fast, Limit(n: int) }
+@comptime const PRIMES: int[] = [2, 3, 5, 7];
+@comptime const DEFAULT: Mode = Mode::Limit(PRIMES[2]);
+@comptime const LIMIT = match DEFAULT {
+    Mode::Fast => len(PRIMES),
+    Mode::Limit(n) => n,
+};
+
+fn main() {}
+```
+
+Each named global constant initializes one read-only runtime object. A local
+constant initializes one per execution of its declaration. Repeated subvalues
+within materialized data get independent copies. Use `.clone()` on a cloneable
+array or tuple to obtain a copy that can be bound to a `var`. Empty arrays need
+an element type from their context. Declared aggregate types such as `int?[]`
+are preserved in the materialized value. WASI supports arrays within its
+supported types. Tuples and enums require the VM, JIT, or native backend.
 
 ```cog
 @!include("std")
@@ -205,9 +224,9 @@ fn main() {
 
 
 Runtime values and ordinary functions are unavailable during compile-time
-evaluation. Struct fields cannot yet be inspected by the evaluator. Division by
-zero and integer overflow produce Error values that a `when`/`match` pattern can
-inspect inside a comptime function. `try`/`catch` can handle these errors in a
+evaluation. Division by zero and integer overflow produce Error values that a
+`when`/`match` pattern can inspect inside a comptime function. `try`/`catch` can
+handle these errors in a
 comptime function, and `!!` propagates through comptime calls until a caller's
 lexical handler or the binding root. Using `!!` directly at a comptime binding
 root is rejected because there is no enclosing comptime function to receive the
@@ -216,13 +235,13 @@ diagnostic.
 
 Unlike Rust `const fn`, an `@comptime fn` is compile-time-only and is omitted from
 the runtime artifact. A normal `fn` remains runtime-only even when its body is pure.
-The lazy `??` and `?!` operators are supported, including in compile-time functions;
-`!!` propagation bypasses them. Native calls, mutation statements, loops, array,
-tuple, and enum values, along with tuple destructuring, are not supported as
-comptime data yet. Type values have a separate, limited form: a top-level binding
-annotated `: type` can name a primitive, struct, enum, array, tuple, or nullable
-type. A type value can also pass
-through an `@comptime fn` whose parameter and result are annotated `type`. Bindings
+The lazy `??` and `?!` operators are supported, including in compile-time functions.
+`!!` propagation bypasses them. Native calls, mutation statements, loops, tuple
+destructuring, and array, tuple, or enum equality are outside the compile-time
+subset. Struct equality without `Eq` currently evaluates to `false` at compile time.
+A top-level binding annotated `: type` can name a primitive, struct, enum,
+array, tuple, or nullable type. A type value can also pass through an
+`@comptime fn` whose parameter and result are annotated `type`. Bindings
 are erased after their types are substituted into annotations, so they have no
 runtime value.
 
@@ -342,6 +361,16 @@ A check proves that a binding is not `nil` on the paths where the check holds:
 - `when x is T`, the `else` branch of `when x is nil`, and `match` arms that follow an
   unguarded `nil` arm;
 - `x ?? fallback`, whose result is not `nil` unless the fallback is.
+
+`crash(value)` is also an expression with no normal result, so
+`node.next ?? crash("missing next node")` asserts a non-`nil` fallback.
+The fallback is evaluated only when the left operand is `nil`; `crash` is fatal
+and is not a recoverable Error.
+
+`if const next = node.next { ... } else { ... }` evaluates the value once and
+binds its non-`nil` result as `next` inside the first branch. The binding is
+immutable and does not exist in the `else` branch. An Error in the value follows
+the normal condition-error path.
 
 ```cog
 @!include("std")
@@ -817,7 +846,11 @@ evaluated once, and a type annotation applies to the complete tuple, for example
 `const (name, age): (str, int) = ("Ada", 37);`. Function parameter destructuring
 remains unsupported. `T[N]` and general user-container operators remain future work.
 `len(array)` or `array.len()` returns the element count; `len(str)`
-counts Unicode scalars, not UTF-8 bytes.
+counts Unicode scalars, not UTF-8 bytes. Only arrays, tuples, and strings have this
+built-in length. `cog check` rejects `len(value)` and `value.len()` for any other
+statically known type, such as a number, struct without its own `len` method,
+record, or `bytes`. A type's own `len` method is called as `value.len()`, and a
+dynamic value is checked at run time.
 
 ### User-defined collection iteration
 
@@ -857,10 +890,14 @@ fn main() {
 }
 ```
 
-The compiler resolves these trait methods statically. Arrays, strings, and
-dynamic values keep their existing runtime iteration paths. User-defined
-iteration requires a statically known concrete collection type; a generic
-function cannot currently iterate a parameter through an `IntoIterator` bound.
+The compiler resolves these trait methods statically. A loop runs the methods of
+the collection type's `iter` implementations, which may be generic; an inherent
+or unrelated extension method named `into_iter`, `next`, or `current` does not
+take part. A generic function can iterate a parameter bounded by
+`iter::IntoIterator[Iter, Item]`, and the loop then uses the implementation with
+those trait arguments. Arrays, strings, and dynamic values keep their existing
+runtime iteration paths. User-defined iteration otherwise requires a statically
+known collection type.
 The effects of iterator methods and the capabilities of returned items participate
 in mutability analysis, including for zipped loops.
 When JIT is enabled, custom iterator calls may resume in the VM; native execution
@@ -929,18 +966,42 @@ method signatures before the implementation is checked. A function's bound may
 refer to another inferred type parameter, as in
 `fn convert[T: type, U: type + Convert[T]](value: U) -> T`.
 `@comptime extend Source with Convert[str]` may use a compile-time type binding for
-the target. Only one implementation of a given trait is allowed per target type;
-generic implementations over a family of target types are not supported.
+the target. A generic implementation covers a family of generic struct or array
+types, as in `extend[T: type + Show] Box[T] with Show`. Implementations of one
+trait must not overlap: two of them conflict when some target type and trait
+arguments match both, and bounds do not make them distinct. A concrete target type
+also takes only one concrete implementation of a trait.
+
+A trait implementation is allowed only in the module that declares the trait or the
+module that declares the target struct or enum (for `Box[Other]`, the module of
+`Box`). Primitives, `bytes`, arrays, tuples, function and task types have no
+declaring module, so only the trait's module can implement a trait for them. A type
+alias counts as the type it names. To implement a foreign trait for a foreign or
+built-in type, wrap the value in a struct declared in your module. The overlap rule
+applies across both eligible modules.
 
 `Self` in a trait signature means the implementing type. A trait method must have
 `self` first and cannot declare default arguments. Its implementation must match
 parameter names and types, result type, and order; names matter because callers can
-use named arguments. Bounds are checked at each generic call, and method calls are
-resolved statically for the specialized receiver. Trait objects and dynamic dispatch
-are not available. Generic `@comptime fn`s and generic trait implementations are
-unsupported. Generic structs and generic extension methods are supported for
-generic structs and arrays. Declare extension parameters before the target; the
-receiver supplies their inferred types:
+use named arguments. Bounds are checked at each generic call.
+
+A method call through a bound runs the method of the implementation that proved
+the bound. This applies when the receiver's type is a bounded type parameter and
+one of its bounds declares the method, including receivers reached through
+bindings, fields, elements, closure parameters, results, and `Self`. The bound's
+trait arguments select among implementations. Inherent methods, methods of other
+traits with the same name, and added imports do not change such a call. If two
+bounds of the parameter declare the method, the call is ambiguous; the standard
+`eq::Eq` and `collections::Hashable` pair is accepted when both define the same
+concrete `equals`. Struct `==` and `!=` and `for` loops likewise use the standard
+trait implementations. Other calls, including calls on a compound type such as
+`Box[T]` inside a generic body, resolve by method name on the specialized receiver
+type. Calls are resolved statically; trait objects and dynamic dispatch are not
+available.
+
+Generic `@comptime fn`s are unsupported. Generic structs and generic extension
+methods are supported for generic structs and arrays. Declare extension parameters
+before the target; the receiver supplies their inferred types:
 
 ```cog
 struct Box[T: type] { value: T }
@@ -966,7 +1027,8 @@ type parameters can also be inferred from a direct declared result context. A
 concrete extension takes precedence over a matching generic extension. Multiple
 matching generic extensions are diagnosed as ambiguous. Generic extensions can target array
 patterns such as `T[]`; the standard `array` module uses this to provide
-`items.swap(left, right)`.
+`items.swap(left, right)`. Program modules extend arrays only with traits (see
+[extensions](#extension-placement)).
 
 The standard `clone` module defines `Clone` for primitive values and provides the
 generic `clone::value[T: type + Clone](value: T)` helper. Arrays and tuples can be cloned
@@ -990,10 +1052,18 @@ Built-in receiver methods are `.len()`, `.append(value)`, `.prepend(value)`,
 `.error_kind()`, `.unwrap()`, and `.expect(message)`. Unwrap/expect crash on Error;
 they are different from `!!` propagation and are not nil unwrapping.
 
-User methods can be declared in an extension. `extend` targets a named struct or
-enum. `@comptime extend` resolves a compile-time type value and can target primitive,
-array, and tuple types; ordinary `fn` methods declared there are generated as
-runtime methods. Dispatch is checked against the receiver's static type.
+### Extension placement
+
+User methods can be declared in an extension. An inherent extension (one without a
+trait) is allowed only in the module that declares the struct or enum, including
+concrete and generic instances such as `Box[int]`. Only the standard library adds
+inherent methods to built-in types such as `int` or `T[]`. In any other module,
+declare a free function, or declare a trait and implement it under the module rule
+for trait implementations. `@comptime extend` resolves a compile-time type value;
+its methods follow the same rules for the resolved type, and a trait implementation
+can target primitive, array, and tuple types. Ordinary `fn` methods declared there
+are generated as runtime methods. Dispatch is checked against the receiver's static
+type.
 
 ```cog
 struct Point { x: int }
@@ -1022,8 +1092,9 @@ fn main() {}
 
 Ordinary extension methods are available for concrete nominal and compile-time
 resolved types. An `@comptime extend` can also implement a trait for its resolved
-target, including a type alias. Trait method lookup is static and implementations are checked against their
-declared signatures. Generic specialization is bounded to 256 instances per
+target, including a type alias, subject to the module rule for trait
+implementations above. Trait method lookup is static and implementations are
+checked against their declared signatures. Generic specialization is bounded to 256 instances per
 compilation; recursive generic calls reuse the same instance.
 
 ## Modules and visibility
@@ -1038,6 +1109,12 @@ form, `run` supplies command-line arguments after `--`, excluding the executable
 name. No other `main` parameter signature is supported. `--restricted` denies
 access to `process::args()` and therefore to this argument list.
 `--restricted` also applies fixed runtime limits; see [runtime](RUNTIME.md).
+When `main` returns an `int`, its low eight bits become the process exit status
+(`-1` becomes 255, and 256 becomes 0). This also applies to `@async main` after
+its tasks and cleanup complete. A non-integer result exits with status 0; an
+unhandled runtime failure exits with status 1. VM, JIT, native executables and
+WASI commands use the same rule. Embedding APIs return normally and expose the
+status through `RunContext::exit_code()`.
 `use math::{PI, max as larger};` and `use math::*;` are supported. Only `len` and
 `exclusive` are in the ordinary prelude. Imports can also be block-local.
 

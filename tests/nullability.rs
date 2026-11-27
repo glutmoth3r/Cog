@@ -40,6 +40,95 @@ fn reject(body: &str, expected: &str) {
 }
 
 #[test]
+fn crash_expression_is_a_lazy_never_typed_nil_fallback() {
+    let compiled = project::compile_source(
+        "nullability.cog",
+        &source(
+            r#"
+            fn main() {
+                const value = find(true) ?? crash("missing node");
+                io::println(value.value)!!;
+            }
+        "#,
+        ),
+    )
+    .unwrap();
+    let encoded = bytecode::encode(&compiled).unwrap();
+    for jit in [false, true] {
+        let program = cog::sdk::Engine::new().decode(&encoded).unwrap();
+        let mut output = Vec::new();
+        program
+            .run_in(&mut cog::sdk::RunContext::new(&mut output).with_jit(jit))
+            .unwrap();
+        assert_eq!(output, b"1\n");
+    }
+
+    let failing = source(
+        r#"
+        fn main() {
+            const value = find(false) ?? crash("missing node");
+            io::println(value.value)!!;
+        }
+    "#,
+    );
+    let program = project::compile_source("nullability.cog", &failing).unwrap();
+    let program = cog::sdk::Engine::new()
+        .decode(&bytecode::encode(&program).unwrap())
+        .unwrap();
+    for jit in [false, true] {
+        let mut output = Vec::new();
+        let error = program
+            .run_in(&mut cog::sdk::RunContext::new(&mut output).with_jit(jit))
+            .unwrap_err();
+        assert!(error.message().contains("missing node"), "{error}");
+        assert!(output.is_empty());
+    }
+}
+
+#[test]
+fn if_const_evaluates_nullable_value_once_and_scopes_the_binding() {
+    let program = project::compile_source(
+        "nullability.cog",
+        &source(
+            r#"
+            use err;
+            var calls: int = 0;
+            fn next(node: Node) -> Node? { calls += 1; node.next }
+            fn failing() -> Node? { err::Error::DivisionByZero() }
+            fn read(node: Node) -> int {
+                if const item = next(node) { item.value } else { -1 }
+            }
+            fn main() {
+                const root = Node(value: 1, next: Node(value: 7, next: nil));
+                if const item = root.next { io::println(item.value)!!; }
+                io::println(read(root))!!;
+                io::println(read(Node(value: 0, next: nil)))!!;
+                io::println(calls)!!;
+                try {
+                    if const item = failing() { io::println(item.value)!!; }
+                    else { io::println("wrong")!!; }
+                } catch(error) { io::println(error.error_kind())!!; }
+            }
+        "#,
+        ),
+    )
+    .unwrap();
+    let encoded = bytecode::encode(&program).unwrap();
+    for jit in [false, true] {
+        let program = cog::sdk::Engine::new().decode(&encoded).unwrap();
+        let mut output = Vec::new();
+        program
+            .run_in(&mut cog::sdk::RunContext::new(&mut output).with_jit(jit))
+            .unwrap();
+        assert_eq!(output, b"7\n7\n-1\n2\nDivisionByZero\n");
+    }
+    reject(
+        "fn f(node: Node) { if const item = node.next {} item; }",
+        "item",
+    );
+}
+
+#[test]
 fn member_use_of_a_nullable_value_is_rejected_with_a_fix() {
     for (body, expected) in [
         (

@@ -33,7 +33,7 @@ not automatically planned.
 | binding_01..05, sequence_01 | Reachable mutating use for local var, available static inference, const access restrictions, transitive mutating calls, method capability checks |
 | flow_01 | Excluding Error does not remove nullable from the declared normal type |
 | nullable_01/04/05/07/08 | Nullable boundaries remain declared; nonterminal arms/writes do not exclude nil; Error exclusion and !! do not unwrap nil; ?? can produce a nonnullable normal result |
-| phase_01..07, phase_10..17, comptime_01..03 | Scalar values and nominal struct construction evaluate before runtime lowering; type-valued bindings substitute recursively into annotations and are erased; arithmetic Error values can be inspected by patterns or diagnosed at the comptime root; `try`/`catch`, `!!`, and lazy `??`/`?!` preserve computational error boundaries; runtime inputs/calls and forbidden runtime effects are rejected, and comptime callables are omitted from runtime artifacts |
+| phase_01..07, phase_10..17, comptime_01..03 | Scalars, arrays, tuples, structs, and enums evaluate before runtime lowering. Type-valued bindings substitute recursively into annotations and are erased. Patterns and recovery operators preserve computational Error boundaries. Phase checks reject runtime inputs and forbidden effects. Comptime callables are omitted from runtime artifacts. |
 
 **Intentional design decision:** Error is a computational state of an expression
 with normal type T; no mandatory `Result`/union/throws annotation is introduced.
@@ -151,9 +151,9 @@ inside a cloned graph remain aliases of the same independent copied object.
   not yet have an accepted contract.
 - Trait associated types are not implemented. Type-associated functions such as
   `Type::new()` are a separate feature implemented by receiverless methods in
-  `extend` declarations. Generic extension methods use static
-  receiver matching and monomorphization; generic trait implementations remain
-  unsupported. No implicit dynamic type or runtime trait object is introduced.
+  `extend` declarations. Generic extension methods and generic trait
+  implementations use static receiver matching and monomorphization. No implicit
+  dynamic type or runtime trait object is introduced.
   Associated types have no scheduled implementation in the roadmap.
 - Clone does not transfer ownership, provide a borrow checker, or add lifetime
   syntax. Copy-on-write or reference counting may optimize observable independence.
@@ -164,15 +164,27 @@ Contracts clone_01..02 are active regressions.
 
 Global and local `@comptime const name[: T] = expression;` bindings are evaluated after
 name resolution and before runtime lowering. Scalar literals, earlier comptime
-bindings, arithmetic, comparisons, boolean operators, unary operators, string
-concatenation, nominal struct constructors, and struct field reads are supported.
-Constructors can be nested and use named/default arguments. Reads use a literal
-field name or position, apply the defining module's visibility rules, and preserve
-Error values. Compile-time functions support scalar and
-struct parameters, named/default arguments, local const/var/comptime bindings,
-returns, `if`, and recursion within deterministic evaluator limits. Scalar results
-are materialized as runtime literals; struct results are materialized through
-their resolved constructors. Comptime-only function definitions are omitted from
+bindings, arithmetic, comparisons, boolean operators, unary operators, and string
+concatenation are supported. Aggregate expressions include array and tuple
+literals, struct and enum constructors, array indices, literal tuple positions,
+field reads, built-in array and string `len`, and enum matches. Constructors can
+be nested, use named arguments, and use struct field defaults. Struct field reads
+apply the defining module's visibility rules. Enum match guards see the current
+arm's payload bindings. Compile-time functions support aggregate parameters and
+results, named/default arguments, local bindings, returns, `if`, and recursion
+within deterministic evaluator limits.
+
+Scalar results become runtime literals. Aggregate results use existing typed
+literals and resolved constructors, preserving the type of empty and nullable
+arrays, tuples, and generic structs. Each global named aggregate initializes one
+read-only runtime object. Each local named aggregate initializes one per execution
+of its declaration. Repeated subvalues are materialized independently. The usual
+mutability rules apply, and cloneable arrays and tuples can be copied with
+`.clone()`. VM, JIT, and native AOT use the same materialized bytecode. WASI
+supports arrays within its supported types and reports tuples and enums as
+unsupported.
+
+Comptime-only function definitions are omitted from
 runtime code. Top-level `@comptime const T: type = ...;` bindings can name primitive,
 nominal, array, tuple, and nullable types used by later annotations. These compiler
 type values are substituted recursively and removed before runtime lowering; they
@@ -191,13 +203,14 @@ function; an unhandled Error at a `comptime` binding root is a compile diagnosti
 through comptime calls to the caller's lexical handler. An unhandled propagation
 reaches the initializer root as a compile diagnostic; using `!!` directly at an
 initializer root is rejected.
-Lazy `??` and `?!` select nil and Error fallbacks in compile-time expressions;
-`!!` propagation bypasses either fallback. **Current implementation limitation:**
-compile-time functions cannot use type parameters, mutation statements, loops,
-array/tuple/enum values, or tuple destructuring.
-Evaluator budget exhaustion produces a compile diagnostic. Array, tuple, and enum
-materialization is planned; the other unsupported forms have no accepted
-implementation schedule.
+Lazy `??` and `?!` select nil and Error fallbacks in compile-time expressions.
+`!!` propagation bypasses either fallback. An Error in a materialized aggregate
+is reported as a compile diagnostic, as is evaluator step, depth, or allocation
+budget exhaustion. Materialized data has a separate depth limit of 48 and remains
+subject to compiler syntax, bytecode, and verifier limits. Type parameters on compile-time functions,
+mutation statements, loops, tuple destructuring, and array, tuple, or enum
+equality remain outside the subset. Struct equality without `Eq` currently
+evaluates to `false` at compile time.
 `comptime const` without the `@` attribute prefix is invalid syntax.
 
 ## Current comptime boundaries and indirect callable contracts
@@ -367,7 +380,8 @@ annotations, and rejects more than 256 instances. Explicit arguments use
 Result-only inference for ordinary generic functions and generic `@comptime fn`s
 remain unsupported. Type-associated generic functions can infer from a direct
 declared result context. Generic extensions use `extend[T: type] Box[T] { ... }`
-or `extend[T: type] T[] { ... }`; extension and method type parameters are inferred
+or, with a trait or in the standard library, `extend[T: type] T[] { ... }`;
+extension and method type parameters are inferred
 from the receiver and arguments, then specialized with the same per-compilation
 limit as generic functions.
 
@@ -387,11 +401,30 @@ binds concrete type values and substitutes them into method signatures. A
 `@comptime extend` may implement a trait for a compile-time-resolved target type.
 Implementations are checked for duplicates, required methods, parameter names and
 types, and result types. Function bounds can refer to other inferred type
-parameters. Only one implementation of a trait is accepted per target type;
-generic target implementations are not supported. `Self` names the implementing
-type. Bounds are checked at specialization sites, and methods resolve statically
-against the concrete receiver. There is no runtime trait object or dynamic dispatch.
-**Current implementation limitation:** cross-module visibility rules remain limited.
+parameters. Targets may be generic, such as `extend[T: type] Box[T] with Show`.
+Implementations of one trait must not overlap, bounds do not make overlaps
+distinct, and a concrete target takes one concrete implementation of a trait.
+`Self` names the implementing type. Bounds are checked at specialization sites.
+There is no runtime trait object or dynamic dispatch.
+
+A trait implementation is allowed only in the module that declares the trait or
+the module that declares the target's struct or enum, identified by canonical
+package and module identity. Built-in, array, tuple, and function types have no
+declaring module, so only the trait's module may implement a trait for them. An
+implementation is therefore loaded whenever its trait and type are used together,
+and an unrelated import cannot add one. Overlap checks cover both modules.
+
+A call through a bound dispatches to the implementation that proved the bound,
+never by method name alone. The compiler selects it from the bounds declared by
+the receiver's type parameter, keeps the choice (with its trait arguments) through
+specialization, and calls that method directly; mutation effects, `await`, and
+JIT or WASI lowering see the same callee. Inherent methods, methods of other
+traits, and imports cannot redirect it. A method declared by two bounds is
+ambiguous, except that the standard `Eq` and `Hashable` bounds accept one
+equivalent concrete `equals`. Struct equality and user-defined iteration resolve
+through the standard trait implementations in the same way. Calls on receivers
+that are not a bare (optionally nilable) type parameter resolve by name on the
+specialized type.
 
 The `clone`, `eq`, and `ord` standard modules provide core traits. Structural clone
 is intrinsic for arrays and tuples whose leaves are supported primitive values or
@@ -399,10 +432,10 @@ nested cloneable containers. Other types can implement `Clone` for generic use, 
 their custom implementations are not automatically composed through arrays/tuples.
 
 The `iter` module defines `IntoIterator[Iter, Item]` and `Iterator[Item]` for
-statically dispatched user-defined `for` iteration. Collection implementations
-must use a concrete target type, and the loop must have a statically known
-concrete collection type; generic target implementations and iteration through a
-generic trait bound remain outside the current contract. Zip clauses evaluate
+statically dispatched user-defined `for` iteration. Implementations may target
+concrete or generic types. The loop needs a statically known collection type or a
+type parameter bounded by `IntoIterator`; it calls the trait implementations'
+methods, never other methods of the same name. Zip clauses evaluate
 each source and call its `into_iter()` from left to right before advancing to the
 next clause. Iterator-method Errors propagate through the loop's normal lexical
 error handling when the method uses `!!`. Array, string, and dynamic iteration
@@ -423,9 +456,13 @@ existing `cog.lock` format.
 Methods with a first `self` parameter are instance methods; methods without one
 are type-associated functions called as `Type::method(...)`. Generic associated
 functions infer type parameters from arguments or a direct declared result context.
-`@comptime extend TypeValue { ... }` resolves a compile-time type binding and can
-register runtime methods for primitive, array, or tuple types. It may also implement
-a trait for the resolved type. Ordinary `fn` methods are statically dispatched by
+An inherent extension is allowed only in the module that declares its struct or
+enum, by canonical package and module identity; only the standard library declares
+inherent methods of built-in types. Another module cannot add or override a type's
+methods, so an import cannot change which inherent method exists.
+`@comptime extend TypeValue { ... }` resolves a compile-time type binding. The same
+placement rules apply to the resolved type, and it may implement a trait for
+primitive, array, or tuple types. Ordinary `fn` methods are statically dispatched by
 receiver type and lower as runtime functions. Compile-time type parameters and
 trait bounds are described above.
 

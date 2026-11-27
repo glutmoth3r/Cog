@@ -9,10 +9,9 @@ fn digit(value: int, uppercase: bool) -> int {
 }
 
 fn nibble(value: int) -> int {
-    if ascii::is_digit(value)!! { return value - 48; }
-    const lower = ascii::to_lowercase(value)!!;
-    if lower >= 97 && lower <= 102 { return lower - 87; }
-    Error::ParseFailure("hex", "bytes")
+    const digit_value = ascii::hex_value(value)!!;
+    if digit_value == nil { return Error::ParseFailure("hex", "bytes"); }
+    digit_value
 }
 
 public fn encode(data, uppercase: bool = false) -> str {
@@ -28,7 +27,7 @@ public fn encode(data, uppercase: bool = false) -> str {
 }
 
 // Decode pairs of hexadecimal digits; whitespace and prefixes are rejected.
-public fn decode(text: str) {
+public fn decode(text: str) -> bytes {
     const data = bytes::from_str(text)!!;
     const length = bytes::len(data)!!;
     if length % 2 != 0 { return Error::ParseFailure("hex", "bytes"); }

@@ -604,6 +604,8 @@ pub enum Expr {
     Ident(String),
     Array(Vec<Expr>),
     Tuple(Vec<Expr>),
+    /// Compiler-generated aggregate literal with its compile-time type.
+    TypedAggregate(Box<Expr>, TypeAnnotation),
     Record(Vec<(String, Expr)>),
     Call(String, Vec<CallArgument>),
     Closure {

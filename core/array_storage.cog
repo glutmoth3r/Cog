@@ -1,6 +1,16 @@
 use err::Error;
 
 extend[T: type] T[] {
+    // Appends the elements that `other` holds on entry, so an array can be
+    // appended to itself.
+    public fn append_all(mut self, other: T[]) -> nil {
+        const count = other.len();
+        for index in 0..count {
+            self.append(other[index]!!)!!;
+        }
+        nil
+    }
+
     // Swaps two existing elements after validating both indices and reads.
     public fn swap(mut self, left: int, right: int) -> nil {
         const length = self.len();

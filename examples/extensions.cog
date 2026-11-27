@@ -18,7 +18,12 @@ extend Point {
     }
 }
 
-@comptime extend Scalar {
+trait Describe {
+    fn describe(self) -> str;
+}
+
+// A built-in type accepts methods only through a trait declared here.
+@comptime extend Scalar with Describe {
     fn describe(self) -> str {
         $"integer {self}"
     }

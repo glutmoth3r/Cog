@@ -211,6 +211,7 @@ pub fn project_with_warnings(
         &loaded.names,
         &loaded.build_inputs,
     )?;
+    let compiled = crate::optimizer::application(&compiled);
     let dependencies = loaded.build_inputs.encode()?;
     protect_build_inputs(&loaded.build_inputs, artifact)?;
     let inputs = with_dependencies(inputs, &dependencies);

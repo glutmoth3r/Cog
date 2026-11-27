@@ -387,6 +387,193 @@ fn comptime_struct_type_tests_match_runtime_identity() {
 }
 
 #[test]
+fn comptime_aggregates_keep_types_through_reads_and_materialization() {
+    assert_eq!(
+        run(r#"
+        use clone;
+        struct Box[T: type] { value: T }
+        struct Buffer[T: type] { values: T[] }
+        enum Mode { Fast, Limit(values: int?[], count: int) }
+        @comptime const EMPTY: int[] = [];
+        @comptime const VALUES: int?[] = [2, 3, 5, 7];
+        @comptime const INDEX = len(VALUES) - 2;
+        @comptime const DEFAULT: Mode = Mode::Limit(count: 1, values: VALUES);
+        @comptime const FAST = Mode::Fast();
+        @comptime const MODES: Mode[] = [FAST, DEFAULT];
+        @comptime fn count(mode: Mode) -> int {
+            match mode {
+                Mode::Limit(values, n) if values.len() > n => values.len() + n,
+                _ => 0,
+            }
+        }
+        @comptime const TOTAL = count(MODES[1]);
+        @comptime const PICK = match FAST { Mode::Fast => VALUES[INDEX], _ => nil };
+        @comptime fn pack() -> (int[], int?[]) { ([], VALUES) }
+        @comptime const EMPTY_BOX: Box[int[]] = Box([]);
+        @comptime const BUFFER = Buffer([PICK, DEFAULT.count]);
+        @comptime const FIRST = BUFFER.values[0];
+        @comptime const BOX = Box(pack());
+        @comptime const PAIR = BOX.value;
+        @comptime const FROM_PAIR = PAIR.1;
+        @comptime const STRUCT_EQUAL = Box(1) == Box(1);
+        @comptime const SAFE = VALUES[20] ?! 0;
+        @comptime const COORDS: (int, int) = (1, 2);
+        @comptime const OPTIONAL_COORDS: (int?, int) = COORDS;
+        fn main() {
+            @comptime const LOCAL = (EMPTY_BOX.value, FROM_PAIR);
+            io::println(FIRST);
+            io::println(STRUCT_EQUAL);
+            io::println(SAFE);
+            var coords = OPTIONAL_COORDS.clone();
+            coords.0 = nil;
+            io::println(coords.0);
+            var empty = LOCAL.0.clone();
+            var copy = LOCAL.1.clone();
+            empty.append(9);
+            copy.append(nil);
+            io::println($"{empty}:{copy}:{VALUES}:{TOTAL}:{PICK}");
+            io::println(match DEFAULT { Mode::Limit(values, n) => values[n], _ => nil });
+        }
+        "#),
+        "5\nfalse\n0\nnil\n[9]:[2, 3, 5, 7, nil]:[2, 3, 5, 7]:5:5\n3\n"
+    );
+}
+
+#[test]
+fn comptime_aggregate_errors_are_diagnostics() {
+    for (body, message) in [
+        ("@comptime const X = [1][-1]; fn main() {}", "out of bounds"),
+        (
+            "@comptime const X = (1, 2).2; fn main() {}",
+            "out of bounds",
+        ),
+        (
+            "@comptime const X: int[] = [\"wrong\"]; fn main() {}",
+            "type mismatch",
+        ),
+        (
+            "@comptime const X = [1]; fn main() { X.append(2); }",
+            "cannot mutate through const",
+        ),
+        ("@comptime const X = [1 / 0]; fn main() {}", "division"),
+        (
+            "@comptime const X = len([1, \"wrong\"]); fn main() {}",
+            "type mismatch",
+        ),
+        (
+            "@comptime const X = ([1], 2); fn main() { X.0[0] = 3; }",
+            "cannot mutate through const",
+        ),
+        (
+            "enum E { Data(items: int[]) } @comptime const X = E::Data([1]); fn main() { X.items.append(2); }",
+            "cannot mutate through const",
+        ),
+        (
+            "enum E { A, B } @comptime const X = match E::A() { E::A => 1 }; fn main() {}",
+            "non-exhaustive",
+        ),
+        (
+            "enum E { A, B } fn runtime() -> int { 2 } @comptime const X = match E::A() { E::A => 1, _ => runtime() }; fn main() {}",
+            "runtime-only",
+        ),
+        (
+            "enum E { A, B } @comptime const X = match E::A() { E::A => 1, _ => { var x = 0; x = 2; x } }; fn main() {}",
+            "not supported",
+        ),
+        (
+            "trait Length { fn len(self) -> int; } @comptime extend int[] with Length { fn len(self) -> int { 9 } } @comptime const X = [1].len(); fn main() {}",
+            "extension method len() cannot execute at comptime",
+        ),
+        (
+            "@comptime fn deep() -> int[] { deep() } @comptime const X = deep(); fn main() {}",
+            "depth limit",
+        ),
+    ] {
+        let error = project::compile_source("bad.cog", body).unwrap_err();
+        assert!(error.to_lowercase().contains(message), "{body}: {error}");
+    }
+}
+
+#[test]
+fn comptime_large_table_round_trips_within_the_evaluator_budget() {
+    let table = |count: usize| "7,".repeat(count);
+    let source = format!(
+        "@comptime const TABLE = [{}];
+         @comptime const LAST = TABLE[len(TABLE) - 1];
+         fn main() {{ io::println(TABLE.len()); io::println(LAST); }}",
+        table(8192)
+    );
+    assert_eq!(run(&source), "8192\n7\n");
+
+    let oversized = format!(
+        "@comptime const TABLE: int[] = [{}]; fn main() {{}}",
+        table(50_001)
+    );
+    let error = project::compile_source("large.cog", &oversized).unwrap_err();
+    assert!(error.contains("comptime evaluator step limit exceeded"));
+}
+
+#[test]
+fn comptime_aggregate_type_depth_limit_is_a_diagnostic() {
+    use std::fmt::Write as _;
+
+    let mut source = String::from("@comptime const N0 = [1];");
+    for depth in 1..70 {
+        write!(source, "@comptime const N{depth} = [N{}];", depth - 1).unwrap();
+    }
+    source.push_str("fn main() {}");
+    let error = project::compile_source("deep.cog", &source).unwrap_err();
+    assert!(
+        error.contains("depth limit") || error.contains("type nesting is too deep"),
+        "{error}"
+    );
+}
+
+const COMPTIME_AGGREGATE_PARITY: &str = r#"
+    enum Mode { Fast, Limit(pair: (int[], int)) }
+    @comptime const TABLE: int[] = [2, 3, 5, 7];
+    @comptime const SETTING = Mode::Limit((TABLE, TABLE[2]));
+    @comptime const FAST = Mode::Fast();
+    @comptime const OFFSET = match FAST { Mode::Fast => 1, Mode::Limit(_) => 0 };
+
+    @inline("never")
+    fn score(i: int) -> int { TABLE[i % 4] + OFFSET }
+
+    fn main() {
+        var sum = 0;
+        for i in 0..6000 { sum += score(i); }
+        io::println(sum);
+        io::println(match SETTING { Mode::Limit(pair) => pair.0[3] + pair.1, _ => 0 });
+    }
+"#;
+
+#[test]
+fn comptime_aggregates_agree_in_vm_and_jit() {
+    let artifact = compile(COMPTIME_AGGREGATE_PARITY);
+    for jit in [false, true] {
+        let mut output = Vec::new();
+        let mut context = cog::runtime::RuntimeContext::new(&mut output, Default::default());
+        context.configure_jit(jit, None, false);
+        interpreter::run_with_context(&artifact, &mut context).unwrap();
+        drop(context);
+        assert_eq!(output, b"31500\n12\n");
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+#[ignore = "requires a C compiler and the Cog AOT runtime archive"]
+fn comptime_aggregates_agree_in_aot() {
+    let artifact = compile(COMPTIME_AGGREGATE_PARITY);
+    let executable = std::env::temp_dir().join(format!("cog-comptime-aot-{}", std::process::id()));
+    cog::native::build_executable(&artifact, &executable).unwrap();
+    let output = std::process::Command::new(&executable).output().unwrap();
+    std::fs::remove_file(executable).unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    assert_eq!(output.stdout, b"31500\n12\n");
+}
+
+#[test]
 fn a_struct_pattern_covers_a_non_nil_scrutinee_of_that_struct() {
     assert_eq!(
         run(r#"

@@ -29,7 +29,17 @@ grep -Eq 'compiled=999999 .*aggregate=1999998' "$out/trace"
 @inline("never")
 fn vm_fallback(value: int) -> int { value + 2 }
 
+COG
+    # Applications drop unreachable functions, so every filler needs a caller.
+    printf 'fn fill() -> nil {\n'
+    for index in $(seq 0 512); do
+        printf '    if (filler_%03d(0)!!) != 1 { crash("filler"); }\n' "$index"
+    done
+    cat <<'COG'
+}
+
 fn main() -> nil {
+    fill()!!;
     var index = 0;
     var total = 0;
     while index < 6000 {

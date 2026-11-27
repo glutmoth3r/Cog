@@ -451,6 +451,10 @@ impl<'a> RunContext<'a> {
     pub fn last_runtime_diagnostic(&self) -> Option<&crate::error::RuntimeDiagnostic> {
         self.inner.last_runtime_diagnostic()
     }
+    /// Process status from the last successful run; never exits the embedding host.
+    pub fn exit_code(&self) -> i32 {
+        self.inner.exit_code()
+    }
     pub fn with_permissions(mut self, permissions: Permissions) -> Self {
         self.inner.capabilities = permissions.runtime();
         self

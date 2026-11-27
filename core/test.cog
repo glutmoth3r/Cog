@@ -1,0 +1,10 @@
+// Small assertion helpers for executable examples and tests.
+use eq::Eq;
+
+public fn assert(condition: bool) {
+    if !condition { crash("assertion failed"); }
+}
+
+public fn assert_eq[T: type + Eq[T]](actual: T, expected: T) {
+    if actual != expected { crash("assertion failed: values are not equal"); }
+}

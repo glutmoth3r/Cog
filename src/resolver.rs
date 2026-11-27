@@ -14,6 +14,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 
+mod placement;
+
 pub type ModuleKey = (usize, String);
 pub const CORE: usize = usize::MAX;
 
@@ -54,6 +56,8 @@ pub struct Resolver {
     loaded: BTreeMap<ModuleKey, Program>,
     pending: VecDeque<ModuleKey>,
     output: Vec<Item>,
+    /// The declaring module and output position of every extension.
+    extensions: Vec<(ModuleKey, usize)>,
     diagnostics: Vec<Diagnostic>,
     next_symbol: usize,
     poison: Vec<String>,
@@ -165,6 +169,7 @@ impl Resolver {
             loaded: BTreeMap::new(),
             pending: VecDeque::new(),
             output: Vec::new(),
+            extensions: Vec::new(),
             diagnostics: Vec::new(),
             next_symbol: 0,
             poison: Vec::new(),
@@ -323,11 +328,21 @@ impl Resolver {
                 && matches!(item, Item::EnumDecl { .. })
             {
                 crate::error::ERROR_TYPE.into()
-            } else if key == &(CORE, "clone".into())
-                && name == "Clone"
+            } else if key.0 == CORE
                 && matches!(item, Item::Trait(_))
+                && matches!(
+                    (key.1.as_str(), name.as_str()),
+                    ("clone", "Clone") | ("eq", "Eq") | ("collections", "Hashable")
+                )
             {
-                "$core::clone::Clone".into()
+                // The compiler identifies these standard traits.
+                format!("$core::{}::{name}", key.1)
+            } else if key == &(CORE, "collections".into())
+                && name == "Map"
+                && matches!(item, Item::StructDecl { .. })
+            {
+                // Native JSON serialization identifies the standard Map type.
+                "$core_collections_Map".into()
             } else {
                 self.fresh()
             };
@@ -982,6 +997,9 @@ impl Resolver {
             }
             Expr::Located(span, inner) => self.expr(inner, owner, scopes, Some(span.clone())),
             Expr::TypeLiteral(ty) => self.type_annotation(ty, owner, scopes),
+            Expr::TypedAggregate(..) => {
+                unreachable!("aggregate types are attached after resolution")
+            }
             Expr::Ident(name)
                 if (matches!(name.as_str(), "int" | "float" | "bool" | "str" | "nil")
                     || self.active_type_parameters.contains(name))
@@ -1438,6 +1456,7 @@ impl Resolver {
                         f.visibility = Visibility::Public;
                     }
                     Item::Extend(extension) => {
+                        self.extensions.push((owner.clone(), self.output.len()));
                         for parameter in &mut extension.type_params {
                             for bound in &mut parameter.bounds {
                                 bound.name = self.name(&bound.name, &owner, &scopes, None);
@@ -1621,6 +1640,7 @@ impl Resolver {
                 self.output.push(item);
             }
         }
+        self.check_extension_placement();
         for name in self.poison {
             self.output.push(Item::Invalid {
                 binding: Some(name),

@@ -871,6 +871,7 @@ struct AsyncTask {
     pending_await: Option<TaskHandle>,
     pending_select: Option<Vec<TaskHandle>>,
     join_outcome: Option<Result<Value, RuntimeError>>,
+    join_cursor: usize,
     plugin_wake: Option<AsyncWakeHandle>,
     io_cancel: Option<Arc<AtomicBool>>,
 }
@@ -1045,6 +1046,7 @@ impl AsyncScheduler {
                 pending_await: None,
                 pending_select: None,
                 join_outcome: None,
+                join_cursor: 0,
                 plugin_wake,
                 io_cancel: None,
             },
@@ -1258,13 +1260,23 @@ impl AsyncScheduler {
 
     fn finish_ready_joins(&mut self, mut parent: usize) -> Result<(), RuntimeError> {
         loop {
-            let ready = self.tasks.get(&parent).is_some_and(|task| {
-                matches!(task.state, AsyncTaskState::Joining)
-                    && task
-                        .children
-                        .iter()
-                        .all(|child| self.task_complete_or_released(*child))
-            });
+            let Some(task) = self.tasks.get(&parent) else {
+                return Ok(());
+            };
+            if !matches!(task.state, AsyncTaskState::Joining) {
+                return Ok(());
+            }
+            let completed = task.children[task.join_cursor..]
+                .iter()
+                .take_while(|child| self.task_complete_or_released(**child))
+                .count();
+            let cursor = task.join_cursor + completed;
+            let ready = cursor == task.children.len();
+            // Completed children never become pending again during a join.
+            self.tasks
+                .get_mut(&parent)
+                .expect("parent was checked above")
+                .join_cursor = cursor;
             if !ready {
                 return Ok(());
             }
@@ -1451,12 +1463,10 @@ impl AsyncScheduler {
                 op: "task already has a parent",
             });
         }
-        let known_child = self
-            .tasks
+        let known_child = task_parent == Some(parent);
+        self.tasks
             .get(&parent)
-            .ok_or(RuntimeError::InvalidArgument { op: "async task" })?
-            .children
-            .contains(&id);
+            .ok_or(RuntimeError::InvalidArgument { op: "async task" })?;
         if !known_child {
             self.tasks
                 .get_mut(&parent)
@@ -3790,60 +3800,53 @@ impl AsyncScheduler {
             .get(&id)
             .ok_or(RuntimeError::InvalidArgument { op: "async task" })?
             .children;
-        let mut last_order = 0;
-        for _ in 0..children.len() {
-            let mut earliest: Option<(u64, RuntimeError)> = None;
-            for child in children {
-                let Some(task) = self.tasks.get(child) else {
-                    continue;
-                };
-                if task.observed {
-                    continue;
-                }
-                let AsyncTaskState::Complete {
-                    outcome: child_outcome,
-                    completed_at,
-                } = &task.state
-                else {
-                    continue;
-                };
-                if *completed_at <= last_order {
-                    continue;
-                }
-                let error = match child_outcome {
-                    Err(error) => Some(error.clone()),
-                    Ok(Value::Error(error)) => Some((**error).clone()),
-                    Ok(_) => None,
-                };
-                if let Some(error) = error
-                    && earliest
-                        .as_ref()
-                        .is_none_or(|(order, _)| completed_at < order)
-                {
-                    earliest = Some((*completed_at, error));
-                }
-            }
-            let Some((order, child_error)) = earliest else {
-                break;
+        let mut errors = Vec::new();
+        for child in children {
+            let Some(task) = self.tasks.get(child) else {
+                continue;
             };
-            last_order = order;
-            match outcome {
+            if task.observed {
+                continue;
+            }
+            let AsyncTaskState::Complete {
+                outcome: child_outcome,
+                completed_at,
+            } = &task.state
+            else {
+                continue;
+            };
+            let error = match child_outcome {
+                Err(error) => Some(error),
+                Ok(Value::Error(error)) => Some(error.as_ref()),
+                Ok(_) => None,
+            };
+            if let Some(error) = error {
+                errors
+                    .try_reserve(1)
+                    .map_err(|_| RuntimeError::ResourceLimit {
+                        resource: "async child errors",
+                    })?;
+                errors.push((*completed_at, error));
+            }
+        }
+        errors.sort_unstable_by_key(|(order, _)| *order);
+        for (_, error) in errors {
+            let child_error = error.clone();
+            let previous = std::mem::replace(outcome, Ok(Value::Nil));
+            *outcome = match previous {
                 Err(primary) if !child_error.is_recoverable() && primary.is_recoverable() => {
-                    *outcome = Err(child_error.with_suppressed(primary.clone()));
+                    Err(child_error.with_suppressed(primary))
                 }
-                Err(primary) => {
-                    *primary = primary.clone().with_suppressed(child_error);
-                }
+                Err(primary) => Err(primary.with_suppressed(child_error)),
                 Ok(Value::Error(primary)) if !child_error.is_recoverable() => {
-                    *outcome = Err(child_error.with_suppressed((**primary).clone()));
+                    Err(child_error.with_suppressed(*primary))
                 }
                 Ok(Value::Error(primary)) => {
-                    let combined = (**primary).clone().with_suppressed(child_error);
-                    *outcome = Ok(Value::Error(Box::new(combined)));
+                    Ok(Value::Error(Box::new(primary.with_suppressed(child_error))))
                 }
-                Ok(_) if !child_error.is_recoverable() => *outcome = Err(child_error),
-                Ok(_) => *outcome = Ok(Value::Error(Box::new(child_error))),
-            }
+                Ok(_) if !child_error.is_recoverable() => Err(child_error),
+                Ok(_) => Ok(Value::Error(Box::new(child_error))),
+            };
         }
         Ok(())
     }
@@ -4722,6 +4725,7 @@ fn run_with_execution_plan(
         (result, cleanup) => result.and(cleanup),
     };
     result.map_err(|error| {
+        context.set_exit_code(&Value::Nil);
         context.record_runtime_diagnostic(&error);
         error.without_provenance()
     })
@@ -4795,6 +4799,7 @@ fn execute_top_level_vm(
                 std::mem::forget(value);
                 return Err(error);
             }
+            context.set_exit_code(&value);
             drop(value);
             Ok(())
         }
@@ -6964,6 +6969,161 @@ fn execute_vm(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn joined_errors_follow_completion_order_and_skip_observed_children() {
+        let mut scheduler = AsyncScheduler::new(None, None, None);
+        let parent = scheduler.create_target(AsyncTaskTarget::YieldNow).unwrap();
+        let first = scheduler.create_target(AsyncTaskTarget::YieldNow).unwrap();
+        let second = scheduler.create_target(AsyncTaskTarget::YieldNow).unwrap();
+        let observed = scheduler.create_target(AsyncTaskTarget::YieldNow).unwrap();
+        scheduler.active.push(parent.id());
+        for child in [&first, &second, &observed] {
+            scheduler.spawn(child.id()).unwrap();
+        }
+        scheduler.active.pop();
+        scheduler.tasks.get_mut(&observed.id()).unwrap().observed = true;
+        scheduler
+            .complete_task_raw(observed.id(), Err(RuntimeError::Overflow))
+            .unwrap();
+        scheduler
+            .complete_task_raw(
+                second.id(),
+                Ok(Value::Error(Box::new(RuntimeError::Timeout))),
+            )
+            .unwrap();
+        scheduler
+            .complete_task_raw(first.id(), Err(RuntimeError::DivisionByZero))
+            .unwrap();
+
+        let mut outcome = Ok(Value::Int(7));
+        scheduler
+            .join_unobserved_errors(parent.id(), &mut outcome)
+            .unwrap();
+        let Ok(Value::Error(error)) = outcome else {
+            panic!("expected a language Error");
+        };
+        assert_eq!(error.kind(), "Timeout");
+        assert_eq!(error.suppressed().len(), 1);
+        assert_eq!(error.suppressed()[0].kind(), "DivisionByZero");
+        assert!(matches!(
+            &scheduler.tasks[&first.id()].state,
+            AsyncTaskState::Complete {
+                outcome: Err(RuntimeError::DivisionByZero),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn fatal_joined_error_promotes_the_primary_and_preserves_suppression_order() {
+        let mut scheduler = AsyncScheduler::new(None, None, None);
+        let parent = scheduler.create_target(AsyncTaskTarget::YieldNow).unwrap();
+        let recoverable = scheduler.create_target(AsyncTaskTarget::YieldNow).unwrap();
+        let fatal = scheduler.create_target(AsyncTaskTarget::YieldNow).unwrap();
+        let later = scheduler.create_target(AsyncTaskTarget::YieldNow).unwrap();
+        scheduler.active.push(parent.id());
+        for child in [&later, &fatal, &recoverable] {
+            scheduler.spawn(child.id()).unwrap();
+        }
+        scheduler.active.pop();
+        scheduler
+            .complete_task_raw(recoverable.id(), Err(RuntimeError::Timeout))
+            .unwrap();
+        scheduler
+            .complete_task_raw(fatal.id(), Err(RuntimeError::InvalidJump(9)))
+            .unwrap();
+        scheduler
+            .complete_task_raw(later.id(), Err(RuntimeError::Overflow))
+            .unwrap();
+
+        for mut outcome in [
+            Err(RuntimeError::DivisionByZero),
+            Ok(Value::Error(Box::new(RuntimeError::DivisionByZero))),
+        ] {
+            scheduler
+                .join_unobserved_errors(parent.id(), &mut outcome)
+                .unwrap();
+            let Err(error) = outcome else {
+                panic!("expected a fatal Error");
+            };
+            assert_eq!(error.kind(), "InvalidJump");
+            assert_eq!(error.suppressed().len(), 2);
+            assert_eq!(error.suppressed()[0].kind(), "DivisionByZero");
+            assert_eq!(error.suppressed()[0].suppressed()[0].kind(), "Timeout");
+            assert_eq!(error.suppressed()[1].kind(), "Overflow");
+        }
+    }
+
+    #[test]
+    fn joining_children_advances_past_completed_prefixes() {
+        let mut scheduler = AsyncScheduler::new(None, None, None);
+        let parent = scheduler.create_target(AsyncTaskTarget::YieldNow).unwrap();
+        let first = scheduler.create_target(AsyncTaskTarget::YieldNow).unwrap();
+        let second = scheduler.create_target(AsyncTaskTarget::YieldNow).unwrap();
+        let third = scheduler.create_target(AsyncTaskTarget::YieldNow).unwrap();
+        scheduler.active.push(parent.id());
+        for child in [&first, &second, &third] {
+            scheduler.spawn(child.id()).unwrap();
+        }
+        scheduler.active.pop();
+        scheduler
+            .finish_task_body(parent.id(), Ok(Value::Int(7)))
+            .unwrap();
+        assert!(matches!(
+            scheduler.tasks[&parent.id()].state,
+            AsyncTaskState::Joining
+        ));
+
+        scheduler
+            .complete_task(second.id(), Ok(Value::Nil))
+            .unwrap();
+        assert_eq!(scheduler.tasks[&parent.id()].join_cursor, 0);
+        scheduler.complete_task(first.id(), Ok(Value::Nil)).unwrap();
+        assert_eq!(scheduler.tasks[&parent.id()].join_cursor, 2);
+        assert!(matches!(
+            scheduler.tasks[&parent.id()].state,
+            AsyncTaskState::Joining
+        ));
+        scheduler.complete_task(third.id(), Ok(Value::Nil)).unwrap();
+        assert!(matches!(
+            scheduler.tasks[&parent.id()].state,
+            AsyncTaskState::Complete {
+                outcome: Ok(Value::Int(7)),
+                ..
+            }
+        ));
+        for child in [&first, &second, &third] {
+            assert!(scheduler.tasks[&child.id()].joined);
+        }
+    }
+
+    #[test]
+    fn spawning_a_task_twice_keeps_one_child_and_one_queue_entry() {
+        let mut scheduler = AsyncScheduler::new(None, None, None);
+        let parent = scheduler.create_target(AsyncTaskTarget::YieldNow).unwrap();
+        let child = scheduler.create_target(AsyncTaskTarget::YieldNow).unwrap();
+        let other_parent = scheduler.create_target(AsyncTaskTarget::YieldNow).unwrap();
+        scheduler.active.push(parent.id());
+
+        scheduler.spawn(child.id()).unwrap();
+        scheduler.spawn(child.id()).unwrap();
+        assert_eq!(scheduler.tasks[&parent.id()].children, [child.id()]);
+        assert_eq!(scheduler.tasks[&child.id()].parent, Some(parent.id()));
+        assert_eq!(
+            scheduler.ready.iter().copied().collect::<Vec<_>>(),
+            [child.id()]
+        );
+
+        scheduler.active[0] = other_parent.id();
+        assert!(matches!(
+            scheduler.spawn(child.id()),
+            Err(RuntimeError::InvalidArgument {
+                op: "task already has a parent"
+            })
+        ));
+        assert!(scheduler.tasks[&other_parent.id()].children.is_empty());
+    }
 
     /// A plugin worker can wake again as soon as its notification is consumed.
     /// One drain must still end so that timers and ready tasks make progress.

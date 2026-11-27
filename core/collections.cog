@@ -168,6 +168,14 @@ extend[K: type + Hashable, V: type] Map[K, V] {
         self.slots[index]!!.value
     }
 
+    // One lookup for both presence and value. A stored nil reads like a
+    // missing key; use contains or get when V is nilable.
+    public fn find(self, key: K) -> V? {
+        const index = find_slot(self, key, key.hash_code()!!);
+        if index < 0 { return nil; }
+        self.slots[index]!!.value
+    }
+
     public fn get_or(self, key: K, default: V) -> V {
         const index = find_slot(self, key, key.hash_code()!!);
         if index < 0 { return default; }

@@ -39,8 +39,12 @@ remaining release acceptance gates, and the next language goals. See the [langua
   indirect calls. Captured closure bodies can enter JIT OSR. Eligible synchronous
   callback dispatch uses the VM call bridge and can return to machine code.
 - Statically dispatched user-defined `for-in` iteration through concrete
-  `iter::IntoIterator` and `iter::Iterator` implementations. Generic target
-  implementations and iteration through a generic trait bound are not supported.
+  `iter::IntoIterator` and `iter::Iterator` implementations, including generic
+  target implementations and iteration through a generic trait bound.
+- Calls through a trait bound dispatch to the implementation that proved the
+  bound, independently of other extensions and imports. Trait implementations
+  are limited to the module of the trait or of the target type, and inherent
+  extensions to the module of the type (built-in types: the standard library).
 - Arrays with generic higher-order `map`, `filter`, and `fold`, Unicode-scalar
   string traversal, insertion-ordered hashed `Map`,
   bounded JSON, process arguments/environment, path and filesystem
@@ -95,9 +99,11 @@ remaining release acceptance gates, and the next language goals. See the [langua
   - Beta's comptime contract is the implemented subset in [compile-time
     evaluation](docs/LANGUAGE.md#compile-time-evaluation) and [its semantic
     contracts](docs/SEMANTIC_CONTRACTS.md#implemented-comptime-evaluation-and-functions):
-    scalar and struct evaluation, struct field reads, comptime functions, limited type-valued bindings,
-    and documented phase/Error behavior. `@comptime var`, reassignment, loops,
-    array/tuple/enum values and native calls remain outside it.
+    scalar and immutable aggregate evaluation, array indexing and length, tuple
+    and field reads, enum matching, comptime functions, limited type-valued
+    bindings, and documented phase/Error behavior. `@comptime var`, reassignment,
+    loops, and native calls remain outside it. WASI materialization covers supported
+    arrays. Tuples and enums require the VM, JIT, or native backend.
   - Beta excludes composing user-defined `Clone` implementations through arrays
     and tuples. Structural cloning remains available for supported primitive leaves
     and nested arrays/tuples; custom implementations remain usable in generic calls.
@@ -161,9 +167,8 @@ thread-safe scheduler wakeups. Detach and async closures remain future work.
 
 1. Extend compile-time programming with value parameters, canonical
    specialization, and materialization of arrays, tuples, and enum values.
-2. Resolve trait implementation coherence/visibility rules and decide whether
-   generic target implementations or iteration through generic trait bounds are
-   needed before expanding generic abstractions further.
+2. Decide whether the module rule for trait implementations should widen to the
+   declaring package before expanding generic abstractions further.
 3. Continue measured compiler/runtime optimization. The opt-in Cranelift JIT
    and APE bootstrap/adaptive selector remain experimental. The JIT validates
    native exit states, charges oversized compilations as refillable budget debt,

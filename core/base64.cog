@@ -79,7 +79,7 @@ public fn encode(data) -> str {
 // Decode strict, padded Base64.
 // Reject invalid digits, whitespace, misplaced padding
 // and nonzero unused padding bits.
-public fn decode(text: str) {
+public fn decode(text: str) -> bytes {
     const data = bytes::from_str(text)!!;
     const length = bytes::len(data)!!;
 

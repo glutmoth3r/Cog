@@ -1072,10 +1072,12 @@ fn finish_source<T>(
         frontend::render(&diagnostics)
     };
     if !diagnostics.is_empty() {
-        diagnostics.extend(crate::analysis::check(
-            &program,
-            &std::collections::HashMap::new(),
-        ));
+        if crate::ast_budget::program(&program).is_ok() {
+            diagnostics.extend(crate::analysis::check(
+                &program,
+                &std::collections::HashMap::new(),
+            ));
+        }
         return Err(render(diagnostics));
     }
     let output = crate::codegen::lower_with_names(&program, names, require_main)

@@ -1484,6 +1484,7 @@ impl<'a> Parser<'a> {
             Some(Token::Continue) => self.parse_continue(),
             Some(Token::Crash) => self.parse_crash(),
             _ => {
+                let started_with_if = self.peek() == Some(&Token::If);
                 let expr = self.parse_expr()?;
                 match self.peek() {
                     Some(Token::Eq) => {
@@ -1596,10 +1597,11 @@ impl<'a> Parser<'a> {
                         })
                     }
                     Some(Token::RBrace) => Ok(Stmt::Expr(expr)),
-                    _ if matches!(
-                        expr.node(),
-                        Expr::If { .. } | Expr::Match { .. } | Expr::Try { .. }
-                    ) =>
+                    _ if started_with_if
+                        || matches!(
+                            expr.node(),
+                            Expr::If { .. } | Expr::Match { .. } | Expr::Try { .. }
+                        ) =>
                     {
                         if self.peek() == Some(&Token::Semi) {
                             self.advance();
@@ -1654,6 +1656,12 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_crash(&mut self) -> Result<Stmt, HlParseError> {
+        let statement = self.parse_crash_inner()?;
+        self.expect(&Token::Semi)?;
+        Ok(statement)
+    }
+
+    fn parse_crash_inner(&mut self) -> Result<Stmt, HlParseError> {
         self.expect(&Token::Crash)?;
         let parenthesized = self.peek() == Some(&Token::LParen);
         if parenthesized {
@@ -1683,7 +1691,6 @@ impl<'a> Parser<'a> {
         if parenthesized {
             self.expect(&Token::RParen)?;
         }
-        self.expect(&Token::Semi)?;
         Ok(Stmt::Crash { value, context })
     }
 
@@ -1977,6 +1984,13 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_if_bounded(&mut self) -> Result<Stmt, HlParseError> {
+        if self
+            .tokens
+            .get(self.pos + 1)
+            .is_some_and(|token| token.token == Token::Const)
+        {
+            return Ok(Stmt::Expr(self.parse_if_expr_bounded()?));
+        }
         self.expect(&Token::If)?;
         let cond = self.parse_expr()?;
         let then_block = self.parse_block()?;
@@ -2100,8 +2114,35 @@ impl<'a> Parser<'a> {
 
     fn parse_if_expr_bounded(&mut self) -> Result<Expr, HlParseError> {
         self.expect(&Token::If)?;
-        let cond = self.parse_expr()?;
-        let then_block = self.parse_block()?;
+        let binding = if self.peek() == Some(&Token::Const) {
+            self.advance();
+            let name = self.expect_ident()?;
+            self.expect(&Token::Eq)?;
+            let temp = format!("$if_const{}", self.pos);
+            Some((name, temp, self.parse_expr()?))
+        } else {
+            None
+        };
+        let cond = if let Some((_, temp, _)) = &binding {
+            Expr::Binary(
+                BinOp::NotEq,
+                Box::new(Expr::Ident(temp.clone())),
+                Box::new(Expr::Nil),
+            )
+        } else {
+            self.parse_expr()?
+        };
+        let mut then_block = self.parse_block()?;
+        if let Some((name, temp, _)) = &binding {
+            then_block.stmts.insert(
+                0,
+                Stmt::Const {
+                    pattern: BindingPattern::Name(name.clone()),
+                    ty: None,
+                    value: Expr::Ident(temp.clone()),
+                },
+            );
+        }
         let else_expr = if self.peek() == Some(&Token::Else) {
             self.advance();
             if self.peek() == Some(&Token::If) {
@@ -2113,11 +2154,23 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(Expr::If {
+        let expression = Expr::If {
             cond: Box::new(cond),
             then_branch: Box::new(Expr::Block(then_block)),
             else_branch: else_expr,
-        })
+        };
+        if let Some((_, temp, value)) = binding {
+            Ok(Expr::Block(Block {
+                stmts: vec![Stmt::Const {
+                    pattern: BindingPattern::Name(temp),
+                    ty: None,
+                    value,
+                }],
+                tail: Some(Box::new(expression)),
+            }))
+        } else {
+            Ok(expression)
+        }
     }
 
     fn parse_while(&mut self) -> Result<Stmt, HlParseError> {
@@ -2679,6 +2732,20 @@ impl<'a> Parser<'a> {
             return self.parse_interpolated_string(literal, offset, line_offset);
         }
         match self.peek().cloned() {
+            Some(Token::Crash) => {
+                if !self
+                    .tokens
+                    .get(self.pos + 1)
+                    .is_some_and(|token| token.token == Token::LParen)
+                {
+                    return Err(self.err("crash expressions require parentheses"));
+                }
+                let statement = self.parse_crash_inner()?;
+                Ok(Expr::Block(Block {
+                    stmts: vec![statement],
+                    tail: None,
+                }))
+            }
             Some(Token::Int(n)) => {
                 self.advance();
                 if n <= i64::MAX as u64 {

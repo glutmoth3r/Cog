@@ -125,6 +125,7 @@ fn mutable_capture_names(block: &Block) -> HashSet<String> {
                 }
             }
             Expr::Located(_, _) => unreachable!("node removes locations"),
+            Expr::TypedAggregate(value, _) => visit_expr(value, names),
             Expr::Int(_)
             | Expr::UInt(_)
             | Expr::BigInt(_)
@@ -241,6 +242,7 @@ fn mutable_capture_names(block: &Block) -> HashSet<String> {
 struct InlineFunction<'a> {
     parameters: Vec<Param>,
     bindings: Vec<&'a Stmt>,
+    globals: HashSet<String>,
     body: &'a Expr,
     nodes: usize,
     mode: InlineMode,
@@ -248,6 +250,14 @@ struct InlineFunction<'a> {
 
 fn collect_inline_functions(program: &Program) -> HashMap<String, InlineFunction<'_>> {
     let mut functions = HashMap::new();
+    let globals = program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::GlobalConst { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
     for item in &program.items {
         let candidates: Vec<&FunctionDecl> = match item {
             Item::Function(function) => vec![function],
@@ -294,6 +304,7 @@ fn collect_inline_functions(program: &Program) -> HashMap<String, InlineFunction
                 .iter()
                 .map(|parameter| parameter.name.clone())
                 .collect::<Vec<_>>();
+            let mut referenced_globals = HashSet::new();
             let mut bindings = Vec::with_capacity(statements.len());
             let mut supported = true;
             for statement in statements {
@@ -315,14 +326,28 @@ fn collect_inline_functions(program: &Program) -> HashMap<String, InlineFunction
                     break;
                 }
                 nodes += 1;
-                if !is_inlineable_body(value, &available_names, &mut nodes) {
+                if !is_inlineable_body(
+                    value,
+                    &available_names,
+                    &globals,
+                    &mut referenced_globals,
+                    &mut nodes,
+                ) {
                     supported = false;
                     break;
                 }
                 available_names.push(name.clone());
                 bindings.push(statement);
             }
-            if !supported || !is_inlineable_body(body, &available_names, &mut nodes) {
+            if !supported
+                || !is_inlineable_body(
+                    body,
+                    &available_names,
+                    &globals,
+                    &mut referenced_globals,
+                    &mut nodes,
+                )
+            {
                 continue;
             }
             functions.insert(
@@ -330,6 +355,7 @@ fn collect_inline_functions(program: &Program) -> HashMap<String, InlineFunction
                 InlineFunction {
                     parameters: function.params.clone(),
                     bindings,
+                    globals: referenced_globals,
                     body,
                     nodes,
                     mode: function.inline,
@@ -359,7 +385,13 @@ fn is_nil_type(ty: &TypeAnnotation) -> bool {
     !ty.nilable && matches!(runtime_type(ty), Some(RuntimeType::Nil))
 }
 
-fn is_inlineable_body(expr: &Expr, parameters: &[String], nodes: &mut usize) -> bool {
+fn is_inlineable_body(
+    expr: &Expr,
+    parameters: &[String],
+    globals: &HashSet<String>,
+    referenced_globals: &mut HashSet<String>,
+    nodes: &mut usize,
+) -> bool {
     *nodes += 1;
     if *nodes > MAX_INLINE_BODY_NODES {
         return false;
@@ -372,8 +404,16 @@ fn is_inlineable_body(expr: &Expr, parameters: &[String], nodes: &mut usize) -> 
         | Expr::Char(_)
         | Expr::Bool(_)
         | Expr::Nil => true,
-        Expr::Ident(name) => parameters.iter().any(|parameter| parameter == name),
-        Expr::Unary(UnOp::Neg | UnOp::Not, value) => is_inlineable_body(value, parameters, nodes),
+        Expr::Ident(name) => {
+            parameters.contains(name)
+                || (globals.contains(name) && {
+                    referenced_globals.insert(name.clone());
+                    true
+                })
+        }
+        Expr::Unary(UnOp::Neg | UnOp::Not, value) => {
+            is_inlineable_body(value, parameters, globals, referenced_globals, nodes)
+        }
         Expr::Binary(
             BinOp::Add
             | BinOp::Sub
@@ -394,8 +434,8 @@ fn is_inlineable_body(expr: &Expr, parameters: &[String], nodes: &mut usize) -> 
             left,
             right,
         ) => {
-            is_inlineable_body(left, parameters, nodes)
-                && is_inlineable_body(right, parameters, nodes)
+            is_inlineable_body(left, parameters, globals, referenced_globals, nodes)
+                && is_inlineable_body(right, parameters, globals, referenced_globals, nodes)
         }
         Expr::Block(block) => {
             let mut names = parameters.to_vec();
@@ -416,26 +456,25 @@ fn is_inlineable_body(expr: &Expr, parameters: &[String], nodes: &mut usize) -> 
                     return false;
                 }
                 *nodes += 1;
-                if !is_inlineable_body(value, &names, nodes) {
+                if !is_inlineable_body(value, &names, globals, referenced_globals, nodes) {
                     return false;
                 }
                 names.push(name.clone());
             }
-            block
-                .tail
-                .as_ref()
-                .is_some_and(|tail| is_inlineable_body(tail, &names, nodes))
+            block.tail.as_ref().is_some_and(|tail| {
+                is_inlineable_body(tail, &names, globals, referenced_globals, nodes)
+            })
         }
         Expr::If {
             cond,
             then_branch,
             else_branch,
         } => {
-            is_inlineable_body(cond, parameters, nodes)
-                && is_inlineable_body(then_branch, parameters, nodes)
-                && else_branch
-                    .as_ref()
-                    .is_none_or(|branch| is_inlineable_body(branch, parameters, nodes))
+            is_inlineable_body(cond, parameters, globals, referenced_globals, nodes)
+                && is_inlineable_body(then_branch, parameters, globals, referenced_globals, nodes)
+                && else_branch.as_ref().is_none_or(|branch| {
+                    is_inlineable_body(branch, parameters, globals, referenced_globals, nodes)
+                })
         }
         _ => false,
     }
@@ -452,7 +491,7 @@ fn substitute_constant_parameters(
             Box::new(substitute_constant_parameters(inner, parameters, values)?),
         ),
         Expr::Ident(name) => values
-            .get(parameters.iter().position(|p| p == name)?)?
+            .get(parameters.iter().rposition(|p| p == name)?)?
             .clone(),
         Expr::Int(_)
         | Expr::UInt(_)
@@ -727,6 +766,7 @@ enum ForZipState {
         var_slot: usize,
         end_slot: usize,
         step_slot: usize,
+        descending: Option<bool>,
     },
     Each {
         bindings: Vec<PatternBindingSlot>,
@@ -1819,9 +1859,8 @@ impl<'a> Codegen<'a> {
                 let cond_label = self.fresh_label("for_cond");
                 let end_label = self.fresh_label("for_end");
                 let next_label = self.fresh_label("for_next");
-                let desc_label = self.fresh_label("for_desc");
-                let cmp_done_label = self.fresh_label("for_cmp_done");
                 scopes.push();
+                let descending = self.constant_range_direction(step.as_deref(), scopes);
                 self.compile_expr(start, scopes)?;
                 self.observe_range_value(start, scopes)?;
                 let var_slot = scopes.reserve_slot();
@@ -1846,46 +1885,13 @@ impl<'a> Codegen<'a> {
                 self.observe_range_value(step.as_deref().unwrap_or(start), scopes)?;
                 self.out.emit(Instruction::Store(step_slot));
 
-                let valid_step = self.fresh_label("nonzero_step");
-                self.out.extend([
-                    Instruction::Load(step_slot),
-                    Instruction::Push(Value::Int(0)),
-                    Instruction::Eq,
-                ]);
-                self.out.jump(Instruction::JumpIfFalse(0), valid_step);
-                self.out.extend([
-                    Instruction::Push(Value::TypeTag(Rc::from(format!(
-                        "{}::InvalidRangeStep",
-                        crate::error::ERROR_TYPE
-                    )))),
-                    Instruction::Push(Value::Nil),
-                    Instruction::MakeRecord(1),
-                ]);
-                self.propagate_control_error(scopes)?;
-                self.out.emit(Instruction::Pop);
-                self.out.bind(valid_step);
+                if descending.is_none() {
+                    self.check_range_step(step_slot, scopes)?;
+                }
 
                 scopes.bind_slot(var, var_slot);
                 self.out.bind(cond_label);
-                // Direction is re-checked every iteration from step_slot
-                // rather than assumed once, so a step computed from a
-                // variable (not just a literal) still picks the right
-                // comparison each time the sign could matter.
-                self.out.emit(Instruction::Load(step_slot));
-                self.out.emit(Instruction::Push(Value::Int(0)));
-                self.out.emit(Instruction::Lt);
-                self.propagate_control_error(scopes)?;
-                self.out.jump(Instruction::JumpIfTrue(0), desc_label);
-                self.load_loop_binding(var_slot, scopes);
-                self.out.emit(Instruction::Load(end_slot));
-                self.out.emit(Instruction::Lt);
-                self.out.jump(Instruction::Jump(0), cmp_done_label);
-                self.out.bind(desc_label);
-                self.load_loop_binding(var_slot, scopes);
-                self.out.emit(Instruction::Load(end_slot));
-                self.out.emit(Instruction::Gt);
-                self.out.bind(cmp_done_label);
-                self.propagate_control_error(scopes)?;
+                self.compile_range_comparison(var_slot, end_slot, step_slot, descending, scopes)?;
                 self.out.jump(Instruction::JumpIfFalse(0), end_label);
                 // push loop end label so `break` can compile to jump here, along with
                 // how many defers were already registered before this loop (see
@@ -2110,6 +2116,85 @@ impl<'a> Codegen<'a> {
         self.propagate_control_error(scopes)
     }
 
+    fn constant_range_direction(&self, step: Option<&Expr>, scopes: &Scopes) -> Option<bool> {
+        let Some(step) = step else {
+            return Some(false);
+        };
+        match self.fold_constant_expression(step, scopes)? {
+            Value::Int(value) if value != 0 => Some(value < 0),
+            Value::UInt(value) if value != 0 => Some(false),
+            Value::BigInt(value) if value.sign() != num_bigint::Sign::NoSign => {
+                Some(value.sign() == num_bigint::Sign::Minus)
+            }
+            _ => None,
+        }
+    }
+
+    fn check_range_step(
+        &mut self,
+        step_slot: usize,
+        scopes: &mut Scopes,
+    ) -> Result<(), CodegenError> {
+        let valid_step = self.fresh_label("nonzero_step");
+        self.out.extend([
+            Instruction::Load(step_slot),
+            Instruction::Push(Value::Int(0)),
+            Instruction::Eq,
+        ]);
+        self.out.jump(Instruction::JumpIfFalse(0), valid_step);
+        self.out.extend([
+            Instruction::Push(Value::TypeTag(Rc::from(format!(
+                "{}::InvalidRangeStep",
+                crate::error::ERROR_TYPE
+            )))),
+            Instruction::Push(Value::Nil),
+            Instruction::MakeRecord(1),
+        ]);
+        self.propagate_control_error(scopes)?;
+        self.out.emit(Instruction::Pop);
+        self.out.bind(valid_step);
+        Ok(())
+    }
+
+    fn compile_range_comparison(
+        &mut self,
+        var_slot: usize,
+        end_slot: usize,
+        step_slot: usize,
+        descending: Option<bool>,
+        scopes: &mut Scopes,
+    ) -> Result<(), CodegenError> {
+        if let Some(descending) = descending {
+            self.load_loop_binding(var_slot, scopes);
+            self.out.emit(Instruction::Load(end_slot));
+            self.out.emit(if descending {
+                Instruction::Gt
+            } else {
+                Instruction::Lt
+            });
+        } else {
+            let descending_label = self.fresh_label("for_descending");
+            let comparison_done = self.fresh_label("for_comparison_done");
+            self.out.extend([
+                Instruction::Load(step_slot),
+                Instruction::Push(Value::Int(0)),
+                Instruction::Lt,
+            ]);
+            self.propagate_control_error(scopes)?;
+            self.out.jump(Instruction::JumpIfTrue(0), descending_label);
+            self.load_loop_binding(var_slot, scopes);
+            self.out.emit(Instruction::Load(end_slot));
+            self.out.emit(Instruction::Lt);
+            self.out.jump(Instruction::Jump(0), comparison_done);
+            self.out.bind(descending_label);
+            self.load_loop_binding(var_slot, scopes);
+            self.out.emit(Instruction::Load(end_slot));
+            self.out.emit(Instruction::Gt);
+            self.out.bind(comparison_done);
+        }
+        self.propagate_control_error(scopes)
+    }
+
     fn range_one(&self, expression: &Expr) -> Value {
         let id = crate::mutability::expr_id(expression);
         if self.bigint_range_expressions.contains(&id) {
@@ -2216,6 +2301,7 @@ impl<'a> Codegen<'a> {
                     end,
                     step,
                 } => {
+                    let descending = self.constant_range_direction(step.as_deref(), scopes);
                     let var_slot = scopes.reserve_slot();
                     self.compile_expr(start, scopes)?;
                     self.observe_range_value(start, scopes)?;
@@ -2238,29 +2324,15 @@ impl<'a> Codegen<'a> {
                     self.observe_range_value(step.as_deref().unwrap_or(start), scopes)?;
                     self.out.emit(Instruction::Store(step_slot));
 
-                    let valid_step = self.fresh_label("for_zip_nonzero_step");
-                    self.out.extend([
-                        Instruction::Load(step_slot),
-                        Instruction::Push(Value::Int(0)),
-                        Instruction::Eq,
-                    ]);
-                    self.out.jump(Instruction::JumpIfFalse(0), valid_step);
-                    self.out.extend([
-                        Instruction::Push(Value::TypeTag(Rc::from(format!(
-                            "{}::InvalidRangeStep",
-                            crate::error::ERROR_TYPE
-                        )))),
-                        Instruction::Push(Value::Nil),
-                        Instruction::MakeRecord(1),
-                    ]);
-                    self.propagate_control_error(scopes)?;
-                    self.out.emit(Instruction::Pop);
-                    self.out.bind(valid_step);
+                    if descending.is_none() {
+                        self.check_range_step(step_slot, scopes)?;
+                    }
 
                     states.push(ForZipState::Range {
                         var_slot,
                         end_slot,
                         step_slot,
+                        descending,
                     });
                 }
                 ForClause::Each { pattern, iterable } => {
@@ -2314,26 +2386,15 @@ impl<'a> Codegen<'a> {
                     var_slot,
                     end_slot,
                     step_slot,
+                    descending,
                 } => {
-                    let descending_label = self.fresh_label("for_zip_descending");
-                    let comparison_done = self.fresh_label("for_zip_comparison_done");
-                    self.out.extend([
-                        Instruction::Load(*step_slot),
-                        Instruction::Push(Value::Int(0)),
-                        Instruction::Lt,
-                    ]);
-                    self.propagate_control_error(scopes)?;
-                    self.out.jump(Instruction::JumpIfTrue(0), descending_label);
-                    self.load_loop_binding(*var_slot, scopes);
-                    self.out.emit(Instruction::Load(*end_slot));
-                    self.out.emit(Instruction::Lt);
-                    self.out.jump(Instruction::Jump(0), comparison_done);
-                    self.out.bind(descending_label);
-                    self.load_loop_binding(*var_slot, scopes);
-                    self.out.emit(Instruction::Load(*end_slot));
-                    self.out.emit(Instruction::Gt);
-                    self.out.bind(comparison_done);
-                    self.propagate_control_error(scopes)?;
+                    self.compile_range_comparison(
+                        *var_slot,
+                        *end_slot,
+                        *step_slot,
+                        *descending,
+                        scopes,
+                    )?;
                     self.out.jump(Instruction::JumpIfFalse(0), end_label);
                 }
                 ForZipState::Each {
@@ -3391,6 +3452,9 @@ impl<'a> Codegen<'a> {
         scopes: &mut Scopes,
     ) -> Result<(), CodegenError> {
         match (expr.node(), &expected.kind) {
+            (Expr::TypedAggregate(value, actual), expected) if &actual.kind == expected => {
+                self.compile_materialized_aggregate(value, actual, scopes)
+            }
             (Expr::Array(items), crate::ast::TypeKind::Array(element)) => {
                 for item in items {
                     self.compile_expr_typed_array(item, element, scopes)?;
@@ -3437,6 +3501,28 @@ impl<'a> Codegen<'a> {
         }
     }
 
+    fn compile_materialized_aggregate(
+        &mut self,
+        expr: &Expr,
+        ty: &crate::ast::TypeAnnotation,
+        scopes: &mut Scopes,
+    ) -> Result<(), CodegenError> {
+        if let (Expr::Array(items), crate::ast::TypeKind::Array(element)) = (expr.node(), &ty.kind)
+            && items.len() > crate::comptime::MAX_COMPTIME_ARRAY_STACK_ITEMS
+            && let Some(element_type) = runtime_array_element_type(ty)
+        {
+            // Keep wide constant tables within the verifier's stack-fact budget.
+            self.out.emit(Instruction::MakeTypedArray(0, element_type));
+            for item in items {
+                self.compile_expr_typed_array(item, element, scopes)?;
+                self.out.emit(Instruction::ArrayPush);
+            }
+            Ok(())
+        } else {
+            self.compile_expr_typed_array(expr, ty, scopes)
+        }
+    }
+
     fn compile_call_argument(
         &mut self,
         expr: &Expr,
@@ -3475,6 +3561,19 @@ impl<'a> Codegen<'a> {
             return Ok(false);
         }
 
+        let Some(globals) = function
+            .globals
+            .iter()
+            .map(|name| {
+                let value = self.global_constant_values.get(name)?;
+                Self::constant_value_expression(value)?;
+                Some((name.clone(), value.clone()))
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(false);
+        };
+
         if self.trace_optimizer {
             let caller = self.current_function.as_deref().unwrap_or("<entry>");
             eprintln!(
@@ -3493,6 +3592,11 @@ impl<'a> Codegen<'a> {
         }
 
         scopes.push();
+        // Bind the callee's globals before its locals so caller shadowing is irrelevant.
+        for (name, value) in globals {
+            let slot = scopes.define(&name);
+            scopes.const_values.insert(slot, value);
+        }
         for (parameter, slot) in function.parameters.iter().zip(slots) {
             scopes.bind_slot(&parameter.name, slot);
         }
@@ -3685,11 +3789,19 @@ impl<'a> Codegen<'a> {
             values.push(Self::constant_value_expression(&value)?);
         }
         *nodes += function.nodes;
-        let mut parameter_names = function
-            .parameters
+        let mut parameter_names = function.globals.iter().cloned().collect::<Vec<_>>();
+        let mut global_values = parameter_names
             .iter()
-            .map(|parameter| parameter.name.clone())
-            .collect::<Vec<_>>();
+            .map(|name| Self::constant_value_expression(self.global_constant_values.get(name)?))
+            .collect::<Option<Vec<_>>>()?;
+        parameter_names.extend(
+            function
+                .parameters
+                .iter()
+                .map(|parameter| parameter.name.clone()),
+        );
+        global_values.append(&mut values);
+        let mut values = global_values;
         for binding in &function.bindings {
             let Stmt::Const {
                 pattern: BindingPattern::Name(name),
@@ -4102,6 +4214,9 @@ impl<'a> Codegen<'a> {
                 });
             }
             Expr::Located(_, _) => unreachable!("node removes locations"),
+            Expr::TypedAggregate(value, ty) => {
+                self.compile_materialized_aggregate(value, ty, scopes)?;
+            }
             Expr::Int(n)
                 if self
                     .bigint_literals
@@ -5448,8 +5563,7 @@ mod tests {
             })],
         };
         let out = compile(&program).expect("should compile");
-        assert!(out.contains("jz "));
-        assert!(out.contains("push 7\n"));
+        assert!(!out.contains("push 7\n"));
         assert!(out.contains("push 9\n"));
     }
 

@@ -39,6 +39,15 @@ public fn is_whitespace(value: int) -> bool {
     byte == 32 || (byte >= 9 && byte <= 13)
 }
 
+// The numeric value of a hexadecimal digit byte in either case, or nil.
+public fn hex_value(value: int) -> int? {
+    const byte = byte_value(value, "ascii::hex_value")!!;
+    if is_digit(byte)!! { return byte - 48; }
+    const lower = if is_uppercase(byte)!! { byte + 32 } else { byte };
+    if lower >= 97 && lower <= 102 { return lower - 87; }
+    nil
+}
+
 public fn to_lowercase(value: int) -> int {
     const byte = byte_value(value, "ascii::to_lowercase")!!;
     if is_uppercase(byte)!! { byte + 32 } else { byte }

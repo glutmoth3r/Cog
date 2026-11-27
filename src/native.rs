@@ -219,6 +219,13 @@ fn link(
     imports: &[Import],
     objects: &[PathBuf],
 ) -> Result<BuildReport, String> {
+    let application;
+    let artifact = if exports.is_empty() {
+        application = crate::optimizer::application(artifact);
+        &application
+    } else {
+        artifact
+    };
     if !cfg!(all(
         target_os = "linux",
         target_arch = "x86_64",
@@ -242,7 +249,7 @@ fn link(
     let length = bytecode.len();
     let (object, entries, code_bytes) = crate::jit::emit_aot_object(artifact, bytecode)?;
     let codegen_time = started.elapsed();
-    if entries.is_empty() {
+    if entries.is_empty() && !exports.is_empty() {
         return Err("no callable can be compiled to native code".into());
     }
 
@@ -415,6 +422,9 @@ fn launcher(entries: &[usize]) -> String {
         writeln!(source, "extern int32_t cog_aot_fn_{pc}(void *);").unwrap();
     }
     source.push_str("static const struct entry entries[] = {\n");
+    if entries.is_empty() {
+        source.push_str("    {0, NULL},\n");
+    }
     for pc in entries {
         writeln!(source, "    {{{pc}, cog_aot_fn_{pc}}},").unwrap();
     }
@@ -476,7 +486,7 @@ unsafe extern "C" fn cog_aot_run_v2(
         };
         run(bytes, entries, bindings)
     }) {
-        Ok(Ok(())) => 0,
+        Ok(Ok(status)) => status,
         Ok(Err(error)) => {
             eprintln!("{error}");
             1
@@ -485,7 +495,7 @@ unsafe extern "C" fn cog_aot_run_v2(
     }
 }
 
-fn run(bytes: &[u8], entries: &[LinkedEntry], bindings: &[LinkedImport]) -> Result<(), String> {
+fn run(bytes: &[u8], entries: &[LinkedEntry], bindings: &[LinkedImport]) -> Result<i32, String> {
     let mut engine = Engine::new();
     for binding in bindings {
         // SAFETY: generated glue provides a static NUL-terminated identifier
@@ -534,7 +544,8 @@ fn run(bytes: &[u8], entries: &[LinkedEntry], bindings: &[LinkedImport]) -> Resu
             || format!("runtime error: {error}"),
             |diagnostic| diagnostic.render(context.last_source_location()),
         )
-    })
+    })?;
+    Ok(context.exit_code())
 }
 
 fn aot_jit_fallback_enabled() -> bool {

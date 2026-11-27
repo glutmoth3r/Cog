@@ -1,0 +1,43 @@
+// Comparison and search over byte buffers, in addition to the runtime primitives.
+use byte_match;
+use err::Error;
+
+public fn equals(a: bytes, b: bytes) -> bool {
+    const length = bytes::len(a)!!;
+    if length != bytes::len(b)!! { return false; }
+    byte_match::matches_at(a, 0, b, length)
+}
+
+public fn starts_with(data: bytes, prefix: bytes) -> bool {
+    const available = bytes::len(data)!!;
+    const length = bytes::len(prefix)!!;
+    if length > available { return false; }
+    byte_match::matches_at(data, 0, prefix, length)
+}
+
+// The first offset at or after start holding the byte value, or nil.
+public fn index_of(data: bytes, value: int, start: int = 0) -> int? {
+    const length = bytes::len(data)!!;
+    value!!;
+    start!!;
+    if value < 0 || value > 255 || start < 0 || start > length {
+        return Error::InvalidArgument("bytes::index_of");
+    }
+    for index in start..length {
+        if bytes::get(data, index)!! == value { return index; }
+    }
+    nil
+}
+
+// The first offset at or after start where the complete pattern occurs, or nil.
+// An empty pattern matches at start.
+public fn find(data: bytes, pattern: bytes, start: int = 0) -> int? {
+    const length = bytes::len(data)!!;
+    const size = bytes::len(pattern)!!;
+    start!!;
+    if start < 0 || start > length { return Error::InvalidArgument("bytes::find"); }
+    if size == 0 { return start; }
+    const position = byte_match::first(data, pattern, start)!!;
+    if position < 0 { return nil; }
+    position
+}

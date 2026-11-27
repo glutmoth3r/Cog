@@ -296,6 +296,10 @@ fn measure_with_pending_limit<'a>(
                 Expr::Str(text) | Expr::Ident(text) => cost = cost.saturating_add(text.len()),
                 Expr::Bytes(bytes) => cost = cost.saturating_add(bytes.len()),
                 Expr::TypeLiteral(ty) => pending.push(Node::Type(ty, 0)),
+                Expr::TypedAggregate(value, ty) => {
+                    pending.push(Node::Expr(value));
+                    pending.push(Node::Type(ty, 0));
+                }
                 Expr::Located(_, inner)
                 | Expr::Unary(_, inner)
                 | Expr::Propagate(inner)

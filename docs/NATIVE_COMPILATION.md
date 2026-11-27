@@ -22,6 +22,10 @@ must point to an existing archive.
 
 ## Compilation and execution
 
+An integer result from synchronous or asynchronous `main` becomes the process
+exit status after cleanup, using its low eight bits. Other normal results use
+status 0, and unhandled runtime failures use status 1.
+
 Native builds use standard project discovery, lock resolution, build inputs,
 the frontend, optimizer, and bytecode verifier. For a project with multiple
 applications, `--target` selects the application from `build.kdl`. Native
@@ -77,5 +81,8 @@ is a Cog program argument, not a runtime option. For a shared library, set
 `COG_AOT_JIT=1` before calling `cog_native_open()`; the setting is captured
 when that runtime context is created. `COG_AOT_TRACE=1` shows JIT compilation
 and bridge decisions.
+
+An executable with no eligible native functions still runs its bytecode in the
+VM. Shared libraries require their exported functions to be eligible.
 
 See [C interoperation](FFI.md) for shared libraries and C imports.

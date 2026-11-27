@@ -2228,11 +2228,13 @@ fn inherent_and_comptime_extensions_dispatch_by_receiver_type() {
         extend Point {
             fn describe(self) -> str { $"point {self.x}" }
         }
-        @comptime extend Scalar {
+        trait Describe { fn describe(self) -> str; }
+        @comptime extend Scalar with Describe {
             fn describe(self) -> str { $"integer {self}" }
         }
         @comptime const Pair: type = (int, str);
-        @comptime extend Pair {
+        trait Flip { fn flipped(self) -> (str, int); }
+        @comptime extend Pair with Flip {
             fn flipped(self) -> (str, int) { (self.1, self.0) }
         }
         fn main() {
@@ -2244,7 +2246,7 @@ fn inherent_and_comptime_extensions_dispatch_by_receiver_type() {
         "point 7\ninteger 42\n[three, 3]\n",
     );
     rejects_semantically(
-        "@comptime extend int { fn add(self, value: int) -> int { self + value } } fn main() { 1.add(\"wrong\"); }",
+        "trait Add { fn add(self, value: int) -> int; } @comptime extend int with Add { fn add(self, value: int) -> int { self + value } } fn main() { 1.add(\"wrong\"); }",
         &[
             "argument `value` of `add()`",
             "declared as int but given str",

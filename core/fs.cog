@@ -1,0 +1,87 @@
+// Synchronous whole-file operations over managed io streams. Permissions are
+// checked by io::open, and I/O failures name the io operation that failed.
+use bytes;
+use io;
+use str;
+use err::Error;
+
+// Extend a buffer by up to `step` bytes, halving the step while the buffer limit
+// rejects it.
+fn extend_buffer(buffer: bytes, step: int) -> bytes {
+    var grown = bytes::concat(buffer, bytes::new(step));
+    when grown is Error::ResourceLimit {
+        if step > 1 { grown = extend_buffer(buffer, step / 2); }
+    } else {}
+    grown
+}
+
+// Read from the current position through EOF, doubling the buffer as needed.
+fn read_to_end(file) -> bytes {
+    var probe = bytes::new(1)!!;
+    var buffer = bytes::new(0)!!;
+    var length = 0;
+    var more = true;
+    while more {
+        const room = bytes::len(buffer)!! - length;
+        if room > 0 {
+            const count = io::read_into(file, buffer, length, room)!!;
+            length += count;
+            more = count > 0;
+        } else {
+            // Grow only after another byte is known to exist, so a file that
+            // exactly fills the buffer limit can still be read.
+            more = io::read_into(file, probe, 0, 1)!! > 0;
+            if more {
+                const step = if length < 4096 { 4096 } else { length };
+                buffer = extend_buffer(buffer, step)!!;
+                bytes::set(buffer, length, bytes::get(probe, 0)!!)!!;
+                length += 1;
+            }
+        }
+    }
+    bytes::slice(buffer, 0, length)
+}
+
+public fn read_bytes(path: str) -> bytes {
+    const file = io::open(path, "r", 0)!!;
+    defer { io::close(file)!!; }
+    read_to_end(file)
+}
+
+public fn read_text(path: str) -> str {
+    str::from_bytes(read_bytes(path)!!)
+}
+
+public fn read_lines(path: str) -> str[] {
+    str::lines(read_text(path)!!)
+}
+
+// Close explicitly so a failed write or close is reported to the caller.
+fn store(path: str, data: bytes, mode: str) -> nil {
+    // Validate the data before opening: "w" truncates the destination.
+    const length = bytes::len(data)!!;
+    const file = io::open(path, mode, 0)!!;
+    const written = io::write_all(file, data, 0, length);
+    const flushed = io::flush(file);
+    const closed = io::close(file);
+    written!!;
+    flushed!!;
+    closed!!;
+    nil
+}
+
+public fn write_bytes(path: str, data: bytes) -> nil {
+    store(path, data, "w")
+}
+
+public fn write_text(path: str, text: str) -> nil {
+    store(path, bytes::from_str(text)!!, "w")
+}
+
+public fn append_bytes(path: str, data: bytes) -> nil {
+    store(path, data, "a")
+}
+
+public fn append_text(path: str, text: str) -> nil {
+    store(path, bytes::from_str(text)!!, "a")
+}

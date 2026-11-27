@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 mod cli_output;
+mod github_install;
 use cli_output::Color;
 
 #[allow(dead_code)]
@@ -77,21 +78,26 @@ struct Options {
     locked: bool,
     output: Option<PathBuf>,
     install_path: Option<PathBuf>,
+    install_git: Option<String>,
+    install_rev: Option<String>,
     init_library: bool,
     program_args: Vec<OsString>,
     program_args_separator: bool,
     plugins: Vec<PathBuf>,
 }
 
-fn main() {
+fn main() -> std::process::ExitCode {
     let mut color = Color::default();
-    if let Err(error) = command(&mut color) {
-        color.error(&error);
-        std::process::exit(1);
+    match command(&mut color) {
+        Ok(status) => std::process::ExitCode::from(status as u8),
+        Err(error) => {
+            color.error(&error);
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 
-fn command(color: &mut Color) -> Result<(), String> {
+fn command(color: &mut Color) -> Result<i32, String> {
     let mut options = Options::default();
     let mut action: Option<String> = None;
     let mut target: Option<OsString> = None;
@@ -171,13 +177,25 @@ fn command(color: &mut Color) -> Result<(), String> {
                 }
                 options.install_path = Some(required_cli_arg(&mut args, "--path")?.into());
             }
+            "--git" => {
+                if options.install_git.is_some() {
+                    return Err("--git may only be specified once".into());
+                }
+                options.install_git = Some(required_cli_arg(&mut args, "--git")?);
+            }
+            "--rev" => {
+                if options.install_rev.is_some() {
+                    return Err("--rev may only be specified once".into());
+                }
+                options.install_rev = Some(required_cli_arg(&mut args, "--rev")?);
+            }
             "--version" | "-V" => {
                 println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-                return Ok(());
+                return Ok(0);
             }
             "--help" | "-h" => {
                 print_usage();
-                return Ok(());
+                return Ok(0);
             }
             "init" | "check" | "run" | "build" | "eval" | "package" | "install"
                 if action.is_none() =>
@@ -238,6 +256,9 @@ fn command(color: &mut Color) -> Result<(), String> {
     if options.install_path.is_some() && action != "install" {
         return Err("--path is only valid with `install`".into());
     }
+    if (options.install_git.is_some() || options.install_rev.is_some()) && action != "install" {
+        return Err("--git and --rev are only valid with `install`".into());
+    }
     if options.init_library && !matches!(action, "init" | "build") {
         return Err("--lib is only valid with `init` or `build`".into());
     }
@@ -263,10 +284,13 @@ fn command(color: &mut Color) -> Result<(), String> {
         return Err("--use is only valid with `eval`".into());
     }
     if action == "install" {
-        let path = options
-            .install_path
-            .as_deref()
-            .ok_or("usage: cog install --path <project-directory>")?;
+        const INSTALL_USAGE: &str = "usage: cog install --path <project-directory> [--locked]\n       cog install --git <owner/repository> [--rev <revision>] [--locked]";
+        if options.install_path.is_some() && options.install_git.is_some() {
+            return Err("choose either --path or --git for installation".into());
+        }
+        if options.install_rev.is_some() && options.install_git.is_none() {
+            return Err("--rev requires --git".into());
+        }
         if target.is_some()
             || options.debug
             || options.allow_asm
@@ -276,10 +300,17 @@ fn command(color: &mut Color) -> Result<(), String> {
             || !options.plugins.is_empty()
             || options.program_args_separator
         {
-            return Err("usage: cog install --path <project-directory>".into());
+            return Err(INSTALL_USAGE.into());
         }
         let started = Instant::now();
-        let installed = cog::package::install_path(path, options.locked)?;
+        let (installed, revision) = if let Some(repo) = options.install_git.as_deref() {
+            let (installed, revision) =
+                github_install::install(repo, options.install_rev.as_deref(), options.locked)?;
+            (installed, Some(revision))
+        } else {
+            let path = options.install_path.as_deref().ok_or(INSTALL_USAGE)?;
+            (cog::package::install_path(path, options.locked)?, None)
+        };
         if !installed.warnings.is_empty() {
             color.warning(&frontend::render(&installed.warnings));
         }
@@ -294,7 +325,10 @@ fn command(color: &mut Color) -> Result<(), String> {
             },
             installed.archive_bytes
         );
-        return Ok(());
+        if let Some(revision) = revision {
+            eprintln!("Git commit {revision}");
+        }
+        return Ok(0);
     }
     if action == "package" {
         if !package_build {
@@ -331,7 +365,7 @@ fn command(color: &mut Color) -> Result<(), String> {
         }
         color.status("packed", &result.path, started.elapsed());
         eprintln!("{} entries, {} bytes", result.entries, result.archive_bytes);
-        return Ok(());
+        return Ok(0);
     }
     if action == "eval" {
         if !options.plugins.is_empty() {
@@ -345,7 +379,7 @@ fn command(color: &mut Color) -> Result<(), String> {
             .and_then(OsStr::to_str)
             .filter(|expression| !expression.trim().is_empty())
             .ok_or("eval requires one Cog expression; usage: cog eval [options] <expression>")?;
-        return eval_expression(expression, &options, color);
+        return eval_expression(expression, &options, color).map(|()| 0);
     }
     if action == "init" {
         if !options.plugins.is_empty() {
@@ -355,7 +389,7 @@ fn command(color: &mut Color) -> Result<(), String> {
             .as_deref()
             .filter(|directory| !directory.is_empty())
             .ok_or("init requires a directory; usage: cog init <directory>")?;
-        return init_project(Path::new(directory), options.init_library);
+        return init_project(Path::new(directory), options.init_library).map(|()| 0);
     }
     let target = Path::new(target.as_deref().unwrap_or(OsStr::new(".")));
     let mode = match action {
@@ -433,7 +467,7 @@ fn command(color: &mut Color) -> Result<(), String> {
         cog::wasm::build_executable(&compiled, &destination)?;
         project::write_lock(lock_update)?;
         color.status("linked", &destination, started.elapsed());
-        return Ok(());
+        return Ok(0);
     }
     if options.native || native_library {
         if package_has_plugins || !options.plugins.is_empty() {
@@ -504,7 +538,7 @@ fn command(color: &mut Color) -> Result<(), String> {
             "AOT: {} functions, {} machine code bytes, {:?} code generation",
             report.functions, report.code_bytes, report.codegen_time
         );
-        return Ok(());
+        return Ok(0);
     }
     if !options.plugins.is_empty() || package_has_plugins {
         return command_with_plugins(target, mode, options, color, prepared);
@@ -539,7 +573,7 @@ fn command(color: &mut Color) -> Result<(), String> {
     match mode {
         Mode::Check => {
             color.status("checked", target, elapsed);
-            Ok(())
+            Ok(0)
         }
         Mode::Run => {
             if !bytecode_input && !reused {
@@ -559,7 +593,7 @@ fn command(color: &mut Color) -> Result<(), String> {
                 &destination,
                 elapsed,
             );
-            Ok(())
+            Ok(0)
         }
     }
 }
@@ -569,7 +603,7 @@ fn execute_bytecode(
     compiled: &CompiledProgram,
     target: &Path,
     options: Options,
-) -> Result<(), String> {
+) -> Result<i32, String> {
     let capabilities = if options.restricted {
         VmCapabilities {
             allow_print: true,
@@ -592,7 +626,8 @@ fn execute_bytecode(
             context.last_source_location(),
             context.last_runtime_diagnostic(),
         )
-    })
+    })?;
+    Ok(context.exit_code())
 }
 
 fn eval_expression(expression: &str, options: &Options, color: &Color) -> Result<(), String> {
@@ -751,6 +786,7 @@ fn print_usage() {
         "       cog package build [project-directory] [--target <triple>] [-o archive.cogpkg]"
     );
     eprintln!("       cog install --path <project-directory> [--locked]");
+    eprintln!("       cog install --git <owner/repository> [--rev <revision>] [--locked]");
     eprintln!("       cog eval [--debug] [--restricted] [--use <module>]... <expression>");
     eprintln!("       cog <bytecode-file> [program-arguments...]");
     eprintln!("       cog --version|-V");
@@ -784,7 +820,7 @@ fn command_with_plugins(
     options: Options,
     color: &Color,
     prepared: Option<project::Prepared>,
-) -> Result<(), String> {
+) -> Result<i32, String> {
     use cog::sdk::{Engine, Permissions, PluginManifest, RunContext};
     if mode == Mode::Run
         && options.restricted
@@ -875,7 +911,7 @@ fn command_with_plugins(
                 color.warning(&frontend::render(&warnings));
             }
             color.status("checked", target, started.elapsed());
-            return Ok(());
+            return Ok(0);
         }
         if mode == Mode::Check {
             (
@@ -898,7 +934,7 @@ fn command_with_plugins(
     match mode {
         Mode::Check => {
             color.status("checked", target, started.elapsed());
-            Ok(())
+            Ok(0)
         }
         Mode::Build => {
             color.status(
@@ -906,7 +942,7 @@ fn command_with_plugins(
                 &destination,
                 started.elapsed(),
             );
-            Ok(())
+            Ok(0)
         }
         Mode::Run => {
             if !bytecode_input && !reused {
@@ -931,7 +967,8 @@ fn command_with_plugins(
                     context.last_source_location(),
                     context.last_runtime_diagnostic(),
                 )
-            })
+            })?;
+            Ok(context.exit_code())
         }
     }
 }
@@ -981,7 +1018,7 @@ fn replaced_path(path: &Path) -> Result<PathBuf, String> {
     Ok(resolved)
 }
 
-fn command_with_application(target: &Path, options: Options, color: &Color) -> Result<(), String> {
+fn command_with_application(target: &Path, options: Options, color: &Color) -> Result<i32, String> {
     use cog::sdk::{Engine, PluginManifest, RunContext};
 
     if options.restricted && !options.plugins.is_empty() {
@@ -1067,7 +1104,8 @@ fn command_with_application(target: &Path, options: Options, color: &Color) -> R
             context.last_source_location(),
             context.last_runtime_diagnostic(),
         )
-    })
+    })?;
+    Ok(context.exit_code())
 }
 
 fn jit_profile_path(target: &Path) -> PathBuf {

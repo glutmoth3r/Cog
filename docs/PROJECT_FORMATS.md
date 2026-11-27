@@ -122,6 +122,31 @@ changing archive contents without changing the version is rejected. An installed
 application can be run by passing its printed `.cogpkg` path to `cog run`.
 Installed libraries can be shared by any project owned by the same user. There
 is no registry, network resolver, version solver, or cache garbage collector.
+
+`cog install --git owner/repository [--rev revision] [--locked]` clones a GitHub
+repository over HTTPS, checks out the requested Git tag, commit, or explicit Git
+revision (such as `origin/main`), and
+installs its root Cog project in the same local store. The full HTTPS GitHub URL
+is also accepted. Git must be installed and available on `PATH`. The command
+prints the resolved commit and package identity. When `--rev` is omitted, it
+uses the repository's default HEAD, which can change; specify a commit for a
+reproducible source selection. The resulting `cog.lock` and installed package
+identity do not record the Git commit. Existing package names and versions
+remain immutable, so changed contents require a new package version.
+
+The command installs one repository; it does not fetch transitive Git
+dependencies. Dependencies must already resolve through local paths or
+installed packages supported by `dependencies.kdl`. The checkout
+is temporary and is removed after installation. Authentication uses the local
+Git configuration and available credentials, with interactive terminal prompts
+disabled. Installing packages can include native plugins; trust the source
+before using them.
+
+For GitHub installs, local path dependencies must resolve inside the checkout,
+including transitive dependencies. Symbolic links anywhere in the checkout
+and local `archive=` dependencies are rejected. Use an already installed
+`package=` dependency when an archive is needed. These restrictions do not
+change `cog install --path`.
 Package archive creation and application extraction/validation are also available
 from the Rust crate through `cog::package::build_archive`,
 `cog::package::build_archive_for_target`, `cog::package::install_path`, and

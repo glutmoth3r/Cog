@@ -6,7 +6,7 @@ use bytes;
 // A 31-bit linear congruential generator, seeded once from OS entropy.
 const MODULUS = 2147483648;
 const UINT_MODULUS: uint = 2147483648;
-var state = 0;
+var state: int = 0;
 var initialized = false;
 
 fn ensure_seeded() {
@@ -18,7 +18,7 @@ fn ensure_seeded() {
     return nil;
 }
 
-fn seed_from_bytes(raw) {
+fn seed_from_bytes(raw) -> int {
     var acc = 0;
     var i = 0;
     while i < bytes::len(raw) {
@@ -28,13 +28,13 @@ fn seed_from_bytes(raw) {
     return acc;
 }
 
-public fn next() {
+public fn next() -> int {
     ensure_seeded()!!;
     state = (state * 1103515245 + 12345) % MODULUS;
     return state;
 }
 
-public fn range(lo, hi) {
+public fn range(lo, hi) -> int {
     const low = range_bound(lo)!!;
     const high = range_bound(hi)!!;
     if high <= low { return Error::InvalidArgument("random::range"); }
@@ -63,12 +63,12 @@ public fn range_uint(lo: uint, hi: uint) -> uint {
     lo + value % width
 }
 
-fn range_bound(value) {
+fn range_bound(value) -> int {
     value!!;
     when value is int { value } else { Error::TypeMismatch("random::range") }
 }
 
-public fn boolean() {
+public fn boolean() -> bool {
     return next()!! >= MODULUS / 2;
 }
 
@@ -88,6 +88,12 @@ extend Seeded {
     public fn next(mut self) -> int {
         self.state = (self.state * 1103515245 + 12345) % MODULUS;
         self.state
+    }
+
+    // A multiple of 2^-31 in [0, 1).
+    public fn float(mut self) -> float {
+        const sample = self.next()!!;
+        (sample as float)!! / 2147483648.0
     }
 
     public fn range(mut self, lo: int, hi: int) -> int {

@@ -22,7 +22,8 @@ pub fn build_executable(program: &CompiledProgram, destination: &Path) -> Result
     {
         return Err("WASI output path must end in .wasm".into());
     }
-    let source = lower(program)?;
+    let application = crate::optimizer::application(program);
+    let source = lower(&application)?;
     let parent = destination
         .parent()
         .filter(|p| !p.as_os_str().is_empty())

@@ -115,19 +115,23 @@ struct State {
     types: Vec<Ty>,
 }
 
-fn main() {
+fn main() -> std::process::ExitCode {
     let mut state = State {
         globals: std::array::from_fn(|_| None),
         types: contract_types(),
     };
-    if let Err(error) = f_0(&mut state, 0, []) {
-        eprintln!(
-            "Error::{}: {}\nOrigin: {}",
-            error.kind,
-            error.message(),
-            site(error.pc)
-        );
-        std::process::exit(1);
+    match f_0(&mut state, 0, []) {
+        Ok((V::Int(value), _)) => std::process::ExitCode::from((value & 255) as u8),
+        Ok(_) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!(
+                "Error::{}: {}\nOrigin: {}",
+                error.kind,
+                error.message(),
+                site(error.pc)
+            );
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 

@@ -1,0 +1,59 @@
+// Byte-sequence matching shared by the str and bytes modules.
+use bytes;
+
+// The caller ensures the complete needle fits at offset.
+public fn matches_at(data, offset: int, needle, length: int) -> bool {
+    for index in 0..length {
+        if bytes::get(data, offset + index)!! != bytes::get(needle, index)!! {
+            return false;
+        }
+    }
+    true
+}
+
+// Knuth-Morris-Pratt over a nonempty needle, starting at a byte offset. With
+// valid UTF-8 operands, a complete match starts and ends at scalar boundaries.
+// Modes: 0 first match, 1 last match, 2 non-overlapping match count.
+fn scan(data, needle, start: int, mode: int) -> int {
+    const size = bytes::len(needle)!!;
+    const length = bytes::len(data)!!;
+    var last_match = -1;
+    var total = 0;
+    if size <= length - start {
+        var prefix: int[] = [0];
+        var matched = 0;
+        for i in 1..size {
+            const symbol = bytes::get(needle, i)!!;
+            while matched > 0 && symbol != bytes::get(needle, matched)!! {
+                matched = prefix[matched - 1]!!;
+            }
+            if symbol == bytes::get(needle, matched)!! { matched += 1; }
+            prefix.append(matched)!!;
+        }
+
+        matched = 0;
+        for i in start..length {
+            const symbol = bytes::get(data, i)!!;
+            while matched > 0 && symbol != bytes::get(needle, matched)!! {
+                matched = prefix[matched - 1]!!;
+            }
+            if symbol == bytes::get(needle, matched)!! { matched += 1; }
+            if matched == size {
+                last_match = i + 1 - size;
+                total += 1;
+                if mode == 0 { return last_match; }
+                matched = if mode == 2 { 0 } else { prefix[matched - 1]!! };
+            }
+        }
+    }
+    if mode == 2 { total } else { last_match }
+}
+
+// Offset of the first match at or after start, or -1.
+public fn first(data, needle, start: int) -> int { scan(data, needle, start, 0) }
+
+// Offset of the last match, including overlapping matches, or -1.
+public fn last(data, needle) -> int { scan(data, needle, 0, 1) }
+
+// Number of non-overlapping matches.
+public fn count(data, needle) -> int { scan(data, needle, 0, 2) }

@@ -10,7 +10,7 @@ The entry point uses `@!include("game")` for the declared source dependency and
 `@!include("std")` for the embedded standard library. Both packages provide a
 `random` module, so the imports select their
 providers with `from`. The `game::numbers` module also defines a compile-time
-type alias and registers an integer extension method.
+type alias and implements a local trait for it, which gives integers a method.
 
 Expected output:
 

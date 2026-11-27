@@ -1508,9 +1508,10 @@ fn build_archive_with_target(
         let (program, warnings) = engine
             .compile_prepared_with_warnings(prepared)
             .map_err(|error| error.to_string())?;
+        let program = crate::optimizer::application(&program.into_compiled());
         plan.add_bytes(
             ".cog/app.cogb".into(),
-            program.encode().map_err(|error| error.to_string())?,
+            crate::bytecode::encode(&program)?,
             None,
         )?;
         warnings

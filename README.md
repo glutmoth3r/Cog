@@ -81,6 +81,7 @@ cog run my-app
 cog package build my-app -o my-app.cogpkg
 cog run my-app.cogpkg -- "argument value"
 cog install --path examples/library_package
+cog install --git owner/repository --rev v1.0.0
 ```
 
 Create a library project directly with `cog init --lib integer-math`. This
@@ -109,6 +110,9 @@ in one dependency line, for example
 do not create a separate plugin manifest. Plugin bundles select an exact Linux,
 Windows, or macOS target without fallback. Archive digests detect changed bytes
 but do not authenticate publishers or make native code safe.
+`cog install --git owner/repository` installs a GitHub checkout in the same
+store; add `--rev <commit-or-tag>` to select its revision. Git dependencies are
+not fetched transitively, and `cog.lock` does not record the Git commit.
 See [project formats](docs/PROJECT_FORMATS.md) for archive and trust limits.
 
 `run` passes arguments after `--` to an entry point declared as `fn main(args: str[])`.
@@ -162,8 +166,8 @@ are not included in the unused-local check.
 
 Arrays are homogeneous and carry a recursive element-type invariant such as
 `int[]` or `str[][]`. Known mismatches are rejected during compilation; mutations
-through dynamic code are checked at runtime. Fixed-shape tuples and user-declared
-extension methods are also supported. Trait implementations and bounded generic
+through dynamic code are checked at runtime. Fixed-shape tuples and extension
+methods declared with a type's own module or through traits are also supported. Trait implementations and bounded generic
 functions use static dispatch. Arrays and tuples support structural `.clone()` for
 supported primitive and nested container types. Generic structs support inferred
 compile-time type parameters and applied type annotations. Nullable and Error flow

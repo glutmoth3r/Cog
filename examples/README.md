@@ -58,7 +58,7 @@ dependency is pinned to the latest library package version.
 | [comptime_types.cog](comptime_types.cog) | Type values passed through a compile-time function and substituted into nested annotations |
 | [comptime_structs.cog](comptime_structs.cog) | Compile-time struct constructors, nested results, and field defaults |
 | [comptime_errors.cog](comptime_errors.cog) | Compile-time nil/Error fallbacks and propagation across function boundaries |
-| [extensions.cog](extensions.cog) | Type aliases, inherent methods, and compile-time registered extensions |
+| [extensions.cog](extensions.cog) | Type aliases, inherent methods, and compile-time registered trait implementations |
 | [generics_traits.cog](generics_traits.cog) | Comptime type parameters, trait implementations, and generic standard-library operations |
 | [package_include](package_include/) | Compile-time package inclusion and explicit package selection for duplicate module names |
 | [control_flow.cog](control_flow.cog) | Ranges, while, break/continue, guards, when, and match |

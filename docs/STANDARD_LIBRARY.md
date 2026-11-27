@@ -36,9 +36,9 @@ The `iter::IntoIterator[Iter, Item]` trait converts a collection into an iterato
 `iter::Iterator[Item]` supplies `next(mut self) -> bool` and `current(self) -> Item`.
 `for` calls `current()` only after `next()` returns true. These methods are
 statically dispatched, and Errors they return use ordinary propagation and
-`try`/`catch` rules when explicitly propagated with `!!`. Implementations must
-target concrete types; generic target
-implementations and iteration through a generic trait bound are not supported.
+`try`/`catch` rules when explicitly propagated with `!!`. Implementations may
+target concrete or generic types, and a generic function can iterate a parameter
+bounded by `iter::IntoIterator[Iter, Item]`.
 See [user-defined collection iteration](LANGUAGE.md#user-defined-collection-iteration)
 for a complete example. `iter::range(start, end)` provides a concrete
 `Range` and `RangeCursor` for half-open ascending integer ranges.
@@ -62,7 +62,9 @@ take positional arguments only. Source functions support named/default arguments
 | `str::starts_with(text, prefix)` / `str::ends_with(text, suffix)` | Exact prefix / suffix test; an empty pattern matches |
 | `str::contains(text, part)` | Exact substring test; an empty pattern matches |
 | `str::replace(text, pattern, replacement)` | Replace all exact non-overlapping matches |
-| `str::split(text, separator)` | New array of strings; separator must be nonempty |
+| `str::split(text, separator)` | New `str[]`; separator must be nonempty |
+| `str::split_whitespace(text)` | New `str[]` of the fields between Unicode whitespace; no empty fields |
+| `str::slice(text, offset, count)` | The `count` Unicode scalars starting at scalar `offset` |
 | `str::join(parts, separator = "")` | Join an array of strings; empty array produces `""` |
 | `str::to_int(value)` / `str::to_uint(value)` / `str::to_bigint(value)` / `str::to_float(value)` | Checked numeric conversion, also available through `as` and receiver methods |
 | `str::to_bool(value)` / `str::to_str(value)` | Boolean / string conversion |
@@ -157,6 +159,14 @@ interior blank lines and omits the empty field after a final newline.
 output buffer. `remove_prefix` and `remove_suffix` remove a single exact
 affix when present. An empty or absent affix leaves the text unchanged.
 
+`slice` takes the half-open scalar range `[offset, offset + count)`. An empty
+range at the end is valid. A negative or out-of-bounds range produces
+`InvalidArgument("str::slice")`; the range is never clamped. Finding scalar
+boundaries takes time proportional to the text size, so slicing in a loop over a
+long text is quadratic. `split_whitespace` recognizes the same White_Space set
+as `trim` and returns an empty array for blank text. Both copy their input into
+a byte buffer, so buffer limits apply.
+
 ### Text utilities
 
 | Call | Result / behavior |
@@ -166,6 +176,7 @@ affix when present. An empty or absent affix leaves the text unchanged.
 | `str::pad_start(text, width, fill = ' ')` / `str::pad_end(text, width, fill = ' ')` | Add the `char` fill before / after text until it has `width` Unicode scalars |
 | `str::is_blank(text)` | Whether text is empty or only Unicode whitespace, as recognized by `trim` |
 | `str::to_ascii_lowercase(text)` / `str::to_ascii_uppercase(text)` | Change ASCII letters and keep every other scalar |
+| `str::equals_ignore_ascii_case(a, b)` | Whether the texts are equal when ASCII letter case is ignored; other scalars must match exactly |
 | `str::to_int_or(text, fallback)` | Parse a string like `str::to_int`; return `fallback` on ParseFailure |
 
 Padding never truncates: text already at least `width` scalars long is
@@ -199,6 +210,8 @@ fn main() -> nil {
 | `array::filter(items, predicate)` | Fresh array containing elements whose predicate returns true |
 | `array::fold(items, initial, combine)` | Left fold in input order; returns `initial` for an empty input |
 | `array::position(items, value)` | Typed equality search; inferred element type `T` must implement `Eq[T]` |
+| `array::equals(a, b)` | Whether lengths match and every pair is equal under `Eq[T]`; stops at the first difference |
+| `items.append_all(other)` | Appends the elements of `other` to a writable array, in order; nil |
 | `items.swap(left, right)` | Mutates one array, or returns IndexOutOfBounds without changing it |
 | `array::min(items)` / `array::max(items)` | Select the least / greatest element using `Ord`; empty input returns InvalidArgument |
 | `array::sum(items)` / `array::sum_float(items)` | Add an `int[]` / `float[]` from left to right; empty input gives `0` / `0.0` |
@@ -219,7 +232,15 @@ propagate key and comparison errors. Key
 functions share the reference access rules of map, so keyed selection over
 reference-valued elements needs a writable source.
 
-All operations except `items.swap` leave their outer input arrays unchanged. A
+`append_all` appends the elements `other` held when the call started, so an
+array can be appended to itself. Elements keep their ordinary aliases. If reading
+or appending an element produces an Error, earlier appends remain. Like `swap`, it
+is available once a module that provides it is imported, for example `use array;`.
+An untyped empty literal cannot determine the element type of `equals` or
+`append_all`; annotate the empty array first.
+
+All operations except `items.swap` and `items.append_all` leave their outer input
+arrays unchanged. A
 nil element is indistinguishable from an empty array through first/last alone; use
 is_empty when that distinction matters. Slice accepts an empty range at the end;
 negative or out-of-bounds ranges produce InvalidArgument rather than clamping.
@@ -341,6 +362,7 @@ stable across processes and must not be persisted.
 | `.len()`, `.is_empty()`, `.capacity()` | Number of live entries, emptiness, and bucket count |
 | `.contains(key)` | Tests key presence, including when the stored value is nil |
 | `.get(key)` | Returns the value or `Error::MissingKey` |
+| `.find(key)` | Returns `V?`: the value, or nil for an absent key. One hash lookup |
 | `.get_or(key, default)` | Returns the value or the default after one lookup |
 | `.get_or_insert(key, default)` | Returns the existing value, including nil, or inserts and returns the eager default. One hash lookup |
 | `.merge(other)` | Applies the source snapshot in source insertion order. Existing destination positions stay fixed |
@@ -352,7 +374,8 @@ stable across processes and must not be persisted.
 For a nilable value type, `contains` reports presence independently of the value:
 declare a comptime alias such as `@comptime const MaybeInt: type = int?;`, then use
 `Map::new[str, MaybeInt]()` and store `nil` under a key. `get` returns nil for that
-present key and `Error::MissingKey` for an absent key.
+present key and `Error::MissingKey` for an absent key. `find` returns nil in both
+cases.
 
 `set`, `remove`, `clear`, `get_or_insert`, and `merge` require a
 writable receiver. If a merge encounters an Error, entries it applied
@@ -445,6 +468,9 @@ and records. A `char` serializes as a one-scalar JSON string; parsing it back
 produces `str`, since JSON has no character type. Record fields are emitted in
 lexicographic key order, so equal records produce deterministic text. Strings
 use JSON escaping and preserve Unicode.
+`collections::Map[str, V]` serializes as a JSON object in insertion order;
+maps with other key types produce `Error::TypeMismatch`, even when empty.
+Rebuild older bytecode to use this Map serialization behavior.
 Top-level Cog `Error` values and Error leaves encountered inside arrays or records
 propagate unchanged; no partial JSON string is returned. Unsupported values
 (including bytes, handles, functions, variants, and iterators) produce
@@ -558,7 +584,8 @@ returns 0. Use `mod_floor` to wrap negative coordinates:
 `math::mod_floor(-1, 64)` is 63, whereas `-1 % 64` is -1.
 
 Random uses a 31-bit pseudorandom generator seeded once from OS entropy. `next()`
-returns an int in `[0, 2147483648)`; `boolean()` returns bool. `range(lo, hi)` takes
+returns an int in `[0, 2147483648)`; `range` returns int and `boolean()` returns
+bool. `range(lo, hi)` takes
 int bounds and samples `[lo, hi)`. `range_uint(lo, hi)` accepts uint bounds and
 returns uint. Both ranges reject empty intervals and widths above `2147483648`;
 `range` also returns Overflow if its signed width calculation overflows. Rejection
@@ -576,8 +603,9 @@ return nonnegative results, or Overflow when the answer cannot fit an
 int. GCD of two zeros and LCM with either operand zero return zero.
 
 `random::Seeded::new(seed)` creates an independent deterministic stream,
-normalizing a signed int seed modulo 2³¹. `next()` and
-`range(low, high)` mutate the stream. Range uses rejection sampling and
+normalizing a signed int seed modulo 2³¹. `next()`, `float()`, and
+`range(low, high)` mutate the stream. `float()` returns the next sample divided
+by 2³¹: a float in `[0, 1)` with 31 bits of precision. Range uses rejection sampling and
 accepts widths up to 2³¹. With a writable stream, `random::choose`
 selects an element, `shuffle` permutes a writable array in place, and
 `sample` returns a fresh array drawn by index without replacement.
@@ -600,6 +628,18 @@ Use `entropy::bytes` for OS entropy.
 | `bytes::get(buffer, index)` | Integer in 0..255 |
 | `bytes::set(buffer, index, value)` | Checked mutation; nil |
 | `bytes::to_str(buffer, offset, count)` | Strict UTF-8 decoding of a byte range |
+| `bytes::equals(a, b)` | Whether two buffers hold the same bytes |
+| `bytes::starts_with(data, prefix)` | Exact prefix test; an empty prefix matches |
+| `bytes::index_of(data, value, start = 0)` | `int?`: first offset at or after `start` holding the byte, or nil |
+| `bytes::find(data, pattern, start = 0)` | `int?`: first offset at or after `start` where the pattern occurs, or nil |
+
+Search offsets count bytes. `start` must be in `0..=bytes::len(data)`, and
+`index_of` requires a byte value in 0..255; violations produce InvalidArgument
+naming the function. An empty pattern matches at `start`. `find` takes time linear
+in the sizes of the searched data and the pattern. These four functions are
+written in Cog, as is the rest of this comparison and search code. Because `str`,
+`array`, and `bytes` share some function names, wildcard imports of two of those
+modules conflict; import the module and qualify the calls instead.
 
 The buffer type is spelled `bytes` in annotations, including struct fields and
 `bytes[]` arrays. Buffers share storage through assignment. `bytes::set` requires writable access.
@@ -608,8 +648,9 @@ Copy, slice, and concat allocate independent storage and obey the runtime buffer
 limit; concat accepts aliases, including the same buffer for both arguments.
 Invalid byte values, negative/out-of-bounds ranges, and invalid UTF-8 produce Error.
 `len(str)` counts Unicode scalars; use `bytes::len(bytes::from_str(text))` for bytes.
-The built-in `len(value)` and `value.len()` do not accept a `bytes` buffer; a
-statically known buffer is a compile error, so call `bytes::len(buffer)`.
+The built-in `len(value)` and `value.len()` accept only arrays, tuples, and
+strings, so a statically known `bytes` buffer is a compile error; call
+`bytes::len(buffer)`.
 
 ```cog
 @!include("std")
@@ -655,10 +696,11 @@ encoding would exceed 64 bits. Existing runtime buffer limits apply.
 | `ascii::is_lowercase(value)` / `ascii::is_uppercase(value)` | ASCII lowercase / uppercase letter test |
 | `ascii::is_whitespace(value)` | Space or a byte in 9..13, including vertical tab |
 | `ascii::to_lowercase(value)` / `ascii::to_uppercase(value)` | Convert ASCII letters; leave other bytes unchanged |
+| `ascii::hex_value(value)` | `int?`: value of a hexadecimal digit byte in either case, or nil for other bytes |
 | `hex::encode(data, uppercase = false)` | Encode a byte buffer as hexadecimal str, two digits per byte |
-| `hex::decode(text)` | New writable byte buffer decoded from hexadecimal str |
+| `hex::decode(text)` | New writable `bytes` buffer decoded from hexadecimal str |
 | `base64::encode(data)` | Encode arbitrary bytes as padded Base64 str |
-| `base64::decode(text)` | Decode strict padded Base64 into a new writable byte buffer |
+| `base64::decode(text)` | Decode strict padded Base64 into a new writable `bytes` buffer |
 
 ASCII functions take int byte values in 0..255; values outside that range produce
 InvalidArgument. Bytes 128..255 return false from all classifiers and are unchanged
@@ -761,14 +803,59 @@ documented project/dependency bases.
 
 ## Filesystem operations
 
+### Synchronous operations
+
+`use fs;` provides blocking operations that run on the calling thread.
+
+| Call | Result / behavior |
+| --- | --- |
+| `fs::read_bytes(path)` | `bytes` holding the whole file |
+| `fs::read_text(path)` | `str` decoded from UTF-8, or ParseFailure |
+| `fs::read_lines(path)` | `str[]` with `str::lines` semantics |
+| `fs::write_bytes(path, data)` / `fs::write_text(path, text)` | Create or truncate the file and write everything; nil |
+| `fs::append_bytes(path, data)` / `fs::append_text(path, text)` | Create the file if needed and write at its end; nil |
+| `fs::metadata(path)` | Record with `is_file`, `is_dir`, `is_readonly`, and OS-reported `len` fields |
+| `fs::read_dir(path)` | Array of immediate entry names, sorted lexically as UTF-8 strings |
+| `fs::create_dir(path)` / `fs::create_dir_all(path)` | Create a directory, or the directory tree |
+| `fs::remove_file(path)` / `fs::remove_dir(path)` | Remove one file, or an empty directory |
+
+The read, write, and append functions are written in Cog over `io::open`,
+`io::read_into`, `io::write_all`, `io::flush`, and `io::close`. They therefore
+check the same capabilities, use one managed handle slot while running, and name
+the `io` operation in `PermissionDenied` and `IoFailure`. A failed host write or
+flush produces `IoWriteFailed`. The file is closed on success and on every such
+Error. An Error argument, including a text that cannot be encoded within the buffer
+limit, propagates before the file is opened, so the destination is not truncated. A
+later write failure can leave a partial file.
+
+Reads continue to EOF, so they do not depend on the reported file size. A file
+longer than `max_buffer_bytes` produces ResourceLimit; one exactly that long is
+read. While reading, the buffer grows by doubling and temporarily uses more memory
+than the file size. `read_lines` applies the limit to the file bytes only.
+
+```cog
+@!include("std")
+use io;
+use fs;
+
+fn main() -> nil {
+    fs::write_text("notes.txt", "first\n")!!;
+    fs::append_text("notes.txt", "second\n")!!;
+    for line in fs::read_lines("notes.txt")!! {
+        io::println(line)!!;
+    }
+    fs::remove_file("notes.txt")!!;
+}
+```
+
+### Asynchronous operations
+
 Asynchronous file operations live under `async::fs`. Import that namespace with
 `use async::fs;` to call them as `fs::read_text(path)`.
 
 | Call | Result / behavior |
 | --- | --- |
-| `fs::metadata(path)` | Record with `is_file`, `is_dir`, `is_readonly`, and OS-reported `len` fields |
 | `fs::metadata(path)` | Cold `Task[record]`; reads metadata on the async I/O worker pool |
-| `fs::read_dir(path)` | Array of immediate entry names, sorted lexically as UTF-8 strings |
 | `fs::read_dir(path)` | Cold `Task[str[]]`; returns sorted UTF-8 entry names |
 | `fs::read_bytes(path)` | Cold `Task[bytes]`; reads the file on the async I/O worker pool |
 | `fs::write_bytes(path, bytes)` | Cold `Task[nil]`; creates or truncates a file and writes the bytes |
@@ -779,9 +866,7 @@ Asynchronous file operations live under `async::fs`. Import that namespace with
 | `fs::append_text(path, text)` | Cold `Task[nil]`; creates a file if needed and appends UTF-8 text |
 | `fs::copy(source, destination)` | Cold `Task[uint]`; copies a file and returns its byte count |
 | `fs::rename(source, destination)` | Cold `Task[nil]`; renames a file or directory |
-| `fs::create_dir(path)` / `fs::create_dir_all(path)` | Create a directory, or the directory tree |
 | `fs::create_dir(path)` / `fs::create_dir_all(path)` | Cold `Task[nil]`; create a directory or directory tree on the worker pool |
-| `fs::remove_file(path)` / `fs::remove_dir(path)` | Remove one file, or an empty directory |
 | `fs::remove_file(path)` / `fs::remove_dir(path)` | Cold `Task[nil]`; remove a file or empty directory on the worker pool |
 | `aio::open(path, mode, buffer_size)` | Cold `Task[handle]`; opens a managed file on the worker pool using `io::open` modes |
 | `aio::read(handle, max_bytes)` | Cold `Task[bytes]`; reads an existing file handle, bounded by `max_buffer_bytes` |
@@ -832,6 +917,7 @@ ordinary runtime policy grants both; the restricted policy denies both.
 | `path::file_name(path)` | Final normal component as str, or nil when absent |
 | `path::extension(path)` | Extension without the leading dot, or nil when absent |
 | `path::with_extension(path, extension)` | Return a path with its extension replaced |
+| `path::stem(path)` | `str?`: final component without its last extension, or nil when absent |
 
 These are lexical path operations: they do not access the filesystem, resolve
 symbolic links, normalize `.`/`..`, or guarantee that a path exists. Their separator,
@@ -840,7 +926,8 @@ root, prefix, and extension behavior follows the host OS. `join` and
 UTF-8 text, and return ResourceLimit when the result exceeds the runtime buffer
 limit. File opening still uses the process working directory and OS permissions.
 `with_extension` returns `InvalidArgument` when the extension contains a path
-separator according to the host OS.
+separator according to the host OS. `stem("a.tar.gz")` is `"a.tar"`, and a name
+such as `.config`, which has no extension, is its own stem.
 
 ## Async task selection
 
@@ -1031,3 +1118,11 @@ returns `""` for a normal value. Both calls inspect an Error argument without
 propagating it. Neither is available at comptime. `.unwrap()`
 and `.expect(message)` crash on Error. Prefer patterns and explicit recovery or
 propagation when failure is recoverable.
+
+## Test helpers
+
+`test::assert(condition)` crashes with `assertion failed` when the condition is
+false. `test::assert_eq(actual, expected)` crashes when the values differ; its
+generic type must implement `eq::Eq[T]`. These helpers are intended for tests,
+examples, and executable checks. They use `crash`, so failures are fatal and
+cannot be recovered with `try`/`catch`.

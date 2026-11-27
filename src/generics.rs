@@ -4,13 +4,14 @@
 //! specializations, and rechecks the expanded program. The interprocedural
 //! mutability pass runs only on the final round (or a failing one). The work and
 //! instance caps bound compiler cost; the final check result is passed on to
-//! codegen.
-use crate::analysis::{self, CheckResult};
+//! codegen. The uses a template makes of its trait bounds are carried to each
+//! instance, so the instance calls the implementation that proved the bound.
+use crate::analysis::{self, BoundCall, BoundCalls, CheckResult, Specialization};
 use crate::ast::{
     Block, Expr, ForClause, FunctionDecl, Item, Program, Stmt, StringPart, TypeAnnotation, TypeKind,
 };
 use crate::diagnostic::Diagnostic;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 const MAX_SPECIALIZATIONS: usize = 256;
 // Specialization discovery rechecks the expanded program once per round. Bound
@@ -62,12 +63,14 @@ fn expand_with_analysis_limit_and_names(
     let mut analysis_cost = check_analysis_cost(0, allocation_cost, analysis_limit)?;
     let mut program = source.clone();
     let mut generated = HashSet::new();
+    let mut bound_calls = BoundCalls::default();
     for round in 0..MAX_SPECIALIZATIONS {
         // Intermediate rounds only discover specializations. The mutability pass
         // runs once on the final program, whose call sites all resolve to
         // generated instances, or on a round that ends with an error, where its
         // diagnostics take precedence as they did when every round ran it.
-        let mut checked = analysis::check_deferring_effects(&program, function_modules, names);
+        let mut checked =
+            analysis::check_deferring_effects(&program, function_modules, names, &bound_calls);
         if !checked.diagnostics.is_empty() {
             analysis::check_deferred_effects(&program, &mut checked);
             return Err(checked.diagnostics);
@@ -109,7 +112,25 @@ fn expand_with_analysis_limit_and_names(
             }
             return Ok((program, checked));
         }
+        let instances: HashSet<_> = additions
+            .iter()
+            .filter_map(|item| match item {
+                Item::Function(function) => Some(function.name.clone()),
+                _ => None,
+            })
+            .collect();
+        // Expression identities are stable once an instance is in the program.
         program.items.extend(additions);
+        for specialization in &checked.specializations {
+            if instances.contains(&specialization.name) {
+                carry_bound_calls(
+                    &mut program,
+                    specialization,
+                    &checked.probed,
+                    &mut bound_calls,
+                );
+            }
+        }
     }
     unreachable!("the last specialization round returns")
 }
@@ -192,7 +213,7 @@ fn specialization_additions(
                 substitute_type(ty, &specialization.arguments);
             }
             if let Some(default) = &mut field.default {
-                substitute_expr(default, &specialization.arguments);
+                substitute_expr(default, &specialization.arguments, &mut Vec::new());
             }
         }
         let instance = Item::StructDecl {
@@ -216,6 +237,57 @@ fn specialization_additions(
         }
     }
     Ok(additions)
+}
+
+/// Records for an instance the bound uses of its template, with the type
+/// arguments of the instance.
+fn carry_bound_calls(
+    program: &mut Program,
+    specialization: &Specialization,
+    probed: &BoundCalls,
+    bound_calls: &mut BoundCalls,
+) {
+    if probed.methods.is_empty() && probed.iterations.is_empty() {
+        return;
+    }
+    let template = expression_ids(program, &specialization.template);
+    let instance = expression_ids(program, &specialization.name);
+    let specialize = |call: &BoundCall| {
+        let mut call = call.clone();
+        substitute_type(&mut call.target, &specialization.arguments);
+        for bound in &mut call.bounds {
+            for argument in &mut bound.arguments {
+                substitute_type(argument, &specialization.arguments);
+            }
+        }
+        call
+    };
+    for (template, instance) in template.into_iter().zip(instance) {
+        if let Some(call) = probed.methods.get(&template) {
+            bound_calls.methods.insert(instance, specialize(call));
+        }
+        if let Some(call) = probed.iterations.get(&template) {
+            bound_calls.iterations.insert(instance, specialize(call));
+        }
+    }
+}
+
+/// The identities of a function's expressions in a fixed traversal order, which
+/// a template shares with its instances.
+fn expression_ids(program: &mut Program, name: &str) -> Vec<usize> {
+    let function = program.items.iter_mut().find_map(|item| match item {
+        Item::Function(function) if function.name == name => Some(function),
+        Item::Extend(extension) => extension
+            .methods
+            .iter_mut()
+            .find(|method| method.function.name == name)
+            .map(|method| &mut method.function),
+        _ => None,
+    });
+    // Substituting no arguments visits every expression and changes nothing.
+    function.map_or_else(Vec::new, |function| {
+        specialize_function(function, &HashMap::new())
+    })
 }
 
 fn function_template<'a>(program: &'a Program, name: &str) -> Option<&'a FunctionDecl> {
@@ -252,28 +324,29 @@ fn check_analysis_cost(
         .ok_or_else(|| budget_error("compiler specialization analysis budget exceeded".into()))
 }
 
+/// Substitutes type arguments and returns the identities of the visited
+/// expressions.
 fn specialize_function(
     function: &mut FunctionDecl,
-    arguments: &std::collections::HashMap<String, TypeAnnotation>,
-) {
+    arguments: &HashMap<String, TypeAnnotation>,
+) -> Vec<usize> {
+    let mut visited = Vec::new();
     for parameter in &mut function.params {
         if let Some(ty) = &mut parameter.ty {
             substitute_type(ty, arguments);
         }
         if let Some(default) = &mut parameter.default {
-            substitute_expr(default, arguments);
+            substitute_expr(default, arguments, &mut visited);
         }
     }
     if let Some(result) = &mut function.result_type {
         substitute_type(result, arguments);
     }
-    substitute_block(&mut function.body, arguments);
+    substitute_block(&mut function.body, arguments, &mut visited);
+    visited
 }
 
-fn substitute_type(
-    ty: &mut TypeAnnotation,
-    arguments: &std::collections::HashMap<String, TypeAnnotation>,
-) {
+fn substitute_type(ty: &mut TypeAnnotation, arguments: &HashMap<String, TypeAnnotation>) {
     if let TypeKind::TypeParameter(name) = &ty.kind {
         if let Some(replacement) = arguments.get(name) {
             let nilable = ty.nilable || replacement.nilable;
@@ -316,45 +389,51 @@ fn substitute_type(
 
 fn substitute_block(
     block: &mut Block,
-    arguments: &std::collections::HashMap<String, TypeAnnotation>,
+    arguments: &HashMap<String, TypeAnnotation>,
+    visited: &mut Vec<usize>,
 ) {
     for statement in &mut block.stmts {
-        substitute_stmt(statement, arguments);
+        substitute_stmt(statement, arguments, visited);
     }
     if let Some(tail) = &mut block.tail {
-        substitute_expr(tail, arguments);
+        substitute_expr(tail, arguments, visited);
     }
 }
 
 fn substitute_stmt(
     statement: &mut Stmt,
-    arguments: &std::collections::HashMap<String, TypeAnnotation>,
+    arguments: &HashMap<String, TypeAnnotation>,
+    visited: &mut Vec<usize>,
 ) {
     match statement {
-        Stmt::Located(_, inner) => substitute_stmt(inner, arguments),
+        Stmt::Located(_, inner) => substitute_stmt(inner, arguments, visited),
         Stmt::VarDecl { ty, value, .. }
         | Stmt::Const { ty, value, .. }
         | Stmt::Comptime { ty, value, .. } => {
             if let Some(ty) = ty {
                 substitute_type(ty, arguments);
             }
-            substitute_expr(value, arguments);
+            substitute_expr(value, arguments, visited);
         }
         Stmt::Assign { target, value } | Stmt::CompoundAssign { target, value, .. } => {
-            substitute_expr(target, arguments);
-            substitute_expr(value, arguments);
+            substitute_expr(target, arguments, visited);
+            substitute_expr(value, arguments, visited);
         }
         Stmt::Return(value) => {
             if let Some(value) = value {
-                substitute_expr(value, arguments);
+                substitute_expr(value, arguments, visited);
             }
         }
-        Stmt::Defer { body } | Stmt::While { body, .. } => substitute_block(body, arguments),
+        Stmt::Defer { body } => substitute_block(body, arguments, visited),
+        Stmt::While { cond, body } => {
+            substitute_expr(cond, arguments, visited);
+            substitute_block(body, arguments, visited);
+        }
         Stmt::Try {
             body, catch_block, ..
         } => {
-            substitute_block(body, arguments);
-            substitute_block(catch_block, arguments);
+            substitute_block(body, arguments, visited);
+            substitute_block(catch_block, arguments, visited);
         }
         Stmt::If {
             cond,
@@ -367,10 +446,10 @@ fn substitute_stmt(
             else_block,
             ..
         } => {
-            substitute_expr(cond, arguments);
-            substitute_block(then_block, arguments);
+            substitute_expr(cond, arguments, visited);
+            substitute_block(then_block, arguments, visited);
             if let Some(else_block) = else_block {
-                substitute_block(else_block, arguments);
+                substitute_block(else_block, arguments, visited);
             }
         }
         Stmt::For {
@@ -380,16 +459,16 @@ fn substitute_stmt(
             body,
             ..
         } => {
-            substitute_expr(start, arguments);
-            substitute_expr(end, arguments);
+            substitute_expr(start, arguments, visited);
+            substitute_expr(end, arguments, visited);
             if let Some(step) = step {
-                substitute_expr(step, arguments);
+                substitute_expr(step, arguments, visited);
             }
-            substitute_block(body, arguments);
+            substitute_block(body, arguments, visited);
         }
         Stmt::ForEach { iterable, body, .. } => {
-            substitute_expr(iterable, arguments);
-            substitute_block(body, arguments);
+            substitute_expr(iterable, arguments, visited);
+            substitute_block(body, arguments, visited);
         }
         Stmt::ForZip { clauses, body } => {
             for clause in clauses {
@@ -397,29 +476,40 @@ fn substitute_stmt(
                     ForClause::Range {
                         start, end, step, ..
                     } => {
-                        substitute_expr(start, arguments);
-                        substitute_expr(end, arguments);
+                        substitute_expr(start, arguments, visited);
+                        substitute_expr(end, arguments, visited);
                         if let Some(step) = step {
-                            substitute_expr(step, arguments);
+                            substitute_expr(step, arguments, visited);
                         }
                     }
-                    ForClause::Each { iterable, .. } => substitute_expr(iterable, arguments),
+                    ForClause::Each { iterable, .. } => {
+                        substitute_expr(iterable, arguments, visited)
+                    }
                 }
             }
-            substitute_block(body, arguments);
+            substitute_block(body, arguments, visited);
         }
-        Stmt::Crash { value, .. } | Stmt::Expr(value) => substitute_expr(value, arguments),
+        Stmt::Crash { value, .. } | Stmt::Expr(value) => substitute_expr(value, arguments, visited),
         Stmt::Invalid { .. } | Stmt::Use { .. } | Stmt::Break | Stmt::Continue => {}
     }
 }
 
-fn substitute_expr(expr: &mut Expr, arguments: &std::collections::HashMap<String, TypeAnnotation>) {
+fn substitute_expr(
+    expr: &mut Expr,
+    arguments: &HashMap<String, TypeAnnotation>,
+    visited: &mut Vec<usize>,
+) {
+    visited.push(crate::mutability::expr_id(expr));
     match expr {
         Expr::Located(_, inner)
         | Expr::Propagate(inner)
         | Expr::Unary(_, inner)
-        | Expr::Cast(inner, _) => substitute_expr(inner, arguments),
+        | Expr::Cast(inner, _) => substitute_expr(inner, arguments, visited),
         Expr::TypeLiteral(ty) => substitute_type(ty, arguments),
+        Expr::TypedAggregate(value, ty) => {
+            substitute_type(ty, arguments);
+            substitute_expr(value, arguments, visited);
+        }
         Expr::Closure {
             params,
             result_type,
@@ -434,16 +524,16 @@ fn substitute_expr(expr: &mut Expr, arguments: &std::collections::HashMap<String
             if let Some(ty) = result_type {
                 substitute_type(ty, arguments);
             }
-            substitute_block(body, arguments);
+            substitute_block(body, arguments, visited);
         }
         Expr::Array(items) | Expr::Tuple(items) => {
             for item in items {
-                substitute_expr(item, arguments);
+                substitute_expr(item, arguments, visited);
             }
         }
         Expr::Record(fields) => {
             for (_, value) in fields {
-                substitute_expr(value, arguments);
+                substitute_expr(value, arguments, visited);
             }
         }
         Expr::SpecializedCall(_, types, call_args) => {
@@ -451,7 +541,7 @@ fn substitute_expr(expr: &mut Expr, arguments: &std::collections::HashMap<String
                 substitute_type(ty, arguments);
             }
             for argument in call_args {
-                substitute_expr(&mut argument.value, arguments);
+                substitute_expr(&mut argument.value, arguments, visited);
             }
         }
         Expr::AssociatedCall {
@@ -465,74 +555,74 @@ fn substitute_expr(expr: &mut Expr, arguments: &std::collections::HashMap<String
                 substitute_type(ty, arguments);
             }
             for argument in call_args {
-                substitute_expr(&mut argument.value, arguments);
+                substitute_expr(&mut argument.value, arguments, visited);
             }
         }
         Expr::BracketApply(receiver, call_args) => {
-            substitute_expr(receiver, arguments);
+            substitute_expr(receiver, arguments, visited);
             for argument in call_args {
-                substitute_expr(argument, arguments);
+                substitute_expr(argument, arguments, visited);
             }
         }
         Expr::Apply(receiver, call_args) => {
-            substitute_expr(receiver, arguments);
+            substitute_expr(receiver, arguments, visited);
             for argument in call_args {
-                substitute_expr(&mut argument.value, arguments);
+                substitute_expr(&mut argument.value, arguments, visited);
             }
         }
         Expr::Call(_, call_args) => {
             for argument in call_args {
-                substitute_expr(&mut argument.value, arguments);
+                substitute_expr(&mut argument.value, arguments, visited);
             }
         }
         Expr::MethodCall(receiver, _, call_args) => {
-            substitute_expr(receiver, arguments);
+            substitute_expr(receiver, arguments, visited);
             for argument in call_args {
-                substitute_expr(argument, arguments);
+                substitute_expr(argument, arguments, visited);
             }
         }
         Expr::Index(receiver, index) | Expr::Binary(_, receiver, index) => {
-            substitute_expr(receiver, arguments);
-            substitute_expr(index, arguments);
+            substitute_expr(receiver, arguments, visited);
+            substitute_expr(index, arguments, visited);
         }
         Expr::Interpolated(parts) => {
             for part in parts {
                 if let StringPart::Expression(value) = part {
-                    substitute_expr(value, arguments);
+                    substitute_expr(value, arguments, visited);
                 }
             }
         }
         Expr::Fallback {
             value, fallback, ..
         } => {
-            substitute_expr(value, arguments);
-            substitute_expr(fallback, arguments);
+            substitute_expr(value, arguments, visited);
+            substitute_expr(fallback, arguments, visited);
         }
-        Expr::Block(block) | Expr::Capture(block) => substitute_block(block, arguments),
+        Expr::Block(block) | Expr::Capture(block) => substitute_block(block, arguments, visited),
         Expr::Match { value, arms, .. } => {
-            substitute_expr(value, arguments);
+            substitute_expr(value, arguments, visited);
             for arm in arms {
                 if let Some(guard) = &mut arm.guard {
-                    substitute_expr(guard, arguments);
+                    substitute_expr(guard, arguments, visited);
                 }
-                substitute_block(&mut arm.body, arguments);
+                substitute_block(&mut arm.body, arguments, visited);
             }
         }
         Expr::Try {
             body, catch_block, ..
         } => {
-            substitute_block(body, arguments);
-            substitute_block(catch_block, arguments);
+            substitute_block(body, arguments, visited);
+            substitute_block(catch_block, arguments, visited);
         }
         Expr::If {
             cond,
             then_branch,
             else_branch,
         } => {
-            substitute_expr(cond, arguments);
-            substitute_expr(then_branch, arguments);
+            substitute_expr(cond, arguments, visited);
+            substitute_expr(then_branch, arguments, visited);
             if let Some(else_branch) = else_branch {
-                substitute_expr(else_branch, arguments);
+                substitute_expr(else_branch, arguments, visited);
             }
         }
         Expr::Int(_)

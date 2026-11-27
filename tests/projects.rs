@@ -75,8 +75,25 @@ impl Fixture {
 
 fn with_explicit_std_package(source: &str) -> String {
     const STANDARD_MODULES: &[&str] = &[
-        "array", "ascii", "base64", "bytes", "clone", "entropy", "eq", "err", "fmt", "hex", "io",
-        "math", "ord", "process", "random", "sort", "str", "time",
+        "array",
+        "ascii",
+        "base64",
+        "byte_match",
+        "bytes",
+        "clone",
+        "entropy",
+        "eq",
+        "err",
+        "fmt",
+        "hex",
+        "io",
+        "math",
+        "ord",
+        "process",
+        "random",
+        "sort",
+        "str",
+        "time",
     ];
 
     let has_std_include = source.contains("@!include(\"std\")");
@@ -2164,7 +2181,8 @@ fn core_implementation_helpers_are_private_for_all_import_forms() {
         ("base64", "sextet", "sextet(65)"),
         ("hex", "digit", "digit(10, false)"),
         ("hex", "nibble", "nibble(65)"),
-        ("str", "bytes_match", "bytes_match(nil, 0, nil, 0)"),
+        ("str", "skip_scalars", "skip_scalars(nil, 0, 0)"),
+        ("byte_match", "scan", "scan(nil, nil, 0, 0)"),
         ("random", "state", "state"),
         ("random", "initialized", "initialized"),
         ("random", "MODULUS", "MODULUS"),

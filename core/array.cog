@@ -81,6 +81,18 @@ public fn position[T: type + Eq[T]](items: T[], value: T) -> int? {
     nil
 }
 
+// Equal lengths and pairwise Eq equality, stopping at the first difference.
+public fn equals[T: type + Eq[T]](a: T[], b: T[]) -> bool {
+    const length = len(a);
+    if length != len(b) { return false; }
+    for index in 0..length {
+        const left = a[index]!!;
+        const right = b[index]!!;
+        if !left.equals(right)!! { return false; }
+    }
+    true
+}
+
 // Select an existing element; arrays remain unchanged and shared values stay shared.
 public fn min[T: type + Ord](items: T[]) -> T {
     const length = len(items);

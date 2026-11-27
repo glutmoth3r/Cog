@@ -124,6 +124,7 @@ impl Writes {
     pub fn expr(&mut self, expr: &Expr) {
         match expr.node() {
             Expr::Located(_, _) => unreachable!("node removes locations"),
+            Expr::TypedAggregate(value, _) => self.expr(value),
             Expr::Closure { captures, body, .. } => {
                 self.captured.extend(
                     captures

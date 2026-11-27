@@ -141,9 +141,11 @@ fn install_requires_one_path_and_an_absolute_cog_home() {
     let dir = Dir::new();
     write_library(&dir);
     let home = dir.path("home");
+    let missing = cog(Some(&home), &["install"]);
+    assert_rejected(&missing, "cog install --path <project-directory>");
     assert_rejected(
-        &cog(Some(&home), &["install"]),
-        "usage: cog install --path <project-directory>",
+        &missing,
+        "cog install --git <owner/repository> [--rev <revision>]",
     );
     assert_rejected(
         &cog(Some(&home), &["install", "--path", "a", "--path", "b"]),

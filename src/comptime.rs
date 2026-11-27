@@ -5,7 +5,8 @@
 //! forbidden runtime effects and evaluator budget exhaustion become diagnostics.
 use crate::ast::{
     BinOp, BindingPattern, Block, CallArgument, Expr, FallbackKind, ForClause, FunctionDecl, Item,
-    MatchPattern, Program, Stmt, StructField, TypeAnnotation, TypeKind, UnOp, Visibility,
+    MatchArm, MatchPattern, Program, Stmt, StructField, TypeAnnotation, TypeKind, TypeParameter,
+    UnOp, VarType, Visibility,
 };
 use crate::diagnostic::{Diagnostic, SourceSpan};
 use crate::error::RuntimeError;
@@ -15,9 +16,12 @@ use std::collections::HashMap;
 
 const MAX_EVALUATION_STEPS: usize = 100_000;
 const MAX_EVALUATION_DEPTH: usize = 256;
+// A value assembled across declarations bypasses the parser's syntax-depth limit.
+const MAX_MATERIALIZATION_DEPTH: usize = 48;
 const MAX_FUNCTION_CALL_DEPTH: usize = 128;
 const MAX_STRING_BYTES: usize = 1_000_000;
 const MAX_SCALAR_FOLD_NODES: usize = 64;
+pub(crate) const MAX_COMPTIME_ARRAY_STACK_ITEMS: usize = 128;
 
 #[derive(Clone, Debug)]
 struct PropagatedError {
@@ -43,8 +47,15 @@ enum ComptimeValue {
     /// Compiler-only type identity. It can be used in annotations but has no
     /// runtime representation and therefore cannot be materialized as Expr.
     Type(TypeAnnotation),
-    Struct {
+    Sequence {
+        items: Vec<ComptimeValue>,
+        tuple: bool,
+        ty: Option<Box<TypeAnnotation>>,
+    },
+    Nominal {
         name: String,
+        enum_name: Option<String>,
+        type_arguments: Vec<TypeAnnotation>,
         fields: Vec<(String, ComptimeValue)>,
     },
 }
@@ -72,10 +83,22 @@ impl ComptimeValue {
             _ => {}
         }
         budget.allocate(self.clone_cost()?)?;
-        self.to_expr(span).map_err(|error| error.to_string())
+        let value = self.to_expr(None, budget, 0)?;
+        Ok(match span {
+            Some(span) => Expr::Located(span, Box::new(value)),
+            None => value,
+        })
     }
 
-    fn to_expr(&self, span: Option<SourceSpan>) -> Result<Expr, RuntimeError> {
+    fn to_expr(
+        &self,
+        expected: Option<&TypeAnnotation>,
+        budget: &mut Budget,
+        depth: usize,
+    ) -> Result<Expr, String> {
+        if depth >= MAX_MATERIALIZATION_DEPTH {
+            return Err("comptime materialization depth limit exceeded".into());
+        }
         let value = match self {
             Self::Int(value) => Expr::Int(*value),
             Self::UInt(value) => Expr::UInt(*value),
@@ -86,29 +109,72 @@ impl ComptimeValue {
             Self::Bytes(value) => Expr::Bytes(value.clone()),
             Self::Bool(value) => Expr::Bool(*value),
             Self::Nil => Expr::Nil,
-            Self::Error(error) => return Err(error.clone()),
-            Self::Propagate(_) => {
-                return Err(RuntimeError::TypeMismatch {
-                    op: "comptime propagation",
-                });
-            }
+            Self::Error(error) => return Err(error.to_string()),
+            Self::Propagate(_) => return Err("cannot materialize comptime propagation".into()),
             Self::Type(_) => {
-                return Err(RuntimeError::TypeMismatch {
-                    op: "comptime type",
-                });
+                return Err("cannot materialize a comptime type as a runtime value".into());
             }
-            Self::Struct { name, fields } => Expr::Call(
-                name.clone(),
-                fields
+            Self::Sequence { items, tuple, ty } => {
+                let inferred;
+                let ty = match ty.as_deref().or(expected) {
+                    Some(ty) => Some(ty),
+                    None => {
+                        inferred = infer_annotation(self, budget)?;
+                        inferred.as_ref()
+                    }
+                };
+                let needs_wrapper = !*tuple && items.len() > MAX_COMPTIME_ARRAY_STACK_ITEMS
+                    || !expected
+                        .zip(ty)
+                        .is_some_and(|(expected, ty)| same_type_kind(&expected.kind, &ty.kind));
+                let annotation = ty
+                    .filter(|_| needs_wrapper)
+                    .map(|ty| budget.copy_annotation(ty))
+                    .transpose()?;
+                let mut expressions = Vec::with_capacity(items.len());
+                for (index, item) in items.iter().enumerate() {
+                    let expected = match ty.as_ref().map(|ty| &ty.kind) {
+                        Some(TypeKind::Array(element)) => Some(element.as_ref()),
+                        Some(TypeKind::Tuple(elements)) => elements.get(index),
+                        _ => None,
+                    };
+                    expressions.push(item.to_expr(expected, budget, depth + 1)?);
+                }
+                let value = if *tuple {
+                    Expr::Tuple(expressions)
+                } else {
+                    Expr::Array(expressions)
+                };
+                if let Some(mut ty) = annotation {
+                    ty.nilable = false;
+                    Expr::TypedAggregate(Box::new(value), ty)
+                } else {
+                    value
+                }
+            }
+            Self::Nominal {
+                name,
+                type_arguments,
+                fields,
+                ..
+            } => {
+                let arguments = fields
                     .iter()
-                    .map(|(field, value)| Ok(CallArgument::named(field, value.to_expr(None)?)))
-                    .collect::<Result<_, RuntimeError>>()?,
-            ),
+                    .map(|(field, value)| {
+                        Ok(CallArgument::named(
+                            field,
+                            value.to_expr(None, budget, depth + 1)?,
+                        ))
+                    })
+                    .collect::<Result<_, String>>()?;
+                if type_arguments.is_empty() {
+                    Expr::Call(name.clone(), arguments)
+                } else {
+                    Expr::SpecializedCall(name.clone(), type_arguments.clone(), arguments)
+                }
+            }
         };
-        Ok(match span {
-            Some(span) => Expr::Located(span, Box::new(value)),
-            None => value,
-        })
+        Ok(value)
     }
 }
 
@@ -189,6 +255,11 @@ impl Budget {
         Ok(copy)
     }
 
+    fn copy_annotation(&mut self, ty: &TypeAnnotation) -> Result<TypeAnnotation, String> {
+        self.allocate(crate::ast_budget::annotation(ty)?)?;
+        Ok(ty.clone())
+    }
+
     fn reserve_vec<T>(&mut self, values: &mut Vec<T>, count: usize) -> Result<(), String> {
         let bytes = count
             .checked_mul(std::mem::size_of::<T>())
@@ -246,6 +317,7 @@ fn fold_constant_expression_inner(expr: &Expr, allow_bigint: bool) -> Option<cra
         functions: &functions,
         structs: StructScope {
             constructors: &constructors,
+            len_extensions: &[],
             owner: None,
         },
         types: &types,
@@ -380,7 +452,24 @@ impl ComptimeValue {
                 ComptimeValue::Type(ty) => {
                     cost = cost.saturating_add(crate::ast_budget::annotation(ty)?);
                 }
-                ComptimeValue::Struct { name, fields } => {
+                ComptimeValue::Sequence { items, ty, .. } => {
+                    if let Some(ty) = ty {
+                        cost = cost.saturating_add(crate::ast_budget::annotation(ty)?);
+                    }
+                    for item in items {
+                        cost = cost.saturating_add(value_cost(item, depth + 1)?);
+                    }
+                }
+                ComptimeValue::Nominal {
+                    name,
+                    enum_name,
+                    type_arguments,
+                    fields,
+                } => {
+                    cost = cost.saturating_add(enum_name.as_ref().map_or(0, String::len));
+                    for argument in type_arguments {
+                        cost = cost.saturating_add(crate::ast_budget::annotation(argument)?);
+                    }
                     cost = cost.saturating_add(name.len()).saturating_add(
                         fields
                             .len()
@@ -416,11 +505,15 @@ impl ComptimeValue {
 struct Constructor {
     fields: Vec<StructField>,
     owner: Option<String>,
+    type_params: Vec<TypeParameter>,
+    enum_name: Option<String>,
+    enum_variant_count: usize,
 }
 
 #[derive(Clone, Copy)]
 struct StructScope<'a> {
     constructors: &'a HashMap<String, Constructor>,
+    len_extensions: &'a [TypeAnnotation],
     owner: Option<&'a str>,
 }
 
@@ -444,6 +537,28 @@ impl<'a> EvalContext<'a> {
         let result = eval(self);
         self.structs.owner = previous;
         result
+    }
+
+    fn annotation(
+        &mut self,
+        ty: &TypeAnnotation,
+        parameters: Option<&HashMap<String, TypeAnnotation>>,
+    ) -> Result<TypeAnnotation, String> {
+        let mut ty = self.budget.copy_annotation(ty)?;
+        substitute_annotation(&mut ty, &mut |kind| {
+            let replacement = match kind {
+                TypeKind::Named(name) | TypeKind::ResolvedName { symbol: name, .. } => {
+                    self.types.get(name)
+                }
+                TypeKind::TypeParameter(name) => parameters.and_then(|types| types.get(name)),
+                _ => None,
+            };
+            replacement
+                .map(|ty| self.budget.copy_annotation(ty))
+                .transpose()
+        })?;
+        crate::ast_budget::annotation(&ty)?;
+        Ok(ty)
     }
 }
 
@@ -477,25 +592,61 @@ pub(crate) fn evaluate_program_with_inputs(
             _ => None,
         })
         .collect();
-    let constructors: HashMap<_, _> = program
-        .items
-        .iter()
-        .filter_map(|item| match item {
+    let mut constructors = HashMap::new();
+    for item in &program.items {
+        match item {
             Item::StructDecl {
                 name,
                 fields,
                 owner,
+                type_params,
                 ..
-            } => Some((
-                name.clone(),
-                Constructor {
-                    fields: fields.clone(),
-                    owner: owner.clone(),
-                },
-            )),
+            } => {
+                constructors.insert(
+                    name.clone(),
+                    Constructor {
+                        fields: fields.clone(),
+                        owner: owner.clone(),
+                        type_params: type_params.clone(),
+                        enum_name: None,
+                        enum_variant_count: 0,
+                    },
+                );
+            }
+            Item::EnumDecl { name, variants, .. } if name != crate::error::ERROR_TYPE => {
+                for variant in variants {
+                    constructors.insert(
+                        format!("{name}::{}", variant.name),
+                        Constructor {
+                            fields: variant.payload.clone(),
+                            owner: None,
+                            type_params: Vec::new(),
+                            enum_name: Some(name.clone()),
+                            enum_variant_count: variants.len(),
+                        },
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    let len_extensions: Vec<_> = program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Extend(extension)
+                if extension.methods.iter().any(|method| method.name == "len") =>
+            {
+                Some(extension.target.clone())
+            }
             _ => None,
         })
         .collect();
+    let structs = StructScope {
+        constructors: &constructors,
+        len_extensions: &len_extensions,
+        owner: None,
+    };
     let mut types = HashMap::<String, TypeAnnotation>::new();
     let mut type_bindings = std::collections::HashSet::new();
 
@@ -514,20 +665,19 @@ pub(crate) fn evaluate_program_with_inputs(
         let ty = ty.clone();
         let span = value.span().cloned();
         let is_type_binding = ty.as_ref().is_some_and(is_type_annotation);
-        match evaluate(
-            value,
-            &globals,
-            &globals,
-            &functions,
-            StructScope {
-                constructors: &constructors,
+        let mut context = EvalContext {
+            globals: &globals,
+            functions: &functions,
+            structs: StructScope {
                 owner: span
                     .as_ref()
                     .and_then(|span| span.source.module_owner.get().map(String::as_str)),
+                ..structs
             },
-            &types,
-            &mut budget,
-        ) {
+            types: &types,
+            budget: &mut budget,
+        };
+        match evaluate(value, ty.as_ref(), &globals, &mut context) {
             Ok(ComptimeValue::Type(result)) if is_type_binding => {
                 if let Err(message) = crate::ast_budget::annotation(&result) {
                     diagnostics.push(comptime_error(message, span));
@@ -596,7 +746,7 @@ pub(crate) fn evaluate_program_with_inputs(
                 function,
                 &globals,
                 &functions,
-                &constructors,
+                structs,
                 &mut budget,
                 &mut diagnostics,
             ),
@@ -607,7 +757,7 @@ pub(crate) fn evaluate_program_with_inputs(
                             &mut method.function,
                             &globals,
                             &functions,
-                            &constructors,
+                            structs,
                             &mut budget,
                             &mut diagnostics,
                         );
@@ -624,7 +774,7 @@ fn evaluate_function(
     function: &mut FunctionDecl,
     globals: &Values,
     functions: &HashMap<String, FunctionDecl>,
-    constructors: &HashMap<String, Constructor>,
+    structs: StructScope<'_>,
     budget: &mut Budget,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -638,8 +788,8 @@ fn evaluate_function(
         globals,
         functions,
         StructScope {
-            constructors,
             owner: function.owner.as_deref(),
+            ..structs
         },
         budget,
         diagnostics,
@@ -700,7 +850,14 @@ fn rewrite_stmt(
                     types.insert(binding.clone(), ty.clone());
                 }
             }
-            match evaluate(&value, values, globals, functions, structs, &types, budget) {
+            let mut context = EvalContext {
+                globals,
+                functions,
+                structs,
+                types: &types,
+                budget,
+            };
+            match evaluate(&value, ty.as_ref(), values, &mut context) {
                 Ok(result) => match result.to_expr_with_budget(span.clone(), budget) {
                     Ok(value) => {
                         values.insert(name.clone(), Some(result));
@@ -1157,7 +1314,7 @@ fn rewrite_expr(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     match expr {
-        Expr::Located(_, inner) => rewrite_expr(
+        Expr::Located(_, inner) | Expr::TypedAggregate(inner, _) => rewrite_expr(
             inner,
             values,
             globals,
@@ -1490,22 +1647,12 @@ fn rewrite_expr(
 
 fn evaluate(
     expr: &Expr,
+    expected: Option<&TypeAnnotation>,
     values: &Values,
-    globals: &Values,
-    functions: &HashMap<String, FunctionDecl>,
-    structs: StructScope<'_>,
-    types: &HashMap<String, TypeAnnotation>,
-    budget: &mut Budget,
+    context: &mut EvalContext<'_>,
 ) -> Result<ComptimeValue, String> {
-    let mut context = EvalContext {
-        globals,
-        functions,
-        structs,
-        types,
-        budget,
-    };
-    validate_expr(expr, values, &mut context, 0)?;
-    let value = match eval_expr(expr, values, &mut context, 0, 0)? {
+    validate_expr(expr, values, context, 0)?;
+    let value = match eval_typed_expr(expr, expected, values, context, 0, 0)? {
         ComptimeValue::Propagate(propagation) => ComptimeValue::Error(propagation.error),
         value => value,
     };
@@ -1522,6 +1669,8 @@ fn validate_expr(
     context.budget.step(depth)?;
     match expr.node() {
         Expr::Int(_)
+        | Expr::UInt(_)
+        | Expr::BigInt(_)
         | Expr::Float(_)
         | Expr::Char(_)
         | Expr::Bool(_)
@@ -1550,19 +1699,97 @@ fn validate_expr(
             validate_expr(left, values, context, depth + 1)?;
             validate_expr(right, values, context, depth + 1)
         }
-        Expr::Index(receiver, index) => {
-            if !matches!(index.node(), Expr::Str(_) | Expr::Int(0..)) {
-                return Err(
-                    "comptime field access requires a literal field name or position".into(),
-                );
+        Expr::Array(items) | Expr::Tuple(items) => {
+            for item in items {
+                validate_expr(item, values, context, depth + 1)?;
             }
+            Ok(())
+        }
+        Expr::Index(receiver, index) => {
             validate_expr(receiver, values, context, depth + 1)?;
             validate_expr(index, values, context, depth + 1)
+        }
+        Expr::MethodCall(receiver, method, arguments) if method == "len" => {
+            if !arguments.is_empty() {
+                return Err("comptime len() expects no method arguments".into());
+            }
+            validate_expr(receiver, values, context, depth + 1)
+        }
+        Expr::Match { value, arms, .. } => {
+            validate_expr(value, values, context, depth + 1)?;
+            for arm in arms {
+                context.budget.step(depth + 1)?;
+                let mut scope = Values::new();
+                for (name, value) in values {
+                    context.budget.insert_value(
+                        &mut scope,
+                        name,
+                        value.as_ref().map(|_| ComptimeValue::Nil),
+                    )?;
+                }
+                if let MatchPattern::Variant { name, bindings } = &arm.pattern {
+                    if let Some(variant) = context.structs.constructors.get(name)
+                        && variant.enum_name.is_some()
+                        && bindings.len() != variant.fields.len()
+                    {
+                        return Err(format!(
+                            "pattern `{name}` expects {} binding(s), got {}",
+                            variant.fields.len(),
+                            bindings.len()
+                        ));
+                    }
+                    for binding in bindings.iter().filter(|binding| *binding != "_") {
+                        context.budget.insert_value(
+                            &mut scope,
+                            binding,
+                            Some(ComptimeValue::Nil),
+                        )?;
+                    }
+                }
+                if let Some(guard) = &arm.guard {
+                    validate_expr(guard, &scope, context, depth + 1)?;
+                }
+                for statement in &arm.body.stmts {
+                    context.budget.step(depth + 1)?;
+                    match statement.node() {
+                        Stmt::Const {
+                            pattern: BindingPattern::Name(name),
+                            value,
+                            ..
+                        }
+                        | Stmt::Comptime { name, value, .. } => {
+                            validate_expr(value, &scope, context, depth + 1)?;
+                            context.budget.insert_value(
+                                &mut scope,
+                                name,
+                                Some(ComptimeValue::Nil),
+                            )?;
+                        }
+                        Stmt::Expr(value) => validate_expr(value, &scope, context, depth + 1)?,
+                        _ => {
+                            return Err(
+                                "this statement is not supported in a comptime match initializer"
+                                    .into(),
+                            );
+                        }
+                    }
+                }
+                if let Some(tail) = &arm.body.tail {
+                    validate_expr(tail, &scope, context, depth + 1)?;
+                }
+            }
+            Ok(())
         }
         Expr::AssociatedCall { .. } => {
             Err("type-associated extension calls are not available at comptime yet".into())
         }
         Expr::Call(name, arguments) | Expr::SpecializedCall(name, _, arguments) => {
+            if matches!(
+                crate::builtins::Builtin::from_name(name),
+                Some(crate::builtins::Builtin::Len)
+            ) {
+                return validate_expr(length_argument(arguments)?, values, context, depth + 1);
+            }
             if matches!(
                 crate::builtins::Builtin::from_name(name),
                 Some(crate::builtins::Builtin::BuildInput)
@@ -1610,6 +1837,78 @@ fn validate_expr(
     }
 }
 
+fn length_argument(arguments: &[CallArgument]) -> Result<&Expr, String> {
+    match arguments {
+        [argument] if argument.name.is_none() => Ok(&argument.value),
+        _ => Err("comptime len expects one positional argument".into()),
+    }
+}
+
+fn eval_length(
+    receiver: &Expr,
+    method: bool,
+    values: &Values,
+    context: &mut EvalContext<'_>,
+    depth: usize,
+    call_depth: usize,
+) -> Result<ComptimeValue, String> {
+    let value = eval_expr(receiver, values, context, depth, call_depth)?;
+    if method && !context.structs.len_extensions.is_empty() {
+        let actual = infer_annotation(&value, context.budget)?;
+        for target in context.structs.len_extensions {
+            context.budget.step(depth)?;
+            let target = context.annotation(target, None)?;
+            let may_dispatch = actual.as_ref().map_or_else(
+                || {
+                    matches!(value, ComptimeValue::Sequence { tuple: false, .. })
+                        && matches!(target.kind, TypeKind::Array(_))
+                },
+                |actual| len_target_matches(&target, actual),
+            );
+            if may_dispatch {
+                return Err("extension method len() cannot execute at comptime; use the built-in len(value) for the length".into());
+            }
+        }
+    } else {
+        validate_array_elements(&value, context.budget)?;
+    }
+    let len = match value {
+        ComptimeValue::Sequence {
+            items,
+            tuple: false,
+            ..
+        } => items.len(),
+        ComptimeValue::Str(text) => text.chars().count(),
+        ComptimeValue::Error(_) | ComptimeValue::Propagate(_) => return Ok(value),
+        _ => return Err("comptime len requires an array or string".into()),
+    };
+    Ok(ComptimeValue::Int(len as i64))
+}
+
+fn eval_typed_expr(
+    expr: &Expr,
+    expected: Option<&TypeAnnotation>,
+    values: &Values,
+    context: &mut EvalContext<'_>,
+    depth: usize,
+    call_depth: usize,
+) -> Result<ComptimeValue, String> {
+    let expected = if context.types.is_empty() {
+        expected.map(std::borrow::Cow::Borrowed)
+    } else {
+        expected
+            .map(|ty| context.annotation(ty, None).map(std::borrow::Cow::Owned))
+            .transpose()?
+    };
+    let expected = expected.as_deref();
+    let value = eval_expr_with_hint(expr, expected, values, context, depth, call_depth)?;
+    if let (ComptimeValue::Sequence { .. }, Some(expected)) = (&value, expected) {
+        contextualize_comptime_value(value, expected, context.budget)
+    } else {
+        Ok(value)
+    }
+}
+
 fn eval_expr(
     expr: &Expr,
     values: &Values,
@@ -1617,7 +1916,204 @@ fn eval_expr(
     depth: usize,
     call_depth: usize,
 ) -> Result<ComptimeValue, String> {
+    eval_expr_with_hint(expr, None, values, context, depth, call_depth)
+}
+
+fn eval_expr_with_hint(
+    expr: &Expr,
+    expected: Option<&TypeAnnotation>,
+    values: &Values,
+    context: &mut EvalContext<'_>,
+    depth: usize,
+    call_depth: usize,
+) -> Result<ComptimeValue, String> {
     context.budget.step(depth)?;
+    match expr.node() {
+        Expr::Call(name, arguments) | Expr::SpecializedCall(name, _, arguments) => eval_call(
+            expr,
+            (name, arguments),
+            expected,
+            values,
+            context,
+            depth,
+            call_depth,
+        ),
+        Expr::Array(items) | Expr::Tuple(items) => eval_sequence(
+            items,
+            matches!(expr.node(), Expr::Tuple(_)),
+            expected,
+            values,
+            context,
+            depth,
+            call_depth,
+        ),
+        _ => eval_other_expr(expr, values, context, depth, call_depth),
+    }
+}
+
+fn eval_sequence(
+    expressions: &[Expr],
+    tuple: bool,
+    expected: Option<&TypeAnnotation>,
+    values: &Values,
+    context: &mut EvalContext<'_>,
+    depth: usize,
+    call_depth: usize,
+) -> Result<ComptimeValue, String> {
+    let mut items = Vec::new();
+    context.budget.reserve_vec(&mut items, expressions.len())?;
+    for (index, expression) in expressions.iter().enumerate() {
+        let element = match expected.map(|ty| &ty.kind) {
+            Some(TypeKind::Array(element)) if !tuple => Some(element.as_ref()),
+            Some(TypeKind::Tuple(elements)) if tuple => elements.get(index),
+            _ => None,
+        };
+        let value =
+            eval_expr_with_hint(expression, element, values, context, depth + 1, call_depth)?;
+        if matches!(value, ComptimeValue::Propagate(_)) {
+            return Ok(value);
+        }
+        if matches!(value, ComptimeValue::Type(_)) {
+            return Err("a comptime type cannot be stored in an aggregate".into());
+        }
+        items.push(value);
+    }
+    Ok(ComptimeValue::Sequence {
+        items,
+        tuple,
+        ty: None,
+    })
+}
+
+fn eval_call(
+    expr: &Expr,
+    (name, arguments): (&str, &[CallArgument]),
+    expected: Option<&TypeAnnotation>,
+    values: &Values,
+    context: &mut EvalContext<'_>,
+    depth: usize,
+    call_depth: usize,
+) -> Result<ComptimeValue, String> {
+    if matches!(
+        crate::builtins::Builtin::from_name(name),
+        Some(crate::builtins::Builtin::Len)
+    ) {
+        return eval_length(
+            length_argument(arguments)?,
+            false,
+            values,
+            context,
+            depth + 1,
+            call_depth,
+        );
+    }
+    if matches!(
+        crate::builtins::Builtin::from_name(name),
+        Some(crate::builtins::Builtin::BuildInput)
+    ) {
+        let path = eval_expr(&arguments[0].value, values, context, depth + 1, call_depth)?;
+        let ComptimeValue::Str(path) = path else {
+            return Err("build input path must be a comptime-known string".into());
+        };
+        let inputs = context
+            .budget
+            .inputs
+            .as_ref()
+            .ok_or("missing compiler build input context")?;
+        return match inputs.read(expr.span(), &path)? {
+            Err(error) => Ok(ComptimeValue::Error(error)),
+            Ok(None) if name.starts_with("build::try_") => Ok(ComptimeValue::Nil),
+            Ok(None) => Ok(ComptimeValue::Error(RuntimeError::IoFailure {
+                op: "build input",
+                message: format!("file not found: {path}"),
+            })),
+            Ok(Some(bytes)) if name.ends_with("include_str") => {
+                context.budget.allocate(bytes.len())?;
+                Ok(match String::from_utf8(bytes) {
+                    Ok(text) => ComptimeValue::Str(text),
+                    Err(_) => ComptimeValue::Error(RuntimeError::ParseFailure {
+                        from: "bytes",
+                        to: "str",
+                    }),
+                })
+            }
+            Ok(Some(bytes)) => {
+                context.budget.allocate(bytes.len())?;
+                Ok(ComptimeValue::Bytes(bytes))
+            }
+        };
+    }
+    if let Some(constructor) = context.structs.constructors.get(name) {
+        if !context.structs.owns(constructor)
+            && constructor
+                .fields
+                .iter()
+                .any(|field| field.visibility == Visibility::Private)
+        {
+            return Err(format!(
+                "cannot construct `{name}` outside its defining module because it has private fields"
+            ));
+        }
+        let type_arguments = match expr.node() {
+            Expr::SpecializedCall(_, types, _) => types.as_slice(),
+            _ => match expected.map(|ty| &ty.kind) {
+                Some(
+                    TypeKind::Applied { source, arguments }
+                    | TypeKind::ResolvedApplied {
+                        symbol: source,
+                        arguments,
+                        ..
+                    },
+                ) if source == name => arguments.as_slice(),
+                _ => &[],
+            },
+        };
+        return eval_constructor(
+            name,
+            constructor,
+            (arguments, type_arguments),
+            values,
+            context,
+            depth + 1,
+            call_depth,
+        );
+    }
+    let function = context
+        .functions
+        .get(name)
+        .filter(|function| function.comptime)
+        .ok_or_else(|| format!("runtime function `{name}` cannot execute at comptime"))?;
+    let bindings = crate::arguments::bind(name, &function.params, arguments);
+    if let Some(error) = bindings.errors.first() {
+        return Err(error.message.clone());
+    }
+    let mut supplied = Vec::new();
+    context.budget.reserve_vec(&mut supplied, arguments.len())?;
+    for argument in arguments {
+        let value = eval_expr(&argument.value, values, context, depth + 1, call_depth)?;
+        if matches!(value, ComptimeValue::Propagate(_)) {
+            return Ok(value);
+        }
+        supplied.push(value);
+    }
+    context.with_owner(function.owner.as_deref(), |context| {
+        eval_comptime_function(
+            function,
+            (&bindings.by_parameter, &supplied),
+            context,
+            depth + 1,
+            call_depth + 1,
+        )
+    })
+}
+
+fn eval_other_expr(
+    expr: &Expr,
+    values: &Values,
+    context: &mut EvalContext<'_>,
+    depth: usize,
+    call_depth: usize,
+) -> Result<ComptimeValue, String> {
     match expr.node() {
         Expr::Int(value) => Ok(ComptimeValue::Int(*value)),
         Expr::UInt(value) => Ok(ComptimeValue::UInt(*value)),
@@ -1637,14 +2133,7 @@ fn eval_expr(
         }
         Expr::Bool(value) => Ok(ComptimeValue::Bool(*value)),
         Expr::Nil => Ok(ComptimeValue::Nil),
-        Expr::TypeLiteral(ty) => {
-            context
-                .budget
-                .allocate(crate::ast_budget::annotation(ty)?)?;
-            let mut ty = ty.clone();
-            substitute_type(&mut ty, context.types);
-            Ok(ComptimeValue::Type(ty))
-        }
+        Expr::TypeLiteral(ty) => Ok(ComptimeValue::Type(context.annotation(ty, None)?)),
         Expr::Ident(name) => {
             let binding = values.get(name).or_else(|| context.globals.get(name));
             if let Some(Some(value)) = binding {
@@ -1754,11 +2243,6 @@ fn eval_expr(
             eval_binary(*op, left, right, context.budget)
         }
         Expr::Index(receiver, index) => {
-            if !matches!(index.node(), Expr::Str(_) | Expr::Int(0..)) {
-                return Err(
-                    "comptime field access requires a literal field name or position".into(),
-                );
-            }
             let receiver = eval_expr(receiver, values, context, depth + 1, call_depth)?;
             if matches!(
                 receiver,
@@ -1766,125 +2250,16 @@ fn eval_expr(
             ) {
                 return Ok(receiver);
             }
-            let ComptimeValue::Struct { name, fields } = receiver else {
-                return Err("comptime field access requires a struct".into());
-            };
-            let positional;
-            let field = match index.node() {
-                Expr::Str(field) if field.len() <= MAX_STRING_BYTES => field.as_str(),
-                Expr::Str(_) => return Err("comptime string size limit exceeded".into()),
-                Expr::Int(position) => {
-                    context.budget.allocate(20)?;
-                    positional = position.to_string();
-                    positional.as_str()
-                }
-                _ => unreachable!("literal field key was checked"),
-            };
-            let constructor = context
-                .structs
-                .constructors
-                .get(&name)
-                .ok_or_else(|| format!("unknown comptime struct `{name}`"))?;
-            for (declaration, (field_name, value)) in constructor.fields.iter().zip(fields) {
-                if field_name == field {
-                    if declaration.visibility == Visibility::Private
-                        && !context.structs.owns(constructor)
-                    {
-                        return Err(format!("field `{field}` is private"));
-                    }
-                    return Ok(value);
-                }
+            eval_index(receiver, index, values, context, depth + 1, call_depth)
+        }
+        Expr::MethodCall(receiver, method, arguments) if method == "len" => {
+            if !arguments.is_empty() {
+                return Err("comptime len() expects no method arguments".into());
             }
-            Err(format!("unknown field `{field}`"))
+            eval_length(receiver, true, values, context, depth + 1, call_depth)
         }
         Expr::AssociatedCall { .. } => {
             Err("type-associated extension calls are not available at comptime yet".into())
-        }
-        Expr::Call(name, arguments) | Expr::SpecializedCall(name, _, arguments) => {
-            if matches!(
-                crate::builtins::Builtin::from_name(name),
-                Some(crate::builtins::Builtin::BuildInput)
-            ) {
-                let path = eval_expr(&arguments[0].value, values, context, depth + 1, call_depth)?;
-                let ComptimeValue::Str(path) = path else {
-                    return Err("build input path must be a comptime-known string".into());
-                };
-                let inputs = context
-                    .budget
-                    .inputs
-                    .as_ref()
-                    .ok_or("missing compiler build input context")?;
-                return match inputs.read(expr.span(), &path)? {
-                    Err(error) => Ok(ComptimeValue::Error(error)),
-                    Ok(None) if name.starts_with("build::try_") => Ok(ComptimeValue::Nil),
-                    Ok(None) => Ok(ComptimeValue::Error(RuntimeError::IoFailure {
-                        op: "build input",
-                        message: format!("file not found: {path}"),
-                    })),
-                    Ok(Some(bytes)) if name.ends_with("include_str") => {
-                        context.budget.allocate(bytes.len())?;
-                        Ok(match String::from_utf8(bytes) {
-                            Ok(text) => ComptimeValue::Str(text),
-                            Err(_) => ComptimeValue::Error(RuntimeError::ParseFailure {
-                                from: "bytes",
-                                to: "str",
-                            }),
-                        })
-                    }
-                    Ok(Some(bytes)) => {
-                        context.budget.allocate(bytes.len())?;
-                        Ok(ComptimeValue::Bytes(bytes))
-                    }
-                };
-            }
-            if let Some(constructor) = context.structs.constructors.get(name) {
-                if !context.structs.owns(constructor)
-                    && constructor
-                        .fields
-                        .iter()
-                        .any(|field| field.visibility == Visibility::Private)
-                {
-                    return Err(format!(
-                        "cannot construct `{name}` outside its defining module because it has private fields"
-                    ));
-                }
-                return eval_struct_constructor(
-                    name,
-                    constructor,
-                    arguments,
-                    values,
-                    context,
-                    depth + 1,
-                    call_depth,
-                );
-            }
-            let function = context
-                .functions
-                .get(name)
-                .filter(|function| function.comptime)
-                .ok_or_else(|| format!("runtime function `{name}` cannot execute at comptime"))?;
-            let bindings = crate::arguments::bind(name, &function.params, arguments);
-            if let Some(error) = bindings.errors.first() {
-                return Err(error.message.clone());
-            }
-            let mut supplied = Vec::new();
-            context.budget.reserve_vec(&mut supplied, arguments.len())?;
-            for argument in arguments {
-                let value = eval_expr(&argument.value, values, context, depth + 1, call_depth)?;
-                if matches!(value, ComptimeValue::Propagate(_)) {
-                    return Ok(value);
-                }
-                supplied.push(value);
-            }
-            context.with_owner(function.owner.as_deref(), |context| {
-                eval_comptime_function(
-                    function,
-                    (&bindings.by_parameter, &supplied),
-                    context,
-                    depth + 1,
-                    call_depth + 1,
-                )
-            })
         }
         Expr::If {
             cond,
@@ -1905,40 +2280,24 @@ fn eval_expr(
                 _ => Err("comptime if condition must be bool".into()),
             }
         }
-        Expr::Match { value, arms, .. } => {
-            let value = eval_expr(value, values, context, depth + 1, call_depth)?;
-            if let ComptimeValue::Propagate(error) = value {
-                return Ok(ComptimeValue::Propagate(error));
+        Expr::Match {
+            value,
+            arms,
+            exhaustive,
+        } => {
+            match eval_match(
+                value,
+                arms,
+                *exhaustive,
+                values,
+                context,
+                depth + 1,
+                call_depth,
+            )? {
+                BlockExit::Return(value) | BlockExit::Tail(value) => Ok(value),
+                BlockExit::Propagate(error) => Ok(ComptimeValue::Propagate(error)),
+                BlockExit::Continue => Ok(ComptimeValue::Nil),
             }
-            for arm in arms {
-                if !matches_pattern(&arm.pattern, &value) {
-                    continue;
-                }
-                if let Some(guard) = &arm.guard {
-                    match eval_expr(guard, values, context, depth + 1, call_depth)? {
-                        ComptimeValue::Bool(true) => {}
-                        ComptimeValue::Bool(false) => continue,
-                        ComptimeValue::Error(error) => return Ok(ComptimeValue::Error(error)),
-                        ComptimeValue::Propagate(error) => {
-                            return Ok(ComptimeValue::Propagate(error));
-                        }
-                        _ => return Err("comptime match guard must be bool".into()),
-                    }
-                }
-                let mut arm_values = context.budget.clone_values(values)?;
-                return match eval_comptime_block(
-                    &arm.body,
-                    &mut arm_values,
-                    context,
-                    depth + 1,
-                    call_depth,
-                )? {
-                    BlockExit::Return(value) | BlockExit::Tail(value) => Ok(value),
-                    BlockExit::Propagate(error) => Ok(ComptimeValue::Propagate(error)),
-                    BlockExit::Continue => Ok(ComptimeValue::Nil),
-                };
-            }
-            Ok(ComptimeValue::Nil)
         }
         Expr::Block(block) | Expr::Capture(block) => {
             let mut values = context.budget.clone_values(values)?;
@@ -1972,16 +2331,113 @@ fn eval_expr(
     }
 }
 
-fn eval_struct_constructor<'a>(
+fn eval_index(
+    receiver: ComptimeValue,
+    index: &Expr,
+    values: &Values,
+    context: &mut EvalContext<'_>,
+    depth: usize,
+    call_depth: usize,
+) -> Result<ComptimeValue, String> {
+    validate_array_elements(&receiver, context.budget)?;
+    match receiver {
+        ComptimeValue::Sequence { items, tuple, .. } => {
+            let index = if tuple {
+                let Expr::Int(position) = index.node() else {
+                    return Err("comptime tuple access requires a numeric constant position".into());
+                };
+                *position
+            } else {
+                match eval_expr(index, values, context, depth, call_depth)? {
+                    ComptimeValue::Int(position) => position,
+                    value @ (ComptimeValue::Error(_) | ComptimeValue::Propagate(_)) => {
+                        return Ok(value);
+                    }
+                    _ => return Err("comptime array index must be an int".into()),
+                }
+            };
+            let len = items.len();
+            Ok(usize::try_from(index)
+                .ok()
+                .and_then(|position| items.into_iter().nth(position))
+                .unwrap_or(ComptimeValue::Error(RuntimeError::IndexOutOfBounds {
+                    index,
+                    len,
+                })))
+        }
+        ComptimeValue::Nominal {
+            name,
+            fields,
+            enum_name,
+            ..
+        } => {
+            let positional;
+            let field = match index.node() {
+                Expr::Str(field) if field.len() <= MAX_STRING_BYTES => field.as_str(),
+                Expr::Str(_) => return Err("comptime string size limit exceeded".into()),
+                Expr::Int(position) if *position >= 0 && enum_name.is_none() => {
+                    context.budget.allocate(20)?;
+                    positional = position.to_string();
+                    positional.as_str()
+                }
+                _ => {
+                    return Err(
+                        "comptime field access requires a literal field name or position".into(),
+                    );
+                }
+            };
+            let constructor = context
+                .structs
+                .constructors
+                .get(&name)
+                .ok_or_else(|| format!("unknown comptime constructor `{name}`"))?;
+            for (declaration, (field_name, value)) in constructor.fields.iter().zip(fields) {
+                if field_name == field {
+                    if declaration.visibility == Visibility::Private
+                        && !context.structs.owns(constructor)
+                    {
+                        return Err(format!("field `{field}` is private"));
+                    }
+                    return Ok(value);
+                }
+            }
+            Err(format!("unknown field `{field}`"))
+        }
+        _ => Err("comptime index access requires an array, tuple, struct, or enum".into()),
+    }
+}
+
+fn eval_constructor<'a>(
     name: &str,
     constructor: &'a Constructor,
-    arguments: &[CallArgument],
+    (arguments, explicit_types): (&[CallArgument], &[TypeAnnotation]),
     values: &Values,
     context: &mut EvalContext<'a>,
     depth: usize,
     call_depth: usize,
 ) -> Result<ComptimeValue, String> {
     let fields = &constructor.fields;
+    let mut type_arguments = Vec::new();
+    let mut substitutions = HashMap::new();
+    if !explicit_types.is_empty() {
+        if explicit_types.len() != constructor.type_params.len() {
+            return Err(format!(
+                "`{name}` expects {} type arguments",
+                constructor.type_params.len()
+            ));
+        }
+        context
+            .budget
+            .reserve_vec(&mut type_arguments, explicit_types.len())?;
+        for (parameter, ty) in constructor.type_params.iter().zip(explicit_types) {
+            let ty = context.annotation(ty, None)?;
+            substitutions.insert(
+                context.budget.copy_string(&parameter.name)?,
+                context.budget.copy_annotation(&ty)?,
+            );
+            type_arguments.push(ty);
+        }
+    }
     let bindings = crate::arguments::bind(name, fields, arguments);
     if let Some(error) = bindings.errors.first() {
         return Err(error.message.clone());
@@ -1995,6 +2451,28 @@ fn eval_struct_constructor<'a>(
             return Ok(value);
         }
         supplied.push(value);
+    }
+
+    if explicit_types.is_empty() && !constructor.type_params.is_empty() {
+        for (field, argument) in fields.iter().zip(&bindings.by_parameter) {
+            if let (Some(ty), Some(argument)) = (&field.ty, argument)
+                && let Some(actual) = infer_annotation(&supplied[*argument], context.budget)?
+            {
+                infer_type_parameters(ty, &actual, &mut substitutions, context.budget)?;
+            }
+        }
+        context
+            .budget
+            .reserve_vec(&mut type_arguments, constructor.type_params.len())?;
+        for parameter in &constructor.type_params {
+            let ty = substitutions.get(&parameter.name).ok_or_else(|| {
+                format!(
+                    "cannot infer type parameter `{}` for `{name}`",
+                    parameter.name
+                )
+            })?;
+            type_arguments.push(context.budget.copy_annotation(ty)?);
+        }
     }
 
     let mut result = Vec::new();
@@ -2013,8 +2491,9 @@ fn eval_struct_constructor<'a>(
             return Ok(value);
         }
         if let Some(ty) = &field.ty {
-            value = contextualize_comptime_value(value, ty);
-            if !comptime_value_matches_annotation(&value, ty) {
+            let ty = context.annotation(ty, Some(&substitutions))?;
+            value = contextualize_comptime_value(value, &ty, context.budget)?;
+            if !comptime_value_matches_annotation(&value, &ty) {
                 return Err(format!(
                     "type mismatch: field `{}` of `{name}` expects {}, got {}",
                     field.name,
@@ -2026,8 +2505,14 @@ fn eval_struct_constructor<'a>(
         let field_name = context.budget.copy_string(&field.name)?;
         result.push((field_name, value));
     }
-    Ok(ComptimeValue::Struct {
+    Ok(ComptimeValue::Nominal {
         name: context.budget.copy_string(name)?,
+        enum_name: constructor
+            .enum_name
+            .as_deref()
+            .map(|name| context.budget.copy_string(name))
+            .transpose()?,
+        type_arguments,
         fields: result,
     })
 }
@@ -2059,8 +2544,9 @@ fn eval_comptime_function(
             return Ok(value);
         }
         if let Some(ty) = &parameter.ty {
-            value = contextualize_comptime_value(value, ty);
-            if !comptime_value_matches_annotation(&value, ty) {
+            let ty = context.annotation(ty, None)?;
+            value = contextualize_comptime_value(value, &ty, context.budget)?;
+            if !comptime_value_matches_annotation(&value, &ty) {
                 return Err(format!(
                     "type mismatch: parameter `{}` of `{}` expects {}, got {}",
                     parameter.name,
@@ -2075,33 +2561,379 @@ fn eval_comptime_function(
             .insert_value(&mut values, &parameter.name, Some(value))?;
     }
     match eval_comptime_block(&function.body, &mut values, context, depth + 1, call_depth)? {
-        BlockExit::Return(value) | BlockExit::Tail(value) => Ok(value),
+        BlockExit::Return(value) | BlockExit::Tail(value) => {
+            if let (ComptimeValue::Sequence { .. }, Some(ty)) = (&value, &function.result_type) {
+                let ty = context.annotation(ty, None)?;
+                contextualize_comptime_value(value, &ty, context.budget)
+            } else {
+                Ok(value)
+            }
+        }
         BlockExit::Propagate(error) => Ok(ComptimeValue::Propagate(error)),
         BlockExit::Continue => Ok(ComptimeValue::Nil),
     }
 }
 
-fn contextualize_comptime_value(value: ComptimeValue, ty: &TypeAnnotation) -> ComptimeValue {
-    match (value, &ty.kind) {
+fn contextualize_comptime_value(
+    value: ComptimeValue,
+    ty: &TypeAnnotation,
+    budget: &mut Budget,
+) -> Result<ComptimeValue, String> {
+    Ok(match (value, &ty.kind) {
         (ComptimeValue::Int(value), TypeKind::Primitive(crate::ast::VarType::UInt))
             if value >= 0 =>
         {
             ComptimeValue::UInt(value as u64)
         }
         (ComptimeValue::Int(value), TypeKind::Primitive(crate::ast::VarType::BigInt)) => {
+            budget.allocate(bigint_storage_cost_from_bits(64))?;
             ComptimeValue::BigInt(BigInt::from(value))
         }
+        (
+            ComptimeValue::Sequence {
+                mut items,
+                tuple,
+                ty: previous,
+            },
+            kind,
+        ) if previous.as_deref().is_none_or(|previous| {
+            tuple && !same_type_kind(&ty.kind, &previous.kind) && annotation_accepts(ty, previous)
+        }) =>
+        {
+            let mut array_items;
+            let mut tuple_items;
+            let expected: &mut dyn Iterator<Item = (&mut ComptimeValue, &TypeAnnotation)> =
+                match kind {
+                    TypeKind::Array(element) if !tuple => {
+                        array_items = items.iter_mut().zip(std::iter::repeat(element.as_ref()));
+                        &mut array_items
+                    }
+                    TypeKind::Tuple(types) if tuple && types.len() == items.len() => {
+                        tuple_items = items.iter_mut().zip(types);
+                        &mut tuple_items
+                    }
+                    TypeKind::TypeParameter(_) => {
+                        return Ok(ComptimeValue::Sequence {
+                            items,
+                            tuple,
+                            ty: None,
+                        });
+                    }
+                    _ => {
+                        return Err(format!(
+                            "type mismatch: comptime aggregate does not match {}",
+                            ty.display()
+                        ));
+                    }
+                };
+            for (item, expected) in expected {
+                let value = std::mem::replace(item, ComptimeValue::Nil);
+                *item = contextualize_comptime_value(value, expected, budget)?;
+                if !comptime_value_matches_annotation(item, expected) {
+                    return Err(format!(
+                        "type mismatch: comptime aggregate element expects {}, got {}",
+                        expected.display(),
+                        comptime_value_type_name(item)
+                    ));
+                }
+            }
+            let mut ty = budget.copy_annotation(ty)?;
+            ty.nilable = false;
+            ComptimeValue::Sequence {
+                items,
+                tuple,
+                ty: Some(Box::new(ty)),
+            }
+        }
         (value, _) => value,
+    })
+}
+
+fn same_annotations(left: &[TypeAnnotation], right: &[TypeAnnotation]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.nilable == right.nilable && same_type_kind(&left.kind, &right.kind)
+        })
+}
+
+fn annotation_accepts(expected: &TypeAnnotation, actual: &TypeAnnotation) -> bool {
+    if actual.nilable && !expected.nilable {
+        return false;
+    }
+    match (&expected.kind, &actual.kind) {
+        (_, TypeKind::Primitive(VarType::Nil)) if expected.nilable => true,
+        (TypeKind::Tuple(expected), TypeKind::Tuple(actual)) => {
+            expected.len() == actual.len()
+                && expected
+                    .iter()
+                    .zip(actual)
+                    .all(|(expected, actual)| annotation_accepts(expected, actual))
+        }
+        (expected, actual) => same_type_kind(expected, actual),
     }
 }
 
+fn len_target_matches(target: &TypeAnnotation, actual: &TypeAnnotation) -> bool {
+    if target.nilable != actual.nilable {
+        return false;
+    }
+    match (&target.kind, &actual.kind) {
+        (TypeKind::TypeParameter(_), _) => true,
+        (TypeKind::Array(target), TypeKind::Array(actual)) => len_target_matches(target, actual),
+        (TypeKind::Tuple(target), TypeKind::Tuple(actual)) => {
+            target.len() == actual.len()
+                && target
+                    .iter()
+                    .zip(actual)
+                    .all(|(target, actual)| len_target_matches(target, actual))
+        }
+        (target, actual) => same_type_kind(target, actual),
+    }
+}
+
+fn same_type_kind(left: &TypeKind, right: &TypeKind) -> bool {
+    match (left, right) {
+        (TypeKind::Array(left), TypeKind::Array(right)) => {
+            left.nilable == right.nilable && same_type_kind(&left.kind, &right.kind)
+        }
+        (TypeKind::Tuple(left), TypeKind::Tuple(right)) => same_annotations(left, right),
+        (
+            TypeKind::Named(left) | TypeKind::ResolvedName { symbol: left, .. },
+            TypeKind::Named(right) | TypeKind::ResolvedName { symbol: right, .. },
+        ) => left == right,
+        (
+            TypeKind::Applied {
+                source: left,
+                arguments: left_args,
+            }
+            | TypeKind::ResolvedApplied {
+                symbol: left,
+                arguments: left_args,
+                ..
+            },
+            TypeKind::Applied {
+                source: right,
+                arguments: right_args,
+            }
+            | TypeKind::ResolvedApplied {
+                symbol: right,
+                arguments: right_args,
+                ..
+            },
+        ) => left == right && same_annotations(left_args, right_args),
+        _ => left == right,
+    }
+}
+
+fn infer_type_parameters(
+    parameter: &TypeAnnotation,
+    actual: &TypeAnnotation,
+    substitutions: &mut HashMap<String, TypeAnnotation>,
+    budget: &mut Budget,
+) -> Result<(), String> {
+    match (&parameter.kind, &actual.kind) {
+        (TypeKind::TypeParameter(name), _) => {
+            if parameter.nilable && matches!(actual.kind, TypeKind::Primitive(VarType::Nil)) {
+                return Ok(());
+            }
+            let mut actual = budget.copy_annotation(actual)?;
+            if parameter.nilable {
+                actual.nilable = false;
+            }
+            if let Some(previous) = substitutions.get(name) {
+                if previous.nilable != actual.nilable
+                    || !same_type_kind(&previous.kind, &actual.kind)
+                {
+                    return Err(format!(
+                        "type parameter `{name}` inferred as both {} and {}",
+                        previous.display(),
+                        actual.display()
+                    ));
+                }
+            } else {
+                substitutions.insert(budget.copy_string(name)?, actual);
+            }
+        }
+        (TypeKind::Array(parameter), TypeKind::Array(actual)) => {
+            infer_type_parameters(parameter, actual, substitutions, budget)?;
+        }
+        (TypeKind::Tuple(parameters), TypeKind::Tuple(actual))
+            if parameters.len() == actual.len() =>
+        {
+            for (parameter, actual) in parameters.iter().zip(actual) {
+                infer_type_parameters(parameter, actual, substitutions, budget)?;
+            }
+        }
+        (
+            TypeKind::Applied {
+                source: parameter,
+                arguments: parameters,
+            }
+            | TypeKind::ResolvedApplied {
+                symbol: parameter,
+                arguments: parameters,
+                ..
+            },
+            TypeKind::Applied {
+                source: actual,
+                arguments,
+            }
+            | TypeKind::ResolvedApplied {
+                symbol: actual,
+                arguments,
+                ..
+            },
+        ) if parameter == actual && parameters.len() == arguments.len() => {
+            for (parameter, actual) in parameters.iter().zip(arguments) {
+                infer_type_parameters(parameter, actual, substitutions, budget)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_array_elements(value: &ComptimeValue, budget: &mut Budget) -> Result<(), String> {
+    if matches!(
+        value,
+        ComptimeValue::Sequence {
+            tuple: false,
+            ty: None,
+            ..
+        }
+    ) {
+        infer_annotation(value, budget)?;
+    }
+    Ok(())
+}
+
+fn infer_annotation(
+    value: &ComptimeValue,
+    budget: &mut Budget,
+) -> Result<Option<TypeAnnotation>, String> {
+    use ComptimeValue as V;
+    let kind = match value {
+        V::Int(_) => TypeKind::Primitive(VarType::Int),
+        V::UInt(_) => TypeKind::Primitive(VarType::UInt),
+        V::BigInt(_) => TypeKind::Primitive(VarType::BigInt),
+        V::Float(_) => TypeKind::Primitive(VarType::Float),
+        V::Char(_) => TypeKind::Primitive(VarType::Char),
+        V::Str(_) => TypeKind::Primitive(VarType::Str),
+        V::Bool(_) => TypeKind::Primitive(VarType::Bool),
+        V::Nil => TypeKind::Primitive(VarType::Nil),
+        V::Bytes(_) => TypeKind::Bytes,
+        V::Nominal {
+            name,
+            enum_name,
+            type_arguments,
+            ..
+        } => {
+            let symbol = budget.copy_string(enum_name.as_ref().unwrap_or(name))?;
+            let source = budget.copy_string(&symbol)?;
+            if type_arguments.is_empty() {
+                TypeKind::ResolvedName { source, symbol }
+            } else {
+                let mut arguments = Vec::new();
+                budget.reserve_vec(&mut arguments, type_arguments.len())?;
+                for ty in type_arguments {
+                    arguments.push(budget.copy_annotation(ty)?);
+                }
+                TypeKind::ResolvedApplied {
+                    source,
+                    symbol,
+                    arguments,
+                }
+            }
+        }
+        V::Sequence { ty: Some(ty), .. } => return budget.copy_annotation(ty).map(Some),
+        V::Sequence {
+            tuple: true, items, ..
+        } => {
+            let mut elements = Vec::new();
+            budget.reserve_vec(&mut elements, items.len())?;
+            for item in items {
+                let Some(ty) = infer_annotation(item, budget)? else {
+                    return Ok(None);
+                };
+                elements.push(ty);
+            }
+            TypeKind::Tuple(elements)
+        }
+        V::Sequence {
+            tuple: false,
+            items,
+            ..
+        } => {
+            let mut element = None;
+            for item in items {
+                if let Some(ty) = infer_annotation(item, budget)? {
+                    element = Some(match element {
+                        None => ty,
+                        Some(previous) => join_array_elements(previous, ty)?,
+                    });
+                }
+            }
+            let Some(element) = element else {
+                return Ok(None);
+            };
+            budget.allocate(std::mem::size_of::<TypeAnnotation>())?;
+            TypeKind::Array(Box::new(element))
+        }
+        V::Error(_) | V::Propagate(_) | V::Type(_) => return Ok(None),
+    };
+    Ok(Some(TypeAnnotation {
+        kind,
+        nilable: false,
+    }))
+}
+
+fn join_array_elements(
+    mut left: TypeAnnotation,
+    mut right: TypeAnnotation,
+) -> Result<TypeAnnotation, String> {
+    if same_type_kind(&left.kind, &right.kind) {
+        left.nilable |= right.nilable;
+        return Ok(left);
+    }
+    if matches!(left.kind, TypeKind::Primitive(VarType::Nil)) {
+        right.nilable = true;
+        return Ok(right);
+    }
+    if matches!(right.kind, TypeKind::Primitive(VarType::Nil)) {
+        left.nilable = true;
+        return Ok(left);
+    }
+    let nilable = left.nilable || right.nilable;
+    let kind = match (left.kind, right.kind) {
+        (TypeKind::Array(mut left), TypeKind::Array(right)) => {
+            *left = join_array_elements(*left, *right)?;
+            TypeKind::Array(left)
+        }
+        (TypeKind::Tuple(mut left), TypeKind::Tuple(right)) if left.len() == right.len() => {
+            left = left
+                .into_iter()
+                .zip(right)
+                .map(|(left, right)| join_array_elements(left, right))
+                .collect::<Result<_, _>>()?;
+            TypeKind::Tuple(left)
+        }
+        _ => {
+            return Err(
+                "type mismatch: comptime array elements must have a consistent type".into(),
+            );
+        }
+    };
+    Ok(TypeAnnotation { kind, nilable })
+}
+
 fn comptime_value_matches_annotation(value: &ComptimeValue, ty: &TypeAnnotation) -> bool {
-    use crate::ast::VarType;
     // Computational Error is orthogonal to a callable's normal value type.
     if matches!(value, ComptimeValue::Error(_)) {
         return true;
     }
     match (&ty.kind, value) {
+        (_, ComptimeValue::Nil) if ty.nilable => true,
+        (TypeKind::TypeParameter(_), _) => true,
         (TypeKind::Named(name), ComptimeValue::Type(_)) if name == "type" => true,
         (TypeKind::Primitive(VarType::Int), ComptimeValue::Int(_))
         | (TypeKind::Primitive(VarType::UInt), ComptimeValue::UInt(_))
@@ -2112,12 +2944,40 @@ fn comptime_value_matches_annotation(value: &ComptimeValue, ty: &TypeAnnotation)
         | (TypeKind::Primitive(VarType::Bool), ComptimeValue::Bool(_))
         | (TypeKind::Primitive(VarType::Nil), ComptimeValue::Nil) => true,
         (TypeKind::Bytes, ComptimeValue::Bytes(_)) => true,
-        (TypeKind::Primitive(_) | TypeKind::Bytes, ComptimeValue::Nil) => ty.nilable,
-        (TypeKind::Named(expected), ComptimeValue::Struct { name, .. }) => expected == name,
-        (TypeKind::ResolvedName { symbol, .. }, ComptimeValue::Struct { name, .. }) => {
-            symbol == name
+        (
+            TypeKind::Named(expected)
+            | TypeKind::ResolvedName {
+                symbol: expected, ..
+            },
+            ComptimeValue::Nominal {
+                name,
+                enum_name,
+                type_arguments,
+                ..
+            },
+        ) => type_arguments.is_empty() && expected == enum_name.as_ref().unwrap_or(name),
+        (
+            TypeKind::Applied { source, arguments }
+            | TypeKind::ResolvedApplied {
+                symbol: source,
+                arguments,
+                ..
+            },
+            ComptimeValue::Nominal {
+                name,
+                type_arguments,
+                ..
+            },
+        ) => {
+            source == name
+                && (type_arguments.is_empty() || same_annotations(arguments, type_arguments))
         }
-        (TypeKind::Named(_) | TypeKind::ResolvedName { .. }, ComptimeValue::Nil) => ty.nilable,
+        (
+            TypeKind::Array(_) | TypeKind::Tuple(_),
+            ComptimeValue::Sequence {
+                ty: Some(actual), ..
+            },
+        ) => annotation_accepts(ty, actual),
         _ => false,
     }
 }
@@ -2135,7 +2995,8 @@ fn comptime_value_type_name(value: &ComptimeValue) -> String {
         ComptimeValue::Nil => "nil".into(),
         ComptimeValue::Error(_) => "Error".into(),
         ComptimeValue::Propagate(_) => "propagated Error".into(),
-        ComptimeValue::Struct { name, .. } => name.clone(),
+        ComptimeValue::Nominal { name, .. } => name.clone(),
+        ComptimeValue::Sequence { tuple, .. } => if *tuple { "tuple" } else { "array" }.into(),
         ComptimeValue::Type(_) => "type".into(),
     }
 }
@@ -2164,43 +3025,48 @@ fn primitive_type(name: &str) -> Option<TypeAnnotation> {
 }
 
 fn substitute_type(ty: &mut TypeAnnotation, aliases: &HashMap<String, TypeAnnotation>) {
+    let _: Result<(), std::convert::Infallible> = substitute_annotation(ty, &mut |kind| {
+        Ok(match kind {
+            TypeKind::Named(name) | TypeKind::ResolvedName { symbol: name, .. } => {
+                aliases.get(name).cloned()
+            }
+            _ => None,
+        })
+    });
+}
+
+fn substitute_annotation<E>(
+    ty: &mut TypeAnnotation,
+    replacement: &mut impl FnMut(&TypeKind) -> Result<Option<TypeAnnotation>, E>,
+) -> Result<(), E> {
+    if let Some(mut substituted) = replacement(&ty.kind)? {
+        substituted.nilable |= ty.nilable;
+        *ty = substituted;
+        return Ok(());
+    }
     match &mut ty.kind {
-        TypeKind::Named(name) => {
-            if let Some(replacement) = aliases.get(name) {
-                let nilable = ty.nilable || replacement.nilable;
-                *ty = replacement.clone();
-                ty.nilable = nilable;
-            }
-        }
-        TypeKind::ResolvedName { symbol, .. } => {
-            if let Some(replacement) = aliases.get(symbol) {
-                let nilable = ty.nilable || replacement.nilable;
-                *ty = replacement.clone();
-                ty.nilable = nilable;
-            }
-        }
-        TypeKind::Array(element) => substitute_type(element, aliases),
-        TypeKind::Applied { arguments, .. } | TypeKind::ResolvedApplied { arguments, .. } => {
+        TypeKind::Array(element) => substitute_annotation(element, replacement)?,
+        TypeKind::Applied { arguments, .. }
+        | TypeKind::ResolvedApplied { arguments, .. }
+        | TypeKind::Tuple(arguments) => {
             for argument in arguments {
-                substitute_type(argument, aliases);
-            }
-        }
-        TypeKind::Tuple(elements) => {
-            for element in elements {
-                substitute_type(element, aliases);
+                substitute_annotation(argument, replacement)?;
             }
         }
         TypeKind::Function { parameters, result } => {
             for parameter in parameters {
-                substitute_type(parameter, aliases);
+                substitute_annotation(parameter, replacement)?;
             }
-            substitute_type(result, aliases);
+            substitute_annotation(result, replacement)?;
         }
         TypeKind::Primitive(_)
         | TypeKind::Bytes
+        | TypeKind::Named(_)
+        | TypeKind::ResolvedName { .. }
         | TypeKind::TypeParameter(_)
         | TypeKind::SelfType => {}
     }
+    Ok(())
 }
 
 fn substitute_program_types(program: &mut Program, aliases: &HashMap<String, TypeAnnotation>) {
@@ -2216,6 +3082,10 @@ fn substitute_program_types(program: &mut Program, aliases: &HashMap<String, Typ
             | Expr::Unary(_, inner)
             | Expr::Cast(inner, _) => expr(inner, aliases),
             Expr::TypeLiteral(ty) => substitute_type(ty, aliases),
+            Expr::TypedAggregate(value, ty) => {
+                substitute_type(ty, aliases);
+                expr(value, aliases);
+            }
             Expr::Closure {
                 params,
                 result_type,
@@ -2473,14 +3343,15 @@ fn eval_comptime_block(
     for statement in &block.stmts {
         context.budget.step(depth)?;
         match statement.node() {
-            Stmt::Const { pattern, value, .. } | Stmt::VarDecl { pattern, value, .. } => {
+            Stmt::Const { pattern, value, ty } | Stmt::VarDecl { pattern, value, ty } => {
                 if matches!(pattern, BindingPattern::Tuple(_)) {
                     return Err(
                         "tuple destructuring is not supported inside a comptime function yet"
                             .into(),
                     );
                 }
-                let value = eval_expr(value, &values, context, depth + 1, call_depth)?;
+                let value =
+                    eval_typed_expr(value, ty.as_ref(), &values, context, depth + 1, call_depth)?;
                 if let ComptimeValue::Propagate(error) = value {
                     return Ok(BlockExit::Propagate(error));
                 }
@@ -2491,8 +3362,9 @@ fn eval_comptime_block(
                     .budget
                     .insert_value(&mut values, name, Some(value))?;
             }
-            Stmt::Comptime { name, value, .. } => {
-                let value = eval_expr(value, &values, context, depth + 1, call_depth)?;
+            Stmt::Comptime { name, value, ty } => {
+                let value =
+                    eval_typed_expr(value, ty.as_ref(), &values, context, depth + 1, call_depth)?;
                 if let ComptimeValue::Propagate(error) = value {
                     return Ok(BlockExit::Propagate(error));
                 }
@@ -2660,36 +3532,24 @@ fn eval_comptime_statement_expr(
                 BlockExit::Tail(_) | BlockExit::Continue => Ok(None),
             }
         }
-        Expr::Match { value, arms, .. } => {
-            let value = eval_expr(value, values, context, depth + 1, call_depth)?;
-            for arm in arms {
-                if !matches_pattern(&arm.pattern, &value) {
-                    continue;
-                }
-                if let Some(guard) = &arm.guard {
-                    match eval_expr(guard, values, context, depth + 1, call_depth)? {
-                        ComptimeValue::Bool(true) => {}
-                        ComptimeValue::Bool(false) => continue,
-                        ComptimeValue::Error(error) => {
-                            return Ok(Some(ComptimeValue::Error(error)));
-                        }
-                        _ => return Err("comptime match guard must be bool".into()),
-                    }
-                }
-                let mut arm_values = context.budget.clone_values(values)?;
-                return match eval_comptime_block(
-                    &arm.body,
-                    &mut arm_values,
-                    context,
-                    depth + 1,
-                    call_depth,
-                )? {
-                    BlockExit::Return(value) => Ok(Some(value)),
-                    BlockExit::Propagate(error) => Ok(Some(ComptimeValue::Propagate(error))),
-                    BlockExit::Tail(_) | BlockExit::Continue => Ok(None),
-                };
+        Expr::Match {
+            value,
+            arms,
+            exhaustive,
+        } => {
+            match eval_match(
+                value,
+                arms,
+                *exhaustive,
+                values,
+                context,
+                depth + 1,
+                call_depth,
+            )? {
+                BlockExit::Return(value) => Ok(Some(value)),
+                BlockExit::Propagate(error) => Ok(Some(ComptimeValue::Propagate(error))),
+                BlockExit::Tail(_) | BlockExit::Continue => Ok(None),
             }
-            Ok(None)
         }
         Expr::Try {
             body,
@@ -2737,6 +3597,22 @@ fn eval_binary(
     }
     if let ComptimeValue::Error(error) = right {
         return Ok(ComptimeValue::Error(error));
+    }
+    if matches!(op, BinOp::Eq | BinOp::NotEq)
+        && !matches!(left, Nil)
+        && !matches!(right, Nil)
+        && [&left, &right].iter().any(|value| {
+            matches!(
+                value,
+                ComptimeValue::Sequence { .. }
+                    | ComptimeValue::Nominal {
+                        enum_name: Some(_),
+                        ..
+                    }
+            )
+        })
+    {
+        return Err("array, tuple, and enum equality is not supported at comptime".into());
     }
     match (op, left, right) {
         (BinOp::Add, Int(a), Int(b)) => checked_int(a.checked_add(b)),
@@ -2919,6 +3795,131 @@ fn preflight_bigint_binary(
     budget.allocate(bigint_storage_cost_from_bits(result_bits))
 }
 
+fn eval_match(
+    scrutinee: &Expr,
+    arms: &[MatchArm],
+    exhaustive: bool,
+    values: &Values,
+    context: &mut EvalContext<'_>,
+    depth: usize,
+    call_depth: usize,
+) -> Result<BlockExit, String> {
+    let value = eval_expr(scrutinee, values, context, depth, call_depth)?;
+    if let ComptimeValue::Propagate(error) = value {
+        return Ok(BlockExit::Propagate(error));
+    }
+    if exhaustive && call_depth == 0 {
+        validate_enum_coverage(arms, &value, context, depth)?;
+    }
+    for arm in arms {
+        let Some(mut scope) = match_arm_values(arm, &value, values, context, depth)? else {
+            continue;
+        };
+        if let Some(guard) = &arm.guard {
+            match eval_expr(guard, &scope, context, depth, call_depth)? {
+                ComptimeValue::Bool(true) => {}
+                ComptimeValue::Bool(false) => continue,
+                ComptimeValue::Error(error) => {
+                    return Ok(BlockExit::Return(ComptimeValue::Error(error)));
+                }
+                ComptimeValue::Propagate(error) => return Ok(BlockExit::Propagate(error)),
+                _ => return Err("comptime match guard must be bool".into()),
+            }
+        }
+        return eval_comptime_block(&arm.body, &mut scope, context, depth, call_depth);
+    }
+    Ok(BlockExit::Continue)
+}
+
+fn validate_enum_coverage(
+    arms: &[MatchArm],
+    value: &ComptimeValue,
+    context: &mut EvalContext<'_>,
+    depth: usize,
+) -> Result<(), String> {
+    let ComptimeValue::Nominal {
+        name,
+        enum_name: Some(enum_name),
+        ..
+    } = value
+    else {
+        return Ok(());
+    };
+    let variant_count = context
+        .structs
+        .constructors
+        .get(name)
+        .ok_or_else(|| format!("unknown comptime enum variant `{name}`"))?
+        .enum_variant_count;
+    let mut covered = Vec::new();
+    context.budget.reserve_vec(&mut covered, arms.len())?;
+    for arm in arms {
+        context.budget.step(depth)?;
+        if arm.guard.is_some() {
+            continue;
+        }
+        let pattern = match &arm.pattern {
+            MatchPattern::Wildcard => return Ok(()),
+            MatchPattern::Type(name) if name == enum_name => return Ok(()),
+            MatchPattern::Type(name) | MatchPattern::Variant { name, .. } => name,
+            _ => continue,
+        };
+        if context
+            .structs
+            .constructors
+            .get(pattern)
+            .is_some_and(|variant| variant.enum_name.as_ref() == Some(enum_name))
+        {
+            covered.push(pattern.as_str());
+        }
+    }
+    covered.sort_unstable();
+    covered.dedup();
+    if covered.len() != variant_count {
+        return Err("non-exhaustive comptime enum match: add missing variants or a `_` arm".into());
+    }
+    Ok(())
+}
+
+fn match_arm_values(
+    arm: &MatchArm,
+    value: &ComptimeValue,
+    values: &Values,
+    context: &mut EvalContext<'_>,
+    depth: usize,
+) -> Result<Option<Values>, String> {
+    context.budget.step(depth)?;
+    if let MatchPattern::Variant { name, bindings } = &arm.pattern
+        && let Some(constructor) = context.structs.constructors.get(name)
+        && constructor.enum_name.is_some()
+        && bindings.len() != constructor.fields.len()
+    {
+        return Err(format!(
+            "pattern `{name}` expects {} binding(s), got {}",
+            constructor.fields.len(),
+            bindings.len()
+        ));
+    }
+    if !matches_pattern(&arm.pattern, value) {
+        return Ok(None);
+    }
+    let mut values = context.budget.clone_values(values)?;
+    if let (MatchPattern::Variant { bindings, .. }, ComptimeValue::Nominal { fields, .. }) =
+        (&arm.pattern, value)
+    {
+        for (binding, (_, value)) in bindings.iter().zip(fields) {
+            context.budget.step(depth)?;
+            if binding != "_" {
+                let value = context.budget.clone_value(value)?;
+                context
+                    .budget
+                    .insert_value(&mut values, binding, Some(value))?;
+            }
+        }
+    }
+    Ok(Some(values))
+}
+
 fn matches_pattern(pattern: &MatchPattern, value: &ComptimeValue) -> bool {
     match pattern {
         MatchPattern::Wildcard => true,
@@ -2937,7 +3938,12 @@ fn matches_pattern(pattern: &MatchPattern, value: &ComptimeValue) -> bool {
             ComptimeValue::Char(_) => name == "char",
             ComptimeValue::Str(_) => name == "str",
             ComptimeValue::Nil => name == "nil",
-            ComptimeValue::Struct { name: actual, .. } => name == actual,
+            ComptimeValue::Nominal {
+                name: actual,
+                enum_name,
+                ..
+            } => name == actual || enum_name.as_ref() == Some(name),
+            ComptimeValue::Sequence { .. } => false,
             ComptimeValue::Type(_) => name == "type",
             ComptimeValue::Bytes(_) => name == "bytes",
             ComptimeValue::Error(error) => {
@@ -2947,8 +3953,9 @@ fn matches_pattern(pattern: &MatchPattern, value: &ComptimeValue) -> bool {
             ComptimeValue::Propagate(_) => false,
         },
         MatchPattern::Variant { name, bindings } => {
-            bindings.is_empty()
-                && matches!(value, ComptimeValue::Error(error) if name.rsplit("::").next() == Some(error.kind()))
+            matches!(value, ComptimeValue::Nominal { name: variant, enum_name: Some(_), .. } if name == variant)
+                || bindings.is_empty()
+                    && matches!(value, ComptimeValue::Error(error) if name.rsplit("::").next() == Some(error.kind()))
         }
     }
 }
@@ -3109,6 +4116,7 @@ mod tests {
             functions: &functions,
             structs: StructScope {
                 constructors: &constructors,
+                len_extensions: &[],
                 owner: None,
             },
             types: &types,
@@ -3334,6 +4342,7 @@ mod tests {
             functions: &functions,
             structs: StructScope {
                 constructors: &constructors,
+                len_extensions: &[],
                 owner: None,
             },
             types: &types,
@@ -3343,9 +4352,19 @@ mod tests {
         let constructor = Constructor {
             fields,
             owner: None,
+            type_params: Vec::new(),
+            enum_name: None,
+            enum_variant_count: 0,
         };
-        let result =
-            eval_struct_constructor("Wide", &constructor, &[], &values, &mut context, 0, 0);
+        let result = eval_constructor(
+            "Wide",
+            &constructor,
+            (&[], &[]),
+            &values,
+            &mut context,
+            0,
+            0,
+        );
 
         assert!(result.unwrap_err().contains("allocation budget exceeded"));
     }

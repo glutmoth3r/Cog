@@ -1,6 +1,10 @@
 @comptime const Scalar: type = int;
 
-@comptime extend Scalar {
+trait Squared {
+    fn squared(self) -> int;
+}
+
+@comptime extend Scalar with Squared {
     fn squared(self) -> int {
         self * self
     }

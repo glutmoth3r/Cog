@@ -1,0 +1,14 @@
+// Lexical path helpers in addition to the runtime path operations.
+use str;
+use path::{extension as final_extension, file_name};
+
+// The final component without its extension, or nil when there is no file name.
+public fn stem(path: str) -> str? {
+    const name = file_name(path)!!;
+    when name is str {
+        const extension = final_extension(path)!!;
+        when extension is str { return str::remove_suffix(name, "." + extension); } else {}
+        return name;
+    } else {}
+    nil
+}

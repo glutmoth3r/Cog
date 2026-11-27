@@ -38,6 +38,44 @@ fn run_wasi(artifact: &Path, args: &[&str]) -> Output {
 }
 
 #[test]
+fn wasi_reports_materialized_tuples_and_enums_as_unsupported() {
+    let directory = Directory::new();
+    for (source, instruction) in [
+        (
+            "@comptime const PAIR: (int, int) = (1, 2); fn main() {}",
+            "MakeTypedTuple",
+        ),
+        (
+            "enum Mode { Fast } @comptime const MODE = Mode::Fast(); fn main() {}",
+            "records other than structs",
+        ),
+    ] {
+        let program = project::compile_source("comptime.cog", source).unwrap();
+        let error =
+            wasm::build_executable(&program, &directory.0.join("unsupported.wasm")).unwrap_err();
+        assert!(error.contains(instruction), "{error}");
+    }
+}
+
+#[test]
+#[ignore = "requires rustc's wasm32-wasip1 target and Node with WASI Preview 1"]
+fn wasi_executes_materialized_comptime_arrays() {
+    let source = r#"
+    @!include("std") use io;
+    @comptime const DATA: int?[] = [7, nil, 9];
+    @comptime const INDEX = DATA.len() - 1;
+    fn main() { io::println(DATA[INDEX] ?? 0)!!; }
+    "#;
+    let program = project::compile_source("comptime.cog", source).unwrap();
+    let directory = Directory::new();
+    let artifact = directory.0.join("array.wasm");
+    wasm::build_executable(&program, &artifact).unwrap();
+    let result = run_wasi(&artifact, &[]);
+    assert!(result.status.success(), "{:?}", result);
+    assert_eq!(result.stdout, b"9\n");
+}
+
+#[test]
 #[ignore = "requires rustc's wasm32-wasip1 target and Node with WASI Preview 1"]
 fn wasi_executes_loops_calls_recursion_and_unicode_stdout() {
     let source = r#"@!include("std")
@@ -596,6 +634,48 @@ fn main(args: str[]) -> nil {
     assert!(diagnostics.contains("str::replace"), "{diagnostics}");
 }
 
+#[test]
+#[ignore = "requires rustc's wasm32-wasip1 target and Node with WASI Preview 1"]
+fn wasi_text_and_byte_helpers_match_the_vm() {
+    let source = r#"@!include("std")
+use io;
+use str;
+use bytes;
+use ascii;
+fn main(args: str[]) -> nil {
+    const text = args[0];
+    for word in str::split_whitespace(text)!! { io::println(word)!!; }
+    for part in str::split(args[2] + "-" + args[2], "-")!! { io::println(part)!!; }
+    io::println(str::slice(text, 1, 4)!!)!!;
+    io::println(str::equals_ignore_ascii_case(text, args[1])!!)!!;
+    const data = bytes::from_str(text)!!;
+    const needle = bytes::from_str(args[2])!!;
+    io::println(bytes::find(data, needle)!! ?? -1)!!;
+    io::println(bytes::find(data, needle, 4)!! ?? -1)!!;
+    io::println(bytes::index_of(data, 32)!! ?? -1)!!;
+    io::println(bytes::starts_with(data, needle)!!)!!;
+    io::println(bytes::equals(data, data)!!)!!;
+    io::println(ascii::hex_value(70)!! ?? -1)!!;
+    io::println(str::find(text, args[2])!! ?? -1)!!;
+    io::println(str::count(text, args[2])!!)!!;
+    str::slice(text, 0, 100)!!;
+}
+"#;
+    let output = assert_vm_parity(
+        "text_and_bytes",
+        source,
+        &[
+            " \u{e9}ab\u{3000}\u{65e5}ab ",
+            " \u{e9}AB\u{3000}\u{65e5}Ab ",
+            "ab",
+        ],
+    );
+    assert_eq!(
+        output,
+        "\u{e9}ab\n\u{65e5}ab\nab\nab\n\u{e9}ab\u{3000}\ntrue\n3\n11\n0\nfalse\ntrue\n15\n2\n2\n"
+    );
+}
+
 const ERROR_RENDER_PROGRAM: &str = r#"@!include("std")
 use fmt;
 use io;
@@ -943,6 +1023,7 @@ fn show(value) -> nil {
 }
 fn push(target, value) { target.append(value) }
 fn plus(left, right) { left + right }
+fn length(value) { len(value) }
 fn read(target, key) { target[key] }
 fn write(target, key, value) {
     try { target[key] = value; "written" } catch(error) { error }
@@ -978,7 +1059,7 @@ fn main() -> nil {
     show(capture { plus(failed, values) });
     show(capture { plus(values, big) });
     show(capture { failed[0] });
-    show(capture { len(failed) });
+    show(capture { length(failed) });
     show(capture { failed.value });
     for item in values {
         const seen = capture { item + 0 };
@@ -1416,4 +1497,56 @@ fn wasi_rejects_unsupported_aggregates_at_build_time() {
         "map",
         "@!include(\"std\")\nuse io;\nuse collections::Map;\nfn main() -> nil { var m = Map::new[str, int](); m.set(\"a\", 1); }\n",
     );
+}
+
+const BOUND_DISPATCH_PROGRAM: &str = r#"@!include("std")
+use io;
+use eq;
+use iter;
+trait Show { fn show(self) -> str; }
+struct Box[T: type] { value: T }
+extend[T: type] Box[T] with Show { fn show(self) -> str { "trait" } }
+extend Box[int] { fn show(self) -> str { "inherent" } }
+extend[T: type] Box[T] with eq::Eq[Box[T]] {
+    fn equals(self, other: Box[T]) -> bool { true }
+}
+struct Source[T: type] { value: T }
+struct Cursor[T: type] { value: T, done: bool }
+extend[T: type] Source[T] with iter::IntoIterator[Cursor[T], T] {
+    fn into_iter(self) -> Cursor[T] { Cursor(self.value, false) }
+}
+extend[T: type] Cursor[T] with iter::Iterator[T] {
+    fn next(mut self) -> bool { const more = !self.done; self.done = true; more }
+    fn current(self) -> T { self.value }
+}
+extend Source[int] { fn into_iter(self) -> int { 0 } }
+fn render[X: type + Show + eq::Eq[X]](left: X, right: X) -> str {
+    if left == right { left.show() } else { "different" }
+}
+fn main() -> nil {
+    io::println(render(Box(1), Box(2)))!!;
+    io::println(Box(1).show())!!;
+    for item in Source(7) { io::println(item)!!; }
+}
+"#;
+
+#[test]
+#[ignore = "requires rustc's wasm32-wasip1 target and Node with WASI Preview 1"]
+fn wasi_dispatches_bound_calls_like_the_vm() {
+    let output = assert_vm_parity("dispatch", BOUND_DISPATCH_PROGRAM, &[]);
+    assert_eq!(output, "trait\ninherent\n7\n");
+}
+
+#[test]
+#[ignore = "requires rustc's wasm32-wasip1 target and Node with WASI Preview 1"]
+fn wasi_executes_if_const_like_the_vm() {
+    let source = r#"@!include("std")
+use io;
+struct Node { value: int, next: Node? }
+fn main() {
+    const node = Node(value: 1, next: Node(value: 7, next: nil));
+    if const next = node.next { io::println(next.value)!!; }
+}
+"#;
+    assert_eq!(assert_vm_parity("if-const", source, &[]), "7\n");
 }

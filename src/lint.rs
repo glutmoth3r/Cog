@@ -438,6 +438,7 @@ impl Linter {
         let error_handled = std::mem::take(&mut self.error_handled);
         match expression.node() {
             Expr::Located(_, _) => unreachable!("node removes source locations"),
+            Expr::TypedAggregate(value, _) => self.expr(value, report),
             Expr::Ident(name) => {
                 if report {
                     let mut task_group = None;

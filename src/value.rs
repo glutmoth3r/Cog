@@ -618,10 +618,8 @@ impl ArrayValue {
             .try_borrow()
             .map_err(|_| RuntimeError::InvalidArgument { op: "clone" })?;
         if let Some(tuple_types) = tuple_types.as_ref() {
-            let copy = Self::try_tuple(values)?;
-            copy.constrain_tuple(tuple_types)
-                .map_err(|error| type_error_for(error, "clone"))?;
-            return Ok(copy);
+            return Self::try_typed_tuple(values, tuple_types.clone())
+                .map_err(|error| type_error_for(error, "clone"));
         }
         drop(tuple_types);
 
@@ -2602,5 +2600,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(copy.runtime_type(), original.runtime_type());
+    }
+
+    #[test]
+    fn fallible_tuple_copy_preserves_nullable_element_contract() {
+        let original = ArrayValue::try_typed_tuple(
+            vec![Value::Int(1)],
+            vec![RuntimeType::Nullable(Box::new(RuntimeType::Int))],
+        )
+        .unwrap();
+        let copy = original.try_with_values_like(vec![Value::Int(1)]).unwrap();
+
+        assert_eq!(copy.runtime_type(), original.runtime_type());
+        copy.try_set(0, Value::Nil).unwrap();
+        assert!(matches!(copy.borrow()[0], Value::Nil));
+        assert!(matches!(original.borrow()[0], Value::Int(1)));
     }
 }

@@ -2,6 +2,7 @@
 use bytes;
 use fmt;
 use text_order;
+use byte_match;
 use ascii;
 use err::Error;
 
@@ -82,22 +83,12 @@ public fn trim_end(text: str) -> str {
     trim_impl(text, false, true)
 }
 
-// The caller ensures the complete needle fits at offset.
-fn bytes_match(data, offset: int, needle, length: int) -> bool {
-    for index in 0..length {
-        if bytes::get(data, offset + index)!! != bytes::get(needle, index)!! {
-            return false;
-        }
-    }
-    true
-}
-
 public fn starts_with(text: str, prefix: str) -> bool {
     const data = bytes::from_str(text)!!;
     const needle = bytes::from_str(prefix)!!;
     const length = bytes::len(needle)!!;
     if length > bytes::len(data)!! { return false; }
-    bytes_match(data, 0, needle, length)
+    byte_match::matches_at(data, 0, needle, length)
 }
 
 public fn ends_with(text: str, suffix: str) -> bool {
@@ -106,7 +97,7 @@ public fn ends_with(text: str, suffix: str) -> bool {
     const length = bytes::len(needle)!!;
     const offset = bytes::len(data)!! - length;
     if offset < 0 { return false; }
-    bytes_match(data, offset, needle, length)
+    byte_match::matches_at(data, offset, needle, length)
 }
 
 public fn contains(text: str, part: str) -> bool {
@@ -116,7 +107,7 @@ public fn contains(text: str, part: str) -> bool {
     const last = bytes::len(data)!! - length;
     var offset = 0;
     while offset <= last {
-        if bytes_match(data, offset, needle, length)!! { return true; }
+        if byte_match::matches_at(data, offset, needle, length)!! { return true; }
         offset += 1;
     }
     false
@@ -139,7 +130,7 @@ public fn replace(text: str, pattern: str, replacement: str) -> str {
     var matches = 0;
     var offset = 0;
     while offset <= length - needle_length {
-        if bytes_match(data, offset, needle, needle_length)!! {
+        if byte_match::matches_at(data, offset, needle, needle_length)!! {
             matches += 1;
             offset += needle_length;
         } else {
@@ -156,7 +147,7 @@ public fn replace(text: str, pattern: str, replacement: str) -> str {
     offset = 0;
 
     while offset <= length - needle_length {
-        if bytes_match(data, offset, needle, needle_length)!! {
+        if byte_match::matches_at(data, offset, needle, needle_length)!! {
             while source < offset {
                 bytes::set(result, output, bytes::get(data, source)!!)!!;
                 source += 1;
@@ -185,7 +176,7 @@ public fn compare(left: str, right: str) -> int {
 }
 
 // Exact, non-overlapping separators. Preserve leading/trailing empty fields.
-public fn split(text: str, separator: str) {
+public fn split(text: str, separator: str) -> str[] {
     text!!;
     separator!!;
     if separator == "" { return Error::InvalidArgument("str::split"); }
@@ -193,20 +184,78 @@ public fn split(text: str, separator: str) {
     const needle = bytes::from_str(separator)!!;
     const length = bytes::len(needle)!!;
     const end = bytes::len(data)!!;
-    var result = [];
+    var result: str[] = [];
     var start = 0;
     var offset = 0;
     while offset <= end - length {
-        if bytes_match(data, offset, needle, length)!! {
-            result.append(bytes::to_str(data, start, offset - start)!!);
+        if byte_match::matches_at(data, offset, needle, length)!! {
+            result.append(bytes::to_str(data, start, offset - start)!!)!!;
             offset += length;
             start = offset;
         } else {
             offset += 1;
         }
     }
-    result.append(bytes::to_str(data, start, end - start)!!);
+    result.append(bytes::to_str(data, start, end - start)!!)!!;
     result
+}
+
+// Fields are the runs between Unicode whitespace, as recognized by trim.
+// Empty fields are never produced.
+public fn split_whitespace(text: str) -> str[] {
+    const data = bytes::from_str(text)!!;
+    const length = bytes::len(data)!!;
+    var result: str[] = [];
+    var start = 0;
+    var offset = 0;
+    while offset < length {
+        const width = whitespace_width(data, offset, length)!!;
+        if width == 0 {
+            offset += 1;
+        } else {
+            if offset > start {
+                result.append(bytes::to_str(data, start, offset - start)!!)!!;
+            }
+            offset += width;
+            start = offset;
+        }
+    }
+    if length > start {
+        result.append(bytes::to_str(data, start, length - start)!!)!!;
+    }
+    result
+}
+
+// The byte offset that follows `scalars` Unicode scalars from the boundary at
+// `from`. The caller ensures the text holds that many.
+fn skip_scalars(data, from: int, scalars: int) -> int {
+    const length = bytes::len(data)!!;
+    var offset = from;
+    for _ in 0..scalars {
+        offset += 1;
+        while offset < length {
+            const byte = bytes::get(data, offset)!!;
+            if byte < 128 || byte >= 192 { break; }
+            offset += 1;
+        }
+    }
+    offset
+}
+
+// Offsets and counts are Unicode scalars. Out-of-range requests are not clamped.
+public fn slice(text: str, offset: int, count: int) -> str {
+    text!!;
+    offset!!;
+    count!!;
+    const length = len(text);
+    if offset < 0 || offset > length || count < 0 || count > length - offset {
+        return Error::InvalidArgument("str::slice");
+    }
+    if count == length { return text; }
+    const data = bytes::from_str(text)!!;
+    const start = skip_scalars(data, 0, offset)!!;
+    const end = skip_scalars(data, start, count)!!;
+    bytes::to_str(data, start, end - start)
 }
 
 public fn join(parts, separator: str = "") -> str {
@@ -225,42 +274,6 @@ public fn join(parts, separator: str = "") -> str {
     str::build(result)
 }
 
-// Knuth-Morris-Pratt over valid UTF-8. A complete nonempty pattern starts
-// and ends at scalar boundaries. Byte offsets stay private to this module.
-fn match_offsets(data, needle, first_only: bool, non_overlapping: bool) -> (int, int) {
-    const size = bytes::len(needle)!!;
-    const length = bytes::len(data)!!;
-    if size > length { return (-1, 0); }
-    var prefix: int[] = [0];
-    var matched = 0;
-    for i in 1..size {
-        const symbol = bytes::get(needle, i)!!;
-        while matched > 0 && symbol != bytes::get(needle, matched)!! {
-            matched = prefix[matched - 1]!!;
-        }
-        if symbol == bytes::get(needle, matched)!! { matched += 1; }
-        prefix.append(matched)!!;
-    }
-
-    var last = -1;
-    var count = 0;
-    matched = 0;
-    for i in 0..length {
-        const symbol = bytes::get(data, i)!!;
-        while matched > 0 && symbol != bytes::get(needle, matched)!! {
-            matched = prefix[matched - 1]!!;
-        }
-        if symbol == bytes::get(needle, matched)!! { matched += 1; }
-        if matched == size {
-            last = i + 1 - size;
-            count += 1;
-            if first_only { return (last, count); }
-            matched = if non_overlapping { 0 } else { prefix[matched - 1]!! };
-        }
-    }
-    (last, count)
-}
-
 fn scalar_offset(data, position: int) -> int? {
     if position < 0 { return nil; }
     var offset = 0;
@@ -277,7 +290,7 @@ public fn find(text: str, pattern: str) -> int? {
     if pattern == "" { return 0; }
     const data = bytes::from_str(text)!!;
     const needle = bytes::from_str(pattern)!!;
-    scalar_offset(data, match_offsets(data, needle, true, false)!!.0)!!
+    scalar_offset(data, byte_match::first(data, needle, 0)!!)!!
 }
 
 public fn rfind(text: str, pattern: str) -> int? {
@@ -286,7 +299,7 @@ public fn rfind(text: str, pattern: str) -> int? {
     if pattern == "" { return len(text); }
     const data = bytes::from_str(text)!!;
     const needle = bytes::from_str(pattern)!!;
-    scalar_offset(data, match_offsets(data, needle, false, false)!!.0)!!
+    scalar_offset(data, byte_match::last(data, needle)!!)!!
 }
 
 public fn count(text: str, pattern: str) -> int {
@@ -295,7 +308,7 @@ public fn count(text: str, pattern: str) -> int {
     if pattern == "" { return Error::InvalidArgument("str::count"); }
     const data = bytes::from_str(text)!!;
     const needle = bytes::from_str(pattern)!!;
-    match_offsets(data, needle, false, true)!!.1
+    byte_match::count(data, needle)
 }
 
 fn split_pair(text: str, separator: str, first_only: bool) -> (str, str) {
@@ -304,7 +317,11 @@ fn split_pair(text: str, separator: str, first_only: bool) -> (str, str) {
     if separator == "" { return Error::InvalidArgument("str::split_once"); }
     const data = bytes::from_str(text)!!;
     const needle = bytes::from_str(separator)!!;
-    const middle = match_offsets(data, needle, first_only, false)!!.0;
+    const middle = if first_only {
+        byte_match::first(data, needle, 0)!!
+    } else {
+        byte_match::last(data, needle)!!
+    };
     if middle < 0 { return Error::MissingKey(); }
     const right = middle + bytes::len(needle)!!;
     (bytes::to_str(data, 0, middle)!!, bytes::to_str(data, right, bytes::len(data)!! - right)!!)
@@ -363,7 +380,7 @@ fn remove_affix(text: str, pattern: str, prefix: bool) -> str {
     const remaining = bytes::len(data)!! - width;
     if remaining < 0 { return text; }
     const offset = if prefix { 0 } else { remaining };
-    if !bytes_match(data, offset, needle, width)!! { return text; }
+    if !byte_match::matches_at(data, offset, needle, width)!! { return text; }
     bytes::to_str(data, if prefix { width } else { 0 }, remaining)
 }
 
@@ -429,6 +446,19 @@ public fn to_ascii_lowercase(text: str) -> str {
 
 public fn to_ascii_uppercase(text: str) -> str {
     change_ascii_case(text, true)
+}
+
+// Compare while ignoring the case of ASCII letters only.
+public fn equals_ignore_ascii_case(a: str, b: str) -> bool {
+    const left = bytes::from_str(a)!!;
+    const right = bytes::from_str(b)!!;
+    const length = bytes::len(left)!!;
+    if length != bytes::len(right)!! { return false; }
+    for index in 0..length {
+        const first = ascii::to_lowercase(bytes::get(left, index)!!)!!;
+        if first != ascii::to_lowercase(bytes::get(right, index)!!)!! { return false; }
+    }
+    true
 }
 
 // The fallback replaces only a ParseFailure; other errors still propagate.

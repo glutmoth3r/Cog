@@ -7,10 +7,15 @@ use crate::builtins::Builtin;
 use crate::diagnostic::{Diagnostic, DiagnosticSuggestion, SourceSpan};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+mod dispatch;
 pub(crate) mod writes;
+use dispatch::Dispatch;
+pub(crate) use dispatch::{BoundCall, BoundCalls};
 use writes::Writes;
 
 const CLONE_TRAIT: &str = "$core::clone::Clone";
+const EQ_TRAIT: &str = "$core::eq::Eq";
+const HASHABLE_TRAIT: &str = "$core::collections::Hashable";
 const MAX_TRAIT_COHERENCE_WORK: usize = 1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1300,40 +1305,49 @@ impl Type {
     }
 }
 
-fn structurally_cloneable(ty: &Type) -> bool {
+/// Whether the built-in length operations may accept a value of this type: they
+/// count array and tuple elements and string scalars. Types unknown until run
+/// time are checked there.
+fn has_builtin_length(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Array(_)
+            | Type::EmptyArray
+            | Type::Tuple(_)
+            | Type::Primitive(VarType::Str, _)
+            | Type::Dynamic
+            | Type::Generic(_)
+            | Type::Named(_)
+            | Type::ErrorValue
+            | Type::Never
+            | Type::Poison
+    )
+}
+
+/// Whether the structural clone covers the type, where `leaf` accepts further
+/// cloneable element types.
+fn structurally_cloneable(ty: &Type, leaf: &dyn Fn(&Type) -> bool) -> bool {
     match ty {
         Type::Primitive(_, _) | Type::Nil => true,
-        Type::Array(element) | Type::Nullable(element) => structurally_cloneable(element),
-        Type::Tuple(items) => items.iter().all(structurally_cloneable),
-        _ => false,
+        Type::Array(element) | Type::Nullable(element) => structurally_cloneable(element, leaf),
+        Type::Tuple(items) => items.iter().all(|item| structurally_cloneable(item, leaf)),
+        other => leaf(other),
     }
 }
 
-fn compatible_eq_hash_traits(checker: &Checker<'_>, left: &str, right: &str) -> bool {
-    let Some(left) = checker.traits.get(left) else {
-        return false;
-    };
-    let Some(right) = checker.traits.get(right) else {
-        return false;
-    };
-    let is_equality = |declaration: &TraitDecl| {
-        declaration.type_params.len() == 1
-            && declaration.methods.len() == 1
-            && declaration.methods[0].name == "equals"
-    };
-    let is_hashable = |declaration: &TraitDecl| {
-        declaration.type_params.is_empty()
-            && declaration.methods.len() == 2
-            && declaration
-                .methods
-                .iter()
-                .any(|method| method.name == "hash_code")
-            && declaration
-                .methods
-                .iter()
-                .any(|method| method.name == "equals")
-    };
-    (is_equality(left) && is_hashable(right)) || (is_hashable(left) && is_equality(right))
+/// One type may define the same `equals` for both `eq::Eq` and
+/// `collections::Hashable`.
+fn equivalent_equality(
+    (left_trait, left): (&str, &ExtensionMethod),
+    (right_trait, right): (&str, &ExtensionMethod),
+) -> bool {
+    let standard_pair = |first, second| first == EQ_TRAIT && second == HASHABLE_TRAIT;
+    left.name == "equals"
+        && right.name == "equals"
+        && (standard_pair(left_trait, right_trait) || standard_pair(right_trait, left_trait))
+        && left.function.params == right.function.params
+        && left.function.result_type == right.function.result_type
+        && equivalent_equals_body(&left.function, &right.function)
 }
 
 fn equivalent_equals_body(left: &FunctionDecl, right: &FunctionDecl) -> bool {
@@ -1555,8 +1569,16 @@ struct Checker<'a> {
     extension_method_traits: HashMap<(Type, String), Option<&'a str>>,
     generic_extension_methods: Vec<(&'a ExtendDecl, &'a ExtensionMethod)>,
     associated_extension_methods: Vec<(&'a ExtendDecl, &'a ExtensionMethod)>,
-    trait_implementations: std::collections::HashSet<(Type, String, Vec<Type>)>,
+    trait_implementations: HashMap<(Type, String, Vec<Type>), &'a ExtendDecl>,
     generic_trait_implementations: Vec<&'a ExtendDecl>,
+    /// Bound uses of the instances in the checked program.
+    bound_calls: &'a BoundCalls,
+    /// Type parameters of the template being probed for its bound uses.
+    probe: Option<Vec<TypeParameter>>,
+    /// Bound uses recorded on templates.
+    probed: BoundCalls,
+    /// A callee the compiler has already selected for a synthesized call.
+    forced_method: Option<(usize, Type, &'a ExtensionMethod)>,
     trait_coherence_work: usize,
     current_function: Option<String>,
     method_calls: HashMap<CallSite, String>,
@@ -1597,6 +1619,8 @@ pub(crate) struct CheckResult {
     pub struct_call_specializations: HashMap<CallSite, String>,
     pub specializations: Vec<Specialization>,
     pub struct_specializations: Vec<StructSpecialization>,
+    /// Bound uses recorded on generic templates, for their instances.
+    pub probed: BoundCalls,
     pub uint_literals: HashSet<usize>,
     pub uint_expressions: HashSet<usize>,
     pub bigint_literals: HashSet<usize>,
@@ -1650,7 +1674,13 @@ pub(crate) fn check_with_methods_and_names(
     function_modules: &HashMap<String, String>,
     names: &BTreeMap<String, String>,
 ) -> CheckResult {
-    check_program(program, function_modules, names, Effects::Check)
+    check_program(
+        program,
+        function_modules,
+        names,
+        Effects::Check,
+        &BoundCalls::default(),
+    )
 }
 
 /// Checks the program without the interprocedural mutability pass and keeps its
@@ -1662,8 +1692,15 @@ pub(crate) fn check_deferring_effects(
     program: &Program,
     function_modules: &HashMap<String, String>,
     names: &BTreeMap<String, String>,
+    bound_calls: &BoundCalls,
 ) -> CheckResult {
-    check_program(program, function_modules, names, Effects::Defer)
+    check_program(
+        program,
+        function_modules,
+        names,
+        Effects::Defer,
+        bound_calls,
+    )
 }
 
 /// Runs the mutability pass deferred by [`check_deferring_effects`] for the
@@ -1684,14 +1721,21 @@ pub(crate) fn resolve_methods_and_names(
     function_modules: &HashMap<String, String>,
     names: &BTreeMap<String, String>,
 ) -> CheckResult {
-    check_program(program, function_modules, names, Effects::Skip)
+    check_program(
+        program,
+        function_modules,
+        names,
+        Effects::Skip,
+        &BoundCalls::default(),
+    )
 }
 
-fn check_program(
-    program: &Program,
+fn check_program<'a>(
+    program: &'a Program,
     function_modules: &HashMap<String, String>,
     names: &BTreeMap<String, String>,
     effects: Effects,
+    bound_calls: &'a BoundCalls,
 ) -> CheckResult {
     let mut c = Checker {
         functions: HashMap::new(),
@@ -1735,6 +1779,10 @@ fn check_program(
         associated_extension_methods: Vec::new(),
         trait_implementations: Default::default(),
         generic_trait_implementations: Vec::new(),
+        bound_calls,
+        probe: None,
+        probed: BoundCalls::default(),
+        forced_method: None,
         trait_coherence_work: 0,
         current_function: None,
         method_calls: HashMap::new(),
@@ -1932,13 +1980,11 @@ fn check_program(
                 let previous = c.extension_methods.get(&key).copied();
                 let previous_trait = c.extension_method_traits.get(&key).copied().flatten();
                 let equivalent = previous.is_some_and(|previous| {
-                    method.name == "equals"
-                        && previous.function.params == function.params
-                        && previous.function.result_type == function.result_type
-                        && equivalent_equals_body(&previous.function, function)
-                        && previous_trait
-                            .zip(extension.trait_name.as_deref())
-                            .is_some_and(|(left, right)| compatible_eq_hash_traits(&c, left, right))
+                    previous_trait
+                        .zip(extension.trait_name.as_deref())
+                        .is_some_and(|(left, right)| {
+                            equivalent_equality((left, previous), (right, method))
+                        })
                 });
                 if previous.is_none() {
                     c.extension_method_traits
@@ -2065,6 +2111,7 @@ fn check_program(
         struct_call_specializations: c.struct_call_specializations,
         specializations: c.specializations,
         struct_specializations: c.struct_specializations,
+        probed: c.probed,
         uint_literals: c.uint_literals,
         uint_expressions: c.uint_expressions,
         bigint_literals: c.bigint_literals,
@@ -2154,9 +2201,12 @@ impl<'a> Checker<'a> {
     }
 
     fn implemented_trait_argument_candidates(&self, ty: &Type, trait_name: &str) -> Vec<Vec<Type>> {
+        if let Some(arguments) = self.probed_bound_arguments(ty, trait_name) {
+            return arguments;
+        }
         let mut matches = self
             .trait_implementations
-            .iter()
+            .keys()
             .filter(|&(target, name, _)| target == ty && name == trait_name)
             .map(|(_, _, arguments)| arguments.clone())
             .collect::<Vec<_>>();
@@ -2247,12 +2297,16 @@ impl<'a> Checker<'a> {
         valid.then_some(arguments)
     }
 
+    /// Checks the call of one iteration protocol method on the implementation
+    /// of the trait for the receiver type.
     fn check_iteration_method(
         &mut self,
         receiver_type: &Type,
+        (trait_name, arguments): (&str, &[Type]),
         method: &str,
         span: Option<SourceSpan>,
     ) -> Option<(Type, String, String)> {
+        let selected = self.implementation_method(receiver_type, trait_name, arguments, method)?;
         let binding_name = format!("$iteration_receiver_{}", self.next_binding);
         let binding_id = self.next_binding;
         self.next_binding += 1;
@@ -2274,15 +2328,19 @@ impl<'a> Checker<'a> {
             method.to_owned(),
             Vec::new(),
         );
+        self.forced_method = Some((
+            crate::mutability::expr_id(&call),
+            receiver_type.clone(),
+            selected,
+        ));
         let previous_flow = self.flow_facts.clone();
         let result = self.expr(&call);
         self.flow_facts = previous_flow;
         let site = expression_site(self.current_function.as_deref(), &call);
-        let resolved = self
-            .call_specializations
-            .get(&site)
-            .or_else(|| self.method_calls.get(&site))
-            .cloned();
+        // Another synthesized call may reuse this identity, so take the records.
+        let specialization = self.call_specializations.remove(&site);
+        let direct = self.method_calls.remove(&site);
+        let resolved = specialization.or(direct);
         let template = self
             .access_facts
             .calls
@@ -2297,11 +2355,14 @@ impl<'a> Checker<'a> {
             .map(|name| (result, template.unwrap_or_else(|| name.clone()), name))
     }
 
+    /// Resolves the `iter::IntoIterator` protocol of a loop over `iterable`.
+    /// Returns the item type, and the methods unless a template is probed.
     fn custom_iteration(
         &mut self,
         collection: &Type,
-        span: Option<SourceSpan>,
-    ) -> Option<(Type, IterationMethods)> {
+        iterable: &Expr,
+    ) -> Option<(Type, Option<IterationMethods>)> {
+        let span = iterable.span().cloned();
         let Some(into_iterator_trait) = self.standard_trait_symbol("iter::IntoIterator") else {
             self.error(
                 "E2001",
@@ -2313,8 +2374,19 @@ impl<'a> Checker<'a> {
             );
             return None;
         };
-        let implemented =
-            self.implemented_trait_argument_candidates(collection, &into_iterator_trait);
+        if let Some(item) = self.probe_iteration(collection, iterable, &into_iterator_trait) {
+            return Some((item, None));
+        }
+        // A loop through a bound uses the implementation that proved it.
+        let implemented = match self.bound_iteration_arguments(iterable) {
+            Some(mut candidates) => {
+                candidates.retain(|arguments| {
+                    self.implements_trait(collection, &into_iterator_trait, arguments)
+                });
+                candidates
+            }
+            None => self.implemented_trait_argument_candidates(collection, &into_iterator_trait),
+        };
         let arguments = match implemented.as_slice() {
             [arguments] => arguments,
             [] => {
@@ -2348,6 +2420,9 @@ impl<'a> Checker<'a> {
             );
             return None;
         };
+        if self.probe.is_some() {
+            return Some((item_type.clone(), None));
+        }
         let Some(iterator_trait) = self.standard_trait_symbol("iter::Iterator") else {
             self.error(
                 "E2001",
@@ -2373,8 +2448,12 @@ impl<'a> Checker<'a> {
             return None;
         }
 
-        let (actual_iterator_type, into_iter_template, into_iter) =
-            self.check_iteration_method(collection, "into_iter", span.clone())?;
+        let (actual_iterator_type, into_iter_template, into_iter) = self.check_iteration_method(
+            collection,
+            (&into_iterator_trait, arguments),
+            "into_iter",
+            span.clone(),
+        )?;
         if !type_compatible(iterator_type, &actual_iterator_type) {
             self.error(
                 "E2001",
@@ -2388,8 +2467,13 @@ impl<'a> Checker<'a> {
             return None;
         }
 
-        let (next_type, next_template, next) =
-            self.check_iteration_method(iterator_type, "next", span.clone())?;
+        let items = std::slice::from_ref(item_type);
+        let (next_type, next_template, next) = self.check_iteration_method(
+            iterator_type,
+            (&iterator_trait, items),
+            "next",
+            span.clone(),
+        )?;
         if !type_compatible(&Type::concrete(VarType::Bool), &next_type) {
             self.error(
                 "E2001",
@@ -2399,8 +2483,12 @@ impl<'a> Checker<'a> {
             return None;
         }
 
-        let (current_type, current_template, current) =
-            self.check_iteration_method(iterator_type, "current", span.clone())?;
+        let (current_type, current_template, current) = self.check_iteration_method(
+            iterator_type,
+            (&iterator_trait, items),
+            "current",
+            span.clone(),
+        )?;
         if !type_compatible(item_type, &current_type) {
             self.error(
                 "E2001",
@@ -2416,14 +2504,14 @@ impl<'a> Checker<'a> {
 
         Some((
             item_type.clone(),
-            IterationMethods {
+            Some(IterationMethods {
                 into_iter,
                 next,
                 current,
                 into_iter_template,
                 next_template,
                 current_template,
-            },
+            }),
         ))
     }
 
@@ -2434,11 +2522,18 @@ impl<'a> Checker<'a> {
         arguments: &[Type],
         visiting: &mut HashSet<(Type, String, Vec<Type>)>,
     ) -> bool {
-        if self.trait_implementations.contains(&(
-            ty.clone(),
-            trait_name.to_owned(),
-            arguments.to_vec(),
-        )) || (trait_name == CLONE_TRAIT && arguments.is_empty() && structurally_cloneable(ty))
+        if let Some(candidates) = self.probed_bound_arguments(ty, trait_name) {
+            return candidates.iter().any(|candidate| candidate == arguments);
+        }
+        let key = (ty.clone(), trait_name.to_owned(), arguments.to_vec());
+        let cloneable_parameter = |ty: &Type| {
+            self.probed_bound_arguments(ty, CLONE_TRAIT)
+                .is_some_and(|candidates| !candidates.is_empty())
+        };
+        if self.trait_implementations.contains_key(&key)
+            || (trait_name == CLONE_TRAIT
+                && arguments.is_empty()
+                && structurally_cloneable(ty, &cloneable_parameter))
         {
             return true;
         }
@@ -2768,7 +2863,7 @@ impl<'a> Checker<'a> {
         if generic && !overlaps {
             let exact_implementations = self
                 .trait_implementations
-                .iter()
+                .keys()
                 .filter(|(_, name, _)| name == trait_name)
                 .cloned()
                 .collect::<Vec<_>>();
@@ -2831,7 +2926,7 @@ impl<'a> Checker<'a> {
         }
         let duplicate_exact = self
             .trait_implementations
-            .iter()
+            .keys()
             .any(|(implemented, name, _)| implemented == target && name == trait_name);
         if overlaps || duplicate_exact {
             self.error(
@@ -2850,7 +2945,7 @@ impl<'a> Checker<'a> {
             trait_arguments.clone(),
         );
         if !generic {
-            self.trait_implementations.insert(key.clone());
+            self.trait_implementations.insert(key.clone(), extension);
         }
 
         let trait_substitutions: HashMap<_, _> = declaration
@@ -3719,9 +3814,14 @@ impl<'a> Checker<'a> {
     }
 
     fn check_function(&mut self, f: &FunctionDecl, function_modules: &HashMap<String, String>) {
-        if !f.type_params.is_empty() {
-            return;
+        if f.type_params.is_empty() {
+            self.check_body(f, function_modules);
+        } else {
+            self.probe_template(f, function_modules);
         }
+    }
+
+    fn check_body(&mut self, f: &FunctionDecl, function_modules: &HashMap<String, String>) {
         let previous_flow_facts = std::mem::take(&mut self.flow_facts);
         let previous_function = self.current_function.replace(f.name.clone());
         let previous_owner = std::mem::replace(&mut self.owner, f.owner.clone());
@@ -3903,7 +4003,9 @@ impl<'a> Checker<'a> {
                 symbol,
                 arguments,
             } => self.applied_struct_type(source, symbol, arguments),
-            TypeKind::TypeParameter(name) => Type::Generic(name.clone()),
+            TypeKind::TypeParameter(name) => self
+                .probed_parameter_type(name)
+                .unwrap_or_else(|| Type::Generic(name.clone())),
             TypeKind::SelfType => Type::Named("Self".into()),
             TypeKind::Array(element) => Type::Array(Box::new(self.annotation_type(element))),
             TypeKind::Tuple(items) => Type::Tuple(
@@ -5083,8 +5185,7 @@ impl<'a> Checker<'a> {
                     Type::ErrorValue | Type::Never => (Type::Never, None),
                     Type::Poison => (Type::Poison, None),
                     _ => self
-                        .custom_iteration(&collection, iterable.span().cloned())
-                        .map(|(element, methods)| (element, Some(methods)))
+                        .custom_iteration(&collection, iterable)
                         .unwrap_or((Type::Poison, None)),
                 };
                 self.iteration_calls.insert(
@@ -5154,8 +5255,7 @@ impl<'a> Checker<'a> {
                                 Type::ErrorValue | Type::Never => (Type::Never, None),
                                 Type::Poison => (Type::Poison, None),
                                 _ => self
-                                    .custom_iteration(&collection, iterable.span().cloned())
-                                    .map(|(element, methods)| (element, Some(methods)))
+                                    .custom_iteration(&collection, iterable)
                                     .unwrap_or((Type::Poison, None)),
                             };
                             iteration_methods.push(methods);
@@ -5297,16 +5397,31 @@ impl<'a> Checker<'a> {
             .unwrap_or_else(|| binding.to_owned())
     }
 
-    /// The built-in length operations count array elements and string scalars.
-    /// A byte buffer's length is a `bytes` module operation.
-    fn reject_bytes_length(&mut self, operation: &str, span: Option<&SourceSpan>) {
+    /// Reports a built-in length operation on a type without a built-in length.
+    fn reject_length(&mut self, operation: &str, receiver: &Type, span: Option<&SourceSpan>) {
+        let declares_length = self
+            .extension_methods
+            .contains_key(&(receiver.clone(), "len".to_owned()))
+            || self
+                .generic_extension_methods
+                .iter()
+                .any(|(extension, method)| {
+                    method.name == "len" && generic_extension_matches(extension, receiver)
+                });
+        let help = if *receiver == Type::Bytes {
+            "import `bytes` and call `bytes::len(buffer)` for the byte length"
+        } else if declares_length {
+            "call the type's own method as `value.len()`"
+        } else {
+            "only arrays, tuples, and strings have a built-in length"
+        };
         self.diagnostics.push(
             Diagnostic::new(
                 "E2001",
-                format!("`{operation}` does not accept `bytes`"),
+                format!("`{operation}` does not accept `{}`", receiver.display()),
                 span.cloned().or_else(|| self.location.clone()),
             )
-            .help("import `bytes` and call `bytes::len(buffer)` for the byte length"),
+            .help(help),
         );
     }
 
@@ -5518,33 +5633,7 @@ impl<'a> Checker<'a> {
             );
             return Type::Poison;
         };
-        // A concrete implementation registers its method under the target type.
-        // Otherwise the matching generic implementation supplies it.
-        let key = (left.clone(), equality.clone(), arguments.to_vec());
-        let method = if self.trait_implementations.contains(&key) {
-            self.extension_methods
-                .get(&(left.clone(), "equals".to_owned()))
-                .copied()
-        } else {
-            self.generic_trait_implementations
-                .iter()
-                .find(|extension| {
-                    self.generic_trait_implementation_arguments(
-                        extension,
-                        &left,
-                        &equality,
-                        Some(arguments),
-                        &mut HashSet::new(),
-                    )
-                    .is_some()
-                })
-                .and_then(|extension| {
-                    extension
-                        .methods
-                        .iter()
-                        .find(|method| method.name == "equals")
-                })
-        };
+        let method = self.implementation_method(&left, &equality, arguments, "equals");
         let Some(method) = method else {
             // The implementation was rejected with its own diagnostic.
             return Type::Poison;
@@ -6410,6 +6499,21 @@ impl<'a> Checker<'a> {
                 if valid { *result } else { Type::Poison }
             }
             Expr::Located(_, _) => unreachable!("node removes locations"),
+            Expr::TypedAggregate(value, ty) => {
+                let expected = self.annotation_type(ty);
+                let actual = self.expr_with_expected_result(value, Some(&expected));
+                if self.assignable(
+                    ty.clone(),
+                    actual.clone(),
+                    expr.span(),
+                    "comptime aggregate",
+                ) && actual != Type::Poison
+                {
+                    expected
+                } else {
+                    Type::Poison
+                }
+            }
             Expr::Int(_)
                 if self
                     .uint_literals
@@ -7034,12 +7138,20 @@ impl<'a> Checker<'a> {
             } => self.associated_call(target, method, type_arguments, args, expr, None),
             Expr::MethodCall(receiver_expr, method, args) => {
                 let receiver = self.expr(receiver_expr);
+                if let Some(result) = self.probe_method_call(expr, &receiver, method, args) {
+                    return result;
+                }
+                let dispatch = self.dispatch_method(expr, method);
                 let mut hints = vec![None; args.len()];
-                if let Some(function) = self
-                    .extension_methods
-                    .get(&(receiver.clone(), method.clone()))
-                    .map(|extension| extension.function.clone())
-                {
+                let named = match &dispatch {
+                    Dispatch::Method(_, selected) => Some(*selected),
+                    Dispatch::ByName => self
+                        .extension_methods
+                        .get(&(receiver.clone(), method.clone()))
+                        .copied(),
+                    Dispatch::StructuralClone | Dispatch::Rejected => None,
+                };
+                if let Some(function) = named.map(|extension| extension.function.clone()) {
                     for ((argument, parameter), hint) in args
                         .iter()
                         .zip(function.params.iter().skip(1))
@@ -7058,12 +7170,17 @@ impl<'a> Checker<'a> {
                 {
                     *hint = Some(*element);
                 }
+                // An implementation for the nilable type itself accepts nil.
+                let accepts_receiver = match &dispatch {
+                    Dispatch::Method(target, _) => *target == receiver,
+                    _ => self
+                        .extension_methods
+                        .contains_key(&(receiver.clone(), method.clone())),
+                };
                 // Error inspection accepts any value, so nil passes through.
                 let receiver = if receiver.may_be_nil()
                     && !matches!(method.as_str(), "unwrap" | "expect" | "error_kind")
-                    && !self
-                        .extension_methods
-                        .contains_key(&(receiver.clone(), method.clone()))
+                    && !accepts_receiver
                 {
                     self.require_value(
                         receiver,
@@ -7086,22 +7203,27 @@ impl<'a> Checker<'a> {
                 if receiver == Type::Poison {
                     return Type::Poison;
                 }
-                let exact_method = self
-                    .extension_methods
-                    .get(&(receiver.clone(), method.clone()))
-                    .copied();
-                let mut generic_candidates: Vec<_> = self
-                    .generic_extension_methods
-                    .iter()
-                    .filter_map(|(extension, extension_method)| {
-                        (extension_method.name == *method
-                            && generic_extension_matches(extension, &receiver))
-                        .then_some(*extension_method)
-                    })
-                    .collect();
-                let ambiguous_generic_method = generic_candidates.len() > 1;
-                let generic_method = generic_candidates.first().copied();
-                generic_candidates.clear();
+                let (exact_method, generic_method, ambiguous_generic_method) = match dispatch {
+                    Dispatch::Method(_, selected) => (Some(selected), None, false),
+                    Dispatch::StructuralClone => (None, None, false),
+                    Dispatch::Rejected => return Type::Poison,
+                    Dispatch::ByName => {
+                        let exact = self
+                            .extension_methods
+                            .get(&(receiver.clone(), method.clone()))
+                            .copied();
+                        let generic: Vec<_> = self
+                            .generic_extension_methods
+                            .iter()
+                            .filter_map(|(extension, extension_method)| {
+                                (extension_method.name == *method
+                                    && generic_extension_matches(extension, &receiver))
+                                .then_some(*extension_method)
+                            })
+                            .collect();
+                        (exact, generic.first().copied(), generic.len() > 1)
+                    }
+                };
                 if exact_method.is_none() && ambiguous_generic_method {
                     self.error(
                         "E2001",
@@ -7276,8 +7398,8 @@ impl<'a> Checker<'a> {
                 if never {
                     return Type::Never;
                 }
-                if method == "len" && receiver == Type::Bytes {
-                    self.reject_bytes_length("len()", expr.span());
+                if method == "len" && !has_builtin_length(&receiver) {
+                    self.reject_length("len()", &receiver, expr.span());
                     return Type::Poison;
                 }
                 match method.as_str() {
@@ -7999,8 +8121,11 @@ impl<'a> Checker<'a> {
             {
                 return Type::Poison;
             }
-            if matches!(builtin, Builtin::Len) && actual.as_slice() == [Type::Bytes] {
-                self.reject_bytes_length("len", span);
+            if matches!(builtin, Builtin::Len)
+                && let [ty] = actual.as_slice()
+                && !has_builtin_length(ty)
+            {
+                self.reject_length("len", ty, span);
                 return Type::Poison;
             }
             if matches!(builtin, Builtin::BuildInput) {

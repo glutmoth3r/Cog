@@ -17,7 +17,7 @@ use crate::backend::{CallableSignature, CompiledProgram, SourceMapEntry};
 use crate::instruction::{Instruction, ValueType};
 use crate::template::ArrayTemplate;
 use crate::value::Value;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 const MAX_REGION_INSTRUCTIONS: usize = 200_000;
 const MAX_ANALYSIS_VISITS: usize = 1_000_000;
@@ -29,6 +29,7 @@ const MAX_SLOT_INTERFERENCE_OPERATIONS: usize = 2_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Fact {
+    NonError,
     Int(i64),
     UInt(u64),
     Float(u64),
@@ -48,12 +49,14 @@ impl Fact {
             Value::Char(value) => Self::Char(*value),
             Value::Nil => Self::Nil,
             Value::Function(entry) => Self::Function(*entry),
-            _ => return None,
+            Value::Error(_) => return None,
+            _ => Self::NonError,
         })
     }
 
-    fn value(self) -> Value {
-        match self {
+    fn value(self) -> Option<Value> {
+        Some(match self {
+            Self::NonError => return None,
             Self::Int(value) => Value::Int(value),
             Self::UInt(value) => Value::UInt(value),
             Self::Float(value) => Value::Float(f64::from_bits(value)),
@@ -61,7 +64,7 @@ impl Fact {
             Self::Char(value) => Value::Char(value),
             Self::Nil => Value::Nil,
             Self::Function(entry) => Value::Function(entry),
-        }
+        })
     }
 
     fn expression(self) -> Option<Expr> {
@@ -72,12 +75,18 @@ impl Fact {
             Self::Bool(value) => Expr::Bool(value),
             Self::Char(value) => Expr::Char(value),
             Self::Nil => Expr::Nil,
-            Self::Function(_) => return None,
+            Self::Function(_) | Self::NonError => return None,
         })
     }
 
-    fn is_type(self, ty: &ValueType) -> bool {
-        matches!(
+    fn is_type(self, ty: &ValueType) -> Option<bool> {
+        if matches!(ty, ValueType::Error) {
+            return Some(false);
+        }
+        if matches!(self, Self::NonError) {
+            return None;
+        }
+        Some(matches!(
             (self, ty),
             (Self::Int(_), ValueType::Int)
                 | (Self::UInt(_), ValueType::UInt)
@@ -85,7 +94,7 @@ impl Fact {
                 | (Self::Bool(_), ValueType::Bool)
                 | (Self::Char(_), ValueType::Char)
                 | (Self::Nil, ValueType::Nil)
-        )
+        ))
     }
 }
 
@@ -145,10 +154,19 @@ impl State {
             return Err(());
         }
         let previous = self.clone();
+        let merge_fact = |slot: &usize, value: &mut Fact, incoming: &HashMap<usize, Fact>| {
+            let Some(other) = incoming.get(slot) else {
+                return false;
+            };
+            if value != other {
+                *value = Fact::NonError;
+            }
+            true
+        };
         self.stack_values
-            .retain(|slot, value| other.stack_values.get(slot) == Some(value));
+            .retain(|slot, value| merge_fact(slot, value, &other.stack_values));
         self.locals
-            .retain(|slot, value| other.locals.get(slot) == Some(value));
+            .retain(|slot, value| merge_fact(slot, value, &other.locals));
         Ok(*self != previous)
     }
 
@@ -181,6 +199,7 @@ struct RegionFacts {
     branch_taken: HashMap<usize, bool>,
     direct_calls: HashMap<usize, (usize, bool)>,
     discarded_loads: BTreeSet<usize>,
+    redundant_error_checks: BTreeSet<usize>,
 }
 
 impl RegionFacts {
@@ -192,6 +211,7 @@ impl RegionFacts {
             branch_taken: HashMap::new(),
             direct_calls: HashMap::new(),
             discarded_loads: BTreeSet::new(),
+            redundant_error_checks: BTreeSet::new(),
         }
     }
 }
@@ -219,6 +239,17 @@ pub(crate) fn optimize(program: &CompiledProgram) -> CompiledProgram {
     let mut source_map = Vec::new();
     let mut source_index = 0;
     let trace = std::env::var_os("COG_OPT_TRACE").is_some();
+    let branch_targets: HashSet<usize> = program
+        .instructions
+        .iter()
+        .filter_map(|instruction| match instruction {
+            Instruction::Jump(target)
+            | Instruction::JumpIfFalse(target)
+            | Instruction::JumpIfTrue(target)
+            | Instruction::JumpIfNoPropagation(target) => Some(*target),
+            _ => None,
+        })
+        .collect();
 
     for window in boundaries.windows(2) {
         let start = window[0];
@@ -239,19 +270,46 @@ pub(crate) fn optimize(program: &CompiledProgram) -> CompiledProgram {
                 facts.direct_calls.len()
             );
         }
+        let mut discarded = HashSet::new();
+        for pc in start..end.saturating_sub(1) {
+            if facts.reachable[pc - start]
+                && facts.reachable[pc + 1 - start]
+                && !branch_targets.contains(&(pc + 1))
+                && matches!(program.instructions[pc + 1], Instruction::Pop)
+                && matches!(
+                    &program.instructions[pc],
+                    Instruction::Push(
+                        Value::Int(_)
+                            | Value::UInt(_)
+                            | Value::Float(_)
+                            | Value::Bool(_)
+                            | Value::Char(_)
+                            | Value::Nil
+                    )
+                )
+            {
+                discarded.insert(pc);
+                discarded.insert(pc + 1);
+            }
+        }
         for (pc, old_pc) in old_to_new.iter_mut().enumerate().take(end).skip(start) {
             if !facts.reachable[pc - start] {
                 continue;
             }
             *old_pc = Some(rewritten.len());
             let location = source_location(program, pc, &mut source_index);
+            if discarded.contains(&pc) || facts.redundant_error_checks.contains(&pc) {
+                continue;
+            }
             match &program.instructions[pc] {
                 Instruction::Load(_) if facts.discarded_loads.contains(&pc) => {}
                 Instruction::Load(_) if facts.load_constants.contains_key(&pc) => {
                     push_instruction(
                         &mut rewritten,
                         &mut source_map,
-                        Instruction::Push(facts.load_constants[&pc].value()),
+                        Instruction::Push(
+                            facts.load_constants[&pc].value().expect("constant fact"),
+                        ),
                         location,
                     );
                 }
@@ -279,7 +337,17 @@ pub(crate) fn optimize(program: &CompiledProgram) -> CompiledProgram {
                 Instruction::JumpIfFalse(target) | Instruction::JumpIfTrue(target)
                     if let Some(taken) = facts.branch_taken.get(&pc).copied() =>
                 {
-                    push_instruction(&mut rewritten, &mut source_map, Instruction::Pop, location);
+                    if !pc
+                        .checked_sub(1)
+                        .is_some_and(|previous| facts.redundant_error_checks.contains(&previous))
+                    {
+                        push_instruction(
+                            &mut rewritten,
+                            &mut source_map,
+                            Instruction::Pop,
+                            location,
+                        );
+                    }
                     if taken && *target != pc + 1 {
                         push_instruction(
                             &mut rewritten,
@@ -337,6 +405,137 @@ pub(crate) fn optimize(program: &CompiledProgram) -> CompiledProgram {
     };
     compact_local_slots(&mut optimized);
     optimized
+}
+
+/// Application artifacts need only callable regions referenced by startup code.
+/// Compilation APIs retain the full program for embedding and named exports.
+pub(crate) fn application(program: &CompiledProgram) -> CompiledProgram {
+    // Registered natives may return callable values whose addresses are supplied
+    // by the host rather than by an instruction in this artifact.
+    if program
+        .imports
+        .iter()
+        .any(crate::runtime::NativeImport::is_registered)
+        || crate::bytecode::validate(program).is_err()
+        || program.instructions.is_empty()
+    {
+        return program.clone();
+    }
+    let count = program.instructions.len();
+    let mut boundaries = vec![0];
+    for entry in program.callables.keys().copied() {
+        if entry == 0 || entry >= count {
+            return program.clone();
+        }
+        boundaries.push(entry);
+    }
+    boundaries.push(count);
+    let regions: HashMap<_, _> = boundaries[..boundaries.len() - 1]
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(region, entry)| (entry, region))
+        .collect();
+    let mut retained = vec![false; boundaries.len() - 1];
+    retained[0] = true;
+    let mut pending = vec![0];
+    while let Some(region) = pending.pop() {
+        for instruction in &program.instructions[boundaries[region]..boundaries[region + 1]] {
+            let mut targets = Vec::new();
+            match instruction {
+                Instruction::Call(target, _)
+                | Instruction::CallAsync(target, _)
+                | Instruction::MakeClosure(target, _)
+                | Instruction::Push(Value::Function(target)) => targets.push(*target),
+                Instruction::PushArray(template) => {
+                    template_function_targets(template, &mut targets)
+                }
+                _ => {}
+            }
+            for target in targets {
+                let Some(&target_region) = regions.get(&target) else {
+                    return program.clone();
+                };
+                if !std::mem::replace(&mut retained[target_region], true) {
+                    pending.push(target_region);
+                }
+            }
+        }
+    }
+    if retained.iter().all(|retained| *retained) {
+        return program.clone();
+    }
+    let mut old_to_new = vec![None; count + 1];
+    let mut instructions = Vec::new();
+    let mut source_map = Vec::new();
+    let mut source_index = 0;
+    for (region, window) in boundaries.windows(2).enumerate() {
+        if !retained[region] {
+            continue;
+        }
+        for (pc, instruction) in program
+            .instructions
+            .iter()
+            .enumerate()
+            .take(window[1])
+            .skip(window[0])
+        {
+            old_to_new[pc] = Some(instructions.len());
+            push_instruction(
+                &mut instructions,
+                &mut source_map,
+                instruction.clone(),
+                source_location(program, pc, &mut source_index),
+            );
+        }
+    }
+    old_to_new[count] = Some(instructions.len());
+    for instruction in &mut instructions {
+        if !remap_instruction(instruction, &old_to_new) {
+            return program.clone();
+        }
+    }
+    let functions = program
+        .functions
+        .iter()
+        .filter_map(|(entry, name)| old_to_new[*entry].map(|entry| (entry, name.clone())))
+        .collect();
+    let retained_callables = program
+        .callables
+        .iter()
+        .filter(|(entry, _)| old_to_new[**entry].is_some())
+        .map(|(entry, signature)| (*entry, signature.clone()))
+        .collect();
+    let Some(callables) = remap_callables(&retained_callables, &old_to_new) else {
+        return program.clone();
+    };
+    let inline_frames =
+        crate::backend::retain_referenced_inline_frames(&program.inline_frames, &mut source_map);
+    let application = CompiledProgram {
+        instructions,
+        imports: program.imports.clone(),
+        functions,
+        callables,
+        source_map,
+        inline_frames,
+    };
+    if crate::bytecode::validate(&application).is_ok() {
+        application
+    } else {
+        program.clone()
+    }
+}
+
+fn template_function_targets(template: &ArrayTemplate, targets: &mut Vec<usize>) {
+    match template {
+        ArrayTemplate::Scalar(Value::Function(target)) => targets.push(*target),
+        ArrayTemplate::Array(items) => {
+            for item in items {
+                template_function_targets(&item.template, targets);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Reuses a local slot only when CFG liveness proves that its previous value is
@@ -675,11 +874,13 @@ fn analyze_region(program: &CompiledProgram, start: usize, end: usize) -> Option
             branch_taken,
         )?;
         for successor in successors.into_iter().flatten() {
+            let mut outgoing = state.clone();
+            refine_successful_error_check(&mut outgoing, program, block, blocks[successor].start);
             let slot = incoming.get_mut(successor)?;
             let changed = match slot {
-                Some(existing) => existing.merge(&state).ok()?,
+                Some(existing) => existing.merge(&outgoing).ok()?,
                 None => {
-                    *slot = Some(state.clone());
+                    *slot = Some(outgoing);
                     true
                 }
             };
@@ -696,6 +897,7 @@ fn analyze_region(program: &CompiledProgram, start: usize, end: usize) -> Option
         branch_taken: HashMap::new(),
         direct_calls: HashMap::new(),
         discarded_loads: BTreeSet::new(),
+        redundant_error_checks: BTreeSet::new(),
     };
     for (index, block) in blocks.iter().enumerate() {
         let Some(mut state) = incoming[index].clone() else {
@@ -704,9 +906,27 @@ fn analyze_region(program: &CompiledProgram, start: usize, end: usize) -> Option
         for pc in block.start..block.end {
             facts.reachable[pc - start] = true;
             match &program.instructions[pc] {
+                Instruction::Dup
+                    if state.peek().is_some()
+                        // The duplicate must stay tracked, or the branch stays
+                        // unresolved and would pop the original value.
+                        && state.stack_values.len() < MAX_TRACKED_VALUES
+                        && pc + 2 < block.end
+                        && matches!(
+                            program.instructions[pc + 1],
+                            Instruction::IsType(ValueType::Error)
+                        )
+                        && matches!(
+                            program.instructions[pc + 2],
+                            Instruction::JumpIfFalse(_) | Instruction::JumpIfTrue(_)
+                        ) =>
+                {
+                    facts.redundant_error_checks.insert(pc);
+                    facts.redundant_error_checks.insert(pc + 1);
+                }
                 Instruction::Load(slot) => {
                     if let Some(value) = state.locals.get(slot).copied()
-                        && !matches!(value, Fact::Function(_))
+                        && !matches!(value, Fact::Function(_) | Fact::NonError)
                     {
                         facts.load_constants.insert(pc, value);
                     }
@@ -728,7 +948,7 @@ fn analyze_region(program: &CompiledProgram, start: usize, end: usize) -> Option
                     facts.direct_calls.insert(pc, (entry, folded_load));
                 }
                 Instruction::Store(slot)
-                    if !matches!(state.peek(), Some(Fact::Function(_)))
+                    if !matches!(state.peek(), Some(Fact::Function(_) | Fact::NonError))
                         && state.peek().is_some()
                         && state.peek() == state.locals.get(slot).copied() =>
                 {
@@ -744,6 +964,43 @@ fn analyze_region(program: &CompiledProgram, start: usize, end: usize) -> Option
         }
     }
     Some(facts)
+}
+
+fn refine_successful_error_check(
+    state: &mut State,
+    program: &CompiledProgram,
+    block: BasicBlock,
+    successor: usize,
+) {
+    let branch = block.end - 1;
+    if branch < block.start + 2
+        || !matches!(program.instructions[branch - 2], Instruction::Dup)
+        || !matches!(
+            program.instructions[branch - 1],
+            Instruction::IsType(ValueType::Error)
+        )
+    {
+        return;
+    }
+    let normal_edge = match program.instructions[branch] {
+        Instruction::JumpIfFalse(target) => target != branch + 1 && successor == target,
+        Instruction::JumpIfTrue(target) => target != branch + 1 && successor == branch + 1,
+        _ => false,
+    };
+    if !normal_edge || state.stack_height == 0 {
+        return;
+    }
+    let top = state.stack_height - 1;
+    if state.stack_values.len() < MAX_TRACKED_VALUES {
+        state.stack_values.entry(top).or_insert(Fact::NonError);
+    }
+    if branch >= block.start + 3
+        && let Instruction::Load(slot) = program.instructions[branch - 3]
+        && !state.locals.contains_key(&slot)
+        && state.locals.len() < MAX_TRACKED_VALUES
+    {
+        state.locals.insert(slot, Fact::NonError);
+    }
 }
 
 fn branch_target(instruction: &Instruction) -> Option<usize> {
@@ -838,6 +1095,12 @@ fn execute(
             state.push(right)?;
             state.push(left)?;
         }
+        Instruction::ConstrainArrayFrom => {
+            state.pop()?;
+            let value = state.pop()?;
+            // Abstract non-Error values may be arrays whose context check fails.
+            state.push(value.filter(|value| !matches!(value, Fact::NonError)))?;
+        }
         Instruction::Not => {
             let value = state.pop()?;
             let folded = value.and_then(|value| {
@@ -852,11 +1115,11 @@ fn execute(
         }
         Instruction::IsType(ty) => {
             let value = state.pop()?;
-            state.push(
+            state.push(Some(
                 value
-                    .filter(|value| !matches!(value, Fact::Function(_)))
-                    .map(|value| Fact::Bool(value.is_type(ty))),
-            )?;
+                    .and_then(|value| value.is_type(ty))
+                    .map_or(Fact::NonError, Fact::Bool),
+            ))?;
         }
         Instruction::Add
         | Instruction::Sub
@@ -1030,4 +1293,66 @@ fn remap_callables(
         remapped.insert(*old_to_new.get(*entry)?.as_ref()?, signature.clone());
     }
     Some(remapped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn application_remaps_function_addresses_inside_array_templates() {
+        let mut program = CompiledProgram::new(vec![
+            Instruction::PushArray(ArrayTemplate::Array(vec![crate::template::ArrayItem {
+                template: ArrayTemplate::Scalar(Value::Function(5)),
+                repeat: 1,
+            }])),
+            Instruction::Pop,
+            Instruction::Halt,
+            Instruction::Push(Value::Nil),
+            Instruction::Return,
+            Instruction::Push(Value::Nil),
+            Instruction::Return,
+        ]);
+        program
+            .callables
+            .insert(3, CallableSignature::dynamic(0, 0));
+        program
+            .callables
+            .insert(5, CallableSignature::dynamic(0, 0));
+        crate::bytecode::validate(&program).unwrap();
+        let reduced = application(&program);
+        crate::bytecode::validate(&reduced).unwrap();
+        assert_eq!(reduced.instructions.len(), 5);
+        assert_eq!(reduced.callables.keys().copied().collect::<Vec<_>>(), [3]);
+        let Instruction::PushArray(ArrayTemplate::Array(items)) = &reduced.instructions[0] else {
+            panic!("expected array template");
+        };
+        assert!(matches!(
+            items[0].template,
+            ArrayTemplate::Scalar(Value::Function(3))
+        ));
+    }
+
+    #[test]
+    fn discarded_literal_is_kept_when_pop_is_a_branch_target() {
+        let program = CompiledProgram {
+            instructions: vec![
+                Instruction::LoadGlobal(0),
+                Instruction::JumpIfFalse(4),
+                Instruction::Push(Value::Int(3)),
+                Instruction::Jump(5),
+                Instruction::Push(Value::Int(5)),
+                Instruction::Pop,
+                Instruction::Halt,
+            ],
+            ..Default::default()
+        };
+        let optimized = optimize(&program);
+        assert!(
+            optimized
+                .instructions
+                .windows(2)
+                .any(|pair| matches!(pair, [Instruction::Push(Value::Int(5)), Instruction::Pop]))
+        );
+    }
 }

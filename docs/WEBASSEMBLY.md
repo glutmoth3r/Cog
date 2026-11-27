@@ -11,7 +11,9 @@ node --disable-warning=ExperimentalWarning examples/wasm/run.mjs target/scalar.w
 
 The host needs a WASI Preview 1 runtime. The example runner uses Node 24 or
 later. The guest receives arguments after its executable name, including Unicode
-text. It exits with status 1 when an Error reaches the entry point, and reports
+text. An integer `main` result supplies its low eight bits as the process status;
+other normal results use status 0. It exits with status 1 when an Error reaches
+the entry point, and reports
 its kind and bytecode origin on stderr. A source coordinate appears when the
 bytecode contains one. Optimizer inlining can remove logical frames. WASI reports
 the source and function information available from the compiled artifact.
@@ -89,7 +91,10 @@ the VM's semantics, including Error kinds and payload fields:
 
 Standard-library functions written in Cog compile when they use only these
 operations. This includes `str::replace`, whose empty pattern returns
-`Error::InvalidArgument("str::replace")`, and functions such as
+`Error::InvalidArgument("str::replace")`, text helpers such as `str::split`,
+`str::split_whitespace`, `str::slice`, and `str::find`, the `bytes::equals`,
+`bytes::starts_with`, `bytes::index_of`, and `bytes::find` searches,
+`ascii::hex_value`, and functions such as
 `http::html_escape`. The guest builds `Error::Variant(...)` values from the core
 `Error` enum. User enums and anonymous records are rejected.
 

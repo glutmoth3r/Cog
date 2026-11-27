@@ -768,6 +768,44 @@ impl Serialize for JsonValue<'_> {
                 let fields = record
                     .try_borrow_fields()
                     .map_err(|_| S::Error::custom(BORROW))?;
+                if let Some(arguments) = record
+                    .nominal_name()
+                    .and_then(|name| name.strip_prefix("$core_collections_Map["))
+                {
+                    if !arguments.starts_with("str,") {
+                        return Err(S::Error::custom(TYPE));
+                    }
+                    let Some(Value::Array(slots)) = fields.get("slots") else {
+                        return Err(S::Error::custom(TYPE));
+                    };
+                    let slots = slots.try_borrow().map_err(|_| S::Error::custom(BORROW))?;
+                    let mut object = serializer.serialize_map(None)?;
+                    for slot in slots.iter() {
+                        let Value::Record(slot) = slot else {
+                            return Err(S::Error::custom(TYPE));
+                        };
+                        let slot = slot
+                            .try_borrow_fields()
+                            .map_err(|_| S::Error::custom(BORROW))?;
+                        match slot.get("live") {
+                            Some(Value::Bool(false)) => continue,
+                            Some(Value::Bool(true)) => {}
+                            _ => return Err(S::Error::custom(TYPE)),
+                        }
+                        let Some(Value::Str(key)) = slot.get("key") else {
+                            return Err(S::Error::custom(TYPE));
+                        };
+                        let value = slot.get("value").ok_or_else(|| S::Error::custom(TYPE))?;
+                        object.serialize_entry(
+                            key.as_ref(),
+                            &JsonValue {
+                                value,
+                                state: self.state.clone(),
+                            },
+                        )?;
+                    }
+                    return object.end();
+                }
                 let key_bytes = fields
                     .len()
                     .checked_mul(std::mem::size_of::<&str>())

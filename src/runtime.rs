@@ -1519,6 +1519,7 @@ pub struct RuntimeContext<'a> {
     process_arguments: Option<Vec<OsString>>,
     last_source_location: Option<crate::diagnostic::SourceLocation>,
     last_runtime_diagnostic: Option<crate::error::RuntimeDiagnostic>,
+    exit_code: i32,
     pub(crate) jit_enabled: bool,
     pub(crate) jit_debug: bool,
     pub(crate) jit_profile_path: Option<PathBuf>,
@@ -1568,6 +1569,7 @@ impl<'a> RuntimeContext<'a> {
             process_arguments: None,
             last_source_location: None,
             last_runtime_diagnostic: None,
+            exit_code: 0,
             jit_enabled: false,
             jit_debug: false,
             jit_profile_path: None,
@@ -1624,7 +1626,21 @@ impl<'a> RuntimeContext<'a> {
         self.last_runtime_diagnostic.as_ref()
     }
 
+    /// Process status from the last successful execution. Embedding never exits
+    /// the host process; integer results use their low eight bits.
+    pub fn exit_code(&self) -> i32 {
+        self.exit_code
+    }
+
+    pub(crate) fn set_exit_code(&mut self, result: &Value) {
+        self.exit_code = match result {
+            Value::Int(value) => (value & 255) as i32,
+            _ => 0,
+        };
+    }
+
     pub(crate) fn clear_runtime_diagnostic(&mut self) {
+        self.exit_code = 0;
         self.last_runtime_diagnostic = None;
         self.last_source_location = None;
     }

@@ -1719,6 +1719,7 @@ impl<'a> Pass<'a> {
                 }
                 result
             }
+            Expr::TypedAggregate(value, _) => self.expr(value),
             Expr::Closure {
                 captures,
                 params,
