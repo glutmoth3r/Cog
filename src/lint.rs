@@ -1,7 +1,8 @@
 //! Small, conservative source warnings that never affect compilation success.
+use crate::analysis::writes::Writes;
 use crate::ast::{
-    BinOp, Block, Expr, ForClause, FunctionDecl, Item, MatchPattern, Program, Stmt, StringPart,
-    TypeKind, UnOp, VarType,
+    BinOp, Block, Expr, FallbackKind, ForClause, FunctionDecl, Item, MatchPattern, Program, Stmt,
+    StringPart, TypeAnnotation, TypeKind, UnOp, VarType,
 };
 use crate::diagnostic::{Diagnostic, SourceSpan};
 use std::collections::{HashMap, HashSet};
@@ -11,6 +12,8 @@ struct Local {
     read: bool,
     report_unused: bool,
     boolean: bool,
+    /// The value this binding holds here is certainly an Error.
+    error: bool,
     task_group: Option<usize>,
     span: Option<SourceSpan>,
 }
@@ -30,6 +33,11 @@ struct Linter {
     async_functions: HashSet<String>,
     async_method_call_sites: HashSet<usize>,
     task_groups: Vec<TaskGroup>,
+    /// An enclosing string expression visibly handles or propagates Error.
+    error_handled: bool,
+    /// Names assigned or mutably captured in the item being checked. Nothing
+    /// is certain about their values without control-flow analysis.
+    rebound: Writes,
 }
 
 pub(crate) fn check_with_names(
@@ -94,11 +102,11 @@ pub(crate) fn check_with_names(
             }
             Item::GlobalConst { value, .. }
             | Item::GlobalVar { value, .. }
-            | Item::Comptime { value, .. } => linter.expr(value, true),
+            | Item::Comptime { value, .. } => linter.initializer(value),
             Item::StructDecl { fields, .. } => {
                 for field in fields {
                     if let Some(default) = &field.default {
-                        linter.expr(default, true);
+                        linter.initializer(default);
                     }
                 }
             }
@@ -121,7 +129,15 @@ fn diagnostic_position(diagnostic: &Diagnostic) -> (String, usize) {
 }
 
 impl Linter {
+    fn initializer(&mut self, value: &Expr) {
+        self.rebound = Writes::default();
+        self.rebound.expr(value);
+        self.expr(value, true);
+    }
+
     fn function(&mut self, function: &FunctionDecl) {
+        self.rebound = Writes::default();
+        self.rebound.block(&function.body);
         self.scopes.push(HashMap::new());
         for parameter in &function.params {
             let boolean = parameter
@@ -129,6 +145,9 @@ impl Linter {
                 .as_ref()
                 .is_some_and(|ty| matches!(ty.kind, TypeKind::Primitive(VarType::Bool)));
             self.define_with_type(&parameter.name, false, None, boolean, None);
+            if parameter.ty.as_ref().is_some_and(is_error_annotation) {
+                self.mark_error(&parameter.name);
+            }
         }
         self.block(&function.body, true);
         self.pop_scope();
@@ -181,6 +200,7 @@ impl Linter {
                     .as_ref()
                     .is_some_and(|ty| matches!(ty.kind, TypeKind::Primitive(VarType::Bool)))
                     || self.expr_is_boolean(value);
+                let error = self.known_error(value).is_some();
                 match pattern {
                     crate::ast::BindingPattern::Name(name) => {
                         let task_group = if cold_task_call {
@@ -189,6 +209,9 @@ impl Linter {
                             task_alias
                         };
                         self.define_with_type(name, report, statement.span(), boolean, task_group);
+                        if error {
+                            self.mark_error(name);
+                        }
                     }
                     crate::ast::BindingPattern::Tuple(_) => {
                         pattern.visit_names(&mut |name| {
@@ -227,6 +250,7 @@ impl Linter {
                 self.block(body, report);
                 self.scopes.push(HashMap::new());
                 self.define(catch_name, report, statement.span());
+                self.mark_error(catch_name);
                 self.block(catch_block, report);
                 self.pop_scope();
             }
@@ -386,6 +410,7 @@ impl Linter {
     }
 
     fn expr(&mut self, expression: &Expr, report: bool) {
+        let error_handled = std::mem::take(&mut self.error_handled);
         match expression.node() {
             Expr::Located(_, _) => unreachable!("node removes source locations"),
             Expr::Ident(name) => {
@@ -407,8 +432,12 @@ impl Linter {
             }
             Expr::Interpolated(parts) => {
                 for part in parts {
-                    if let StringPart::Expression(expression) = part {
-                        self.expr(expression, report);
+                    if let StringPart::Expression(hole) = part {
+                        if report && !error_handled {
+                            self.check_error_hole(hole, expression.span());
+                        }
+                        self.error_handled = error_handled;
+                        self.expr(hole, report);
                     }
                 }
             }
@@ -453,24 +482,41 @@ impl Linter {
                     self.expr(&argument.value, report);
                 }
             }
-            Expr::MethodCall(receiver, _, args) => {
+            Expr::MethodCall(receiver, method, args) => {
+                self.error_handled = matches!(method.as_str(), "unwrap" | "expect" | "error_kind");
                 self.expr(receiver, report);
                 for argument in args {
                     self.expr(argument, report);
                 }
             }
-            Expr::Index(target, index) | Expr::Binary(_, target, index) => {
+            Expr::Index(target, index) => {
                 self.expr(target, report);
                 self.expr(index, report);
             }
+            Expr::Binary(_, left, right) => {
+                self.error_handled = error_handled;
+                self.expr(left, report);
+                self.error_handled = error_handled;
+                self.expr(right, report);
+            }
             Expr::Unary(UnOp::Await, value) => self.mark_task_started(value, report),
-            Expr::Unary(_, value) | Expr::Propagate(value) | Expr::Cast(value, _) => {
+            Expr::Propagate(value) => {
+                self.error_handled = true;
+                self.expr(value, report)
+            }
+            Expr::Unary(_, value) => self.expr(value, report),
+            Expr::Cast(value, _) => {
+                self.error_handled = error_handled;
                 self.expr(value, report)
             }
             Expr::Fallback {
-                value, fallback, ..
+                kind,
+                value,
+                fallback,
             } => {
+                self.error_handled = error_handled || matches!(kind, FallbackKind::Error);
                 self.expr(value, report);
+                self.error_handled = error_handled;
                 self.expr(fallback, report);
             }
             Expr::Closure {
@@ -479,15 +525,24 @@ impl Linter {
                 body,
                 ..
             } => {
+                let mut errors = Vec::new();
                 for capture in captures {
-                    self.expr(&Expr::Ident(capture.name.clone()), report);
+                    let name = Expr::Ident(capture.name.clone());
+                    errors.push(self.known_error(&name).is_some());
+                    self.expr(&name, report);
                 }
                 self.scopes.push(HashMap::new());
-                for capture in captures {
+                for (capture, error) in captures.iter().zip(errors) {
                     self.define(&capture.name, report, expression.span());
+                    if error {
+                        self.mark_error(&capture.name);
+                    }
                 }
                 for parameter in params {
                     self.define(&parameter.name, report, expression.span());
+                    if parameter.ty.as_ref().is_some_and(is_error_annotation) {
+                        self.mark_error(&parameter.name);
+                    }
                 }
                 self.block(body, report);
                 self.pop_scope();
@@ -496,6 +551,22 @@ impl Linter {
             Expr::Match { value, arms, .. } => {
                 self.expr(value, report);
                 for arm in arms {
+                    // Inside an Error pattern the matched binding is an Error,
+                    // unless another kind of pattern shares the body, as in
+                    // `when value is Error | int`.
+                    let narrowed = match value.node() {
+                        Expr::Ident(name)
+                            if is_error_pattern(&arm.pattern)
+                                && self.known_error(value).is_none()
+                                && !arms.iter().any(|other| {
+                                    !is_error_pattern(&other.pattern) && other.body == arm.body
+                                }) =>
+                        {
+                            self.mark_error(name);
+                            Some(name)
+                        }
+                        _ => None,
+                    };
                     self.scopes.push(HashMap::new());
                     if let MatchPattern::Variant { bindings, .. } = &arm.pattern {
                         for binding in bindings {
@@ -511,6 +582,9 @@ impl Linter {
                     }
                     self.block(&arm.body, report);
                     self.pop_scope();
+                    if let Some(name) = narrowed {
+                        self.set_error(name, false);
+                    }
                 }
             }
             Expr::Try {
@@ -521,6 +595,7 @@ impl Linter {
                 self.block(body, report);
                 self.scopes.push(HashMap::new());
                 self.define(catch_name, report, expression.span());
+                self.mark_error(catch_name);
                 self.block(catch_block, report);
                 self.pop_scope();
             }
@@ -571,6 +646,71 @@ impl Linter {
             | Expr::Nil
             | Expr::TypeLiteral(_) => {}
         }
+    }
+
+    /// The binding behind an expression that certainly produces its Error.
+    /// A conversion of an Error is still that Error.
+    fn known_error<'a>(&self, expression: &'a Expr) -> Option<&'a str> {
+        match expression.node() {
+            Expr::Cast(value, _) => self.known_error(value),
+            Expr::Ident(name) => self
+                .scopes
+                .iter()
+                .rev()
+                .find_map(|scope| scope.get(name))
+                .is_some_and(|local| local.error)
+                .then_some(name.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Records that a binding certainly holds an Error for its whole scope.
+    fn mark_error(&mut self, name: &str) {
+        if !self.rebound.assigned.contains(name) && !self.rebound.captured.contains(name) {
+            self.set_error(name, true);
+        }
+    }
+
+    fn set_error(&mut self, name: &str, error: bool) {
+        if let Some(local) = self
+            .scopes
+            .iter_mut()
+            .rev()
+            .find_map(|scope| scope.get_mut(name))
+        {
+            local.error = error;
+        }
+    }
+
+    fn check_error_hole(&mut self, hole: &Expr, string: Option<&SourceSpan>) {
+        let Some(name) = self.known_error(hole) else {
+            return;
+        };
+        let span = hole.span().or(string);
+        // A `when` with alternative patterns repeats its body in every arm.
+        if self
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "W0008" && warning.span.as_ref() == span)
+        {
+            return;
+        }
+        let warning = Diagnostic::warning(
+            "W0008",
+            "interpolating an Error makes the whole string an Error",
+            span.cloned(),
+        )
+        .note(format!(
+            "`{name}` is an Error here, so the result does not hold the message text"
+        ))
+        .help(format!(
+            "use `{{{name}.error_kind()}}` for the kind name, read a payload with a `when` pattern on `{name}`, or pass `{name}` alone to `io::println` to print its message"
+        ))
+        .help(format!(
+            "for the message as str, store `bytes::render({name})` in `text` and decode it with `bytes::to_str(text, 0, bytes::len(text))`"
+        ))
+        .help("if the Error should propagate, make that visible with `!!`");
+        self.warnings.push(warning);
     }
 
     fn is_cold_task_call(&self, expression: &Expr) -> bool {
@@ -676,9 +816,8 @@ impl Linter {
         boolean: bool,
         task_group: Option<usize>,
     ) {
-        if name.starts_with('_') {
-            return;
-        }
+        // An underscore name is tracked only for what its value is known to be.
+        let ignored = name.starts_with('_');
         self.scopes
             .last_mut()
             .expect("a function or block scope is active")
@@ -686,9 +825,10 @@ impl Linter {
                 name.to_owned(),
                 Local {
                     read: false,
-                    report_unused,
-                    boolean,
-                    task_group,
+                    report_unused: report_unused && !ignored,
+                    boolean: boolean && !ignored,
+                    error: false,
+                    task_group: task_group.filter(|_| !ignored),
                     span: span.cloned(),
                 },
             );
@@ -810,6 +950,28 @@ impl Linter {
             _ => false,
         }
     }
+}
+
+fn is_error_pattern(pattern: &MatchPattern) -> bool {
+    match pattern {
+        MatchPattern::Type(name) | MatchPattern::Variant { name, .. } => is_error_symbol(name),
+        _ => false,
+    }
+}
+
+fn is_error_symbol(name: &str) -> bool {
+    name.strip_prefix(crate::error::ERROR_TYPE)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+}
+
+fn is_error_annotation(annotation: &TypeAnnotation) -> bool {
+    !annotation.nilable
+        && match &annotation.kind {
+            TypeKind::Named(symbol) | TypeKind::ResolvedName { symbol, .. } => {
+                is_error_symbol(symbol)
+            }
+            _ => false,
+        }
 }
 
 fn branch_bool(expression: &Expr) -> Option<bool> {

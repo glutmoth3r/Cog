@@ -7,7 +7,7 @@ use crate::builtins::Builtin;
 use crate::diagnostic::{Diagnostic, DiagnosticSuggestion, SourceSpan};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-mod writes;
+pub(crate) mod writes;
 use writes::Writes;
 
 const CLONE_TRAIT: &str = "$core::clone::Clone";

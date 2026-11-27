@@ -255,3 +255,38 @@ Diagnostic rendering deliberately shows Error text: `io::println(error)` and
 conversion such as `error as str`, which propagates Error. Printing inside try
 can itself observe an Error argument before the print call; inspect or handle the
 value explicitly when choosing a diagnostic path.
+
+A caught Error therefore cannot be embedded in a message directly:
+`$"Save failed: {error}"` is itself an Error. Interpolate `error.error_kind()`,
+which is the kind name as str, or read a variant payload with `when`. For the
+whole message text as str, decode the buffer returned by `bytes::render`:
+
+```cog
+@!include("std")
+use io;
+use bytes;
+use err::Error;
+
+fn message(error: Error) -> str {
+    const text = bytes::render(error);
+    bytes::to_str(text, 0, bytes::len(text))
+}
+
+fn main() -> nil {
+    try { io::println("invalid" as int); }
+    catch(error) {
+        io::println($"Save failed: {error.error_kind()}")!!;
+        io::println($"Save failed: {message(error)}")!!;
+        io::println(error)!!; // The runtime message on its own line.
+    }
+}
+```
+
+
+Compiler warning `W0008` reports an interpolation hole that is certainly an Error:
+a `catch` binding, a parameter declared as `err::Error`, a binding inside an Error
+pattern arm, or a local initialized from one of these, optionally converted with
+`as`. Bindings that are reassigned or mutably captured are not tracked, and neither
+are dynamic values, fields, elements, or call results. No warning is reported when
+the string is the operand of `!!`, `?!`, `.error_kind()`, `.unwrap()`, or
+`.expect()`, including through `+`. The warning does not change runtime behavior.

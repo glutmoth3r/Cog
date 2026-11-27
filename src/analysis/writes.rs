@@ -5,7 +5,7 @@ use crate::ast::*;
 use std::collections::HashSet;
 
 #[derive(Default)]
-pub(super) struct Writes {
+pub(crate) struct Writes {
     /// Names that are the target of an assignment.
     pub assigned: HashSet<String>,
     /// Names captured mutably by a closure; any call may rebind them.

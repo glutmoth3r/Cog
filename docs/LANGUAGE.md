@@ -730,9 +730,10 @@ Nested interpolation is limited to 64 lexer levels.
 Raw strings, Unicode escapes, and `f"..."` are not supported.
 
 Nil renders as `nil`; computational Error remains Error rather than silently
-becoming text. String construction respects runtime buffer limits. See
-[errors](ERRORS.md) for observation and [text APIs](STANDARD_LIBRARY.md) for trimming
-and formatting.
+becoming text, and the compiler warns (`W0008`) when a hole is certainly an Error,
+such as a `catch` binding. String construction respects runtime buffer limits. See
+[errors](ERRORS.md#strings-and-diagnostic-rendering) for rendering a caught Error
+and [text APIs](STANDARD_LIBRARY.md) for trimming and formatting.
 
 ## Arrays, records, structs, and enums
 
