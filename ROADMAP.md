@@ -46,6 +46,9 @@ remaining release acceptance gates, and the next language goals. See the [langua
   bounded JSON, process arguments/environment, path and filesystem
   APIs, byte streams, and Cog implementations of common search, sort, string,
   and encoding utilities.
+- Native executables and shared libraries (`cog build --native`, `--lib`) and
+  scalar C interoperation, **on Linux x86_64 GNU only**. Windows and macOS
+  artifact production is pending. See [native compilation](docs/NATIVE_COMPILATION.md).
 - A tutorial and CI/fuzz infrastructure. Short fuzz smoke runs and local Linux
   validation have been recorded; sustained fuzz campaigns remain outstanding.
   The CI workflow is configured for Linux x86_64, Windows x86_64, and macOS
@@ -206,6 +209,8 @@ implemented Beta contracts and Linux x86_64 packaging and installation on
 Rust 1.95 and stable. CI run
 [45030017021](https://github.com/glutmoth3r/cog-lang/actions/runs/45030017021)
 then passed Linux x86_64, Windows x86_64 and macOS arm64 on both Rust 1.95 and
-stable, along with the tutorial. Full release acceptance still requires the
+stable, along with the tutorial. That run predates later changes, including native
+compilation and recent JIT work, which have been validated locally on Linux
+x86_64 only. Full release acceptance still requires the
 four sustained fuzz campaigns. Detailed audit evidence lives in the
 repository's development records.

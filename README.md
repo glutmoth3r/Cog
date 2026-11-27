@@ -36,6 +36,22 @@ Use the [documentation index](docs/README.md) to find the [language reference](d
 [runtime and bytecode guide](docs/RUNTIME.md), [project formats](docs/PROJECT_FORMATS.md),
 [Rust SDK](docs/SDK.md), and [contributor guide](docs/CONTRIBUTING.md).
 
+## Platform support
+
+Some features work only on **Linux x86_64 GNU** (`x86_64-unknown-linux-gnu`):
+
+| Feature | Platforms |
+| --- | --- |
+| [Native compilation](docs/NATIVE_COMPILATION.md): `cog build --native` executables and `cog build --lib` shared libraries | Linux x86_64 GNU only |
+| [C interoperation](docs/FFI.md): exported C functions and `--c-import` / `--c-link` | Linux x86_64 GNU only |
+| Process-group termination on async process cancellation or timeout, and cancellable TCP connect | Unix; other platforms have the weaker behavior described in [async design](docs/ASYNC_DESIGN.md) |
+| Native plugin bundles | Linux x86_64 GNU, Windows x86_64 MSVC, macOS arm64 |
+
+The compiler, bytecode VM and optional JIT also target Windows x86_64 and macOS
+arm64. The last recorded CI run on all three platforms predates later changes,
+including native compilation and recent JIT work; those changes have been
+validated locally on Linux x86_64 only.
+
 ## Build and install
 
 You need Rust 1.95 or newer and Cargo. From this directory:
