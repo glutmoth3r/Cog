@@ -7,7 +7,6 @@
 //! native exits are validated before their frame is restored.
 
 use crate::backend::{CallableSignature, CompiledProgram};
-use crate::error::RuntimeError;
 use crate::instruction::{Instruction, ValueType};
 use crate::value::{RuntimeType, Value};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -29,6 +28,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::mem::{offset_of, size_of, transmute};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -41,6 +41,10 @@ const MAX_JIT_CODE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_JIT_ENUM_VARIANTS: usize = 32;
 const MAX_JIT_ROOTS: usize = 65_536;
 const MAX_JIT_CALL_ARGS: usize = 16;
+/// Compiled callees nest on the native stack. Deeper chains unwind to the
+/// outermost compiled call, which the VM then executes.
+const MAX_JIT_CALL_DEPTH: usize = 32;
+const MAX_JIT_MEMOIZED_CALLABLES: usize = 64;
 const MAX_BOOTSTRAP_PROBES: usize = 3;
 const WINDOW_BACKEDGES: u64 = 256;
 const REQUIRED_WINDOWS: u32 = 3;
@@ -51,7 +55,7 @@ const TOKEN_CAPACITY_NS: u64 = 20_000_000;
 const TOKEN_REFILL_PER_NS: f64 = 0.02;
 const MAX_PROFILE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PROFILE_METRIC_NS: u64 = 60_000_000_000;
-const APE_VERSION: u32 = 17;
+const APE_VERSION: u32 = 18;
 static PROFILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const EXIT_COMPLETED: i32 = 0;
@@ -119,26 +123,78 @@ pub(crate) struct JitFrame {
 
 pub(crate) type JitEntry = unsafe extern "C" fn(*mut JitFrame) -> i32;
 
-#[derive(Clone)]
+/// A compiled side-effect-free callee that generated code may enter through
+/// the compiled-callee adapter. All references borrow the active JIT state.
+#[derive(Clone, Copy)]
 struct JitCallable<'a> {
     entry: JitEntry,
-    plan: Arc<FunctionPlan>,
+    plan: &'a FunctionPlan,
     signature: &'a CallableSignature,
     int_slot_arguments: Option<bool>,
+}
+
+/// Read-only view of the JIT state used to resolve compiled callees lazily
+/// while a native invocation is active.
+#[derive(Clone, Copy)]
+struct JitCallableSource<'a> {
+    candidates: &'a BTreeMap<usize, Candidate>,
+    plans: &'a BTreeMap<usize, Arc<FunctionPlan>>,
+    aot_entries: &'a BTreeSet<usize>,
+}
+
+impl<'a> JitCallableSource<'a> {
+    fn resolve(&self, artifact: &'a CompiledProgram, entry: usize) -> Option<JitCallable<'a>> {
+        // The VM rejects a call to address zero before it enters a frame.
+        if entry == 0 {
+            return None;
+        }
+        let candidate = self.candidates.get(&entry)?;
+        let compiled = candidate.compiled.as_ref()?;
+        let plan = self.plans.get(&entry)?;
+        let call_profiled = compiled.call_compiled
+            && candidate.profile.total_calls >= HOT_CALL_THRESHOLD
+            && candidate.profile.total_calls >= candidate.retry_after_calls;
+        let aot = self.aot_entries.contains(&entry);
+        // OSR timings include VM/JIT entry costs; they do not predict whether
+        // calling this compiled function from another JIT function is useful.
+        if !plan.callable_from_jit
+            || compiled.probe_pending
+            || candidate.disabled
+            || !(aot || candidate.profile.calibrated || call_profiled)
+            || candidate.profile.total_backedges < candidate.retry_after_backedges
+        {
+            return None;
+        }
+        let signature = artifact.callables.get(&entry)?;
+        let int_slot_arguments = if signature.result_type == Some(RuntimeType::Int) {
+            match &signature.parameter_types {
+                None => Some(false),
+                Some(types) if types.iter().all(|ty| *ty == Some(RuntimeType::Int)) => Some(true),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        Some(JitCallable {
+            entry: compiled.entry,
+            plan: plan.as_ref(),
+            signature,
+            int_slot_arguments,
+        })
+    }
 }
 
 struct JitCallFrame {
     frame: JitFrame,
     locals: Vec<JitSlot>,
     stack: Vec<JitSlot>,
-    roots: Vec<Value>,
+    captures: Vec<JitSlot>,
 }
 
 impl JitCallFrame {
     fn new(runtime_context: *mut std::ffi::c_void) -> Self {
         let mut locals = Vec::new();
         let mut stack = Vec::new();
-        let roots = Vec::new();
         let frame = JitFrame {
             locals: locals.as_mut_ptr(),
             stack: stack.as_mut_ptr(),
@@ -157,19 +213,26 @@ impl JitCallFrame {
             frame,
             locals,
             stack,
-            roots,
+            captures: Vec::new(),
         }
     }
 
-    fn prepare(&mut self, plan: &FunctionPlan, runtime_context: *mut std::ffi::c_void) {
+    fn prepare(
+        &mut self,
+        plan: &FunctionPlan,
+        runtime_context: *mut std::ffi::c_void,
+        roots: *mut Vec<Value>,
+    ) {
         self.locals.resize(plan.local_count, JitSlot::default());
         self.locals.fill(JitSlot::default());
         self.stack.resize(plan.max_stack.max(1), JitSlot::default());
         self.stack.fill(JitSlot::default());
-        self.roots.clear();
+        self.captures.clear();
         self.frame.locals = self.locals.as_mut_ptr();
         self.frame.stack = self.stack.as_mut_ptr();
-        self.frame.roots = &mut self.roots;
+        self.frame.captures = std::ptr::null_mut();
+        self.frame.capture_count = 0;
+        self.frame.roots = roots;
         self.frame.runtime_context = runtime_context;
         self.frame.pc = plan.entry as u64;
         self.frame.stack_len = 0;
@@ -204,16 +267,75 @@ struct BridgeStats {
 struct JitExecutionContext<'a, 'bridge> {
     artifact: &'a CompiledProgram,
     variant_tags: &'a VariantTags,
-    callables: HashMap<usize, JitCallable<'a>>,
+    callable_source: JitCallableSource<'a>,
+    /// Memoized callee resolutions for this invocation. Call sites are few,
+    /// so a linear scan is cheaper than hashing.
+    callables: Vec<(usize, Option<JitCallable<'a>>)>,
+    /// Program owner used to authorize compiled closure calls. `None` keeps
+    /// every indirect call on the VM bridge.
+    owner: Option<&'a Rc<()>>,
     profile_fallback_calls: bool,
     deferred_calls: BTreeMap<usize, u64>,
-    call_frame: Option<Box<JitCallFrame>>,
+    // Boxed so that taking a frame from the pool and returning it moves a
+    // pointer rather than the whole frame on every compiled call.
+    #[allow(clippy::vec_box)]
+    call_frames: Vec<Box<JitCallFrame>>,
+    /// Number of compiled callees currently active on the native stack.
+    call_depth: usize,
     bridge: Option<&'a mut RuntimeBridge<'bridge>>,
     arguments: Vec<Value>,
     committed: bool,
     bridge_active: bool,
     fallback: Option<&'static str>,
     stats: Option<BridgeStats>,
+}
+
+impl<'a> JitExecutionContext<'a, '_> {
+    fn new(
+        artifact: &'a CompiledProgram,
+        variant_tags: &'a VariantTags,
+        callable_source: JitCallableSource<'a>,
+    ) -> Self {
+        Self {
+            artifact,
+            variant_tags,
+            callable_source,
+            callables: Vec::new(),
+            owner: None,
+            profile_fallback_calls: false,
+            deferred_calls: BTreeMap::new(),
+            call_frames: Vec::new(),
+            call_depth: 0,
+            bridge: None,
+            arguments: Vec::new(),
+            committed: false,
+            bridge_active: false,
+            fallback: None,
+            stats: None,
+        }
+    }
+
+    fn callable(&mut self, entry: usize) -> Option<JitCallable<'a>> {
+        if let Some((_, callable)) = self
+            .callables
+            .iter()
+            .find(|(candidate, _)| *candidate == entry)
+        {
+            return *callable;
+        }
+        let callable = self.callable_source.resolve(self.artifact, entry);
+        if self.callables.len() < MAX_JIT_MEMOIZED_CALLABLES {
+            self.callables.push((entry, callable));
+        }
+        callable
+    }
+
+    fn record_deferred_call(&mut self, target: usize) {
+        if self.profile_fallback_calls {
+            let calls = self.deferred_calls.entry(target).or_default();
+            *calls = calls.saturating_add(1);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -230,6 +352,9 @@ struct FunctionPlan {
     osr_entries: Vec<usize>,
     direct_call_targets: Vec<usize>,
     has_backedges: bool,
+    /// The body is side-effect free, so a failed compiled-callee invocation
+    /// can be discarded and executed again by the VM. Direct calls qualify
+    /// only when every callee also qualifies.
     callable_from_jit: bool,
 }
 
@@ -671,6 +796,7 @@ impl JitState {
         captures: &crate::interpreter::CaptureValues,
         propagation_pending: &mut bool,
         debug: bool,
+        owner: &Rc<()>,
         bridge: &mut RuntimeBridge<'_>,
     ) -> Option<JitExit> {
         let plan = Arc::clone(self.plans.get(&entry)?);
@@ -715,64 +841,21 @@ impl JitState {
             }
             (compiled.entry, compiled.probe_pending)
         };
-        // OSR timings include VM/JIT entry costs; they do not predict whether
-        // calling this compiled function from another JIT function is useful.
-        let callables = plan
-            .direct_call_targets
-            .iter()
-            .filter_map(|&candidate_entry| {
-                let candidate = self.candidates.get(&candidate_entry)?;
-                let compiled = candidate.compiled.as_ref()?;
-                let plan = self.plans.get(&candidate_entry)?;
-                let call_profiled = compiled.call_compiled
-                    && candidate.profile.total_calls >= HOT_CALL_THRESHOLD
-                    && candidate.profile.total_calls >= candidate.retry_after_calls;
-                let aot = self.aot_entries.contains(&candidate_entry);
-                if !plan.callable_from_jit
-                    || compiled.probe_pending
-                    || candidate.disabled
-                    || !(aot || candidate.profile.calibrated || call_profiled)
-                    || candidate.profile.total_backedges < candidate.retry_after_backedges
-                {
-                    return None;
-                }
-                let signature = artifact.callables.get(&candidate_entry)?;
-                let int_slot_arguments = if signature.result_type == Some(RuntimeType::Int) {
-                    match &signature.parameter_types {
-                        None => Some(false),
-                        Some(types) if types.iter().all(|ty| *ty == Some(RuntimeType::Int)) => {
-                            Some(true)
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-                Some((
-                    candidate_entry,
-                    JitCallable {
-                        entry: compiled.entry,
-                        plan: Arc::clone(plan),
-                        signature,
-                        int_slot_arguments,
-                    },
-                ))
-            })
-            .collect();
-        let mut runtime = JitExecutionContext {
+        let mut runtime = JitExecutionContext::new(
             artifact,
-            variant_tags: &self.variant_tags,
-            callables,
-            profile_fallback_calls: !self.aot_entries.is_empty() && self.compiler.is_some(),
-            deferred_calls: BTreeMap::new(),
-            call_frame: None,
-            bridge: Some(bridge),
-            arguments: Vec::new(),
-            committed: false,
-            bridge_active: false,
-            fallback: None,
-            stats: debug.then(BridgeStats::default),
-        };
+            &self.variant_tags,
+            JitCallableSource {
+                candidates: &self.candidates,
+                plans: &self.plans,
+                aot_entries: &self.aot_entries,
+            },
+        );
+        runtime.owner = Some(owner);
+        // Calls that miss the compiled-callee adapter are counted so a later
+        // OSR entry can use the callee once it has been compiled.
+        runtime.profile_fallback_calls = self.compiler.is_some();
+        runtime.bridge = Some(bridge);
+        runtime.stats = debug.then(BridgeStats::default);
         let runtime_context = (&mut runtime as *mut JitExecutionContext<'_, '_>).cast();
         let mut roots = Vec::new();
         let mut jit_locals = vec![JitSlot::default(); plan.local_count];
@@ -1023,20 +1106,17 @@ impl JitState {
             let compiled = candidate.compiled.as_ref()?;
             compiled.entry
         };
-        let mut runtime = JitExecutionContext {
+        // Without a VM bridge, nested compiled callees either complete or
+        // leave this function at the call instruction.
+        let mut runtime = JitExecutionContext::new(
             artifact,
-            variant_tags: &self.variant_tags,
-            callables: HashMap::new(),
-            profile_fallback_calls: false,
-            deferred_calls: BTreeMap::new(),
-            call_frame: None,
-            bridge: None,
-            arguments: Vec::new(),
-            committed: false,
-            bridge_active: false,
-            fallback: None,
-            stats: None,
-        };
+            &self.variant_tags,
+            JitCallableSource {
+                candidates: &self.candidates,
+                plans: &self.plans,
+                aot_entries: &self.aot_entries,
+            },
+        );
         let runtime_context = (&mut runtime as *mut JitExecutionContext<'_, '_>).cast();
         let mut roots = Vec::new();
         let mut jit_locals = vec![JitSlot::default(); plan.local_count];
@@ -1299,9 +1379,9 @@ impl JitState {
             let Some(signature) = artifact.callables.get(&entry) else {
                 continue;
             };
+            // Closure bodies qualify too: `CallValue` passes their captures.
             if !plan.callable_from_jit
                 || signature.asynchronous
-                || signature.captures != 0
                 || self.aot_entries.contains(&entry)
             {
                 continue;
@@ -1320,6 +1400,9 @@ impl JitState {
                     .is_some_and(|candidate| candidate.compiled.is_some())
                     && !self.aot_entries.contains(&caller)
                     && let Some(candidate) = self.candidates.get_mut(&caller)
+                    // Without a VM timing a new probe has nothing to compare
+                    // against and would reject the caller as unprofitable.
+                    && candidate.profile.vm_ns_per_backedge != 0
                 {
                     candidate.profile.calibrated = false;
                     if let Some(compiled) = candidate.compiled.as_mut() {
@@ -1690,10 +1773,41 @@ fn analyze_program(artifact: &CompiledProgram) -> BTreeMap<usize, Arc<FunctionPl
             continue;
         }
         if let Some(plan) = analyze_function(artifact, entry, end, signature.parameters) {
-            plans.insert(entry, Arc::new(plan));
+            plans.insert(entry, plan);
+        }
+    }
+    // A direct call keeps its caller side-effect free only when the callee is
+    // too. Recursion is allowed; the greatest fixed point keeps pure cycles.
+    loop {
+        let impure: Vec<usize> = plans
+            .iter()
+            .filter(|(_, plan)| {
+                plan.callable_from_jit
+                    && plan.direct_call_targets.iter().any(|callee| {
+                        !plans
+                            .get(callee)
+                            .is_some_and(|callee| callee.callable_from_jit)
+                            || artifact
+                                .callables
+                                .get(callee)
+                                .is_none_or(|signature| signature.captures != 0)
+                    })
+            })
+            .map(|(entry, _)| *entry)
+            .collect();
+        if impure.is_empty() {
+            break;
+        }
+        for entry in impure {
+            if let Some(plan) = plans.get_mut(&entry) {
+                plan.callable_from_jit = false;
+            }
         }
     }
     plans
+        .into_iter()
+        .map(|(entry, plan)| (entry, Arc::new(plan)))
+        .collect()
 }
 
 fn analyze_function(
@@ -1846,9 +1960,12 @@ fn analyze_function(
         let instruction = &artifact.instructions[pc];
         matches!(
             instruction,
-            Instruction::Push(_)
+            // Direct calls are checked transitively by `analyze_program`.
+            Instruction::Call(..)
+                | Instruction::Push(_)
                 | Instruction::PushArray(_)
                 | Instruction::Load(_)
+                | Instruction::LoadCapture(_)
                 | Instruction::Store(_)
                 | Instruction::Add
                 | Instruction::Sub
@@ -1885,6 +2002,9 @@ fn analyze_function(
                 // VM at this instruction, which keeps the direct-call path safe.
                 | Instruction::ConstrainArrayFrom
                 | Instruction::Return
+                // Generated code resumes before a propagating return, so the
+                // adapter discards the callee and the VM repeats the call.
+                | Instruction::ReturnPropagate
                 | Instruction::Crash(_)
         ) || matches!(instruction, Instruction::CallNative(index)
             if artifact.imports.get(*index).is_some_and(|import| import.name() == "str::to_bigint"))
@@ -2605,10 +2725,74 @@ unsafe fn jit_runtime_bridge_inner(
     let Some(base) = depth.checked_sub(consumed).filter(|_| depth <= MAX_STACK) else {
         return false;
     };
+    // Compiled callees are side-effect free and have no VM frame to resume:
+    // they never cross into the VM. The outermost compiled call falls back.
+    // SAFETY: `frame` comes from generated code and no reference to it or its
+    // context is live yet.
+    if unsafe { in_compiled_callee(frame) } {
+        return false;
+    }
+    // SAFETY: `in_compiled_callee` returned false, so both the frame and its
+    // context are non-null. This shared borrow ends with the statement.
+    let is_value_call = matches!(
+        unsafe {
+            &*(*frame)
+                .runtime_context
+                .cast::<JitExecutionContext<'_, '_>>()
+        }
+        .artifact
+        .instructions
+        .get(pc),
+        Some(Instruction::CallValue(_))
+    );
+    // SAFETY: The generated helper call supplies the verified operand range and
+    // this function holds no reference into the frame or context.
+    if is_value_call && unsafe { jit_compiled_value_call(frame, pc, depth, consumed) } {
+        return true;
+    }
     let frame = unsafe { &mut *frame };
     let context = unsafe { &mut *frame.runtime_context.cast::<JitExecutionContext<'_, '_>>() };
     let roots = unsafe { &mut *frame.roots };
     let instruction = &context.artifact.instructions[pc];
+    if let Instruction::ArrayPush | Instruction::ArrayPrepend = instruction {
+        // `array.append(value)` and `array.prepend(value)` mutate the array
+        // in place and produce it. Scalars cannot constrain array metadata; other
+        // values and every failure go through the VM bridge below.
+        let front = matches!(instruction, Instruction::ArrayPrepend);
+        let (array_index, value_index) = if front {
+            (base + 1, base)
+        } else {
+            (base, base + 1)
+        };
+        // SAFETY: A push consumes two operands and the verified plan keeps
+        // `base..depth` (at most `MAX_STACK`) inside the frame's stack buffer.
+        let object = unsafe { *frame.stack.add(array_index) };
+        // SAFETY: As above.
+        let value = unsafe { *frame.stack.add(value_index) };
+        if consumed == 2
+            && object.tag == TAG_ARRAY
+            && matches!(
+                value.tag,
+                TAG_INT | TAG_UINT | TAG_FLOAT | TAG_BOOL | TAG_CHAR | TAG_NIL
+            )
+            && let Some(Value::Array(array)) = roots.get(object.payload as usize)
+            && let Ok(Some(value)) = from_slot(value, roots, context.variant_tags)
+        {
+            let started = context.stats.is_some().then(Instant::now);
+            // `try_push` validates before mutating, so an error leaves the
+            // array unchanged for the VM to report.
+            if array.try_push(value, front).is_ok() {
+                context.committed = true;
+                if let Some(stats) = &mut context.stats {
+                    stats.aggregate_ops += 1;
+                    stats.bridge_ns += started.map_or(0, |start| nanos(start.elapsed()));
+                }
+                // SAFETY: `base` is the first of the two verified operands.
+                unsafe { *frame.stack.add(base) = object };
+                return true;
+            }
+        }
+    }
     if matches!(
         instruction,
         Instruction::Index | Instruction::IndexSet | Instruction::Len
@@ -2748,6 +2932,8 @@ unsafe extern "C" fn jit_native_call(
                 stats.specialized_native_calls += 1;
             }
             true
+        } else if in_compiled_callee(frame) {
+            false
         } else {
             let context = &*(*frame)
                 .runtime_context
@@ -2894,6 +3080,8 @@ unsafe extern "C" fn jit_direct_call(
     target: u64,
     arity: u64,
 ) -> i32 {
+    // SAFETY: Generated code passes its own live frame. The inner helper
+    // validates it, so a successful call implies non-null frame and context.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         if jit_direct_call_inner(frame, pc, depth, target, arity) {
             let context = &mut *(*frame)
@@ -2903,6 +3091,10 @@ unsafe extern "C" fn jit_direct_call(
                 stats.compiled_calls += 1;
             }
             true
+        } else if in_compiled_callee(frame) {
+            // A compiled callee has no VM frame to resume. Unwind to the
+            // outermost compiled call, which the VM then executes in full.
+            false
         } else {
             record_deferred_direct_call(frame, pc, target);
             jit_runtime_bridge_inner(frame, pc as usize, depth as usize, arity as usize)
@@ -2911,6 +3103,25 @@ unsafe extern "C" fn jit_direct_call(
     .unwrap_or(false) as i32
 }
 
+/// Whether the innermost native frame belongs to a compiled callee rather
+/// than to the function the VM entered. Unknown state counts as nested so the
+/// caller never crosses into the VM from an unexpected frame.
+///
+/// SAFETY: `frame` is null or a live `JitFrame` whose `runtime_context` is null
+/// or points to the active `JitExecutionContext`, with no exclusive reference
+/// to that context held by the caller.
+unsafe fn in_compiled_callee(frame: *mut JitFrame) -> bool {
+    let Some(frame) = (unsafe { frame.as_ref() }) else {
+        return true;
+    };
+    if frame.runtime_context.is_null() {
+        return true;
+    }
+    let context = unsafe { &*frame.runtime_context.cast::<JitExecutionContext<'_, '_>>() };
+    context.call_depth != 0
+}
+
+/// SAFETY: Same pointer contract as `in_compiled_callee`.
 unsafe fn record_deferred_direct_call(frame: *mut JitFrame, pc: u64, target: u64) {
     let Some(frame) = (unsafe { frame.as_ref() }) else {
         return;
@@ -2922,13 +3133,9 @@ unsafe fn record_deferred_direct_call(frame: *mut JitFrame, pc: u64, target: u64
         return;
     };
     let context = unsafe { &mut *frame.runtime_context.cast::<JitExecutionContext<'_, '_>>() };
-    if !context.profile_fallback_calls {
-        return;
-    }
     if matches!(context.artifact.instructions.get(pc), Some(Instruction::Call(actual, _)) if *actual == target)
     {
-        let calls = context.deferred_calls.entry(target).or_default();
-        *calls = calls.saturating_add(1);
+        context.record_deferred_call(target);
     }
 }
 
@@ -2960,6 +3167,7 @@ unsafe fn jit_direct_call_inner(
     if depth > MAX_STACK || arity > depth {
         return false;
     }
+    // A callee may observe the propagation bit; the child frame starts clear.
     if frame_ref.propagation_pending != 0 {
         return false;
     }
@@ -2967,7 +3175,7 @@ unsafe fn jit_direct_call_inner(
         .runtime_context
         .cast::<JitExecutionContext<'_, '_>>();
     let callable = {
-        let context = unsafe { &*context_ptr };
+        let context = unsafe { &mut *context_ptr };
         if !matches!(
             context.artifact.instructions.get(pc),
             Some(Instruction::Call(actual_target, actual_arity))
@@ -2975,7 +3183,13 @@ unsafe fn jit_direct_call_inner(
         ) {
             return false;
         }
-        let Some(callable) = context.callables.get(&target).cloned() else {
+        let Some(callable) = context.callable(target) else {
+            // The VM-entered frame records its own misses before bridging. A
+            // miss below it never reaches the bridge, so count it here or the
+            // nested callee is never compiled.
+            if context.call_depth != 0 {
+                context.record_deferred_call(target);
+            }
             return false;
         };
         callable
@@ -2985,142 +3199,253 @@ unsafe fn jit_direct_call_inner(
         return false;
     }
     let base = depth - arity;
-    if let Some(typed_ints) = callable.int_slot_arguments {
-        let Some(result) = (unsafe {
-            jit_direct_call_int_slots(frame_ref, base, arity, context_ptr, &callable, typed_ints)
-        }) else {
-            return false;
-        };
-        unsafe { *frame_ref.stack.add(base) = result };
-        return true;
-    }
-
-    let variant_tags = unsafe { &(*context_ptr).variant_tags };
-    let roots = unsafe { &*frame_ref.roots };
-    if arity > MAX_JIT_CALL_ARGS {
-        return false;
-    }
-    let mut arguments = std::array::from_fn::<_, MAX_JIT_CALL_ARGS, _>(|_| Value::Nil);
-    for index in base..depth {
-        let slot = unsafe { *frame_ref.stack.add(index) };
-        let Ok(Some(value)) = from_slot(slot, roots, variant_tags) else {
-            return false;
-        };
-        if matches!(value, Value::Error(_)) {
-            return false;
-        }
-        arguments[index - base] = value;
-    }
-    if !crate::interpreter::call_arguments_match(signature, &arguments[..arity]) {
-        return false;
-    }
-    let mut child = unsafe { (&mut *context_ptr).call_frame.take() }
-        .unwrap_or_else(|| Box::new(JitCallFrame::new(frame_ref.runtime_context)));
-    child.prepare(&callable.plan, frame_ref.runtime_context);
-    for (index, value) in arguments.iter_mut().take(arity).enumerate() {
-        let value = std::mem::replace(value, Value::Nil);
-        let Some(slot) = append_owned_value(value, &mut child.roots, variant_tags) else {
-            return false;
-        };
-        child.stack[index] = slot;
-    }
-    child.frame.stack_len = arity as u64;
-    // SAFETY: `callable.entry` belongs to the same live JITModule as the parent
-    // plan, and `child.prepare` built its frame for that compiled function. The
-    // child buffers and shared execution context remain live until it returns.
-    let status = unsafe { (callable.entry)(&mut child.frame) };
-    let result_slot =
-        (|| {
-            let context = unsafe { &*context_ptr };
-            if !matches!(
-                decode_exit(&callable.plan, context.artifact, &child.frame, status),
-                Ok(JitExit::Completed)
-            ) {
-                return None;
-            }
-            let result_depth = usize::try_from(child.frame.stack_len).ok()?;
-            let result_index = result_depth.checked_sub(1)?;
-            let result_slot = child.stack.get(result_index).copied()?;
-            let Ok(Some(mut result)) = from_slot(result_slot, &child.roots, context.variant_tags)
-            else {
-                return None;
-            };
-            if signature.result_type.as_ref().is_some_and(|expected| {
-                !crate::interpreter::matches_runtime_type(expected, &result)
-            }) {
-                result = Value::Error(Box::new(RuntimeError::TypeMismatch { op: "return" }));
-            }
-            append_owned_value(
-                result,
-                unsafe { &mut *frame_ref.roots },
-                context.variant_tags,
-            )
-        })();
-    unsafe { (&mut *context_ptr).call_frame = Some(child) };
-    let Some(result_slot) = result_slot.filter(|slot| slot.tag != TAG_ERROR) else {
+    // SAFETY: `base..depth` are the verified argument operands of this `Call`,
+    // and no borrow of the context is live.
+    let Some(result) =
+        (unsafe { invoke_compiled_callee(frame_ref, context_ptr, callable, base, arity, None) })
+    else {
         return false;
     };
-    unsafe { *frame_ref.stack.add(base) = result_slot };
+    // SAFETY: `base <= depth <= MAX_STACK` and the plan's stack holds the result.
+    unsafe { *frame_ref.stack.add(base) = result };
     true
 }
 
-unsafe fn jit_direct_call_int_slots(
+/// Calls a compiled closure or bound function value from `CallValue`. Returns
+/// `false` without side effects when the target cannot use the compiled-callee
+/// adapter; the caller then dispatches the call through the VM.
+///
+/// SAFETY: Same generated-code frame contract as `jit_runtime_bridge_inner`;
+/// `base..depth` is the verified operand range of the `CallValue` at `pc`.
+unsafe fn jit_compiled_value_call(
+    frame: *mut JitFrame,
+    pc: usize,
+    depth: usize,
+    consumed: usize,
+) -> bool {
+    let Some(frame_ref) = (unsafe { frame.as_ref() }) else {
+        return false;
+    };
+    if frame_ref.runtime_context.is_null()
+        || frame_ref.stack.is_null()
+        || frame_ref.roots.is_null()
+        || frame_ref.propagation_pending != 0
+        || depth > MAX_STACK
+    {
+        return false;
+    }
+    let context_ptr = frame_ref
+        .runtime_context
+        .cast::<JitExecutionContext<'_, '_>>();
+    let (owner, arity) = {
+        let context = unsafe { &*context_ptr };
+        let Some(Instruction::CallValue(arity)) = context.artifact.instructions.get(pc) else {
+            return false;
+        };
+        let Some(owner) = context.owner else {
+            return false;
+        };
+        (owner, *arity)
+    };
+    let Some(base) = depth.checked_sub(consumed) else {
+        return false;
+    };
+    if arity.checked_add(1) != Some(consumed) {
+        return false;
+    }
+    // SAFETY: `consumed >= 1`, so `depth - 1` is the callee operand inside the
+    // verified stack range.
+    let target_slot = unsafe { *frame_ref.stack.add(depth - 1) };
+    if target_slot.tag != TAG_OPAQUE {
+        return false;
+    }
+    // Clone the target so its captures stay alive while the callee may grow
+    // the shared root vector.
+    // SAFETY: `roots` is non-null and no exclusive borrow of it is active. The
+    // shared borrow ends once the value is cloned.
+    let Some(target) = (unsafe { &*frame_ref.roots })
+        .get(target_slot.payload as usize)
+        .cloned()
+    else {
+        return false;
+    };
+    // The VM rejects callables owned by another program; leave that to it.
+    let (entry, captures) = match &target {
+        Value::Closure(entry, captures) if captures.belongs_to(owner) => {
+            (*entry, Some(&**captures))
+        }
+        Value::BoundFunction(function) if Rc::ptr_eq(&function.owner, owner) => {
+            (function.entry, None)
+        }
+        _ => return false,
+    };
+    // SAFETY: The context is non-null and exclusively borrowed only for this
+    // lookup, and again for the record below.
+    let Some(callable) = (unsafe { &mut *context_ptr }).callable(entry) else {
+        // SAFETY: The lookup borrow has ended.
+        unsafe { (*context_ptr).record_deferred_call(entry) };
+        return false;
+    };
+    let signature = callable.signature;
+    if signature.asynchronous
+        || signature.parameters != arity
+        || signature.captures != captures.map_or(0, |captures| captures.len())
+    {
+        return false;
+    }
+    // SAFETY: `base..base + arity` are the verified argument operands, and the
+    // signature accepts exactly this arity and capture count.
+    let Some(result) = (unsafe {
+        invoke_compiled_callee(frame_ref, context_ptr, callable, base, arity, captures)
+    }) else {
+        return false;
+    };
+    // SAFETY: `base < depth` is inside the caller's stack buffer.
+    unsafe { *frame_ref.stack.add(base) = result };
+    // SAFETY: The callee has returned, so nothing else borrows the context.
+    if let Some(stats) = unsafe { &mut (*context_ptr).stats } {
+        stats.compiled_calls += 1;
+    }
+    true
+}
+
+/// Runs a compiled side-effect-free callee in a pooled child frame that shares
+/// the caller's roots. Roots created by the callee are released before its
+/// result is rooted again, so repeated calls do not accumulate temporaries.
+/// Any exit other than a normal completion with a non-Error value of the
+/// declared result type returns `None`. The callee committed nothing, so the
+/// caller can let the VM execute the whole call instead.
+///
+/// SAFETY: `frame` is the live caller frame and `context_ptr` its active
+/// execution context. `base..base + arity` lies within the caller's verified
+/// stack. References derived from `context_ptr` or `frame.roots` are never
+/// held across the native callee invocation, whose helpers use them too.
+unsafe fn invoke_compiled_callee(
     frame: &JitFrame,
+    context_ptr: *mut JitExecutionContext<'_, '_>,
+    callable: JitCallable<'_>,
     base: usize,
     arity: usize,
-    context_ptr: *mut JitExecutionContext<'_, '_>,
-    callable: &JitCallable<'_>,
-    typed_ints: bool,
+    captures: Option<&crate::value::ClosureCaptures>,
 ) -> Option<JitSlot> {
-    // SAFETY: The caller checks the active stack depth, callee arity, and context
-    // before entering this path. The generated callee uses the same live
-    // stack/root storage synchronously and has a scalar result.
-    if arity > MAX_JIT_CALL_ARGS {
+    // SAFETY (for every `context_ptr` access below): the context is live for
+    // the whole invocation and each access is a short borrow that ends before
+    // the native callee runs or after it returned.
+    if arity > MAX_JIT_CALL_ARGS || unsafe { (*context_ptr).call_depth } >= MAX_JIT_CALL_DEPTH {
         return None;
     }
-    for index in base..base + arity {
-        let slot = unsafe { *frame.stack.add(index) };
-        if matches!(slot.tag, TAG_UNINITIALIZED | TAG_ERROR) || (typed_ints && slot.tag != TAG_INT)
-        {
+    let variant_tags = unsafe { (*context_ptr).variant_tags };
+    {
+        // SAFETY: `roots` outlives the invocation; only shared reads happen here.
+        let roots = unsafe { &*frame.roots };
+        match callable.int_slot_arguments {
+            Some(typed_ints) => {
+                for index in base..base + arity {
+                    // SAFETY: Within the caller's verified argument operands.
+                    let slot = unsafe { *frame.stack.add(index) };
+                    if matches!(slot.tag, TAG_UNINITIALIZED | TAG_ERROR)
+                        || (typed_ints && slot.tag != TAG_INT)
+                    {
+                        return None;
+                    }
+                }
+            }
+            None => {
+                let mut arguments = std::array::from_fn::<_, MAX_JIT_CALL_ARGS, _>(|_| Value::Nil);
+                for (index, argument) in arguments.iter_mut().take(arity).enumerate() {
+                    // SAFETY: Within the caller's verified argument operands.
+                    let slot = unsafe { *frame.stack.add(base + index) };
+                    match from_slot(slot, roots, variant_tags) {
+                        Ok(Some(Value::Error(_))) | Ok(None) | Err(()) => return None,
+                        Ok(Some(value)) => *argument = value,
+                    }
+                }
+                if !crate::interpreter::call_arguments_match(
+                    callable.signature,
+                    &arguments[..arity],
+                ) {
+                    return None;
+                }
+            }
+        }
+    }
+    let capture_count = captures.map_or(0, |captures| captures.len());
+    // SAFETY (for every `frame.roots` access below): the vector belongs to the
+    // outermost invocation, outlives this call, and is borrowed only briefly.
+    // Truncating to `root_len` cannot invalidate a caller slot, because every
+    // caller slot was rooted below that length.
+    let root_len = unsafe { (*frame.roots).len() };
+    if capture_count != 0
+        && (root_len.saturating_add(capture_count) > MAX_JIT_ROOTS
+            || unsafe { (*frame.roots).try_reserve(capture_count) }.is_err())
+    {
+        return None;
+    }
+
+    let mut child = unsafe { (*context_ptr).call_frames.pop() }
+        .unwrap_or_else(|| Box::new(JitCallFrame::new(context_ptr.cast())));
+    child.prepare(callable.plan, context_ptr.cast(), frame.roots);
+    let prepared = (|| {
+        let arguments = child.stack.get_mut(..arity)?;
+        for (index, slot) in arguments.iter_mut().enumerate() {
+            // SAFETY: Within the caller's verified argument operands. The child
+            // stack is a separate buffer.
+            *slot = unsafe { *frame.stack.add(base + index) };
+        }
+        if let Some(captures) = captures {
+            let roots = unsafe { &mut *frame.roots };
+            for index in 0..capture_count {
+                let value = captures.get(index)?;
+                child.captures.push(to_slot(&value, roots, variant_tags));
+            }
+            child.frame.captures = child.captures.as_mut_ptr();
+            child.frame.capture_count = capture_count as u64;
+        }
+        child.frame.stack_len = arity as u64;
+        Some(())
+    })();
+    let result = prepared.and_then(|()| {
+        unsafe { (*context_ptr).call_depth += 1 };
+        // SAFETY: `callable.entry` belongs to the same live JITModule as the
+        // caller, and `child.prepare` built its frame for that function. The
+        // child buffers, shared roots, and execution context outlive the call.
+        let status = unsafe { (callable.entry)(&mut child.frame) };
+        unsafe { (*context_ptr).call_depth -= 1 };
+        let artifact = unsafe { (*context_ptr).artifact };
+        if !matches!(
+            decode_exit(callable.plan, artifact, &child.frame, status),
+            Ok(JitExit::Completed)
+        ) {
             return None;
         }
-    }
-
-    let root_len = unsafe { (&*frame.roots).len() };
-    let mut child = unsafe { (&mut *context_ptr).call_frame.take() }
-        .unwrap_or_else(|| Box::new(JitCallFrame::new(context_ptr.cast())));
-    child.prepare(&callable.plan, context_ptr.cast());
-    child.frame.roots = frame.roots;
-    for (index, slot) in child.stack.get_mut(..arity)?.iter_mut().enumerate() {
-        *slot = unsafe { *frame.stack.add(base + index) };
-    }
-    child.frame.stack_len = arity as u64;
-
-    // The callee plan excludes Cog-to-Cog calls and effectful native imports.
-    // Sharing roots therefore avoids cloning large BigInts for every pixel;
-    // roots created by this call are discarded once its scalar result returns.
-    let status = unsafe { (callable.entry)(&mut child.frame) };
-    let result = {
-        let context = unsafe { &*context_ptr };
-        if matches!(
-            decode_exit(&callable.plan, context.artifact, &child.frame, status),
-            Ok(JitExit::Completed)
-        ) && child.frame.stack_len == 1
-        {
-            child
-                .stack
-                .first()
-                .copied()
-                .filter(|slot| slot.tag == TAG_INT)
-        } else {
-            None
+        let result_index = usize::try_from(child.frame.stack_len)
+            .ok()?
+            .checked_sub(1)?;
+        let result_slot = child.stack.get(result_index).copied()?;
+        // An unrooted `int` already satisfies an `int` result contract and
+        // survives releasing the callee's roots.
+        if result_slot.tag == TAG_INT && callable.int_slot_arguments.is_some() {
+            return Some(Ok(result_slot));
         }
-    };
+        let roots = unsafe { &*frame.roots };
+        let Ok(Some(result)) = from_slot(result_slot, roots, variant_tags) else {
+            return None;
+        };
+        let type_matches = callable
+            .signature
+            .result_type
+            .as_ref()
+            .is_none_or(|expected| crate::interpreter::matches_runtime_type(expected, &result));
+        (type_matches && !matches!(result, Value::Error(_))).then_some(Err(result))
+    });
     unsafe {
-        (&mut *frame.roots).truncate(root_len);
-        (&mut *context_ptr).call_frame = Some(child);
+        (*frame.roots).truncate(root_len);
+        (*context_ptr).call_frames.push(child);
     }
-    result
+    match result? {
+        Ok(slot) => Some(slot),
+        Err(value) => append_owned_value(value, unsafe { &mut *frame.roots }, variant_tags),
+    }
 }
 
 fn decode_exit(
@@ -3327,6 +3652,8 @@ fn jit_reachable_pcs(
             | Instruction::Index
             | Instruction::IndexSet
             | Instruction::Len
+            | Instruction::ArrayPush
+            | Instruction::ArrayPrepend
             | Instruction::Add
             | Instruction::Sub
             | Instruction::Mul
@@ -3530,6 +3857,8 @@ fn jit_instruction_preserves_type_facts(instruction: &Instruction, state: &JitTy
             | Instruction::Index
             | Instruction::IndexSet
             | Instruction::Len
+            | Instruction::ArrayPush
+            | Instruction::ArrayPrepend
             | Instruction::Add
             | Instruction::Sub
             | Instruction::Mul
@@ -4247,7 +4576,9 @@ fn lower_function(
             Instruction::CallValue(_)
             | Instruction::Index
             | Instruction::IndexSet
-            | Instruction::Len => {
+            | Instruction::Len
+            | Instruction::ArrayPush
+            | Instruction::ArrayPrepend => {
                 let (consumed, _) = artifact.instructions[pc]
                     .stack_effect(&artifact.imports)
                     .map_err(|error| error.to_string())?;
@@ -7327,6 +7658,7 @@ ret
                     &crate::interpreter::CaptureValues::default(),
                     &mut false,
                     false,
+                    &std::rc::Rc::new(()),
                     &mut |_, _, _| panic!("failed compilation cannot enter the bridge"),
                 )
                 .is_none()
@@ -7498,5 +7830,459 @@ ret
             }
             .is_valid()
         );
+    }
+
+    /// Compiles `entry` and marks it as a hot, call-compiled function, as if
+    /// the VM had observed enough calls. Debug builds would otherwise spend
+    /// the whole compile budget before every function in a fixture compiles.
+    fn force_call_compiled(jit: &mut JitState, artifact: &CompiledProgram, entry: usize) {
+        let plan = Arc::clone(&jit.plans[&entry]);
+        let (function, _) = jit
+            .compiler
+            .as_mut()
+            .unwrap()
+            .compile(&plan, artifact, &jit.variant_tags)
+            .unwrap();
+        let candidate = jit.candidates.get_mut(&entry).unwrap();
+        candidate.profile.total_calls = HOT_CALL_THRESHOLD;
+        candidate.retry_after_calls = 0;
+        candidate.compiled = Some(CompiledFunction {
+            entry: function,
+            probe_pending: false,
+            call_compiled: true,
+        });
+    }
+
+    fn callable_entries(artifact: &CompiledProgram) -> Vec<usize> {
+        artifact.callables.keys().copied().collect()
+    }
+
+    const NESTED_CALLS: &str = "call main 0
+pop
+halt
+.function outer 1 0
+outer:
+store 0
+load 0
+call middle 1
+push 1
+add
+ret
+.function middle 1 0
+middle:
+store 0
+load 0
+call leaf 1
+ret
+.function leaf 1 0
+leaf:
+store 0
+push 600
+load 0
+div
+ret
+.function down 1 0
+down:
+store 0
+load 0
+push 0
+eq
+jz recurse
+push 0
+ret
+recurse:
+load 0
+push 1
+sub
+call down 1
+push 1
+add
+ret
+.function impure 1 0
+impure:
+store 0
+load 0
+call effect 1
+ret
+.function effect 1 0
+effect:
+store 0
+load 0
+call_native io::stdout
+pop
+ret
+.function main 0 0
+main:
+push 0
+ret
+";
+
+    fn call_compiled(
+        jit: &mut JitState,
+        artifact: &CompiledProgram,
+        entry: usize,
+        argument: i64,
+    ) -> (Option<JitExit>, usize, Vec<Value>) {
+        jit.candidates.get_mut(&entry).unwrap().retry_after_calls = 0;
+        let mut pc = entry;
+        let mut locals = Vec::new();
+        let mut stack = vec![Value::Int(argument)];
+        let exit = jit.try_call(
+            artifact,
+            entry,
+            &mut pc,
+            &mut locals,
+            0,
+            &mut stack,
+            0,
+            &crate::interpreter::CaptureValues::default(),
+            &mut false,
+            false,
+        );
+        (exit, pc, stack)
+    }
+
+    #[test]
+    fn pure_direct_calls_are_callable_from_jit_only_through_pure_callees() {
+        let artifact = crate::parser::assemble(NESTED_CALLS).unwrap();
+        let plans = analyze_program(&artifact);
+        let entries = callable_entries(&artifact);
+        let [outer, middle, leaf, down, impure, effect, _main] = entries[..] else {
+            panic!("fixture declares seven functions");
+        };
+        for pure in [outer, middle, leaf, down] {
+            assert!(plans[&pure].callable_from_jit, "function {pure}");
+        }
+        assert!(!plans[&effect].callable_from_jit);
+        assert!(!plans[&impure].callable_from_jit);
+    }
+
+    #[test]
+    fn nested_compiled_calls_complete_natively_and_unwind_on_inner_faults() {
+        let artifact = crate::parser::assemble(NESTED_CALLS).unwrap();
+        let mut jit = JitState::new(&artifact, None).unwrap();
+        let entries = callable_entries(&artifact);
+        let [outer, middle, leaf, ..] = entries[..] else {
+            panic!("fixture declares nested functions");
+        };
+        for entry in [outer, middle, leaf] {
+            force_call_compiled(&mut jit, &artifact, entry);
+        }
+
+        let (exit, pc, stack) = call_compiled(&mut jit, &artifact, outer, 5);
+        assert_eq!(exit, Some(JitExit::Completed));
+        assert!(matches!(artifact.instructions[pc], Instruction::Return));
+        assert!(matches!(stack[..], [Value::Int(121)]), "{stack:?}");
+
+        // `leaf` faults two compiled frames deep. Neither compiled callee can
+        // resume in the VM, so `outer` resumes before its own call with the
+        // original argument for the VM to repeat the whole call.
+        let call_pc = outer + 2;
+        assert!(
+            matches!(artifact.instructions[call_pc], Instruction::Call(target, 1) if target == middle)
+        );
+        let (exit, pc, stack) = call_compiled(&mut jit, &artifact, outer, 0);
+        assert_eq!(exit, Some(JitExit::ResumeAt { pc: call_pc }));
+        assert_eq!(pc, call_pc);
+        assert!(matches!(stack[..], [Value::Int(0)]), "{stack:?}");
+    }
+
+    #[test]
+    fn compiled_recursion_beyond_the_native_depth_resumes_before_the_outer_call() {
+        let artifact = crate::parser::assemble(NESTED_CALLS).unwrap();
+        let mut jit = JitState::new(&artifact, None).unwrap();
+        let down = callable_entries(&artifact)[3];
+        force_call_compiled(&mut jit, &artifact, down);
+
+        let (exit, _, stack) = call_compiled(&mut jit, &artifact, down, 10);
+        assert_eq!(exit, Some(JitExit::Completed));
+        assert!(matches!(stack[..], [Value::Int(10)]), "{stack:?}");
+
+        let call_pc = (down..artifact.instructions.len())
+            .find(|pc| matches!(artifact.instructions[*pc], Instruction::Call(..)))
+            .unwrap();
+        let (exit, _, stack) =
+            call_compiled(&mut jit, &artifact, down, MAX_JIT_CALL_DEPTH as i64 + 8);
+        assert_eq!(exit, Some(JitExit::ResumeAt { pc: call_pc }));
+        assert!(
+            matches!(stack[..], [Value::Int(value)] if value == MAX_JIT_CALL_DEPTH as i64 + 7),
+            "{stack:?}"
+        );
+    }
+
+    const CLOSURE_CALLS: &str = "call main 0
+pop
+halt
+.function work 2 0
+work:
+store 1
+store 0
+push 0
+store 2
+push 0
+store 3
+loop:
+load 2
+load 0
+lt
+jz done
+load 3
+load 2
+load 1
+callv 1
+add
+store 3
+load 2
+push 1
+add
+store 2
+jmp loop
+done:
+load 3
+ret
+.function adder 1 1
+adder:
+store 0
+load 0
+loadcap 0
+add
+ret
+.function ratio 1 1
+ratio:
+store 0
+push 600
+loadcap 0
+load 0
+sub
+div
+ret
+.function main 0 0
+main:
+push 0
+ret
+";
+
+    struct ClosureRun {
+        exit: Option<JitExit>,
+        locals: Vec<Option<Value>>,
+        stack: Vec<Value>,
+        bridge_calls: usize,
+    }
+
+    fn run_closure_loop(
+        closure_entry: usize,
+        capture: i64,
+        closure_owner: &Rc<()>,
+        program_owner: &Rc<()>,
+    ) -> (ClosureRun, usize) {
+        let artifact = crate::parser::assemble(CLOSURE_CALLS).unwrap();
+        let mut jit = JitState::new(&artifact, None).unwrap();
+        let entries = callable_entries(&artifact);
+        let [work, adder, ratio, _main] = entries[..] else {
+            panic!("fixture declares four functions");
+        };
+        for entry in [work, adder, ratio] {
+            force_call_compiled(&mut jit, &artifact, entry);
+        }
+        let target = jit.plans[&work].osr_entries[0];
+        let closure = Value::Closure(
+            entries[closure_entry],
+            crate::heap::HeapRef::try_new(crate::value::ClosureCaptures::for_program(
+                vec![Value::Int(capture)],
+                closure_owner,
+            ))
+            .unwrap(),
+        );
+        let mut pc = target;
+        let mut locals = vec![
+            Some(Value::Int(100)),
+            Some(closure),
+            Some(Value::Int(0)),
+            Some(Value::Int(0)),
+        ];
+        let mut stack = Vec::new();
+        let mut bridge_calls = 0;
+        let exit = jit.try_osr(
+            &artifact,
+            work,
+            target,
+            &mut pc,
+            &mut locals,
+            0,
+            &mut stack,
+            0,
+            &crate::interpreter::CaptureValues::default(),
+            &mut false,
+            false,
+            program_owner,
+            &mut |_, _, _| {
+                bridge_calls += 1;
+                BridgeOutcome::Unsupported("test bridge")
+            },
+        );
+        let call_pc = (work..adder)
+            .find(|pc| matches!(artifact.instructions[*pc], Instruction::CallValue(1)))
+            .unwrap();
+        (
+            ClosureRun {
+                exit,
+                locals,
+                stack,
+                bridge_calls,
+            },
+            call_pc,
+        )
+    }
+
+    #[test]
+    fn owned_pure_closures_run_as_compiled_callees() {
+        let owner = Rc::new(());
+        let (run, _) = run_closure_loop(1, 7, &owner, &owner);
+        assert_eq!(run.exit, Some(JitExit::Completed));
+        assert_eq!(run.bridge_calls, 0);
+        assert!(
+            matches!(run.stack[..], [Value::Int(5650)]),
+            "{:?}",
+            run.stack
+        );
+    }
+
+    #[test]
+    fn foreign_closures_dispatch_through_the_vm_bridge() {
+        let (run, call_pc) = run_closure_loop(1, 7, &Rc::new(()), &Rc::new(()));
+        assert_eq!(run.exit, Some(JitExit::ResumeAt { pc: call_pc }));
+        assert_eq!(run.bridge_calls, 1);
+        assert!(matches!(run.locals[2], Some(Value::Int(0))));
+        assert!(
+            matches!(
+                run.stack[..],
+                [Value::Int(0), Value::Int(0), Value::Closure(..)]
+            ),
+            "{:?}",
+            run.stack
+        );
+    }
+
+    #[test]
+    fn faulting_compiled_closures_resume_before_the_call_with_the_original_operands() {
+        let owner = Rc::new(());
+        let (run, call_pc) = run_closure_loop(2, 50, &owner, &owner);
+        assert_eq!(run.exit, Some(JitExit::ResumeAt { pc: call_pc }));
+        // Only the faulting call reaches the bridge, which declines it.
+        assert_eq!(run.bridge_calls, 1);
+        let expected: i64 = (0..50).map(|x| 600 / (50 - x)).sum();
+        assert!(matches!(run.locals[2], Some(Value::Int(50))));
+        assert!(matches!(run.locals[3], Some(Value::Int(sum)) if sum == expected));
+        assert!(
+            matches!(run.stack[..], [Value::Int(sum), Value::Int(50), Value::Closure(..)] if sum == expected),
+            "{:?}",
+            run.stack
+        );
+    }
+
+    const MISSED_NESTED_CALLS: &str = "call main 0
+pop
+halt
+.function work 1 0
+work:
+store 0
+push 0
+store 1
+push 0
+store 2
+loop:
+load 1
+load 0
+lt
+jz done
+load 2
+load 1
+push 1
+add
+call middle 1
+add
+store 2
+load 1
+push 1
+add
+store 1
+jmp loop
+done:
+load 2
+ret
+.function middle 1 0
+middle:
+store 0
+load 0
+call leaf 1
+ret
+.function leaf 1 0
+leaf:
+store 0
+push 600
+load 0
+div
+ret
+.function main 0 0
+main:
+push 0
+ret
+";
+
+    #[test]
+    fn calls_missed_inside_compiled_callees_compile_for_the_next_osr_entry() {
+        let artifact = crate::parser::assemble(MISSED_NESTED_CALLS).unwrap();
+        let mut jit = JitState::new(&artifact, None).unwrap();
+        let entries = callable_entries(&artifact);
+        let [work, middle, leaf, _main] = entries[..] else {
+            panic!("fixture declares four functions");
+        };
+        // `leaf` is only reached from the compiled `middle`.
+        force_call_compiled(&mut jit, &artifact, work);
+        force_call_compiled(&mut jit, &artifact, middle);
+        let target = jit.plans[&work].osr_entries[0];
+        let owner = Rc::new(());
+        let expected: i64 = (0..200).map(|x| 600 / (x + 1)).sum();
+        for expected_bridge_calls in [200, 0] {
+            let mut pc = target;
+            let mut locals = vec![
+                Some(Value::Int(200)),
+                Some(Value::Int(0)),
+                Some(Value::Int(0)),
+            ];
+            let mut stack = Vec::new();
+            let mut bridge_calls = 0;
+            let exit = jit.try_osr(
+                &artifact,
+                work,
+                target,
+                &mut pc,
+                &mut locals,
+                0,
+                &mut stack,
+                0,
+                &crate::interpreter::CaptureValues::default(),
+                &mut false,
+                false,
+                &owner,
+                &mut |_, operands, _| {
+                    bridge_calls += 1;
+                    let [Value::Int(argument)] = operands[..] else {
+                        return BridgeOutcome::Unsupported("test bridge");
+                    };
+                    BridgeOutcome::Returned {
+                        value: Value::Int(600 / argument),
+                        propagation_pending: false,
+                    }
+                },
+            );
+            assert_eq!(exit, Some(JitExit::Completed));
+            assert_eq!(bridge_calls, expected_bridge_calls);
+            assert!(
+                matches!(stack[..], [Value::Int(sum)] if sum == expected),
+                "{stack:?}"
+            );
+            assert!(jit.candidates[&leaf].compiled.is_some());
+        }
     }
 }

@@ -457,6 +457,7 @@ impl VmExecutionPlan {
             captures,
             propagation_pending,
             debug,
+            owner,
             &mut bridge,
         );
         if let Some((error, pc)) = fatal {

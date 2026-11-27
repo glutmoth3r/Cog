@@ -29,6 +29,27 @@ JIT V1 is successful when it can safely select work that is likely to repay comp
   instruction after the call frames unwind. Nested and recursive calls use
   ordinary VM frames. The invocation reuses its operand, local, and call-frame
   buffers across bridge calls. The outer JIT keeps its locals in SSA.
+- A compiled callee is side-effect free: besides scalar and aggregate
+  construction it may read captures, return through a propagating return,
+  and make direct calls to callees that are side-effect free as well
+  (recursion included). Compiled callees therefore nest: each nested call
+  runs in a pooled child frame that shares the caller's roots and releases
+  the callee's temporary roots on return. Nesting is limited to 32 native
+  frames. A compiled callee never enters the VM bridge. Any fault, fallback,
+  Error result, or depth overflow discards the whole chain of compiled
+  callees, and the outermost call runs in the VM (from an OSR loop) or the
+  caller resumes at the call instruction (when the VM entered it). The VM
+  then reproduces errors and traces itself. Eligibility does not imply native
+  coverage: an unlowered instruction, such as aggregate construction, ends
+  the compiled attempt in the same way.
+- `CallValue` targets that are closures or bound function values owned by
+  the running program use the same adapter when their body is compiled and
+  side-effect free; captures are passed through the child frame. Other
+  targets, foreign owners, and closures that update mutable cells use the VM
+  dispatch below. Calls that miss the adapter in an OSR loop are counted,
+  including direct calls missed inside compiled callees, so hot
+  side-effect-free callees and closure bodies compile once the loop leaves
+  native code, and the next OSR entry uses them.
 - Indirect calls use the same VM dispatch as interpreted calls. It checks the
   callable's current program owner, signature, and captures on each call.
   Named function values, scalar and reference captures, mutable cells, and
@@ -42,8 +63,10 @@ JIT V1 is successful when it can safely select work that is likely to repay comp
   Managed arguments and captures preserve their identity. The general bridge
   reserves result space before dispatch, so a capacity miss can resume before
   an operation with effects. Array updates can reuse the input root. Array
-  indexing, indexed writes, and length have tagged fast paths for common
-  inputs. Other supported index and length cases use shared VM handlers.
+  indexing, indexed writes, length, and scalar `append`/`prepend` calls have
+  tagged fast paths for common inputs; a push validates the element before
+  mutating, and a rejected value goes through the VM bridge, which reports the
+  error. Other supported index, length, and push cases use shared VM handlers.
 - The VM bridge carries the propagation bit in both directions. A returned
   Error resumes the VM **after** the operation with the Error on the stack
   and its origin recorded. The VM then performs observation, propagation and
@@ -55,9 +78,10 @@ JIT V1 is successful when it can safely select work that is likely to repay comp
   VM call cannot suspend its native caller, and extra JIT roots would affect
   reference count observations. Bridged callees run in the VM until they
   return. Unsupported instructions still resume at the current bytecode PC.
-- APE version 17 invalidates earlier timings. Probe time includes synchronous
-  bridge work. Failure, cooldown, and compilation-budget rules still apply.
-  JIT debug output records compiled callees, Cog and native bridge calls,
+- APE version 18 invalidates earlier timings, because nested compiled
+  callees, compiled closure calls, and native pushes changed which code runs
+  natively. Probe time includes synchronous bridge work. Failure, cooldown,
+  and compilation-budget rules still apply. JIT debug output records compiled callees, Cog and native bridge calls,
   specialized native calls, aggregate operations, time inside bridge dispatch,
   fallback PCs and reasons, and generated code size. Host-specific benchmarks are
   recorded in the repository development evidence.
@@ -188,6 +212,8 @@ the [roadmap](../ROADMAP.md) for accepted future work.
 - Async suspension, metered execution, and SDK callback reentry across the bridge.
 - Adaptive inline caches for indirect callable targets and native lowering of
   mutable-cell operations. A closure can access and update cells through the VM.
+- A native calling convention between compiled functions. Every compiled call
+  still crosses a Rust helper that validates arguments and the callee's exit.
 - Full coverage of collection and string operations.
 
 - Training a portable CPU model from benchmark data or adapting coefficients across unrelated bytecode artifacts.

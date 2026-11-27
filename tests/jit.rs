@@ -1833,3 +1833,634 @@ fn jit_and_vm_report_the_same_inlined_error_frames() {
     assert_eq!(trace.callers[0].function.as_deref(), Some("work"));
     assert_eq!(run(true), vm);
 }
+
+/// Runs `source` in the VM and with JIT enabled after a bytecode round trip.
+/// Both runs must produce the same output and the same error, including the
+/// diagnostic kind and logical trace. Returns the JIT profile for coverage
+/// assertions.
+fn assert_jit_matches_vm_with_diagnostics(source: &str, suffix: &str) -> serde_json::Value {
+    let artifact = project::compile_source(&format!("{suffix}.cog"), source)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let artifact = cog::bytecode::decode(&cog::bytecode::encode(&artifact).unwrap()).unwrap();
+    let profile = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("jit-{suffix}-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&profile);
+    let run = |jit| {
+        let mut output = Vec::new();
+        let mut context = RuntimeContext::new(&mut output, VmCapabilities::default());
+        context.configure_jit(jit, jit.then_some(profile.as_path()), false);
+        let result = interpreter::run_with_context(&artifact, &mut context)
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+        let diagnostic = context.last_runtime_diagnostic().cloned();
+        let location = context.last_source_location().cloned();
+        drop(context);
+        (
+            result,
+            String::from_utf8(output).unwrap(),
+            diagnostic,
+            location,
+        )
+    };
+    let vm = run(false);
+    let jit = run(true);
+    assert_eq!(jit, vm);
+    let data: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&profile).expect("JIT should persist a profile after compilation"),
+    )
+    .expect("APE profile should be valid JSON");
+    std::fs::remove_file(&profile).unwrap();
+    data
+}
+
+fn compiled_function_count(profile: &serde_json::Value) -> usize {
+    profile["functions"].as_object().map_or(0, |functions| {
+        functions
+            .values()
+            .filter(|function| function["compile_ns"].as_u64().unwrap_or(0) > 0)
+            .count()
+    })
+}
+
+#[test]
+fn jit_nested_compiled_calls_match_vm() {
+    let profile = assert_jit_matches_vm_with_diagnostics(
+        r#"
+        @!include("std") use io;
+        @inline("never")
+        fn step(x: int) -> int { x * 3 + 1 }
+        @inline("never")
+        fn stage(x: int) -> int { step(x) + step(x + 1) }
+        fn work(n: int) -> int {
+            var i = 0;
+            var sum = 0;
+            while i < n { sum += stage(i); i += 1; }
+            sum
+        }
+        fn main() { io::println(work(6000)); }
+        "#,
+        "nested-calls",
+    );
+    // Debug builds may exhaust the compile budget after the first function;
+    // `src/jit.rs` unit tests force the nested compiled-callee path directly.
+    assert!(compiled_function_count(&profile) >= 1, "{profile}");
+}
+
+#[test]
+fn jit_nested_compiled_call_errors_unwind_to_the_vm_with_the_same_trace() {
+    let profile = assert_jit_matches_vm_with_diagnostics(
+        r#"
+        @!include("std") use io;
+        @inline("never")
+        fn step(x: int) -> int { 600 / x }
+        @inline("never")
+        fn stage(x: int) -> int { step(x + 1) + step(x) }
+        fn work(n: int) -> int {
+            var i = 0;
+            var sum = 0;
+            while i < n { sum += stage(n - 2 - i); i += 1; }
+            sum
+        }
+        fn main() -> nil {
+            const total = work(6000)!!;
+            io::println(total);
+        }
+        "#,
+        "nested-call-error",
+    );
+    assert!(compiled_function_count(&profile) >= 1, "{profile}");
+}
+
+#[test]
+fn jit_recursion_beyond_the_native_call_depth_matches_vm() {
+    // Depths up to 49 exceed the native nesting cap, so the outermost
+    // compiled call is discarded and repeated by the VM.
+    assert_jit_matches_vm_with_diagnostics(
+        r#"
+        @!include("std") use io;
+        @inline("never")
+        fn dive(n: int, divisor: int) -> int {
+            if n == 0 { 100 / divisor } else { dive(n - 1, divisor) + 1 }
+        }
+        fn work(n: int) -> int {
+            var i = 0;
+            var sum = 0;
+            while i < n { sum += dive(i % 50, n - 1 - i); i += 1; }
+            sum
+        }
+        fn main() -> nil {
+            io::println(work(5999))!!;
+            io::println(work(6000))!!;
+        }
+        "#,
+        "deep-recursion",
+    );
+}
+
+#[test]
+fn jit_compiled_closure_calls_match_vm_for_captures_cells_and_bound_functions() {
+    let profile = assert_jit_matches_vm_with_diagnostics(
+        r#"
+        @!include("std") use io;
+        fn make_adder(bias: int) -> fn(int) -> int {
+            const add = fn[bias](x: int) -> int { x + bias };
+            add
+        }
+        @inline("never")
+        fn twice(x: int) -> int { x * 2 }
+        fn work(
+            n: int,
+            a: fn(int) -> int,
+            b: fn(int) -> int,
+            c: fn(int) -> int,
+            d: fn(int) -> int,
+            e: fn(int) -> int,
+        ) -> int {
+            var i = 0;
+            var sum = 0;
+            while i < n {
+                const slot = i % 5;
+                var callback = a;
+                if slot == 1 { callback = b; }
+                else if slot == 2 { callback = c; }
+                else if slot == 3 { callback = d; }
+                else if slot == 4 { callback = e; }
+                sum += (callback)(i);
+                i += 1;
+            }
+            sum
+        }
+        fn main() -> nil {
+            var count = 0;
+            const counter = fn[var count](x: int) -> int { count += 1; x + count };
+            const offset = 3;
+            const scaled = fn[offset](x: int) -> int { twice(x) + offset };
+            io::println(work(6000, make_adder(7), make_adder(11), twice, counter, scaled))!!;
+            io::println(count)!!;
+        }
+        "#,
+        "closure-calls",
+    );
+    // Debug builds exhaust the compile budget after the first few functions;
+    // `src/jit.rs` unit tests force the compiled-closure path directly.
+    assert!(compiled_function_count(&profile) >= 1, "{profile}");
+}
+
+#[test]
+fn jit_compiled_closure_call_errors_match_vm() {
+    assert_jit_matches_vm_with_diagnostics(
+        r#"
+        @!include("std") use io;
+        fn work(n: int, callback: fn(int) -> int) -> int {
+            var i = 0;
+            var sum = 0;
+            while i < n { sum += (callback)(i); i += 1; }
+            sum
+        }
+        fn main() -> nil {
+            const limit = 5999;
+            const ratio = fn[limit](x: int) -> int { 600 / (limit - x) };
+            io::println(work(6000, ratio))!!;
+        }
+        "#,
+        "closure-call-error",
+    );
+}
+
+#[test]
+fn jit_array_push_and_prepend_match_vm_through_aliases() {
+    let profile = assert_jit_matches_vm_with_diagnostics(
+        r#"
+        @!include("std") use io;
+        fn fill(values: int[], rows: int[][], labels: str[], n: int) -> int {
+            var i = 0;
+            while i < n {
+                values.append(i);
+                values.prepend(i * 2);
+                rows.append([i]);
+                labels.append("x");
+                i += 1;
+            }
+            values.len() + rows.len() + labels.len()
+        }
+        fn main() -> nil {
+            var values: int[] = [];
+            const alias = values;
+            var rows: int[][] = [];
+            var labels: str[] = [];
+            io::println(fill(values, rows, labels, 6000))!!;
+            io::println(alias.len())!!;
+            io::println(alias[0])!!;
+            io::println(alias[11999])!!;
+            io::println(rows[5999][0])!!;
+        }
+        "#,
+        "array-push",
+    );
+    assert!(compiled_function_count(&profile) >= 1, "{profile}");
+}
+
+#[test]
+fn jit_array_push_type_error_matches_vm() {
+    // A scalar of the wrong type takes the native fast path first; `try_push`
+    // rejects it without mutation and the VM bridge reports the error.
+    let source = r#"
+call main 0
+halt
+
+.function main 0 0
+main:
+push -1
+array 1
+store 1
+push 0
+store 0
+loop:
+load 1
+load 0
+arrpush
+pop
+load 0
+push 1
+add
+store 0
+load 0
+push 6000
+lt
+jnz loop
+load 1
+push 1.5
+arrpush
+ret
+"#;
+    let profile_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("jit-array-push-error-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&profile_path);
+    let vm = execute_assembly_result(source, false, None);
+    let jit = execute_assembly_result(source, true, Some(&profile_path));
+    assert!(vm.is_err(), "{vm:?}");
+    assert_eq!(jit, vm);
+    let profile: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&profile_path).expect("loop should compile"))
+            .unwrap();
+    assert!(compiled_function_count(&profile) >= 1, "{profile}");
+    let _ = std::fs::remove_file(profile_path);
+}
+
+/// Differential check for assembled programs: output and error text must match
+/// after a bytecode round trip. Returns the VM result for further assertions.
+fn assert_assembly_jit_matches_vm(source: &str, suffix: &str) -> Result<String, String> {
+    let artifact = cog::parser::assemble(source).unwrap_or_else(|error| panic!("{error}"));
+    let artifact = cog::bytecode::decode(&cog::bytecode::encode(&artifact).unwrap()).unwrap();
+    let profile = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("jit-asm-{suffix}-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&profile);
+    let run = |jit| {
+        let mut output = Vec::new();
+        let mut context = RuntimeContext::new(&mut output, VmCapabilities::default());
+        context.configure_jit(jit, jit.then_some(profile.as_path()), false);
+        let result = interpreter::run_with_context(&artifact, &mut context)
+            .map(|value| format!("{value:?}"))
+            .map_err(|error| error.to_string());
+        drop(context);
+        result.map(|value| format!("{value} {}", String::from_utf8(output).unwrap()))
+    };
+    let vm = run(false);
+    assert_eq!(run(true), vm, "{suffix}");
+    assert!(profile.exists(), "{suffix}: the loop should compile");
+    std::fs::remove_file(profile).unwrap();
+    vm
+}
+
+/// A loop that applies one array operation 6000 times to an initially empty
+/// array, then runs `tail` and returns the array.
+fn array_loop_assembly(operation: &str, tail: &str) -> String {
+    format!(
+        "
+call main 0
+halt
+
+.function main 0 0
+main:
+array 0
+store 1
+push 0
+store 0
+loop:
+{operation}
+pop
+load 0
+push 1
+add
+store 0
+load 0
+push 6000
+lt
+jnz loop
+{tail}
+load 1
+ret
+"
+    )
+}
+
+#[test]
+fn jit_native_pushes_establish_array_types_and_preserve_error_operands() {
+    let append = "load 1\nload 0\narrpush";
+    let prepend = "load 0\nload 1\narrprepend";
+    for (name, operation) in [("append", append), ("prepend", prepend)] {
+        let result = assert_assembly_jit_matches_vm(&array_loop_assembly(operation, ""), name);
+        assert!(result.is_ok(), "{result:?}");
+        // The first native push fixes the element type; later values of another
+        // type are rejected and leave the array unchanged.
+        for (value, kind) in [
+            ("push 1.5", "float"),
+            ("push true", "bool"),
+            ("push nil", "nil"),
+        ] {
+            let bad = if name == "append" {
+                format!("load 1\n{value}\narrpush\npop")
+            } else {
+                format!("{value}\nload 1\narrprepend\npop")
+            };
+            let _ = assert_assembly_jit_matches_vm(
+                &array_loop_assembly(operation, &bad),
+                &format!("{name}-bad-{kind}"),
+            );
+        }
+    }
+    // An Error operand on either side is returned unchanged, mid-loop.
+    for (name, operation) in [
+        (
+            "error-value",
+            "load 1\npush 600\npush 3000\nload 0\nsub\ndiv\narrpush",
+        ),
+        (
+            "error-value-front",
+            "push 600\npush 3000\nload 0\nsub\ndiv\nload 1\narrprepend",
+        ),
+        (
+            "error-array",
+            "push 600\npush 3000\nload 0\nsub\ndiv\nload 0\narrpush",
+        ),
+        ("scalar-array", "load 0\nload 0\narrpush"),
+        ("self-push", "load 1\nload 1\narrpush"),
+        ("self-prepend", "load 1\nload 1\narrprepend"),
+    ] {
+        let _ = assert_assembly_jit_matches_vm(&array_loop_assembly(operation, ""), name);
+    }
+}
+
+#[test]
+fn jit_array_pushes_stay_correct_past_the_native_root_capacity() {
+    // Reference values go through the bridge and root their results; the loop
+    // must survive exhausting the native root table without repeating a push.
+    assert_jit_matches_vm_with_diagnostics(
+        r#"
+        @!include("std") use io;
+        fn work(n: int, x: str, y: str, row: int[], labels: str[], rows: int[][], values: int[]) -> int {
+            var i = 0;
+            var kept = x;
+            while i < n {
+                labels.prepend(x);
+                labels.append(y);
+                rows.prepend(row);
+                values.append(i);
+                kept = labels[0];
+                kept = labels[1];
+                kept = labels[0];
+                kept = labels[1];
+                i += 1;
+            }
+            io::println(kept);
+            labels.len() + rows.len() + rows[0].len() + values.len()
+        }
+        fn main() -> nil {
+            var labels: str[] = [];
+            var rows: int[][] = [];
+            var values: int[] = [];
+            const row = [1, 2];
+            io::println(work(24000, "x", "y", row, labels, rows, values))!!;
+            io::println(values[23999])!!;
+            if false { labels.append(""); rows.append([0]); values.append(0); }
+        }
+        "#,
+        "array-push-roots",
+    );
+}
+
+#[test]
+fn jit_arrays_resized_between_native_reads_stay_visible_through_aliases() {
+    assert_jit_matches_vm_with_diagnostics(
+        r#"
+        @!include("std") use io;
+        @inline("never")
+        fn grow(values: int[], i: int) -> int { values.append(i); values.len() }
+        fn work(n: int, values: int[], other: int[]) -> int {
+            var i = 0;
+            var sum = 0;
+            while i < n {
+                sum += grow(values, i);
+                other.append(values[values.len() - 1]);
+                values[i] = values[i] + other[0];
+                other.prepend(i);
+                sum += values[values.len() - 1] + other[other.len() - 1] + other.len();
+                i += 1;
+            }
+            sum + values[n - 1]
+        }
+        fn main() -> nil {
+            var values: int[] = [];
+            const alias = values;
+            var other: int[] = [];
+            io::println(work(6000, values, other)!!)!!;
+            io::println(alias.len())!!;
+        }
+        "#,
+        "array-resize",
+    );
+}
+
+#[test]
+fn jit_compiled_callee_results_keep_identity_and_release_temporary_roots() {
+    // More calls than the native root table holds, with rooted arguments,
+    // captures, temporaries and results at every nesting level.
+    assert_jit_matches_vm_with_diagnostics(
+        r#"
+        @!include("std") use io;
+        use str;
+        @inline("never")
+        fn same(values: int[]) -> int[] { values }
+        @inline("never")
+        fn pass(values: int[]) -> int[] { same(same(values)) }
+        @inline("never")
+        fn grow(value: bigint, x: int) -> bigint { value * 3 + 18446744073709551617 + str::to_bigint(x) }
+        @inline("never")
+        fn twice(value: bigint, x: int) -> bigint { grow(grow(value, x), x) }
+        @inline("never")
+        fn label(text: str, other: str, x: int) -> str { if x % 2 == 0 { text } else { other } }
+        @inline("never")
+        fn relabel(text: str, other: str, x: int) -> str { label(label(text, other, x), other, x + 1) }
+        fn make(values: int[], seed: bigint) -> fn(int) -> bigint {
+            const run = fn[values, seed](x: int) -> bigint {
+                if x < 0 { same(values); }
+                twice(seed, x)
+            };
+            run
+        }
+        fn work(n: int, values: int[], run: fn(int) -> bigint, first: str, second: str) -> bigint {
+            var i = 0;
+            var total: bigint = str::to_bigint(0);
+            var text = first;
+            while i < n {
+                var shared = pass(values);
+                shared[0] = shared[0] + 1;
+                total += twice(18446744073709551616, i) + (run)(i);
+                text = relabel(text, second, i);
+                i += 1;
+            }
+            io::println(text);
+            total
+        }
+        fn main() -> nil {
+            var values: int[] = [0];
+            const run = make(values, 36893488147419103232);
+            io::println(work(20000, values, run, "even", "odd"))!!;
+            io::println(values[0])!!;
+        }
+        "#,
+        "callee-roots",
+    );
+}
+
+#[test]
+fn jit_mutual_recursion_and_late_errors_match_vm_traces() {
+    assert_jit_matches_vm_with_diagnostics(
+        r#"
+        @!include("std") use io;
+        @inline("never")
+        fn even(n: int, d: int) -> int { if n <= 0 { (600 / d)!! } else { odd(n - 1, d) + 1 } }
+        @inline("never")
+        fn odd(n: int, d: int) -> int { if n <= 0 { (500 / d)!! } else { even(n - 1, d) + 2 } }
+        @inline("never")
+        fn tree(n: int) -> int { if n <= 1 { n } else { tree(n - 2) + tree(n - 1) } }
+        fn inlined(n: int, d: int) -> int { even(n, d) }
+        @inline("never")
+        fn stage(n: int, d: int) -> int { inlined(n, d) + tree(n % 12) }
+        fn work(n: int) -> int {
+            var i = 0;
+            var sum = 0;
+            var errors = 0;
+            while i < n {
+                try { sum += stage(i % 41, i % 977); }
+                catch(_error) { errors += 1; }
+                i += 1;
+            }
+            while i < n * 2 {
+                sum += stage(i % 41, n * 2 - 200 - i);
+                i += 1;
+            }
+            sum + errors
+        }
+        fn main() -> nil { io::println(work(6000))!!; }
+        "#,
+        "mutual-recursion",
+    );
+}
+
+#[test]
+fn jit_compiled_closure_calls_reject_bad_arguments_like_the_vm() {
+    // After a compiled loop of valid calls, the same closure receives a float
+    // and an Error argument, and non-callable targets are invoked.
+    let program = |tail: &str| {
+        format!(
+            "
+call main 0
+halt
+
+.function main 0 0
+main:
+push 5
+closure @add 1
+store 1
+push 0
+store 0
+loop:
+load 0
+load 1
+callv 1
+pop
+load 0
+push 1
+add
+store 0
+load 0
+push 6000
+lt
+jnz loop
+{tail}
+ret
+
+.function add 1 1
+add:
+store 0
+load 0
+loadcap 0
+add
+ret
+"
+        )
+    };
+    for (name, tail) in [
+        ("ok", "load 0\nload 1\ncallv 1"),
+        ("float", "push 1.5\nload 1\ncallv 1"),
+        ("error-argument", "push 1\npush 0\ndiv\nload 1\ncallv 1"),
+        ("error-target", "load 0\npush 1\npush 0\ndiv\ncallv 1"),
+        ("not-callable", "load 0\nload 0\ncallv 1"),
+    ] {
+        let _ = assert_assembly_jit_matches_vm(&program(tail), &format!("closure-args-{name}"));
+    }
+}
+
+#[test]
+fn resource_limits_keep_nested_and_closure_calls_in_the_vm() {
+    let source = r#"
+        @!include("std") use io;
+        @inline("never")
+        fn dive(n: int) -> int { if n <= 0 { 0 } else { dive(n - 1) + 1 } }
+        fn work(n: int, run: fn(int) -> int, values: int[]) -> int {
+            var i = 0;
+            var sum = 0;
+            while i < n { values.append(i); sum += dive(i % 20) + (run)(i); i += 1; }
+            sum + dive(200)
+        }
+        fn main() -> nil {
+            var values: int[] = [];
+            io::println(work(3000, dive, values))!!;
+            if false { values.append(0); }
+        }
+    "#;
+    let artifact = project::compile_source("jit-limits.cog", source).unwrap();
+    let profile = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("jit-call-limits-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&profile);
+    let run = |jit| {
+        let mut output = Vec::new();
+        let mut context = RuntimeContext::new(&mut output, VmCapabilities::default());
+        context.limits.max_call_frames = Some(100);
+        context.configure_jit(jit, jit.then_some(profile.as_path()), false);
+        let result = interpreter::run_with_context(&artifact, &mut context)
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+        drop(context);
+        (result, output)
+    };
+    let vm = run(false);
+    assert!(vm.0.is_err(), "{vm:?}");
+    assert_eq!(run(true), vm);
+    assert!(!profile.exists(), "limited runs must not enable the JIT");
+}
