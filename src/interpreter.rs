@@ -4920,13 +4920,32 @@ pub(crate) fn array_index_set(
     array.try_set(index, value)
 }
 
-fn index_value(object: Value, key: Value) -> Value {
-    let key = match (&object, key) {
-        (Value::Record(_), Value::Int(index)) if index >= 0 => {
-            Value::Str(Rc::from(index.to_string()))
+const RECORD_INDEX_DIGITS: usize = i64::MAX.ilog10() as usize + 1;
+
+fn record_field_name<'a>(
+    key: &'a Value,
+    digits: &'a mut [u8; RECORD_INDEX_DIGITS],
+) -> Option<&'a str> {
+    match key {
+        Value::Str(name) => Some(name),
+        Value::Int(index) if *index >= 0 => {
+            let mut index = *index as u64;
+            let mut start = digits.len();
+            loop {
+                start -= 1;
+                digits[start] = b'0' + (index % 10) as u8;
+                index /= 10;
+                if index == 0 {
+                    break;
+                }
+            }
+            Some(std::str::from_utf8(&digits[start..]).expect("decimal digits are valid UTF-8"))
         }
-        (_, key) => key,
-    };
+        _ => None,
+    }
+}
+
+fn index_value(object: Value, key: Value) -> Value {
     // Type metadata is unspellable in source. This generic query
     // lets lowered patterns inspect nominal identity without a
     // match/enum instruction or a forgeable record field.
@@ -4940,10 +4959,14 @@ fn index_value(object: Value, key: Value) -> Value {
         (Value::Error(_), _) => Ok(object),
         (_, Value::Error(_)) => Ok(key),
         (Value::Array(arr), Value::Int(i)) => array_index(arr, *i),
-        (Value::Record(record), Value::Str(name)) => record
-            .try_get_field(name.as_ref())
-            .map_err(|_| borrow_conflict("index"))
-            .and_then(|value| value.map_or_else(|| missing_field(name), Ok)),
+        (Value::Record(record), key) => record_field_name(key, &mut [0; RECORD_INDEX_DIGITS])
+            .ok_or(RuntimeError::TypeMismatch { op: "index" })
+            .and_then(|name| {
+                record
+                    .try_get_field(name)
+                    .map_err(|_| borrow_conflict("index"))?
+                    .map_or_else(|| missing_field(name), Ok)
+            }),
         (Value::Variant(_, fields), Value::Str(name)) => fields
             .get(name.as_ref())
             .map_or_else(|| missing_field(name), |value| Ok(value.clone())),
@@ -4956,60 +4979,48 @@ fn index_value(object: Value, key: Value) -> Value {
 }
 
 fn index_set_value(array: Value, idx: Value, value: Value) -> Value {
-    let idx = match (&array, idx) {
-        (Value::Record(_), Value::Int(index)) if index >= 0 => {
-            Value::Str(Rc::from(index.to_string()))
-        }
-        (_, index) => index,
-    };
     if let Value::Error(_) = array {
-        array
-    } else if let Value::Error(_) = idx {
-        idx
-    } else {
-        match (&array, &idx) {
-            (Value::Array(arr), Value::Int(i)) => match array_index_set(arr, *i, value) {
-                Ok(()) => array,
-                Err(error) => Value::Error(Box::new(error)),
-            },
-            (Value::Record(record), Value::Str(key)) => match record.try_get_field(key.as_ref()) {
-                Err(_) => Value::Error(Box::new(borrow_conflict("indexset"))),
-                Ok(current) => {
-                    let validation = match (&value, current.as_ref()) {
-                        (Value::Array(replacement), Some(Value::Array(template)))
-                            if record.is_nominal() =>
-                        {
-                            replacement.try_constrain_like(template)
-                        }
-                        (Value::Array(replacement), Some(Value::Array(template)))
-                            if replacement.needs_type_context() =>
-                        {
-                            replacement.try_constrain_from(template)
-                        }
-                        (Value::Array(replacement), _) if replacement.needs_type_context() => {
-                            Err(RuntimeError::TypeMismatch { op: "indexset" })
-                        }
-                        _ => Ok(()),
-                    };
-                    if let Err(error) = validation {
-                        let error = match error {
-                            RuntimeError::TypeMismatch { .. } => {
-                                RuntimeError::TypeMismatch { op: "indexset" }
-                            }
-                            error => error,
-                        };
-                        Value::Error(Box::new(error))
-                    } else {
-                        match record.try_set_field(key.as_ref(), value) {
-                            Ok(()) => array.clone(),
-                            Err(error) => Value::Error(Box::new(error)),
-                        }
-                    }
-                }
-            },
-            _ => Value::Error(Box::new(RuntimeError::TypeMismatch { op: "indexset" })),
-        }
+        return array;
     }
+    if let Value::Error(_) = idx {
+        return idx;
+    }
+    let result = match (&array, &idx) {
+        (Value::Array(arr), Value::Int(i)) => array_index_set(arr, *i, value),
+        (Value::Record(record), key) => record_field_name(key, &mut [0; RECORD_INDEX_DIGITS])
+            .ok_or(RuntimeError::TypeMismatch { op: "indexset" })
+            .and_then(|name| record_index_set(record, name, value)),
+        _ => Err(RuntimeError::TypeMismatch { op: "indexset" }),
+    };
+    match result {
+        Ok(()) => array,
+        Err(error) => Value::Error(Box::new(error)),
+    }
+}
+
+fn record_index_set(record: &RecordValue, name: &str, value: Value) -> Result<(), RuntimeError> {
+    let current = record
+        .try_get_field(name)
+        .map_err(|_| borrow_conflict("indexset"))?;
+    match (&value, current.as_ref()) {
+        (Value::Array(replacement), Some(Value::Array(template))) if record.is_nominal() => {
+            replacement.try_constrain_like(template)
+        }
+        (Value::Array(replacement), Some(Value::Array(template)))
+            if replacement.needs_type_context() =>
+        {
+            replacement.try_constrain_from(template)
+        }
+        (Value::Array(replacement), _) if replacement.needs_type_context() => {
+            Err(RuntimeError::TypeMismatch { op: "indexset" })
+        }
+        _ => Ok(()),
+    }
+    .map_err(|error| match error {
+        RuntimeError::TypeMismatch { .. } => RuntimeError::TypeMismatch { op: "indexset" },
+        error => error,
+    })?;
+    record.try_set_field(name, value)
 }
 
 #[allow(clippy::too_many_arguments)]

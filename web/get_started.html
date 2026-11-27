@@ -353,6 +353,20 @@ fn main() -&gt; nil {
         const checkRun = check.querySelector('.check-run');
         const verdict = check.querySelector('.check-verdict');
         const showVerdict = (state, text) => { verdict.hidden = false; verdict.dataset.state = state; verdict.textContent = text; };
+        expected.addEventListener('input', () => {
+            generation += 1;
+            checkRun.disabled = false;
+            verdict.hidden = true;
+        });
+        const invalidateOutput = () => {
+            generation += 1;
+            lastOutput = null;
+            checkRun.disabled = false;
+            check.hidden = true;
+            verdict.hidden = true;
+        };
+        editor.addEventListener('input', invalidateOutput);
+        input?.addEventListener('input', invalidateOutput);
         const runCheck = async () => {
             if (lastOutput === null || checkRun.disabled) return;
             const mine = generation;
@@ -383,6 +397,7 @@ fn main() -&gt; nil {
             diagnosticGroup.hidden = true;
             lastOutput = null;
             generation += 1;
+            const runGeneration = generation;
             checkRun.disabled = false;
             check.hidden = true;
             verdict.hidden = true;
@@ -393,7 +408,7 @@ fn main() -&gt; nil {
                 output.textContent = value.stdout || (value.ok ? 'Program finished without output.' : 'No output.');
                 diagnostics.textContent = value.diagnostics;
                 diagnosticGroup.hidden = !value.diagnostics;
-                if (value.ok) {
+                if (value.ok && runGeneration === generation) {
                     lastOutput = value.stdout;
                     expected.value = expectedOutputs[lesson.id] ?? '';
                     check.hidden = false;

@@ -3,6 +3,7 @@
 //! `SourceFile` keeps the original text alive through AST cloning and lowering so
 //! diagnostics can use byte ranges without rewriting source coordinates. Compiled
 //! artifacts retain only compact file/line/column source-map entries, not the text.
+use std::cell::OnceCell;
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -13,6 +14,7 @@ const LINE_INDEX_BLOCK_BYTES: usize = 4096;
 pub struct SourceFile {
     pub name: String,
     pub text: String,
+    pub(crate) module_owner: OnceCell<String>,
     line_index: Vec<LineCheckpoint>,
 }
 
@@ -60,6 +62,7 @@ impl SourceFile {
         Rc::new(Self {
             name: name.into(),
             text,
+            module_owner: OnceCell::new(),
             line_index,
         })
     }

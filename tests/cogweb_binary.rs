@@ -51,15 +51,35 @@ fn free_port() -> u16 {
 }
 
 fn request(port: u16, method: &str, path: &str) -> Response {
+    request_with_body(port, method, path, &[])
+}
+
+fn request_with_body(port: u16, method: &str, path: &str, body: &[u8]) -> Response {
+    request_with_content_type(port, method, path, "", body)
+}
+
+fn request_with_content_type(
+    port: u16,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    body: &[u8],
+) -> Response {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(20)))
         .unwrap();
     write!(
         stream,
-        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n",
+        body.len()
     )
     .unwrap();
+    if !content_type.is_empty() {
+        write!(stream, "Content-Type: {content_type}\r\n").unwrap();
+    }
+    write!(stream, "\r\n").unwrap();
+    stream.write_all(body).unwrap();
     let mut raw = Vec::new();
     // The server closes the connection after the response; a reset after the
     // data has arrived is tolerated.
@@ -210,6 +230,58 @@ fn cogweb_binary_assets_example_serves_bytes_and_rejects_bad_paths() {
         Some("application/octet-stream")
     );
     assert!(head.body.is_empty());
+}
+
+#[test]
+fn cogweb_request_body_preserves_binary_bytes_and_utf8_text_api() {
+    let port = free_port();
+    let scratch = scratch_dir("cogweb_request_body");
+    prepare_example(&scratch, port);
+    let _server = start_server(&scratch);
+
+    let binary = [0x00, 0xff, 0x80, 0x0a, 0x0d];
+    let echoed = request_with_body(port, "POST", "/echo", &binary);
+    assert_eq!(echoed.status, 200);
+    assert_eq!(echoed.body, binary);
+    assert_eq!(echoed.header("content-length"), Some("5"));
+
+    let text = "Cog ☃ request".as_bytes();
+    let echoed = request_with_body(port, "POST", "/text", text);
+    assert_eq!(echoed.status, 200);
+    assert_eq!(echoed.body, text);
+
+    let not_text = request_with_body(port, "POST", "/text", &binary);
+    assert_eq!(not_text.status, 415);
+    assert_eq!(not_text.body, b"Body is not UTF-8");
+
+    let valid_form = request_with_content_type(
+        port,
+        "POST",
+        "/form",
+        "application/x-www-form-urlencoded",
+        b"value=hello",
+    );
+    assert_eq!(valid_form.status, 200);
+    assert_eq!(valid_form.body, b"hello");
+
+    let invalid_form = request_with_content_type(
+        port,
+        "POST",
+        "/form",
+        "application/x-www-form-urlencoded",
+        &binary,
+    );
+    assert_eq!(invalid_form.status, 400);
+    assert_eq!(invalid_form.body, b"Invalid form body");
+
+    let valid_json = request_with_content_type(port, "POST", "/json", "application/json", b"{}");
+    assert_eq!(valid_json.status, 200);
+    assert_eq!(valid_json.body, b"Valid JSON");
+
+    let invalid_json =
+        request_with_content_type(port, "POST", "/json", "application/json", &binary);
+    assert_eq!(invalid_json.status, 400);
+    assert_eq!(invalid_json.body, b"Invalid JSON body");
 }
 
 #[test]

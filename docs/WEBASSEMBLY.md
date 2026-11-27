@@ -44,9 +44,9 @@ fields:
   concatenation, typed assignment, parameters, results, and struct fields check
   it and report `TypeMismatch` without changing the array. Array types deeper
   than the VM allows report `ResourceLimit`.
-- `for` iterates arrays, strings, ranges, parallel clauses, and user types that
-  implement `iter::IntoIterator`. Changing the length of an array during its
-  iteration reports `InvalidArgument`.
+- `for` iterates arrays, strings, `int` and `uint` ranges, parallel clauses, and
+  user types that implement `iter::IntoIterator`. Changing the length of an
+  array during its iteration reports `InvalidArgument`.
 - Named, empty, tuple-like, and generic structs support construction, field
   defaults, field reads and writes, methods, `when value is Struct`, and `==`
   through an `eq::Eq` implementation.

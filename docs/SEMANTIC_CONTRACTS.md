@@ -165,8 +165,10 @@ Contracts clone_01..02 are active regressions.
 Global and local `@comptime const name[: T] = expression;` bindings are evaluated after
 name resolution and before runtime lowering. Scalar literals, earlier comptime
 bindings, arithmetic, comparisons, boolean operators, unary operators, string
-concatenation, and nominal struct constructors are supported. Constructors can be
-nested and use named/default arguments. Compile-time functions support scalar and
+concatenation, nominal struct constructors, and struct field reads are supported.
+Constructors can be nested and use named/default arguments. Reads use a literal
+field name or position, apply the defining module's visibility rules, and preserve
+Error values. Compile-time functions support scalar and
 struct parameters, named/default arguments, local const/var/comptime bindings,
 returns, `if`, and recursion within deterministic evaluator limits. Scalar results
 are materialized as runtime literals; struct results are materialized through
@@ -191,8 +193,8 @@ reaches the initializer root as a compile diagnostic; using `!!` directly at an
 initializer root is rejected.
 Lazy `??` and `?!` select nil and Error fallbacks in compile-time expressions;
 `!!` propagation bypasses either fallback. **Current implementation limitation:**
-compile-time functions cannot inspect struct fields or use type parameters,
-mutation statements, loops, array/tuple/enum values, or tuple destructuring.
+compile-time functions cannot use type parameters, mutation statements, loops,
+array/tuple/enum values, or tuple destructuring.
 Evaluator budget exhaustion produces a compile diagnostic. Array, tuple, and enum
 materialization is planned; the other unsupported forms have no accepted
 implementation schedule.

@@ -7,7 +7,7 @@
 use crate::ast::Program;
 use crate::diagnostic::{Diagnostic, SourceSpan};
 use crate::lockfile::{self, Lockfile};
-use crate::resolver::{CORE, ModuleKey, Resolver, Source};
+use crate::resolver::{CORE, EntryParse, ModuleKey, Resolver, Source};
 use crate::{config, frontend};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -31,10 +31,23 @@ impl Loaded {
             &self.build_inputs,
         )
     }
+
+    /// Validate a loaded source project and return its compiler warnings.
+    pub fn check(self, kind: config::PackageKind) -> Result<Vec<Diagnostic>, String> {
+        finish_source(
+            self.program,
+            self.diagnostics,
+            &self.names,
+            &self.build_inputs,
+            kind == config::PackageKind::Application,
+            crate::backend::Emitter::check,
+        )
+        .map(|(_, warnings)| warnings)
+    }
 }
 
 /// Discovery and configuration validation, including entry-point package declarations.
-/// Preparation parses the entry point before the build cache is checked.
+/// Preparation discovers entry-point package inclusions before the build cache is checked.
 pub struct Prepared {
     pub artifact_name: String,
     pub kind: config::PackageKind,
@@ -50,6 +63,7 @@ pub struct Prepared {
     pub(crate) sources: BTreeMap<ModuleKey, Source>,
     pub(crate) aliases: BTreeMap<(usize, String), usize>,
     pub(crate) entry: ModuleKey,
+    entry_parse: Option<EntryParse>,
     pub(crate) resolved_includes: BTreeSet<String>,
     pub(crate) manifests: Vec<PathBuf>,
     pub(crate) build_manifest: Option<String>,
@@ -60,6 +74,7 @@ pub struct Prepared {
 impl Prepared {
     pub fn resolve(self) -> Loaded {
         let resolved = Resolver::new(self.sources, self.aliases, self.entry)
+            .with_entry_parse(self.entry_parse)
             .with_resolved_includes(self.resolved_includes)
             .resolve();
         Loaded {
@@ -621,14 +636,22 @@ pub fn prepare(
         (root.join("main.cog"), package_name)
     };
     let mut resolved_includes = BTreeSet::new();
-    if let Ok(text) = crate::limits::read_source_text(&entry) {
-        let parsed = frontend::parse(entry.display().to_string(), &text);
+    let mut entry_parse = None;
+    // An inclusion needs the literal identifier; the resolver reports all syntax errors.
+    if let Ok(text) = crate::limits::read_source_text(&entry)
+        && text.contains("include")
+    {
+        let parsed = frontend::parse(entry.display().to_string(), text);
+        let mut source = None;
         // Valid declarations in the recovered AST still establish imports.
         // The resolver reports independent frontend errors before compilation.
         for (alias, span) in parsed.program.items.iter().filter_map(|item| match item {
             crate::ast::Item::ComptimeInclude { package, span } => Some((package, span)),
             _ => None,
         }) {
+            if source.is_none() {
+                source = span.as_ref().map(|span| span.source.clone());
+            }
             resolved_includes.insert(alias.clone());
             if alias == "std" {
                 graph.bind_alias(0, alias, CORE, span.clone());
@@ -652,6 +675,7 @@ pub fn prepare(
                 graph.bind_alias(0, alias, id, span.clone());
             }
         }
+        entry_parse = source.map(|source| EntryParse { source, parsed });
     }
     graph.validate_cycles();
     let mut sources = BTreeMap::new();
@@ -844,6 +868,7 @@ pub fn prepare(
         sources,
         aliases: graph.aliases,
         entry: entry_key,
+        entry_parse,
         resolved_includes,
         manifests,
         build_manifest,
@@ -939,64 +964,58 @@ pub fn compile_with_inputs(
         .map(|(program, _)| program)
 }
 
-/// Check a library package without generating executable bytecode.
+/// Check a library package without producing an executable artifact.
 pub fn check_with_inputs_and_warnings(
     program: Program,
     diagnostics: Vec<Diagnostic>,
     names: &BTreeMap<String, String>,
     inputs: &crate::build_inputs::BuildInputs,
 ) -> Result<Vec<Diagnostic>, String> {
-    compile_library_with_inputs_and_warnings(program, diagnostics, names, inputs)
-        .map(|(_, warnings)| warnings)
+    finish_source(
+        program,
+        diagnostics,
+        names,
+        inputs,
+        false,
+        crate::backend::Emitter::check,
+    )
+    .map(|(_, warnings)| warnings)
 }
 
 /// Compile a library and retain callable metadata for native artifact emission.
 pub fn compile_library_with_inputs_and_warnings(
     program: Program,
-    mut diagnostics: Vec<Diagnostic>,
+    diagnostics: Vec<Diagnostic>,
     names: &BTreeMap<String, String>,
     inputs: &crate::build_inputs::BuildInputs,
 ) -> Result<(crate::backend::CompiledProgram, Vec<Diagnostic>), String> {
-    inputs.begin();
-    let mut program = program;
-    if let Err(message) = crate::ast_budget::program(&program) {
-        diagnostics.push(Diagnostic::new("E4003", message, None));
-    }
-    if diagnostics.is_empty() {
-        diagnostics.extend(crate::comptime::evaluate_program_with_inputs(
-            &mut program,
-            inputs,
-        ));
-    }
-    let display = |mut text: String| {
-        let mut pairs: Vec<_> = names
-            .iter()
-            .filter(|(bound, _)| bound.starts_with('$'))
-            .collect();
-        pairs.sort_by_key(|(bound, _)| std::cmp::Reverse(bound.len()));
-        for (bound, name) in pairs {
-            text = text.replace(bound, name);
-        }
-        text
-    };
-    let render = |mut diagnostics: Vec<Diagnostic>| {
-        for diagnostic in &mut diagnostics {
-            diagnostic.message = display(std::mem::take(&mut diagnostic.message));
-            for note in &mut diagnostic.notes {
-                *note = display(std::mem::take(note));
-            }
-        }
-        frontend::render(&diagnostics)
-    };
-    if !diagnostics.is_empty() {
-        diagnostics.extend(crate::analysis::check(
-            &program,
-            &std::collections::HashMap::new(),
-        ));
-        return Err(render(diagnostics));
-    }
-    let mut compiled = crate::codegen::compile_library(&program, names)
-        .map_err(|error| render(error.diagnostics))?;
+    compile_source_program(program, diagnostics, names, inputs, false)
+}
+
+pub fn compile_with_inputs_and_warnings(
+    program: Program,
+    diagnostics: Vec<Diagnostic>,
+    names: &BTreeMap<String, String>,
+    inputs: &crate::build_inputs::BuildInputs,
+) -> Result<(crate::backend::CompiledProgram, Vec<Diagnostic>), String> {
+    compile_source_program(program, diagnostics, names, inputs, true)
+}
+
+fn compile_source_program(
+    program: Program,
+    diagnostics: Vec<Diagnostic>,
+    names: &BTreeMap<String, String>,
+    inputs: &crate::build_inputs::BuildInputs,
+    require_main: bool,
+) -> Result<(crate::backend::CompiledProgram, Vec<Diagnostic>), String> {
+    let (mut compiled, warnings) = finish_source(
+        program,
+        diagnostics,
+        names,
+        inputs,
+        require_main,
+        crate::backend::Emitter::finish,
+    )?;
     for name in compiled.functions.values_mut().chain(
         compiled
             .inline_frames
@@ -1007,17 +1026,18 @@ pub fn compile_library_with_inputs_and_warnings(
             *name = original.clone();
         }
     }
-    Ok((compiled, crate::lint::check_with_names(&program, names)))
+    Ok((compiled, warnings))
 }
 
-pub fn compile_with_inputs_and_warnings(
-    program: Program,
+fn finish_source<T>(
+    mut program: Program,
     mut diagnostics: Vec<Diagnostic>,
     names: &BTreeMap<String, String>,
     inputs: &crate::build_inputs::BuildInputs,
-) -> Result<(crate::backend::CompiledProgram, Vec<Diagnostic>), String> {
+    require_main: bool,
+    finish: impl FnOnce(crate::backend::Emitter) -> Result<T, String>,
+) -> Result<(T, Vec<Diagnostic>), String> {
     inputs.begin();
-    let mut program = program;
     if let Err(message) = crate::ast_budget::program(&program) {
         diagnostics.push(Diagnostic::new("E4003", message, None));
     }
@@ -1041,8 +1061,10 @@ pub fn compile_with_inputs_and_warnings(
     let render = |mut diagnostics: Vec<Diagnostic>| {
         for diagnostic in &mut diagnostics {
             diagnostic.message = display(std::mem::take(&mut diagnostic.message));
-            for note in &mut diagnostic.notes {
-                *note = display(std::mem::take(note));
+            let texts = diagnostic.notes.iter_mut().chain(&mut diagnostic.helps);
+            let suggestions = diagnostic.suggestions.iter_mut();
+            for text in texts.chain(suggestions.map(|suggestion| &mut suggestion.message)) {
+                *text = display(std::mem::take(text));
             }
         }
         // Source names, source lines and highlight coordinates are original
@@ -1056,20 +1078,10 @@ pub fn compile_with_inputs_and_warnings(
         ));
         return Err(render(diagnostics));
     }
-    let warnings = crate::lint::check_with_names(&program, names);
-    let mut compiled =
-        crate::codegen::compile_with_names(&program, names).map_err(|e| render(e.diagnostics))?;
-    for name in compiled.functions.values_mut().chain(
-        compiled
-            .inline_frames
-            .iter_mut()
-            .map(|frame| &mut frame.function),
-    ) {
-        if let Some(original) = names.get(name) {
-            *name = original.clone();
-        }
-    }
-    Ok((compiled, warnings))
+    let output = crate::codegen::lower_with_names(&program, names, require_main)
+        .and_then(|emitter| finish(emitter).map_err(crate::codegen::CodegenError::new))
+        .map_err(|error| render(error.diagnostics))?;
+    Ok((output, crate::lint::check_with_names(&program, names)))
 }
 
 pub fn write_lock(update: Option<(PathBuf, String)>) -> Result<(), String> {

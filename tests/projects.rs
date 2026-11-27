@@ -222,6 +222,52 @@ fn public_comptime_functions_import_and_materialize_across_modules() {
 }
 
 #[test]
+fn comptime_field_reads_obey_the_defining_modules_privacy() {
+    let f = Fixture::new();
+    f.write(
+        "constants.cog",
+        r#"
+        @public struct Secret { private value: int }
+        @public @comptime const VALUE = Secret(7).value;
+        @public @comptime fn make(value: int) -> Secret { Secret(value) }
+        @public @comptime fn reveal() -> int { make(8).value }
+        @public fn local() -> int {
+            @comptime const LOCAL = Secret(9).value;
+            LOCAL
+        }
+        "#,
+    );
+    f.write(
+        "main.cog",
+        r#"
+        use constants; use io;
+        @comptime const VALUE = constants::reveal();
+        fn main() {
+            io::println(constants::VALUE);
+            io::println(VALUE);
+            io::println(constants::local());
+        }
+        "#,
+    );
+    assert_eq!(f.run(), "7\n8\n9\n");
+
+    for (expr, diagnostic) in [
+        ("constants::make(10).value", "field `value` is private"),
+        (
+            "constants::Secret(10).value",
+            "outside its defining module because it has private fields",
+        ),
+    ] {
+        f.write(
+            "main.cog",
+            &format!("use constants; @comptime const VALUE = {expr}; fn main() {{}}"),
+        );
+        let error = f.compile().unwrap_err();
+        assert!(error.contains(diagnostic), "{error}");
+    }
+}
+
+#[test]
 fn cli_evaluates_expressions_with_optional_imports_and_bytecode_debugging() {
     let binary = env!("CARGO_BIN_EXE_cog");
     let evaluated = Command::new(binary)

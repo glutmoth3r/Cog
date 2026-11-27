@@ -5,7 +5,7 @@
 //! forbidden runtime effects and evaluator budget exhaustion become diagnostics.
 use crate::ast::{
     BinOp, BindingPattern, Block, CallArgument, Expr, FallbackKind, ForClause, FunctionDecl, Item,
-    MatchPattern, Program, Stmt, StructField, TypeAnnotation, TypeKind, UnOp,
+    MatchPattern, Program, Stmt, StructField, TypeAnnotation, TypeKind, UnOp, Visibility,
 };
 use crate::diagnostic::{Diagnostic, SourceSpan};
 use crate::error::RuntimeError;
@@ -244,7 +244,10 @@ fn fold_constant_expression_inner(expr: &Expr, allow_bigint: bool) -> Option<cra
     let mut context = EvalContext {
         globals: &globals,
         functions: &functions,
-        constructors: &constructors,
+        structs: StructScope {
+            constructors: &constructors,
+            owner: None,
+        },
         types: &types,
         budget: &mut budget,
     };
@@ -410,12 +413,38 @@ impl ComptimeValue {
     }
 }
 
+struct Constructor {
+    fields: Vec<StructField>,
+    owner: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct StructScope<'a> {
+    constructors: &'a HashMap<String, Constructor>,
+    owner: Option<&'a str>,
+}
+
+impl StructScope<'_> {
+    fn owns(self, constructor: &Constructor) -> bool {
+        self.owner.is_some() && self.owner == constructor.owner.as_deref()
+    }
+}
+
 struct EvalContext<'a> {
     globals: &'a Values,
     functions: &'a HashMap<String, FunctionDecl>,
-    constructors: &'a HashMap<String, Vec<StructField>>,
+    structs: StructScope<'a>,
     types: &'a HashMap<String, TypeAnnotation>,
     budget: &'a mut Budget,
+}
+
+impl<'a> EvalContext<'a> {
+    fn with_owner<T>(&mut self, owner: Option<&'a str>, eval: impl FnOnce(&mut Self) -> T) -> T {
+        let previous = std::mem::replace(&mut self.structs.owner, owner);
+        let result = eval(self);
+        self.structs.owner = previous;
+        result
+    }
 }
 
 enum BlockExit {
@@ -452,7 +481,18 @@ pub(crate) fn evaluate_program_with_inputs(
         .items
         .iter()
         .filter_map(|item| match item {
-            Item::StructDecl { name, fields, .. } => Some((name.clone(), fields.clone())),
+            Item::StructDecl {
+                name,
+                fields,
+                owner,
+                ..
+            } => Some((
+                name.clone(),
+                Constructor {
+                    fields: fields.clone(),
+                    owner: owner.clone(),
+                },
+            )),
             _ => None,
         })
         .collect();
@@ -479,7 +519,12 @@ pub(crate) fn evaluate_program_with_inputs(
             &globals,
             &globals,
             &functions,
-            &constructors,
+            StructScope {
+                constructors: &constructors,
+                owner: span
+                    .as_ref()
+                    .and_then(|span| span.source.module_owner.get().map(String::as_str)),
+            },
             &types,
             &mut budget,
         ) {
@@ -579,7 +624,7 @@ fn evaluate_function(
     function: &mut FunctionDecl,
     globals: &Values,
     functions: &HashMap<String, FunctionDecl>,
-    constructors: &HashMap<String, Vec<StructField>>,
+    constructors: &HashMap<String, Constructor>,
     budget: &mut Budget,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -592,7 +637,10 @@ fn evaluate_function(
         &mut values,
         globals,
         functions,
-        constructors,
+        StructScope {
+            constructors,
+            owner: function.owner.as_deref(),
+        },
         budget,
         diagnostics,
     );
@@ -603,7 +651,7 @@ fn rewrite_block(
     outer: &mut Values,
     globals: &Values,
     functions: &HashMap<String, FunctionDecl>,
-    constructors: &HashMap<String, Vec<StructField>>,
+    structs: StructScope<'_>,
     budget: &mut Budget,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -616,7 +664,7 @@ fn rewrite_block(
             &mut values,
             globals,
             functions,
-            constructors,
+            structs,
             budget,
             diagnostics,
         );
@@ -627,7 +675,7 @@ fn rewrite_block(
             &mut values,
             globals,
             functions,
-            constructors,
+            structs,
             budget,
             diagnostics,
         );
@@ -639,7 +687,7 @@ fn rewrite_stmt(
     values: &mut Values,
     globals: &Values,
     functions: &HashMap<String, FunctionDecl>,
-    constructors: &HashMap<String, Vec<StructField>>,
+    structs: StructScope<'_>,
     budget: &mut Budget,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -652,15 +700,7 @@ fn rewrite_stmt(
                     types.insert(binding.clone(), ty.clone());
                 }
             }
-            match evaluate(
-                &value,
-                values,
-                globals,
-                functions,
-                constructors,
-                &types,
-                budget,
-            ) {
+            match evaluate(&value, values, globals, functions, structs, &types, budget) {
                 Ok(result) => match result.to_expr_with_budget(span.clone(), budget) {
                     Ok(value) => {
                         values.insert(name.clone(), Some(result));
@@ -707,7 +747,7 @@ fn rewrite_stmt(
                 values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -730,7 +770,7 @@ fn rewrite_stmt(
                 values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -739,7 +779,7 @@ fn rewrite_stmt(
                 values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -751,7 +791,7 @@ fn rewrite_stmt(
                 values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -763,7 +803,7 @@ fn rewrite_stmt(
                 values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -779,7 +819,7 @@ fn rewrite_stmt(
                 values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -793,7 +833,7 @@ fn rewrite_stmt(
                 &mut catch_values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -816,7 +856,7 @@ fn rewrite_stmt(
                 values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -825,7 +865,7 @@ fn rewrite_stmt(
                 values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -835,7 +875,7 @@ fn rewrite_stmt(
                     values,
                     globals,
                     functions,
-                    constructors,
+                    structs,
                     budget,
                     diagnostics,
                 );
@@ -860,7 +900,7 @@ fn rewrite_stmt(
                 values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -874,7 +914,7 @@ fn rewrite_stmt(
                 &mut then_values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -884,7 +924,7 @@ fn rewrite_stmt(
                     values,
                     globals,
                     functions,
-                    constructors,
+                    structs,
                     budget,
                     diagnostics,
                 );
@@ -905,7 +945,7 @@ fn rewrite_stmt(
                 values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -914,7 +954,7 @@ fn rewrite_stmt(
                 values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -932,7 +972,7 @@ fn rewrite_stmt(
                 values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -941,7 +981,7 @@ fn rewrite_stmt(
                 values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -951,7 +991,7 @@ fn rewrite_stmt(
                     values,
                     globals,
                     functions,
-                    constructors,
+                    structs,
                     budget,
                     diagnostics,
                 );
@@ -966,7 +1006,7 @@ fn rewrite_stmt(
                 &mut loop_values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -991,7 +1031,7 @@ fn rewrite_stmt(
                 values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -1009,7 +1049,7 @@ fn rewrite_stmt(
                 &mut loop_values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -1036,7 +1076,7 @@ fn rewrite_stmt(
                             values,
                             globals,
                             functions,
-                            constructors,
+                            structs,
                             budget,
                             diagnostics,
                         );
@@ -1045,7 +1085,7 @@ fn rewrite_stmt(
                             values,
                             globals,
                             functions,
-                            constructors,
+                            structs,
                             budget,
                             diagnostics,
                         );
@@ -1055,7 +1095,7 @@ fn rewrite_stmt(
                                 values,
                                 globals,
                                 functions,
-                                constructors,
+                                structs,
                                 budget,
                                 diagnostics,
                             );
@@ -1066,7 +1106,7 @@ fn rewrite_stmt(
                         values,
                         globals,
                         functions,
-                        constructors,
+                        structs,
                         budget,
                         diagnostics,
                     ),
@@ -1095,7 +1135,7 @@ fn rewrite_stmt(
                 &mut loop_values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -1112,7 +1152,7 @@ fn rewrite_expr(
     values: &mut Values,
     globals: &Values,
     functions: &HashMap<String, FunctionDecl>,
-    constructors: &HashMap<String, Vec<StructField>>,
+    structs: StructScope<'_>,
     budget: &mut Budget,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -1122,7 +1162,7 @@ fn rewrite_expr(
             values,
             globals,
             functions,
-            constructors,
+            structs,
             budget,
             diagnostics,
         ),
@@ -1133,7 +1173,7 @@ fn rewrite_expr(
                     values,
                     globals,
                     functions,
-                    constructors,
+                    structs,
                     budget,
                     diagnostics,
                 );
@@ -1147,7 +1187,7 @@ fn rewrite_expr(
                         values,
                         globals,
                         functions,
-                        constructors,
+                        structs,
                         budget,
                         diagnostics,
                     );
@@ -1161,7 +1201,7 @@ fn rewrite_expr(
                     values,
                     globals,
                     functions,
-                    constructors,
+                    structs,
                     budget,
                     diagnostics,
                 );
@@ -1189,7 +1229,7 @@ fn rewrite_expr(
                         values,
                         globals,
                         functions,
-                        constructors,
+                        structs,
                         budget,
                         diagnostics,
                     );
@@ -1223,7 +1263,7 @@ fn rewrite_expr(
                     values,
                     globals,
                     functions,
-                    constructors,
+                    structs,
                     budget,
                     diagnostics,
                 );
@@ -1237,7 +1277,7 @@ fn rewrite_expr(
                     values,
                     globals,
                     functions,
-                    constructors,
+                    structs,
                     budget,
                     diagnostics,
                 );
@@ -1249,7 +1289,7 @@ fn rewrite_expr(
                 values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -1259,7 +1299,7 @@ fn rewrite_expr(
                     values,
                     globals,
                     functions,
-                    constructors,
+                    structs,
                     budget,
                     diagnostics,
                 );
@@ -1271,7 +1311,7 @@ fn rewrite_expr(
                 values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -1280,7 +1320,7 @@ fn rewrite_expr(
                 values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -1291,7 +1331,7 @@ fn rewrite_expr(
                 values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -1304,7 +1344,7 @@ fn rewrite_expr(
                 values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -1313,7 +1353,7 @@ fn rewrite_expr(
                 values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -1323,7 +1363,7 @@ fn rewrite_expr(
             values,
             globals,
             functions,
-            constructors,
+            structs,
             budget,
             diagnostics,
         ),
@@ -1333,7 +1373,7 @@ fn rewrite_expr(
                 values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -1353,7 +1393,7 @@ fn rewrite_expr(
                         &mut arm_values,
                         globals,
                         functions,
-                        constructors,
+                        structs,
                         budget,
                         diagnostics,
                     );
@@ -1363,7 +1403,7 @@ fn rewrite_expr(
                     &mut arm_values,
                     globals,
                     functions,
-                    constructors,
+                    structs,
                     budget,
                     diagnostics,
                 );
@@ -1379,7 +1419,7 @@ fn rewrite_expr(
                 values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -1393,7 +1433,7 @@ fn rewrite_expr(
                 &mut catch_values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -1408,7 +1448,7 @@ fn rewrite_expr(
                 values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -1417,7 +1457,7 @@ fn rewrite_expr(
                 values,
                 globals,
                 functions,
-                constructors,
+                structs,
                 budget,
                 diagnostics,
             );
@@ -1427,7 +1467,7 @@ fn rewrite_expr(
                     values,
                     globals,
                     functions,
-                    constructors,
+                    structs,
                     budget,
                     diagnostics,
                 );
@@ -1453,14 +1493,14 @@ fn evaluate(
     values: &Values,
     globals: &Values,
     functions: &HashMap<String, FunctionDecl>,
-    constructors: &HashMap<String, Vec<StructField>>,
+    structs: StructScope<'_>,
     types: &HashMap<String, TypeAnnotation>,
     budget: &mut Budget,
 ) -> Result<ComptimeValue, String> {
     let mut context = EvalContext {
         globals,
         functions,
-        constructors,
+        structs,
         types,
         budget,
     };
@@ -1510,6 +1550,15 @@ fn validate_expr(
             validate_expr(left, values, context, depth + 1)?;
             validate_expr(right, values, context, depth + 1)
         }
+        Expr::Index(receiver, index) => {
+            if !matches!(index.node(), Expr::Str(_) | Expr::Int(0..)) {
+                return Err(
+                    "comptime field access requires a literal field name or position".into(),
+                );
+            }
+            validate_expr(receiver, values, context, depth + 1)?;
+            validate_expr(index, values, context, depth + 1)
+        }
         Expr::AssociatedCall { .. } => {
             Err("type-associated extension calls are not available at comptime yet".into())
         }
@@ -1528,8 +1577,8 @@ fn validate_expr(
                 }
                 return validate_expr(&arguments[0].value, values, context, depth + 1);
             }
-            let parameters = if let Some(fields) = context.constructors.get(name) {
-                fields.as_slice()
+            let parameters = if let Some(constructor) = context.structs.constructors.get(name) {
+                constructor.fields.as_slice()
             } else if let Some(function) = context.functions.get(name).filter(|f| f.comptime) {
                 function.params.as_slice()
             } else if context.functions.contains_key(name) {
@@ -1704,6 +1753,50 @@ fn eval_expr(
             let right = eval_expr(right, values, context, depth + 1, call_depth)?;
             eval_binary(*op, left, right, context.budget)
         }
+        Expr::Index(receiver, index) => {
+            if !matches!(index.node(), Expr::Str(_) | Expr::Int(0..)) {
+                return Err(
+                    "comptime field access requires a literal field name or position".into(),
+                );
+            }
+            let receiver = eval_expr(receiver, values, context, depth + 1, call_depth)?;
+            if matches!(
+                receiver,
+                ComptimeValue::Error(_) | ComptimeValue::Propagate(_)
+            ) {
+                return Ok(receiver);
+            }
+            let ComptimeValue::Struct { name, fields } = receiver else {
+                return Err("comptime field access requires a struct".into());
+            };
+            let positional;
+            let field = match index.node() {
+                Expr::Str(field) if field.len() <= MAX_STRING_BYTES => field.as_str(),
+                Expr::Str(_) => return Err("comptime string size limit exceeded".into()),
+                Expr::Int(position) => {
+                    context.budget.allocate(20)?;
+                    positional = position.to_string();
+                    positional.as_str()
+                }
+                _ => unreachable!("literal field key was checked"),
+            };
+            let constructor = context
+                .structs
+                .constructors
+                .get(&name)
+                .ok_or_else(|| format!("unknown comptime struct `{name}`"))?;
+            for (declaration, (field_name, value)) in constructor.fields.iter().zip(fields) {
+                if field_name == field {
+                    if declaration.visibility == Visibility::Private
+                        && !context.structs.owns(constructor)
+                    {
+                        return Err(format!("field `{field}` is private"));
+                    }
+                    return Ok(value);
+                }
+            }
+            Err(format!("unknown field `{field}`"))
+        }
         Expr::AssociatedCall { .. } => {
             Err("type-associated extension calls are not available at comptime yet".into())
         }
@@ -1744,10 +1837,20 @@ fn eval_expr(
                     }
                 };
             }
-            if let Some(fields) = context.constructors.get(name) {
+            if let Some(constructor) = context.structs.constructors.get(name) {
+                if !context.structs.owns(constructor)
+                    && constructor
+                        .fields
+                        .iter()
+                        .any(|field| field.visibility == Visibility::Private)
+                {
+                    return Err(format!(
+                        "cannot construct `{name}` outside its defining module because it has private fields"
+                    ));
+                }
                 return eval_struct_constructor(
                     name,
-                    fields,
+                    constructor,
                     arguments,
                     values,
                     context,
@@ -1773,13 +1876,15 @@ fn eval_expr(
                 }
                 supplied.push(value);
             }
-            eval_comptime_function(
-                function,
-                (&bindings.by_parameter, &supplied),
-                context,
-                depth + 1,
-                call_depth + 1,
-            )
+            context.with_owner(function.owner.as_deref(), |context| {
+                eval_comptime_function(
+                    function,
+                    (&bindings.by_parameter, &supplied),
+                    context,
+                    depth + 1,
+                    call_depth + 1,
+                )
+            })
         }
         Expr::If {
             cond,
@@ -1867,15 +1972,16 @@ fn eval_expr(
     }
 }
 
-fn eval_struct_constructor(
+fn eval_struct_constructor<'a>(
     name: &str,
-    fields: &[StructField],
+    constructor: &'a Constructor,
     arguments: &[CallArgument],
     values: &Values,
-    context: &mut EvalContext<'_>,
+    context: &mut EvalContext<'a>,
     depth: usize,
     call_depth: usize,
 ) -> Result<ComptimeValue, String> {
+    let fields = &constructor.fields;
     let bindings = crate::arguments::bind(name, fields, arguments);
     if let Some(error) = bindings.errors.first() {
         return Err(error.message.clone());
@@ -1897,7 +2003,9 @@ fn eval_struct_constructor(
         let mut value = if let Some(argument) = bindings.by_parameter[index] {
             context.budget.clone_value(&supplied[argument])?
         } else if let Some(default) = &field.default {
-            eval_expr(default, values, context, depth + 1, call_depth)?
+            context.with_owner(constructor.owner.as_deref(), |context| {
+                eval_expr(default, values, context, depth + 1, call_depth)
+            })?
         } else {
             return Err(format!("`{name}` expects argument `{}`", field.name));
         };
@@ -2999,7 +3107,10 @@ mod tests {
         let mut context = EvalContext {
             globals,
             functions: &functions,
-            constructors: &constructors,
+            structs: StructScope {
+                constructors: &constructors,
+                owner: None,
+            },
             types: &types,
             budget,
         };
@@ -3221,12 +3332,20 @@ mod tests {
         let mut context = EvalContext {
             globals: &globals,
             functions: &functions,
-            constructors: &constructors,
+            structs: StructScope {
+                constructors: &constructors,
+                owner: None,
+            },
             types: &types,
             budget: &mut budget,
         };
 
-        let result = eval_struct_constructor("Wide", &fields, &[], &values, &mut context, 0, 0);
+        let constructor = Constructor {
+            fields,
+            owner: None,
+        };
+        let result =
+            eval_struct_constructor("Wide", &constructor, &[], &values, &mut context, 0, 0);
 
         assert!(result.unwrap_err().contains("allocation budget exceeded"));
     }

@@ -311,7 +311,12 @@ pub enum TypeKind {
 impl TypeAnnotation {
     /// Stable internal identity used for monomorphized nominal types.
     pub fn canonical(&self) -> String {
-        let base = match &self.kind {
+        self.with_nil_suffix(self.canonical_base())
+    }
+
+    /// Internal identity without the annotation's outer nullability.
+    pub(crate) fn canonical_base(&self) -> String {
+        match &self.kind {
             TypeKind::Primitive(base) => base.name().to_string(),
             TypeKind::Bytes => "bytes".to_string(),
             TypeKind::Named(name) | TypeKind::TypeParameter(name) => name.clone(),
@@ -337,7 +342,7 @@ impl TypeAnnotation {
                     .join(",")
             ),
             TypeKind::SelfType => "Self".to_string(),
-            TypeKind::Array(element) => format!("{}[]", element.canonical()),
+            TypeKind::Array(element) => element.with_array_suffix(element.canonical()),
             TypeKind::Tuple(items) => format!(
                 "({})",
                 items
@@ -355,11 +360,25 @@ impl TypeAnnotation {
                     .join(","),
                 result.canonical()
             ),
-        };
-        if self.nilable {
-            format!("{base}?")
-        } else {
-            base
+        }
+    }
+
+    // A function element is parenthesized: a bare suffix would name an array
+    // result. A nullable function type is already parenthesized.
+    fn with_array_suffix(&self, element: String) -> String {
+        match &self.kind {
+            TypeKind::Function { .. } if !self.nilable => format!("({element})[]"),
+            _ => format!("{element}[]"),
+        }
+    }
+
+    // A nullable function type is parenthesized: its bare suffix would name a
+    // nullable result.
+    fn with_nil_suffix(&self, base: String) -> String {
+        match &self.kind {
+            _ if !self.nilable => base,
+            TypeKind::Function { .. } => format!("({base})?"),
+            _ => format!("{base}?"),
         }
     }
 
@@ -384,7 +403,7 @@ impl TypeAnnotation {
             ),
             TypeKind::TypeParameter(name) => name.clone(),
             TypeKind::SelfType => "Self".to_string(),
-            TypeKind::Array(element) => format!("{}[]", element.display()),
+            TypeKind::Array(element) => element.with_array_suffix(element.display()),
             TypeKind::Tuple(items) => format!(
                 "({})",
                 items
@@ -403,11 +422,7 @@ impl TypeAnnotation {
                 result.display()
             ),
         };
-        if self.nilable {
-            format!("{base}?")
-        } else {
-            base
-        }
+        self.with_nil_suffix(base)
     }
 }
 

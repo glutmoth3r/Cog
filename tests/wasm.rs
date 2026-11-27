@@ -980,7 +980,8 @@ struct Box[T: type] { value: T }
 extend Node {
     fn sum(self) -> int {
         var total = self.value;
-        when self.next is Node { total += self.next.sum(); };
+        const next = self.next;
+        when next is Node { total += next.sum(); };
         total
     }
 }
@@ -1026,7 +1027,8 @@ fn main() -> nil {
     io::println(number.value + 1)!!;
     io::println(words)!!;
     io::println([Marker(), Marker()])!!;
-    io::println(list.next.next)!!;
+    const tail = list.next;
+    if tail != nil { io::println(tail.next)!!; };
 }
 "#;
 
@@ -1120,7 +1122,11 @@ fn main() -> nil {
     var node = Node(1);
     node.next = node;
     node.children.append(node);
-    io::println(node.next.next.value)!!;
+    const first = node.next;
+    if first != nil {
+        const second = first.next;
+        if second != nil { io::println(second.value)!!; };
+    };
     var out = str::builder()!!;
     const rendered = capture { fmt::write(out, "{}", node) };
     when rendered is Error::ResourceLimit(resource) { io::println(resource)!!; };

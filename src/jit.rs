@@ -228,6 +228,7 @@ struct FunctionPlan {
     max_stack: usize,
     stack_depths: Vec<Option<usize>>,
     osr_entries: Vec<usize>,
+    direct_call_targets: Vec<usize>,
     has_backedges: bool,
     callable_from_jit: bool,
 }
@@ -716,12 +717,13 @@ impl JitState {
         };
         // OSR timings include VM/JIT entry costs; they do not predict whether
         // calling this compiled function from another JIT function is useful.
-        let callables = self
-            .candidates
+        let callables = plan
+            .direct_call_targets
             .iter()
-            .filter_map(|(&candidate_entry, candidate)| {
+            .filter_map(|&candidate_entry| {
+                let candidate = self.candidates.get(&candidate_entry)?;
                 let compiled = candidate.compiled.as_ref()?;
-                let plan = Arc::clone(self.plans.get(&candidate_entry)?);
+                let plan = self.plans.get(&candidate_entry)?;
                 let call_profiled = compiled.call_compiled
                     && candidate.profile.total_calls >= HOT_CALL_THRESHOLD
                     && candidate.profile.total_calls >= candidate.retry_after_calls;
@@ -750,7 +752,7 @@ impl JitState {
                     candidate_entry,
                     JitCallable {
                         entry: compiled.entry,
-                        plan,
+                        plan: Arc::clone(plan),
                         signature,
                         int_slot_arguments,
                     },
@@ -1798,6 +1800,7 @@ fn analyze_function(
         }
     }
     let mut predecessors = HashMap::<usize, usize>::new();
+    let mut direct_call_targets = Vec::new();
     for pc in entry..end {
         if depths[pc - entry].is_none() {
             continue;
@@ -1814,9 +1817,15 @@ fn analyze_function(
             | Instruction::ReturnPropagate
             | Instruction::Crash(_)
             | Instruction::Halt => {}
+            Instruction::Call(target, _) => {
+                direct_call_targets.push(*target);
+                *predecessors.entry(pc + 1).or_default() += 1;
+            }
             _ => *predecessors.entry(pc + 1).or_default() += 1,
         }
     }
+    direct_call_targets.sort_unstable();
+    direct_call_targets.dedup();
     let phi_estimate = blocks
         .iter()
         .filter(|pc| predecessors.get(pc).copied().unwrap_or_default() > 1)
@@ -1891,6 +1900,7 @@ fn analyze_function(
         max_stack,
         stack_depths: depths,
         osr_entries,
+        direct_call_targets,
         has_backedges,
         callable_from_jit,
     })
@@ -6952,6 +6962,7 @@ fn main() -> nil {}
             max_stack: 1,
             stack_depths: vec![Some(0); artifact.instructions.len()],
             osr_entries: vec![1],
+            direct_call_targets: Vec::new(),
             has_backedges: false,
             callable_from_jit: false,
         };
@@ -7000,6 +7011,7 @@ fn main() -> nil {}
             max_stack: 2,
             stack_depths: vec![Some(1), Some(0), Some(1), Some(2), Some(1), Some(0)],
             osr_entries: vec![1],
+            direct_call_targets: Vec::new(),
             has_backedges: true,
             callable_from_jit: false,
         };
@@ -7127,6 +7139,7 @@ fn main() -> nil {}
             max_stack: 1,
             stack_depths: Vec::new(),
             osr_entries: vec![entry + 4],
+            direct_call_targets: Vec::new(),
             has_backedges: true,
             callable_from_jit: false,
         };
@@ -7225,6 +7238,7 @@ fn main() -> nil {}
             max_stack: 1,
             stack_depths: Vec::new(),
             osr_entries: vec![entry + 4],
+            direct_call_targets: Vec::new(),
             has_backedges: true,
             callable_from_jit: false,
         };
@@ -7430,6 +7444,7 @@ ret
             max_stack: 1,
             stack_depths: vec![Some(1)],
             osr_entries: Vec::new(),
+            direct_call_targets: Vec::new(),
             has_backedges: false,
             callable_from_jit: false,
         };

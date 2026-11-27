@@ -263,7 +263,7 @@ pub(crate) fn optimize(program: &CompiledProgram) -> CompiledProgram {
                             &mut rewritten,
                             &mut source_map,
                             Instruction::Pop,
-                            location.clone(),
+                            location,
                         );
                     }
                     push_instruction(
@@ -279,12 +279,7 @@ pub(crate) fn optimize(program: &CompiledProgram) -> CompiledProgram {
                 Instruction::JumpIfFalse(target) | Instruction::JumpIfTrue(target)
                     if let Some(taken) = facts.branch_taken.get(&pc).copied() =>
                 {
-                    push_instruction(
-                        &mut rewritten,
-                        &mut source_map,
-                        Instruction::Pop,
-                        location.clone(),
-                    );
+                    push_instruction(&mut rewritten, &mut source_map, Instruction::Pop, location);
                     if taken && *target != pc + 1 {
                         push_instruction(
                             &mut rewritten,
@@ -942,14 +937,11 @@ fn fold_binary(instruction: &Instruction, left: Fact, right: Fact) -> Option<Fac
         .and_then(Fact::from_value)
 }
 
-/// Source coordinate and innermost inline frame of one instruction.
-type SourcePoint = (crate::diagnostic::SourceLocation, Option<usize>);
-
-fn source_location(
-    program: &CompiledProgram,
+fn source_location<'a>(
+    program: &'a CompiledProgram,
     pc: usize,
     source_index: &mut usize,
-) -> Option<SourcePoint> {
+) -> Option<&'a SourceMapEntry> {
     while program
         .source_map
         .get(*source_index)
@@ -961,32 +953,31 @@ fn source_location(
         .source_map
         .get(*source_index)
         .filter(|entry| entry.start <= pc && pc < entry.end)
-        .map(|entry| (entry.location.clone(), entry.inline))
 }
 
 fn push_instruction(
     instructions: &mut Vec<Instruction>,
     source_map: &mut Vec<SourceMapEntry>,
     instruction: Instruction,
-    location: Option<SourcePoint>,
+    location: Option<&SourceMapEntry>,
 ) {
     let pc = instructions.len();
     instructions.push(instruction);
-    let Some((location, inline)) = location else {
+    let Some(source) = location else {
         return;
     };
     if let Some(previous) = source_map.last_mut()
         && previous.end == pc
-        && previous.location == location
-        && previous.inline == inline
+        && previous.location == source.location
+        && previous.inline == source.inline
     {
         previous.end += 1;
     } else {
         source_map.push(SourceMapEntry {
             start: pc,
             end: pc + 1,
-            location,
-            inline,
+            location: source.location.clone(),
+            inline: source.inline,
         });
     }
 }

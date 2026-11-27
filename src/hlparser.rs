@@ -1814,8 +1814,9 @@ impl<'a> Parser<'a> {
         } else if self.peek() == Some(&Token::LParen) {
             self.advance();
             let mut items = vec![self.parse_type()?];
-            if self.peek() != Some(&Token::Comma) {
-                return Err(self.err("tuple types require at least two elements"));
+            let grouped = self.peek() == Some(&Token::RParen);
+            if !grouped && self.peek() != Some(&Token::Comma) {
+                return Err(self.err("expected `,` or `)` in a parenthesized type"));
             }
             while self.peek() == Some(&Token::Comma) {
                 self.advance();
@@ -1825,9 +1826,14 @@ impl<'a> Parser<'a> {
                 items.push(self.parse_type()?);
             }
             self.expect(&Token::RParen)?;
-            TypeAnnotation {
-                kind: TypeKind::Tuple(items),
-                nilable: false,
+            // Parentheses around one type only group it, as in `(fn() -> int)?`.
+            if grouped && let Some(inner) = items.pop() {
+                inner
+            } else {
+                TypeAnnotation {
+                    kind: TypeKind::Tuple(items),
+                    nilable: false,
+                }
             }
         } else {
             match self.peek().cloned() {

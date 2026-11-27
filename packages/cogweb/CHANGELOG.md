@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.0
+
+- Requires a Cog compiler that checks nullable types.
+- `Request.body_bytes` exposes the bounded raw request body. Existing UTF-8
+  callers can keep using `Request.body`; `body_text()` reports invalid UTF-8 as
+  `nil` instead of rejecting the request. Form helpers raise
+  `Error::ParseFailure("http", "request body UTF-8")` for invalid text, and
+  `Request.json()` returns that Error value rather than parsing an empty string.
+
 ## 0.5.0
 
 - Requires a Cog compiler with integer shift operators. Library sources add array

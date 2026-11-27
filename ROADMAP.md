@@ -72,8 +72,8 @@ remaining release acceptance gates, and the next language goals. See the [langua
   re-run, and scalar-typed constructor fields no longer carry references. `cog check`
   of `packages/cogweb` dropped from 14 s to under 2 s, and of `web/tutorial` from
   over 10 minutes to about 5 s.
-- `cogweb` 0.5.0 in `packages/cogweb` with `static_files::serve_file` and
-  `http::binary_response`. The tutorial server is a Cog program (`web/tutorial`)
+- `cogweb` 0.6.0 in `packages/cogweb` with `static_files::serve_file`,
+  `http::binary_response`, and raw request bodies. The tutorial server is a Cog program (`web/tutorial`)
   on it, launched by `web/server.mts`, with 22 tests in `web/server.test.mts`.
 
 ## Beta release acceptance
@@ -92,9 +92,9 @@ remaining release acceptance gates, and the next language goals. See the [langua
   - Beta's comptime contract is the implemented subset in [compile-time
     evaluation](docs/LANGUAGE.md#compile-time-evaluation) and [its semantic
     contracts](docs/SEMANTIC_CONTRACTS.md#implemented-comptime-evaluation-and-functions):
-    scalar and struct evaluation, comptime functions, limited type-valued bindings,
+    scalar and struct evaluation, struct field reads, comptime functions, limited type-valued bindings,
     and documented phase/Error behavior. `@comptime var`, reassignment, loops,
-    array/tuple/enum values, field inspection, and native calls remain outside it.
+    array/tuple/enum values and native calls remain outside it.
   - Beta excludes composing user-defined `Clone` implementations through arrays
     and tuples. Structural cloning remains available for supported primitive leaves
     and nested arrays/tuples; custom implementations remain usable in generic calls.
@@ -181,17 +181,17 @@ thread-safe scheduler wakeups. Detach and async closures remain future work.
 4. Implement Windows process-tree termination to match Unix process-group
    cancellation. Buffered TCP framing helpers and detached tasks need separate memory,
    ownership, cancellation, and shutdown contracts.
-5. Struct type tests (`when value is Struct`) can guard an optional struct
-   field, so a user-written `Clone` can copy recursive fields. The checker still
-   treats `Node?` like `Node` and joins `nil` with a struct to `dynamic`, so
-   `if field == nil { nil } else { field.clone() }` is rejected; decide whether
-   to track struct nullability. For the same reason a `match` with only a struct
-   arm is exhaustive just for the few proven non-nil scrutinees listed in
-   [LANGUAGE.md](docs/LANGUAGE.md#patterns-when-and-match). Struct `==` and `!=`
-   call an explicit `eq::Eq[Self]` implementation, and `cog check` rejects structs
-   without one. Compile-time evaluation still compares structs without that
-   implementation (equal records compare as `false`). Decide whether a built-in
-   struct `.clone()` should exist.
+5. The checker tracks [nullability](docs/LANGUAGE.md#nullable-types) for every
+   type and narrows bindings after nil checks. Unannotated global `var` bindings stay
+   dynamic and unchecked; inferring their types needs write constraints from the
+   whole program. Other open follow-ups include narrowing on assignment, a non-nil
+   assertion form, narrowing of fields, array literals assigned to existing
+   nullable-element variables, and `?` inside explicit generic arguments of
+   expressions. Struct `==` and `!=` call an explicit
+   `eq::Eq[Self]` implementation, and `cog check` rejects structs without one.
+   Compile-time evaluation still compares structs without that implementation
+   (equal records compare as `false`). Decide whether a built-in struct
+   `.clone()` should exist.
 6. Extend the WASI backend only by owner decision. `str::to_int`, `to_uint`,
    `to_bool`, `to_char`, `str::builder`, `build`, `fmt::write`, `replace`, arrays
    and structs have VM parity (tests/wasm.rs); the guest has no cycle collector.

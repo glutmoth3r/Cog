@@ -755,15 +755,16 @@ fn collect_with_excluded(
             resource: "VM heap",
         })?;
     incoming.resize(snapshot.len(), 0usize);
-    let mut edges = Vec::new();
-    edges
-        .try_reserve_exact(snapshot.len())
+    let mut edge_offsets = Vec::new();
+    edge_offsets
+        .try_reserve_exact(snapshot.len() + 1)
         .map_err(|_| RuntimeError::ResourceLimit {
             resource: "VM heap",
         })?;
-    edges.resize_with(snapshot.len(), Vec::new);
+    let mut edges = Vec::new();
     let mut edge_allocation_failed = false;
-    for (index, (_, weak)) in snapshot.iter().enumerate() {
+    for (_, weak) in &snapshot {
+        edge_offsets.push(edges.len());
         let Some(object) = weak.upgrade() else {
             continue;
         };
@@ -776,12 +777,12 @@ fn collect_with_excluded(
                 if Rc::ptr_eq(&registry, &child.registry)
                     && let Some(child_index) = snapshot_index(child.id)
                 {
-                    if edges[index].try_reserve(1).is_err() {
+                    if edges.try_reserve(1).is_err() {
                         edge_allocation_failed = true;
                         return;
                     }
                     incoming[child_index] = incoming[child_index].saturating_add(1);
-                    edges[index].push(child_index);
+                    edges.push(child_index);
                 }
             });
             if result.is_err() {
@@ -789,6 +790,7 @@ fn collect_with_excluded(
             }
         });
     }
+    edge_offsets.push(edges.len());
     if edge_allocation_failed {
         return Err(RuntimeError::ResourceLimit {
             resource: "VM heap",
@@ -838,7 +840,7 @@ fn collect_with_excluded(
         }
     }
     while let Some(index) = work.pop() {
-        for &child in &edges[index] {
+        for &child in &edges[edge_offsets[index]..edge_offsets[index + 1]] {
             if !marked[child] {
                 marked[child] = true;
                 work.push(child);

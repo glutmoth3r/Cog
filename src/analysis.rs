@@ -7,12 +7,18 @@ use crate::builtins::Builtin;
 use crate::diagnostic::{Diagnostic, DiagnosticSuggestion, SourceSpan};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+mod writes;
+use writes::Writes;
+
 const CLONE_TRAIT: &str = "$core::clone::Clone";
 const MAX_TRAIT_COHERENCE_WORK: usize = 1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum Type {
     Primitive(VarType, bool),
+    /// A non-primitive type that also admits nil. Primitives keep their own
+    /// flag; build values with [`Type::nullable`] to stay canonical.
+    Nullable(Box<Type>),
     Nil,
     Never,
     EmptyArray,
@@ -36,7 +42,7 @@ pub(crate) enum Type {
 /// Marks the bound symbols printed by `Type::display` for `name_nominal_types`.
 const NOMINAL_MARK: char = '\u{e000}';
 
-const NILABLE_STRUCT_MATCH: &str =
+const NILABLE_MATCH: &str =
     "non-exhaustive match: the scrutinee may be nil; add a `nil` or `_` arm";
 
 pub(crate) fn type_compatible(expected: &Type, actual: &Type) -> bool {
@@ -45,7 +51,9 @@ pub(crate) fn type_compatible(expected: &Type, actual: &Type) -> bool {
         (Type::Primitive(a, nullable), Type::Primitive(b, actual_nullable)) => {
             a == b && (!*actual_nullable || *nullable)
         }
-        (Type::Primitive(_, true), Type::Nil) | (Type::Nil, Type::Nil) => true,
+        (Type::Primitive(_, true) | Type::Nullable(_), Type::Nil) | (Type::Nil, Type::Nil) => true,
+        (Type::Nullable(expected), Type::Nullable(actual)) => type_compatible(expected, actual),
+        (Type::Nullable(expected), actual) => type_compatible(expected, actual),
         (Type::Named(expected), Type::Struct(_, actual, _) | Type::Enum(_, actual)) => {
             expected == actual || actual.ends_with(&format!("::{expected}"))
         }
@@ -59,7 +67,11 @@ pub(crate) fn type_compatible(expected: &Type, actual: &Type) -> bool {
                 && expected_args
                     .iter()
                     .zip(actual_args)
-                    .all(|(expected, actual)| type_compatible(expected, actual))
+                    // Instances are distinct runtime types, so type arguments
+                    // cannot differ in nullability.
+                    .all(|(expected, actual)| {
+                        type_compatible(expected, actual) && same_nullability(expected, actual)
+                    })
         }
         (Type::Enum(expected, _), Type::Enum(actual, _)) => expected == actual,
         (Type::Array(_), Type::EmptyArray) => true,
@@ -79,6 +91,158 @@ pub(crate) fn type_compatible(expected: &Type, actual: &Type) -> bool {
     }
 }
 
+fn same_nullability(left: &Type, right: &Type) -> bool {
+    if matches!(
+        (left, right),
+        (Type::Dynamic | Type::Generic(_) | Type::Poison, _)
+            | (_, Type::Dynamic | Type::Generic(_) | Type::Poison)
+    ) {
+        return true;
+    }
+    if left.is_nullable() != right.is_nullable() {
+        return false;
+    }
+    match (left.non_nil(), right.non_nil()) {
+        (Type::Array(left), Type::Array(right)) | (Type::Task(left), Type::Task(right)) => {
+            same_nullability(&left, &right)
+        }
+        (Type::Tuple(left), Type::Tuple(right))
+        | (Type::Struct(_, _, left), Type::Struct(_, _, right)) => left
+            .iter()
+            .zip(&right)
+            .all(|(left, right)| same_nullability(left, right)),
+        (Type::Function(left, left_result), Type::Function(right, right_result)) => {
+            same_nullability(&left_result, &right_result)
+                && left
+                    .iter()
+                    .zip(&right)
+                    .all(|(left, right)| same_nullability(left, right))
+        }
+        _ => true,
+    }
+}
+
+/// Whether joining two types would let an existing mutable container be used
+/// with a different element type or type argument. Containers are invariant:
+/// a write through the joined type could not be stored.
+fn container_conflict(left: &Type, right: &Type) -> bool {
+    match (left.non_nil(), right.non_nil()) {
+        (Type::Array(left), Type::Array(right)) => {
+            let joined = (*left).clone().join((*right).clone());
+            container_conflict(&left, &right)
+                || (joined != Type::Dynamic
+                    && !(array_element_compatible(&joined, &left)
+                        && array_element_compatible(&joined, &right)))
+        }
+        (Type::Task(left), Type::Task(right)) => container_conflict(&left, &right),
+        (Type::Tuple(left), Type::Tuple(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(&right)
+                    .any(|(left, right)| container_conflict(left, right))
+        }
+        (Type::Struct(left_id, _, left), Type::Struct(right_id, _, right)) => {
+            left_id == right_id
+                && !left
+                    .iter()
+                    .zip(&right)
+                    .all(|(left, right)| same_nullability(left, right))
+        }
+        _ => false,
+    }
+}
+
+/// Natives that declare an unconstrained parameter but cannot convert or hash
+/// `nil`.
+fn native_rejects_nil(name: &str, parameter: usize) -> bool {
+    parameter == 0
+        && matches!(
+            name,
+            "hash::of"
+                | "str::to_int"
+                | "str::to_uint"
+                | "str::to_bigint"
+                | "str::to_float"
+                | "str::to_bool"
+                | "str::to_char"
+        )
+}
+
+/// An array or tuple literal takes a nullable element type from its context:
+/// the emitter builds it with the declared element type.
+fn literal_widens(expr: &Expr, actual: &Type, expected: &Type) -> bool {
+    if actual == expected {
+        return true;
+    }
+    if expected.is_nullable() {
+        return *actual == Type::Nil
+            || literal_widens(expr, &actual.non_nil(), &expected.non_nil());
+    }
+    match (expr.node(), actual, expected) {
+        (Expr::Array(_), Type::EmptyArray, Type::Array(_)) => true,
+        (Expr::Array(items), Type::Array(actual), Type::Array(expected)) => items
+            .iter()
+            .all(|item| literal_widens(item, actual, expected)),
+        (Expr::Tuple(items), Type::Tuple(actual), Type::Tuple(expected)) => {
+            items.len() == actual.len()
+                && actual.len() == expected.len()
+                && items
+                    .iter()
+                    .zip(actual)
+                    .zip(expected)
+                    .all(|((item, actual), expected)| literal_widens(item, actual, expected))
+        }
+        _ => false,
+    }
+}
+
+/// The type of an argument or result after its context widens a literal.
+fn widened(expr: &Expr, actual: Type, expected: &Type) -> Type {
+    if matches!(expr.node(), Expr::Array(_) | Expr::Tuple(_))
+        && literal_widens(expr, &actual, expected)
+    {
+        expected.clone()
+    } else {
+        actual
+    }
+}
+
+fn contains_nullable(ty: &Type) -> bool {
+    match ty {
+        Type::Primitive(..) => ty.is_nullable(),
+        Type::Nullable(_) => true,
+        Type::Array(element) | Type::Task(element) => contains_nullable(element),
+        Type::Tuple(items) | Type::Struct(_, _, items) => items.iter().any(contains_nullable),
+        Type::Function(parameters, result) => {
+            parameters.iter().any(contains_nullable) || contains_nullable(result)
+        }
+        _ => false,
+    }
+}
+
+fn contains_generic(ty: &Type) -> bool {
+    match ty {
+        Type::Generic(_) => true,
+        Type::Nullable(inner) | Type::Array(inner) | Type::Task(inner) => contains_generic(inner),
+        Type::Tuple(items) | Type::Struct(_, _, items) => items.iter().any(contains_generic),
+        Type::Function(parameters, result) => {
+            parameters.iter().any(contains_generic) || contains_generic(result)
+        }
+        _ => false,
+    }
+}
+
+/// Generic inference visits `nil` arguments last, so that `T?` takes `T` from
+/// the other arguments when they provide it.
+fn inference_order(actual: &[Type]) -> impl Iterator<Item = (usize, &Type)> {
+    let indexed = actual.iter().enumerate();
+    indexed
+        .clone()
+        .filter(|(_, ty)| **ty != Type::Nil)
+        .chain(indexed.filter(|(_, ty)| **ty == Type::Nil))
+}
+
 fn integer_literal_expression(expr: &Expr) -> bool {
     match expr.node() {
         Expr::Int(value) => *value >= 0,
@@ -93,15 +257,21 @@ fn integer_literal_expression(expr: &Expr) -> bool {
 }
 
 fn bigint_literal_expression(expr: &Expr) -> bool {
+    integer_literal_tree(expr).is_some()
+}
+
+/// Whether an integer-literal expression contains a BigInt literal.
+fn integer_literal_tree(expr: &Expr) -> Option<bool> {
     match expr.node() {
-        Expr::Int(_) | Expr::UInt(_) | Expr::BigInt(_) => true,
-        Expr::Unary(UnOp::Neg, value) => bigint_literal_expression(value),
+        Expr::Int(_) | Expr::UInt(_) => Some(false),
+        Expr::BigInt(_) => Some(true),
+        Expr::Unary(UnOp::Neg, value) => integer_literal_tree(value),
         Expr::Binary(
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod,
             left,
             right,
-        ) => bigint_literal_expression(left) && bigint_literal_expression(right),
-        _ => false,
+        ) => Some(integer_literal_tree(left)? | integer_literal_tree(right)?),
+        _ => None,
     }
 }
 
@@ -224,26 +394,19 @@ fn mixed_numeric_suggestions(
 }
 
 fn nullable_type_mismatch_help(expected: &Type, actual: &Type) -> Option<String> {
-    match (expected, actual) {
-        (Type::Primitive(expected, false), Type::Nil) if *expected != VarType::Nil => {
-            Some(format!(
-                "this value may be `nil`; handle that case or make the destination `{}`",
-                Type::Primitive(*expected, true).display()
-            ))
-        }
-        (Type::Primitive(expected, false), Type::Primitive(actual, true))
-            if expected == actual && *expected != VarType::Nil =>
-        {
-            Some(format!(
-                "this value may be `nil`; handle that case or make the destination `{}`",
-                Type::Primitive(*expected, true).display()
-            ))
-        }
-        (Type::Primitive(_, false), Type::Primitive(_, true)) => {
-            Some("handle the possible `nil` value before converting".into())
-        }
-        _ => None,
+    if expected.is_nullable() || matches!(expected, Type::Nil | Type::Dynamic) {
+        return None;
     }
+    let may_be_nil = *actual == Type::Nil
+        || (actual.is_nullable() && type_compatible(expected, &actual.non_nil()));
+    if may_be_nil {
+        return Some(format!(
+            "this value may be `nil`; check it with `!= nil`, supply a fallback with `??`, or make the destination `{}`",
+            expected.clone().nullable().display()
+        ));
+    }
+    (matches!(expected, Type::Primitive(_, false)) && matches!(actual, Type::Primitive(_, true)))
+        .then(|| "handle the possible `nil` value before converting".into())
 }
 
 fn primitive_type_mismatch_suggestion(
@@ -324,6 +487,9 @@ fn array_element_compatible(expected: &Type, actual: &Type) -> bool {
         (Type::Dynamic, _) | (_, Type::Dynamic) => true,
         (_, Type::Poison | Type::ErrorValue | Type::Never) => true,
         (Type::Enum(expected, _), Type::Enum(actual, _)) => expected == actual,
+        (Type::Nullable(expected), Type::Nullable(actual)) => {
+            array_element_compatible(expected, actual)
+        }
         (Type::Array(_), Type::EmptyArray) => true,
         (Type::Array(expected), Type::Array(actual)) => array_element_compatible(expected, actual),
         (Type::Tuple(expected), Type::Tuple(actual)) => {
@@ -395,6 +561,15 @@ fn match_extension_type(
     parameters: &HashSet<&str>,
     substitutions: &mut HashMap<String, Type>,
 ) -> bool {
+    // A nullable pattern matches on the underlying type. Any other pattern
+    // except a bare type parameter rejects a nullable receiver below.
+    let stripped;
+    let actual = if pattern.nilable {
+        stripped = actual.non_nil();
+        &stripped
+    } else {
+        actual
+    };
     match &pattern.kind {
         TypeKind::TypeParameter(name) if parameters.contains(name.as_str()) => {
             if matches!(
@@ -592,6 +767,9 @@ fn concrete_trait_type_pattern(ty: &Type) -> TraitTypePattern {
             TraitTypePattern::Nullable(Box::new(TraitTypePattern::Primitive(*base)))
         }
         Type::Primitive(base, false) => TraitTypePattern::Primitive(*base),
+        Type::Nullable(inner) => {
+            TraitTypePattern::Nullable(Box::new(concrete_trait_type_pattern(inner)))
+        }
         Type::Nil => TraitTypePattern::Nil,
         Type::Array(element) => {
             TraitTypePattern::Array(Box::new(concrete_trait_type_pattern(element)))
@@ -822,7 +1000,9 @@ fn trait_annotation_cost(ty: &TypeAnnotation) -> usize {
 
 fn concrete_trait_type_cost(ty: &Type) -> usize {
     1usize.saturating_add(match ty {
-        Type::Array(element) | Type::Task(element) => concrete_trait_type_cost(element),
+        Type::Array(element) | Type::Task(element) | Type::Nullable(element) => {
+            concrete_trait_type_cost(element)
+        }
         Type::Tuple(elements) => elements.iter().map(concrete_trait_type_cost).sum(),
         Type::Function(parameters, result) => parameters
             .iter()
@@ -861,7 +1041,7 @@ fn trait_implementation_cost(extension: &ExtendDecl) -> usize {
 fn contains_unresolved_empty_array(ty: &Type) -> bool {
     match ty {
         Type::EmptyArray => true,
-        Type::Array(element) => contains_unresolved_empty_array(element),
+        Type::Array(element) | Type::Nullable(element) => contains_unresolved_empty_array(element),
         Type::Tuple(items) => items.iter().any(contains_unresolved_empty_array),
         Type::Function(parameters, result) => {
             parameters.iter().any(contains_unresolved_empty_array)
@@ -942,7 +1122,7 @@ fn substitute_trait_type(ty: &mut TypeAnnotation, substitutions: &HashMap<String
 fn is_concrete_trait_argument(ty: &Type) -> bool {
     match ty {
         Type::Dynamic | Type::Generic(_) | Type::EmptyArray | Type::Never | Type::Poison => false,
-        Type::Array(element) => is_concrete_trait_argument(element),
+        Type::Array(element) | Type::Nullable(element) => is_concrete_trait_argument(element),
         Type::Tuple(elements) => elements.iter().all(is_concrete_trait_argument),
         Type::Function(parameters, result) => {
             parameters.iter().all(is_concrete_trait_argument) && is_concrete_trait_argument(result)
@@ -959,6 +1139,39 @@ impl Type {
         Self::Primitive(base, false)
     }
 
+    /// The canonical type admitting the values of `self` and nil.
+    fn nullable(self) -> Self {
+        match self {
+            Self::Primitive(base, _) => Self::Primitive(base, true),
+            Self::Nil | Self::Dynamic | Self::Poison | Self::Nullable(_) => self,
+            Self::Never | Self::ErrorValue => Self::Nil,
+            other => Self::Nullable(Box::new(other)),
+        }
+    }
+
+    /// Whether the type admits both nil and another normal value.
+    fn is_nullable(&self) -> bool {
+        match self {
+            Self::Primitive(base, nilable) => *nilable && *base != VarType::Nil,
+            Self::Nullable(_) => true,
+            _ => false,
+        }
+    }
+
+    /// Whether a member of this value cannot be used without a nil check.
+    fn may_be_nil(&self) -> bool {
+        *self == Self::Nil || self.is_nullable()
+    }
+
+    /// The type of a value of this type that is known not to be nil.
+    fn non_nil(&self) -> Self {
+        match self {
+            Self::Primitive(base, _) if *base != VarType::Nil => Self::Primitive(*base, false),
+            Self::Nullable(inner) => (**inner).clone(),
+            other => other.clone(),
+        }
+    }
+
     fn display(&self) -> String {
         match self {
             Self::Primitive(base, nilable) => TypeAnnotation {
@@ -966,9 +1179,16 @@ impl Type {
                 nilable: *nilable,
             }
             .display(),
+            Self::Nullable(inner) if matches!(**inner, Self::Function(..)) => {
+                format!("({})?", inner.display())
+            }
+            Self::Nullable(inner) => format!("{}?", inner.display()),
             Self::Nil => "nil".into(),
             Self::Never => "<no normal exit>".into(),
             Self::EmptyArray => "empty array".into(),
+            Self::Array(element) if matches!(**element, Self::Function(..)) => {
+                format!("({})[]", element.display())
+            }
             Self::Array(element) => format!("{}[]", element.display()),
             Self::Task(result) => format!("Task[{}]", result.display()),
             Self::Tuple(items) => format!(
@@ -1028,11 +1248,14 @@ impl Type {
             (Self::Poison, _) | (_, Self::Poison) => Self::Poison,
             (Self::Never, t) | (t, Self::Never) => t,
             (Self::ErrorValue, t) | (t, Self::ErrorValue) => t,
+            (Self::Dynamic, _) | (_, Self::Dynamic) => Self::Dynamic,
+            (Self::Nil, Self::Nil) => Self::Nil,
+            (Self::Nil, t) | (t, Self::Nil) => t.nullable(),
+            (a, b) if a.is_nullable() || b.is_nullable() => {
+                a.non_nil().join(b.non_nil()).nullable()
+            }
             (Self::Primitive(a, an), Self::Primitive(b, bn)) if a == b => {
                 Self::Primitive(a, an || bn)
-            }
-            (Self::Primitive(t, _), Self::Nil) | (Self::Nil, Self::Primitive(t, _)) => {
-                Self::Primitive(t, true)
             }
             (Self::EmptyArray, Self::Array(element)) | (Self::Array(element), Self::EmptyArray) => {
                 Self::Array(element)
@@ -1062,6 +1285,15 @@ impl Type {
                 }
             }
             (Self::Tuple(a), Self::Tuple(b)) if a == b => Self::Tuple(a),
+            // Positions that differ only in nullability keep the tuple shape.
+            (Self::Tuple(a), Self::Tuple(b))
+                if a.len() == b.len()
+                    && a.iter().zip(&b).all(|(a, b)| {
+                        a.non_nil() == b.non_nil() || *a == Self::Nil || *b == Self::Nil
+                    }) =>
+            {
+                Self::Tuple(a.into_iter().zip(b).map(|(a, b)| a.join(b)).collect())
+            }
             (a, b) if a == b => a,
             _ => Self::Dynamic,
         }
@@ -1071,7 +1303,7 @@ impl Type {
 fn structurally_cloneable(ty: &Type) -> bool {
     match ty {
         Type::Primitive(_, _) | Type::Nil => true,
-        Type::Array(element) => structurally_cloneable(element),
+        Type::Array(element) | Type::Nullable(element) => structurally_cloneable(element),
         Type::Tuple(items) => items.iter().all(structurally_cloneable),
         _ => false,
     }
@@ -1220,6 +1452,7 @@ fn c_record_kind(facts: &mut crate::mutability::Facts, id: usize, ty: Type) {
             Type::Primitive(_, _) | Type::Nil | Type::Handle | Type::ErrorValue => {
                 ValueKind::Scalar
             }
+            Type::Nullable(inner) if *inner == Type::Handle => ValueKind::Scalar,
             _ => ValueKind::Reference,
         },
     );
@@ -1290,9 +1523,22 @@ struct Checker<'a> {
     module: Option<String>,
     owner: Option<String>,
     loops: usize,
-    loop_breaks: Vec<bool>,
+    /// Facts at each reachable `break` of the enclosing loops.
+    loop_breaks: Vec<Vec<FlowFacts>>,
     normal_reachable: bool,
     flow_facts: FlowFacts,
+    /// Rebinding summary of the function being checked.
+    writes: Writes,
+    /// Facts of the last condition evaluated with distinct true and false exits.
+    branch_flows: Option<(usize, FlowFacts, FlowFacts)>,
+    /// The expected type of a constructor call, keyed by its expression.
+    result_hint: Option<(usize, Type)>,
+    /// A nullable expected type of a literal or branching expression, keyed by
+    /// its expression, so that its branches build the declared type.
+    value_hint: Option<(usize, Type)>,
+    /// Branching expressions whose value is never used.
+    discarded: HashSet<usize>,
+    literal_types: HashMap<usize, TypeAnnotation>,
     in_cleanup: bool,
     in_function: bool,
     in_async: bool,
@@ -1300,13 +1546,6 @@ struct Checker<'a> {
     in_comptime_initializer: bool,
     result_type: Option<TypeAnnotation>,
     dynamic_bindings: std::collections::HashSet<usize>,
-    // Struct types do not record nullability. These bindings are additionally
-    // known to hold a struct: parameters guarded by a non-nil runtime contract
-    // and constants initialized from a non-nil value.
-    non_nil_bindings: HashSet<usize>,
-    reassigned_bindings: HashSet<usize>,
-    // Matches whose coverage depends on a parameter that is never reassigned.
-    parameter_matches: Vec<(usize, Option<SourceSpan>)>,
     unresolved_empty_arrays: HashMap<usize, (String, SourceSpan)>,
     next_binding: usize,
     diagnostics: Vec<Diagnostic>,
@@ -1328,6 +1567,7 @@ struct Checker<'a> {
     uint_literals: HashSet<usize>,
     uint_expressions: HashSet<usize>,
     bigint_literals: HashSet<usize>,
+    bigint_range_expressions: HashSet<usize>,
     specialization_names: HashMap<(String, Vec<Type>), String>,
     struct_specializations: Vec<StructSpecialization>,
     struct_specialization_names: HashMap<(String, Vec<Type>), String>,
@@ -1360,6 +1600,10 @@ pub(crate) struct CheckResult {
     pub uint_literals: HashSet<usize>,
     pub uint_expressions: HashSet<usize>,
     pub bigint_literals: HashSet<usize>,
+    pub bigint_range_expressions: HashSet<usize>,
+    /// Literals that must be built with a nullable element type taken from
+    /// their context.
+    pub literal_types: HashMap<usize, TypeAnnotation>,
     /// Access facts kept by [`check_deferring_effects`] for a later
     /// [`check_deferred_effects`] call.
     deferred_effects: Option<crate::mutability::Facts>,
@@ -1467,6 +1711,12 @@ fn check_program(
         loop_breaks: Vec::new(),
         normal_reachable: true,
         flow_facts: FlowFacts::default(),
+        writes: Writes::default(),
+        branch_flows: None,
+        result_hint: None,
+        value_hint: None,
+        discarded: HashSet::new(),
+        literal_types: HashMap::new(),
         in_cleanup: false,
         in_function: false,
         in_async: false,
@@ -1474,9 +1724,6 @@ fn check_program(
         in_comptime_initializer: false,
         result_type: None,
         dynamic_bindings: Default::default(),
-        non_nil_bindings: HashSet::new(),
-        reassigned_bindings: HashSet::new(),
-        parameter_matches: Vec::new(),
         unresolved_empty_arrays: HashMap::new(),
         next_binding: 1,
         diagnostics: Vec::new(),
@@ -1498,6 +1745,7 @@ fn check_program(
         uint_literals: HashSet::new(),
         uint_expressions: HashSet::new(),
         bigint_literals: HashSet::new(),
+        bigint_range_expressions: HashSet::new(),
         specialization_names: HashMap::new(),
         struct_specializations: Vec::new(),
         struct_specialization_names: HashMap::new(),
@@ -1758,7 +2006,10 @@ fn check_program(
         {
             c.module = name.rsplit_once("::").map(|(m, _)| m.to_owned());
             let expected_type = ty.as_ref().map(|annotation| c.annotation_type(annotation));
-            let actual = c.expr_with_expected_type(value, expected_type.as_ref());
+            c.writes = Writes::default();
+            c.writes.expr(value);
+            c.flow_facts = FlowFacts::default();
+            let actual = c.expr_with_expected_result(value, expected_type.as_ref());
             if ty.is_none() && contains_unresolved_empty_array(&actual) {
                 c.error(
                     "E2001",
@@ -1800,11 +2051,6 @@ fn check_program(
             _ => {}
         }
     }
-    for (binding, span) in std::mem::take(&mut c.parameter_matches) {
-        if c.reassigned_bindings.contains(&binding) {
-            c.error("E2003", NILABLE_STRUCT_MATCH, span.as_ref());
-        }
-    }
     if effects == Effects::Check {
         c.diagnostics
             .extend(crate::mutability::check(program, &c.access_facts));
@@ -1822,6 +2068,8 @@ fn check_program(
         uint_literals: c.uint_literals,
         uint_expressions: c.uint_expressions,
         bigint_literals: c.bigint_literals,
+        bigint_range_expressions: c.bigint_range_expressions,
+        literal_types: c.literal_types,
         deferred_effects,
     }
 }
@@ -2321,11 +2569,20 @@ impl<'a> Checker<'a> {
                 }
             }
         };
-        Some(ty)
+        Some(if annotation.nilable {
+            ty.nullable()
+        } else {
+            ty
+        })
     }
 
     fn type_annotation_for(&self, ty: &Type) -> Option<TypeAnnotation> {
         let kind = match ty {
+            Type::Nullable(inner) => {
+                let mut annotation = self.type_annotation_for(inner)?;
+                annotation.nilable = true;
+                return Some(annotation);
+            }
             Type::Primitive(base, _) => TypeKind::Primitive(*base),
             Type::Nil => TypeKind::Primitive(VarType::Nil),
             Type::Array(element) => TypeKind::Array(Box::new(self.type_annotation_for(element)?)),
@@ -2841,7 +3098,7 @@ impl<'a> Checker<'a> {
             .map(|parameter| parameter.name.as_str())
             .collect();
         let mut substitutions = self.explicit_substitutions(&function.type_params, expr);
-        for (argument_index, actual_type) in actual.iter().enumerate() {
+        for (argument_index, actual_type) in inference_order(&actual) {
             let Some(parameter_index) = bindings.by_argument[argument_index] else {
                 continue;
             };
@@ -2955,6 +3212,11 @@ impl<'a> Checker<'a> {
             };
             if let Some(expected) = function.params[parameter_index].ty.as_ref() {
                 let expected_type = self.substituted_type(expected, &substitutions);
+                let actual_type = &widened(
+                    &args[argument_index].value,
+                    actual_type.clone(),
+                    &expected_type,
+                );
                 if !type_compatible(&expected_type, actual_type) {
                     let mut diagnostic = Diagnostic::new(
                         "E2001",
@@ -3075,11 +3337,30 @@ impl<'a> Checker<'a> {
             .map(|parameter| parameter.name.as_str())
             .collect();
         let mut substitutions = self.explicit_substitutions(&parameters, expr);
-        for (argument_index, actual_type) in actual.iter().enumerate() {
+        // A declared destination such as `Box[Node?]` selects the nullable
+        // instance; argument types alone cannot.
+        if let Some((_, expected)) = self
+            .result_hint
+            .take_if(|(hinted, _)| *hinted == crate::mutability::expr_id(expr))
+            && let Type::Struct(expected_id, _, arguments) = expected.non_nil()
+            && expected_id == id
+        {
+            for (parameter, argument) in parameters.iter().zip(arguments) {
+                if contains_nullable(&argument) {
+                    substitutions
+                        .entry(parameter.name.clone())
+                        .or_insert(argument);
+                }
+            }
+        }
+        for (argument_index, actual_type) in inference_order(&actual) {
             let Some(field_index) = bindings.by_argument[argument_index] else {
                 continue;
             };
             if let Some(expected) = fields[field_index].ty.as_ref() {
+                let known = self.substituted_type(expected, &substitutions);
+                let actual_type =
+                    &widened(&args[argument_index].value, actual_type.clone(), &known);
                 self.infer_generic_type(
                     expected,
                     actual_type,
@@ -3132,8 +3413,13 @@ impl<'a> Checker<'a> {
             };
             if let Some(expected) = fields[field_index].ty.as_ref() {
                 let expected_type = self.substituted_type(expected, &substitutions);
+                let actual_type = &widened(
+                    &args[argument_index].value,
+                    actual_type.clone(),
+                    &expected_type,
+                );
                 if actual_type == &Type::EmptyArray
-                    && let Type::Array(element) = expected_type
+                    && let Type::Array(element) = expected_type.non_nil()
                 {
                     self.refine_empty_array(&args[argument_index].value, &element);
                 } else if !type_compatible(&expected_type, actual_type) {
@@ -3200,9 +3486,21 @@ impl<'a> Checker<'a> {
         substitutions: &mut HashMap<String, Type>,
         span: Option<&SourceSpan>,
     ) {
+        // A `P?` pattern infers `P` from the underlying type. Other patterns
+        // also look through nil so the compatibility check reports it.
+        let stripped;
+        let actual = if pattern.nilable || !matches!(pattern.kind, TypeKind::TypeParameter(_)) {
+            stripped = actual.non_nil();
+            &stripped
+        } else {
+            actual
+        };
         match &pattern.kind {
             TypeKind::TypeParameter(name) if parameters.contains(name.as_str()) => {
                 if matches!(actual, Type::ErrorValue | Type::Poison) {
+                    return;
+                }
+                if pattern.nilable && substitutions.contains_key(name) && *actual == Type::Nil {
                     return;
                 }
                 if substitutions.contains_key(name)
@@ -3342,7 +3640,7 @@ impl<'a> Checker<'a> {
         annotation: &TypeAnnotation,
         substitutions: &HashMap<String, Type>,
     ) -> Type {
-        match &annotation.kind {
+        let ty = match &annotation.kind {
             TypeKind::TypeParameter(name) => substitutions
                 .get(name)
                 .cloned()
@@ -3393,6 +3691,11 @@ impl<'a> Checker<'a> {
                 symbol, arguments, ..
             } => self.substituted_applied_type(symbol, arguments, substitutions),
             _ => self.annotation_type(annotation),
+        };
+        if annotation.nilable {
+            ty.nullable()
+        } else {
+            ty
         }
     }
 
@@ -3427,11 +3730,12 @@ impl<'a> Checker<'a> {
             .get(&f.name)
             .cloned()
             .or_else(|| f.name.rsplit_once("::").map(|(m, _)| m.to_owned()));
+        self.writes = Writes::default();
+        self.writes.block(&f.body);
         loop {
             self.flow_facts = FlowFacts::default();
             self.unresolved_empty_arrays.clear();
             let diagnostics_start = self.diagnostics.len();
-            let matches_start = self.parameter_matches.len();
             let unresolved = self.dynamic_bindings.len();
             self.scopes.push(Scope::default());
             self.in_comptime = f.comptime;
@@ -3453,7 +3757,6 @@ impl<'a> Checker<'a> {
                     },
                     None,
                 );
-                self.record_non_nil_parameter(parameter);
             }
             self.in_function = true;
             self.result_type = f.result_type.clone();
@@ -3494,7 +3797,6 @@ impl<'a> Checker<'a> {
                 break;
             }
             self.diagnostics.truncate(diagnostics_start);
-            self.parameter_matches.truncate(matches_start);
         }
         self.flow_facts = previous_flow_facts;
         self.current_function = previous_function;
@@ -3503,6 +3805,15 @@ impl<'a> Checker<'a> {
     }
 
     fn annotation_type(&mut self, ty: &TypeAnnotation) -> Type {
+        let resolved = self.annotation_base_type(ty);
+        if ty.nilable {
+            resolved.nullable()
+        } else {
+            resolved
+        }
+    }
+
+    fn annotation_base_type(&mut self, ty: &TypeAnnotation) -> Type {
         match &ty.kind {
             TypeKind::Primitive(base) if *base == VarType::Nil && !ty.nilable => Type::Nil,
             TypeKind::Primitive(base) => Type::Primitive(*base, ty.nilable),
@@ -3734,8 +4045,7 @@ impl<'a> Checker<'a> {
     ) -> bool {
         let expected_type = self.annotation_type(&expected);
         let valid = matches!(actual, Type::Poison | Type::ErrorValue | Type::Never)
-            || type_compatible(&expected_type, &actual)
-            || matches!(actual, Type::Nil) && expected.nilable;
+            || type_compatible(&expected_type, &actual);
         if !valid {
             let mut diagnostic = Diagnostic::new(
                 "E2001",
@@ -3800,6 +4110,9 @@ impl<'a> Checker<'a> {
                     ),
                     span.cloned().or_else(|| self.location.clone()),
                 );
+                if let Some(help) = nullable_type_mismatch_help(&expected, &actual) {
+                    diagnostic = diagnostic.help(help);
+                }
                 match (&expected, &actual) {
                     (Type::Array(expected), Type::Array(_)) => {
                         diagnostic = diagnostic.help(format!(
@@ -3914,49 +4227,24 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Record the parameter defined last as holding a value if its annotation
-    /// excludes nil; calls enforce that annotation at runtime.
-    fn record_non_nil_parameter(&mut self, parameter: &Param) {
-        if parameter.ty.as_ref().is_some_and(|ty| !ty.nilable) {
-            self.non_nil_bindings.insert(self.next_binding - 1);
-        }
-    }
-
-    /// Prove that a struct-typed expression is not nil. `Some(Some(binding))`
-    /// holds only while that parameter is never reassigned.
-    fn non_nil_proof(&mut self, value: &Expr) -> Option<Option<usize>> {
-        match value.node() {
-            Expr::Ident(name) => {
-                let binding = self.local(name)?;
-                self.non_nil_bindings
-                    .contains(&binding.id)
-                    .then(|| binding.mutable.then_some(binding.id))
-            }
-            Expr::Call(name, _) if self.local(name).is_none() => {
-                let name = self.resolve(name, value.span())?;
-                let proven = self.constructors.contains_key(&name)
-                    || self.functions.get(&name).is_some_and(|function| {
-                        function.type_params.is_empty()
-                            && function.result_type.as_ref().is_some_and(|ty| !ty.nilable)
-                    });
-                proven.then_some(None)
-            }
-            _ => None,
-        }
-    }
-
-    fn binding_for_value(&self, value: &Expr) -> Option<Binding> {
+    fn binding_for_value(&mut self, value: &Expr) -> Option<Binding> {
         let Expr::Ident(name) = value.node() else {
             return None;
         };
-        self.local(name).or_else(|| self.globals.get(name).cloned())
+        if let Some(binding) = self.local(name) {
+            return Some(binding);
+        }
+        let resolved = self.resolve(name, value.span())?;
+        self.globals.get(&resolved).cloned()
     }
 
     fn apply_type_pattern(&mut self, value: &Expr, name: &str, positive: bool) {
         let Some(binding) = self.binding_for_value(value) else {
             return;
         };
-        if binding.id == 0 {
+        if binding.id == 0
+            || matches!(value.node(), Expr::Ident(name) if self.writes.deferred.contains(name))
+        {
             return;
         }
         let error_pattern = name == "Error"
@@ -4011,6 +4299,10 @@ impl<'a> Checker<'a> {
                     {
                         Some(Type::Primitive(*actual, false))
                     }
+                    // A successful enum test keeps the already known variant set.
+                    (Type::Nullable(inner), Some(Type::Enum(id, _))) if matches!(**inner, Type::Enum(other, _) if other == id) => {
+                        Some((**inner).clone())
+                    }
                     (Type::Dynamic, Some(tested)) => Some(tested),
                     (_, Some(tested)) if type_compatible(&current, &tested) => Some(tested),
                     _ => None,
@@ -4020,12 +4312,7 @@ impl<'a> Checker<'a> {
                 self.flow_facts.normal_types.insert(binding.id, refined);
             }
         } else if name == "nil" {
-            let current = self.effective_type(&binding);
-            if let Type::Primitive(base, true) = current {
-                self.flow_facts
-                    .normal_types
-                    .insert(binding.id, Type::Primitive(base, false));
-            }
+            self.narrow_non_nil(value);
         } else if name != "Error" {
             // A failed Error test proves only that Error is absent. It does not
             // remove nil or otherwise change the declared normal type.
@@ -4033,17 +4320,52 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn invalidate_mutable_flow_facts(&mut self) {
-        let mutable_ids: HashSet<_> = self
+    /// Record that a nullable binding holds a value on the current path.
+    /// Only bindings narrow: fields and elements can change through aliases.
+    fn narrow_non_nil(&mut self, value: &Expr) {
+        let Expr::Ident(name) = value.node() else {
+            return;
+        };
+        if self.writes.deferred.contains(name) {
+            return;
+        }
+        let Some(binding) = self.binding_for_value(value) else {
+            return;
+        };
+        let current = self.effective_type(&binding);
+        if binding.id != 0 && current.is_nullable() {
+            self.flow_facts
+                .normal_types
+                .insert(binding.id, current.non_nil());
+        }
+    }
+
+    /// Discard facts that a call, or a task running during `await`, can break:
+    /// mutable globals and locals captured mutably by a closure.
+    fn invalidate_call_flow_facts(&mut self) {
+        self.invalidate_flow_facts(&HashSet::new());
+    }
+
+    /// Discard facts that do not hold on every entry of a region that runs the
+    /// code summarized by `writes` an unknown number of times.
+    fn invalidate_region_flow_facts(&mut self, writes: &Writes) {
+        self.invalidate_flow_facts(&writes.assigned);
+    }
+
+    fn invalidate_flow_facts(&mut self, assigned: &HashSet<String>) {
+        let locals = self
             .scopes
             .iter()
-            .flat_map(|scope| scope.bindings.values())
-            .chain(self.globals.values())
-            .filter(|binding| binding.mutable)
-            .map(|binding| binding.id)
-            .collect();
-        for id in mutable_ids {
-            self.flow_facts.forget(id);
+            .flat_map(|scope| scope.bindings.iter())
+            .filter(|(_, binding)| binding.mutable);
+        for (name, binding) in locals {
+            self.flow_facts.error_excluded.remove(&binding.id);
+            if assigned.contains(name) || self.writes.captured.contains(name) {
+                self.flow_facts.normal_types.remove(&binding.id);
+            }
+        }
+        for binding in self.globals.values().filter(|binding| binding.mutable) {
+            self.flow_facts.forget(binding.id);
         }
     }
 
@@ -4217,7 +4539,12 @@ impl<'a> Checker<'a> {
     fn defaults(&mut self, fields: &[StructField]) {
         for field in fields {
             if let Some(value) = &field.default {
-                let actual = self.expr(value);
+                let expected = field
+                    .ty
+                    .as_ref()
+                    .map(|ty| self.annotation_type(ty))
+                    .filter(contains_nullable);
+                let actual = self.expr_with_expected_result(value, expected.as_ref());
                 if let Some(ty) = field.ty.clone() {
                     self.assignable(
                         ty,
@@ -4237,6 +4564,45 @@ impl<'a> Checker<'a> {
     }
 
     fn block(&mut self, block: &Block) -> Type {
+        self.block_expecting(block, None)
+    }
+
+    /// Check a block whose value is never used.
+    fn discarded_block(&mut self, block: &Block) -> Type {
+        self.discard_tail(block);
+        self.block(block)
+    }
+
+    fn discard(&mut self, expr: &Expr) {
+        self.discarded.insert(crate::mutability::expr_id(expr));
+    }
+
+    fn discard_tail(&mut self, block: &Block) {
+        if let Some(tail) = &block.tail {
+            self.discard(tail);
+        }
+    }
+
+    /// Join the values of two branches, rejecting a join that would change the
+    /// element type of a container that may already be shared.
+    fn join_values(&mut self, left: Type, right: Type, used: bool) -> Type {
+        if !used || !container_conflict(&left, &right) {
+            return left.join(right);
+        }
+        let message = format!(
+            "type mismatch: cannot join `{}` and `{}`; array element types and generic type arguments are invariant",
+            left.display(),
+            right.display()
+        );
+        self.diagnostics.push(
+            Diagnostic::new("E2001", message, self.location.clone()).help(
+                "annotate the destination so that every branch builds that type, or copy the elements into a new array",
+            ),
+        );
+        Type::Poison
+    }
+
+    fn block_expecting(&mut self, block: &Block, expected: Option<&Type>) -> Type {
         self.scopes.push(Scope::default());
         let mut reaches_tail = true;
         let previous_reachability = self.normal_reachable;
@@ -4248,16 +4614,26 @@ impl<'a> Checker<'a> {
             reaches_tail &= result != Type::Never;
         }
         self.normal_reachable = previous_reachability && reaches_tail;
-        let expected_result = block
-            .tail
-            .as_deref()
-            .filter(|_| self.in_function && self.scopes.len() == 3)
-            .and_then(|_| self.result_type.clone())
-            .map(|annotation| self.annotation_type(&annotation));
+        let expected_result = expected.cloned().or_else(|| {
+            block
+                .tail
+                .as_deref()
+                .filter(|_| self.in_function && self.scopes.len() == 3)
+                .and_then(|_| self.result_type.clone())
+                .map(|annotation| self.annotation_type(&annotation))
+        });
         let tail = block.tail.as_ref().map_or(Type::Nil, |tail| {
             self.expr_with_expected_result(tail, expected_result.as_ref())
         });
         self.normal_reachable = previous_reachability;
+        // Leaving the block runs its cleanup, which may call anything.
+        if block
+            .stmts
+            .iter()
+            .any(|stmt| matches!(stmt.node(), Stmt::Defer { .. }))
+        {
+            self.invalidate_call_flow_facts();
+        }
         self.scopes.pop();
         if reaches_tail { tail } else { Type::Never }
     }
@@ -4299,12 +4675,6 @@ impl<'a> Checker<'a> {
                     .as_ref()
                     .map(|annotation| self.annotation_type(annotation));
                 let actual = self.expr_with_expected_result(value, expected_result.as_ref());
-                // Decide before the new binding can shadow a name in `value`.
-                let non_nil_constant = matches!(stmt.node(), Stmt::Const { .. })
-                    && matches!(pattern, BindingPattern::Name(_))
-                    && matches!(actual, Type::Struct(..))
-                    && ty.as_ref().is_none_or(|ty| !ty.nilable)
-                    && self.non_nil_proof(value) == Some(None);
                 let valid = ty.clone().is_none_or(|annotation| {
                     self.assignable(annotation, actual.clone(), value.span(), &binding_label)
                 });
@@ -4367,9 +4737,6 @@ impl<'a> Checker<'a> {
                         },
                         span.as_ref(),
                     );
-                    if non_nil_constant {
-                        self.non_nil_bindings.insert(self.next_binding - 1);
-                    }
                 }
                 if actual == Type::Never {
                     return Type::Never;
@@ -4436,27 +4803,43 @@ impl<'a> Checker<'a> {
                 }
             }
             Stmt::CompoundAssign { target, op, value } => {
-                let left = self.expr(target);
+                let diagnostics = self.diagnostics.len();
+                let element = self.element_target(target);
+                let left = match target.node() {
+                    Expr::Index(..) => element.clone().unwrap_or(Type::Poison),
+                    _ => self.expr(target),
+                };
+                let invalid_target = self.diagnostics.len() > diagnostics;
                 // A shift amount keeps its own `int`/`uint` type.
                 if left == Type::concrete(VarType::UInt) && !matches!(op, BinOp::Shl | BinOp::Shr) {
                     self.contextualize_integer_literals(value, &left);
                 }
                 let right = self.expr(value);
                 let actual = self.binary_types(*op, left, right, value.span(), None);
-                return self.assignment(target, value, actual, value.span());
+                // Writing through a rejected target would repeat its diagnostic.
+                if invalid_target {
+                    return Type::Nil;
+                }
+                return self.assignment(target, element, value, actual, value.span());
             }
             Stmt::Assign { target, value } => {
+                // As in emission, an indexed target's receiver and index run
+                // before the value and are checked with the facts known then.
+                let element = self.element_target(target);
                 let actual = if matches!(value.node(), Expr::Array(items) if items.is_empty()) {
-                    let expected = self.expr(target);
-                    if matches!(expected, Type::Array(_)) {
-                        expected
+                    let expected = match target.node() {
+                        Expr::Index(..) => element.clone().unwrap_or(Type::Poison),
+                        _ => self.expr(target),
+                    };
+                    if matches!(expected.non_nil(), Type::Array(_)) {
+                        expected.non_nil()
                     } else {
                         self.expr(value)
                     }
                 } else {
                     self.expr(value)
                 };
-                return self.assignment(target, value, actual, value.span());
+                return self.assignment(target, element, value, actual, value.span());
             }
             Stmt::Use {
                 module,
@@ -4504,6 +4887,7 @@ impl<'a> Checker<'a> {
                 return Type::Never;
             }
             Stmt::Expr(expr) => {
+                self.discard(expr);
                 let actual = self.expr(expr);
                 if contains_unresolved_empty_array(&actual) {
                     self.error(
@@ -4523,7 +4907,17 @@ impl<'a> Checker<'a> {
             Stmt::Defer { body } => {
                 let loops = std::mem::replace(&mut self.loops, 0);
                 let in_cleanup = std::mem::replace(&mut self.in_cleanup, true);
-                self.block(body);
+                // Cleanup runs later, after writes this point cannot see.
+                let flow = self.flow_facts.clone();
+                self.flow_facts.normal_types.retain(|id, _| {
+                    self.scopes
+                        .iter()
+                        .flat_map(|scope| scope.bindings.values())
+                        .chain(self.globals.values())
+                        .any(|binding| binding.id == *id && !binding.mutable)
+                });
+                self.discarded_block(body);
+                self.flow_facts = flow;
                 self.loops = loops;
                 self.in_cleanup = in_cleanup;
             }
@@ -4532,7 +4926,9 @@ impl<'a> Checker<'a> {
                 catch_name,
                 catch_block,
             } => {
-                if self.try_blocks(body, catch_name, catch_block) == Type::Never {
+                self.discard_tail(body);
+                self.discard_tail(catch_block);
+                if self.try_blocks(body, catch_name, catch_block, None, false) == Type::Never {
                     return Type::Never;
                 }
             }
@@ -4541,19 +4937,20 @@ impl<'a> Checker<'a> {
                 then_block,
                 else_block,
             } => {
-                let condition = self.condition(cond);
+                let (condition, true_flow, false_flow) = self.condition(cond);
                 let reachable = self.normal_reachable;
                 let base_flow = self.flow_facts.clone();
                 let then_reachable = reachable && !matches!(cond.node(), Expr::Bool(false));
                 self.normal_reachable = then_reachable;
-                let a = self.block(then_block);
+                self.flow_facts = true_flow;
+                let a = self.discarded_block(then_block);
                 let then_flow = self.flow_facts.clone();
-                self.flow_facts = base_flow.clone();
+                self.flow_facts = false_flow;
                 let else_reachable = reachable && !matches!(cond.node(), Expr::Bool(true));
                 self.normal_reachable = else_reachable;
                 let b = else_block
                     .as_ref()
-                    .map_or(Type::Nil, |block| self.block(block));
+                    .map_or(Type::Nil, |block| self.discarded_block(block));
                 let else_flow = self.flow_facts.clone();
                 self.normal_reachable = reachable;
                 let mut exits = Vec::new();
@@ -4592,12 +4989,12 @@ impl<'a> Checker<'a> {
                     },
                     value.span(),
                 );
-                let then_result = self.block(then_block);
+                let then_result = self.discarded_block(then_block);
                 let then_flow = self.flow_facts.clone();
                 self.scopes.pop();
                 self.flow_facts = base_flow.clone();
                 if let Some(block) = else_block {
-                    let else_result = self.block(block);
+                    let else_result = self.discarded_block(block);
                     let else_flow = self.flow_facts.clone();
                     let mut exits = Vec::new();
                     if then_result != Type::Never {
@@ -4618,20 +5015,24 @@ impl<'a> Checker<'a> {
                 }
             }
             Stmt::While { cond, body } => {
-                self.invalidate_mutable_flow_facts();
-                let condition = self.condition(cond);
-                let loop_flow = self.flow_facts.clone();
-                self.invalidate_mutable_flow_facts();
+                let mut writes = Writes::default();
+                writes.expr(cond);
+                writes.block(body);
+                self.invalidate_region_flow_facts(&writes);
+                let (condition, true_flow, false_flow) = self.condition(cond);
+                self.flow_facts = true_flow;
                 self.loops += 1;
-                self.loop_breaks.push(false);
-                self.block(body);
-                self.flow_facts = loop_flow;
-                self.invalidate_mutable_flow_facts();
-                let has_break = self.loop_breaks.pop().unwrap();
+                self.loop_breaks.push(Vec::new());
+                self.discarded_block(body);
+                let mut exits = self.loop_breaks.pop().unwrap();
                 self.loops -= 1;
-                if condition == Type::Never
-                    || (matches!(cond.node(), Expr::Bool(true)) && !has_break)
-                {
+                let forever = matches!(cond.node(), Expr::Bool(true));
+                let has_break = !exits.is_empty();
+                if !forever || !has_break {
+                    exits.push(false_flow);
+                }
+                self.join_flow_exits(exits);
+                if condition == Type::Never || (forever && !has_break) {
                     return Type::Never;
                 }
             }
@@ -4655,15 +5056,7 @@ impl<'a> Checker<'a> {
                     },
                     start.span(),
                 );
-                let loop_flow = self.flow_facts.clone();
-                self.invalidate_mutable_flow_facts();
-                self.loops += 1;
-                self.loop_breaks.push(false);
-                self.block(body);
-                self.flow_facts = loop_flow;
-                self.invalidate_mutable_flow_facts();
-                self.loop_breaks.pop();
-                self.loops -= 1;
+                self.loop_body(body);
                 self.scopes.pop();
                 if range_type == Type::Never || step_type == Some(Type::Never) {
                     return Type::Never;
@@ -4675,6 +5068,7 @@ impl<'a> Checker<'a> {
                 body,
             } => {
                 let collection = self.expr(iterable);
+                let collection = self.require_value(collection, iterable, "iterate over");
                 if self.in_comptime {
                     self.error(
                         "E4002",
@@ -4716,15 +5110,7 @@ impl<'a> Checker<'a> {
                         span.as_ref(),
                     );
                 }
-                let loop_flow = self.flow_facts.clone();
-                self.invalidate_mutable_flow_facts();
-                self.loops += 1;
-                self.loop_breaks.push(false);
-                self.block(body);
-                self.flow_facts = loop_flow;
-                self.invalidate_mutable_flow_facts();
-                self.loop_breaks.pop();
-                self.loops -= 1;
+                self.loop_body(body);
                 self.scopes.pop();
                 if collection == Type::Never || collection == Type::ErrorValue {
                     return Type::Never;
@@ -4750,6 +5136,8 @@ impl<'a> Checker<'a> {
                         }
                         ForClause::Each { pattern, iterable } => {
                             let collection = self.expr(iterable);
+                            let collection =
+                                self.require_value(collection, iterable, "iterate over");
                             if self.in_comptime {
                                 self.error(
                                     "E4002",
@@ -4802,15 +5190,7 @@ impl<'a> Checker<'a> {
                         span.as_ref(),
                     );
                 }
-                let loop_flow = self.flow_facts.clone();
-                self.invalidate_mutable_flow_facts();
-                self.loops += 1;
-                self.loop_breaks.push(false);
-                self.block(body);
-                self.flow_facts = loop_flow;
-                self.invalidate_mutable_flow_facts();
-                self.loop_breaks.pop();
-                self.loops -= 1;
+                self.loop_body(body);
                 self.scopes.pop();
                 if never {
                     return Type::Never;
@@ -4821,7 +5201,13 @@ impl<'a> Checker<'a> {
             }
             Stmt::Break => {
                 if self.normal_reachable {
-                    *self.loop_breaks.last_mut().unwrap() = true;
+                    let flow = self.flow_facts.clone();
+                    // A `break` may run cleanup before reaching the loop exit.
+                    if self.writes.has_defer {
+                        self.invalidate_call_flow_facts();
+                    }
+                    let exit = std::mem::replace(&mut self.flow_facts, flow);
+                    self.loop_breaks.last_mut().unwrap().push(exit);
                 }
                 return Type::Never;
             }
@@ -4831,6 +5217,52 @@ impl<'a> Checker<'a> {
             Stmt::Continue => return Type::Never,
         }
         Type::Nil
+    }
+
+    /// Check the body of a `for` loop; it may run any number of times.
+    fn loop_body(&mut self, body: &Block) {
+        let mut writes = Writes::default();
+        writes.block(body);
+        self.invalidate_region_flow_facts(&writes);
+        let entry = self.flow_facts.clone();
+        self.loops += 1;
+        self.loop_breaks.push(Vec::new());
+        self.discarded_block(body);
+        self.loop_breaks.pop();
+        self.loops -= 1;
+        self.flow_facts = entry;
+    }
+
+    /// Report an operation that needs a value on an operand that may be nil.
+    /// Returns the poisoned type after reporting, otherwise the operand type.
+    fn require_value(&mut self, ty: Type, operand: &Expr, action: &str) -> Type {
+        if !ty.may_be_nil() {
+            return ty;
+        }
+        let name = ty.display();
+        let message = if ty == Type::Nil {
+            format!("cannot {action} a value that is `nil`")
+        } else {
+            format!("cannot {action} a value of type `{name}` that may be `nil`")
+        };
+        let help = match operand.node() {
+            Expr::Ident(binding) if self.writes.deferred.contains(binding) => format!(
+                "`{binding}` is assigned in a `defer` block and cannot be narrowed; copy it to a `const` and check that"
+            ),
+            Expr::Ident(binding) => format!(
+                "check `{binding} != nil` first, or supply a fallback with `{binding} ?? value`"
+            ),
+            _ => "bind it to a `const` and check that with `!= nil`, or supply a fallback with `??`; fields and elements are not narrowed".to_owned(),
+        };
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E2004",
+                message,
+                operand.span().cloned().or_else(|| self.location.clone()),
+            )
+            .help(help),
+        );
+        Type::Poison
     }
 
     fn binary_types(
@@ -4955,15 +5387,21 @@ impl<'a> Checker<'a> {
                 Type::Primitive(VarType::Char, false),
             ) => Type::concrete(VarType::Bool),
             _ => {
-                self.error(
+                let mut diagnostic = Diagnostic::new(
                     "E2002",
                     format!(
                         "invalid operands {} and {} for {op:?}",
                         a.display(),
                         b.display()
                     ),
-                    span,
+                    span.cloned().or_else(|| self.location.clone()),
                 );
+                if a.may_be_nil() || b.may_be_nil() {
+                    diagnostic = diagnostic.help(
+                        "an operand may be `nil`; check it with `!= nil` or supply a fallback with `??`",
+                    );
+                }
+                self.diagnostics.push(diagnostic);
                 Type::Poison
             }
         }
@@ -5067,7 +5505,7 @@ impl<'a> Checker<'a> {
             return Type::Poison;
         };
         let function = &method.function;
-        self.invalidate_mutable_flow_facts();
+        self.invalidate_call_flow_facts();
         self.access_facts
             .calls
             .insert(crate::mutability::expr_id(expr), function.name.clone());
@@ -5107,9 +5545,36 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Check the receiver and index of an element assignment and return the
+    /// element type. Returns nothing for other targets and rejected receivers.
+    fn element_target(&mut self, target: &Expr) -> Option<Type> {
+        let Expr::Index(receiver, _) = target.node() else {
+            return None;
+        };
+        let diagnostics = self.diagnostics.len();
+        let entry = self.flow_facts.clone();
+        if matches!(
+            self.expr(receiver).non_nil(),
+            Type::Enum(_, _) | Type::ErrorValue
+        ) {
+            self.error(
+                "E1003",
+                "enum payload bindings are immutable",
+                target.span(),
+            );
+        }
+        // A rejected receiver would be reported again by the target.
+        if self.diagnostics.len() > diagnostics {
+            return None;
+        }
+        self.flow_facts = entry;
+        Some(self.expr(target))
+    }
+
     fn assignment(
         &mut self,
         target: &Expr,
+        element: Option<Type>,
         value: &Expr,
         mut actual: Type,
         span: Option<&SourceSpan>,
@@ -5125,7 +5590,6 @@ impl<'a> Checker<'a> {
                     })
                 });
                 if let Some(binding) = binding {
-                    self.reassigned_bindings.insert(binding.id);
                     let expected = binding
                         .inferred
                         .as_ref()
@@ -5180,15 +5644,10 @@ impl<'a> Checker<'a> {
                     );
                 }
             }
-            Expr::Index(receiver, _) => {
-                if matches!(self.expr(receiver), Type::Enum(_, _) | Type::ErrorValue) {
-                    self.error(
-                        "E1003",
-                        "enum payload bindings are immutable",
-                        target.span(),
-                    );
-                }
-                let expected = self.expr(target);
+            Expr::Index(..) => {
+                let Some(expected) = element else {
+                    return Type::Nil;
+                };
                 self.assignable_type(expected, actual.clone(), span, "field");
             }
             _ => self.error(
@@ -5204,8 +5663,10 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn condition(&mut self, expr: &Expr) -> Type {
-        let actual = self.expr(expr);
+    /// Check a condition and return the facts of its true and false exits. The
+    /// current facts are left at the merge of both.
+    fn condition(&mut self, expr: &Expr) -> (Type, FlowFacts, FlowFacts) {
+        let (actual, true_flow, false_flow) = self.branch(expr);
         // Dynamic conditions remain runtime checked; a statically invalid condition is rejected.
         if !matches!(actual, Type::Dynamic | Type::ErrorValue | Type::Poison) {
             self.assignable(
@@ -5218,16 +5679,74 @@ impl<'a> Checker<'a> {
                 "condition",
             );
         }
-        actual
+        (actual, true_flow, false_flow)
     }
 
-    fn try_blocks(&mut self, body: &Block, name: &str, catch: &Block) -> Type {
+    fn branch(&mut self, expr: &Expr) -> (Type, FlowFacts, FlowFacts) {
+        self.branch_flows = None;
+        let actual = self.expr(expr);
+        match self.branch_flows.take() {
+            Some((id, true_flow, false_flow)) if id == crate::mutability::expr_id(expr) => {
+                (actual, true_flow, false_flow)
+            }
+            _ => (actual, self.flow_facts.clone(), self.flow_facts.clone()),
+        }
+    }
+
+    /// `&&` and `||` evaluate the right operand only on one exit of the left.
+    fn logical(&mut self, op: BinOp, left: &Expr, right: &Expr, expr: &Expr) -> Type {
+        let (left_type, left_true, left_false) = self.branch(left);
+        let (entry, skipped) = if op == BinOp::And {
+            (left_true, left_false)
+        } else {
+            (left_false, left_true)
+        };
+        self.flow_facts = entry;
+        let (right_type, right_true, right_false) = self.branch(right);
+        let (true_flow, false_flow) = if op == BinOp::And {
+            (right_true, FlowFacts::join([skipped, right_false]))
+        } else {
+            (FlowFacts::join([skipped, right_true]), right_false)
+        };
+        self.join_flow_exits([true_flow.clone(), false_flow.clone()]);
+        self.branch_flows = Some((crate::mutability::expr_id(expr), true_flow, false_flow));
+        self.binary_types(op, left_type, right_type, expr.span(), Some((left, right)))
+    }
+
+    /// Record the facts established by `binding == nil` and `binding != nil`.
+    fn nil_comparison(&mut self, op: BinOp, left: &Expr, right: &Expr, expr: &Expr) {
+        let value = match (left.node(), right.node()) {
+            (value, Expr::Nil) if !matches!(value, Expr::Nil) => left,
+            (Expr::Nil, _) => right,
+            _ => return,
+        };
+        let unproven = self.flow_facts.clone();
+        self.narrow_non_nil(value);
+        let proven = std::mem::replace(&mut self.flow_facts, unproven.clone());
+        let (true_flow, false_flow) = if op == BinOp::NotEq {
+            (proven, unproven)
+        } else {
+            (unproven, proven)
+        };
+        self.branch_flows = Some((crate::mutability::expr_id(expr), true_flow, false_flow));
+    }
+
+    fn try_blocks(
+        &mut self,
+        body: &Block,
+        name: &str,
+        catch: &Block,
+        expected: Option<&Type>,
+        used: bool,
+    ) -> Type {
         let base_flow = self.flow_facts.clone();
-        let success = self.block(body);
+        let success = self.block_expecting(body, expected);
         let success_flow = self.flow_facts.clone();
         self.flow_facts = base_flow;
-        // A failure may happen after the body has performed arbitrary writes.
-        self.invalidate_mutable_flow_facts();
+        // A failure may happen after any of the body's writes.
+        let mut writes = Writes::default();
+        writes.block(body);
+        self.invalidate_region_flow_facts(&writes);
         self.scopes.push(Scope::default());
         self.define(
             name,
@@ -5240,7 +5759,7 @@ impl<'a> Checker<'a> {
             },
             None,
         );
-        let failure = self.block(catch);
+        let failure = self.block_expecting(catch, expected);
         let failure_flow = self.flow_facts.clone();
         self.scopes.pop();
         let exits = [
@@ -5250,7 +5769,7 @@ impl<'a> Checker<'a> {
         .into_iter()
         .flatten();
         self.join_flow_exits(exits);
-        success.join(failure)
+        self.join_values(success, failure, used)
     }
 
     fn expr_with_expected_result(&mut self, expr: &Expr, expected: Option<&Type>) -> Type {
@@ -5264,7 +5783,29 @@ impl<'a> Checker<'a> {
             args,
         } = expr.node()
         else {
-            return self.expr(expr);
+            let Some(expected) = expected else {
+                return self.expr(expr);
+            };
+            match expr.node() {
+                Expr::Call(..) | Expr::SpecializedCall(..) => {
+                    self.result_hint = Some((crate::mutability::expr_id(expr), expected.clone()));
+                }
+                Expr::Array(_)
+                | Expr::Tuple(_)
+                | Expr::Block(_)
+                | Expr::Capture(_)
+                | Expr::If { .. }
+                | Expr::Match { .. }
+                | Expr::Try { .. }
+                | Expr::Fallback { .. }
+                    if contains_nullable(expected) =>
+                {
+                    self.value_hint = Some((crate::mutability::expr_id(expr), expected.clone()));
+                }
+                _ => {}
+            }
+            let actual = self.expr(expr);
+            return widened(expr, actual, expected);
         };
         let previous = self.location.clone();
         if let Some(span) = expr.span() {
@@ -5362,11 +5903,20 @@ impl<'a> Checker<'a> {
                 }
             }
         }
-        let mut actual = Vec::with_capacity(args.len());
-        for argument in args {
-            actual.push(self.expr(&argument.value));
+        let mut hints = vec![None; args.len()];
+        if function.type_params.is_empty() {
+            let argument_bindings = crate::arguments::bind(method, &function.params, args);
+            for (hint, parameter) in hints.iter_mut().zip(argument_bindings.by_argument) {
+                if let Some(ty) = parameter.and_then(|index| function.params[index].ty.as_ref()) {
+                    *hint = Some(self.annotation_type(ty)).filter(contains_nullable);
+                }
+            }
         }
-        self.invalidate_mutable_flow_facts();
+        let mut actual = Vec::with_capacity(args.len());
+        for (argument, hint) in args.iter().zip(&hints) {
+            actual.push(self.expr_with_expected_result(&argument.value, hint.as_ref()));
+        }
+        self.invalidate_call_flow_facts();
         self.access_facts
             .calls
             .insert(crate::mutability::expr_id(expr), function.name.clone());
@@ -5428,9 +5978,14 @@ impl<'a> Checker<'a> {
                 continue;
             };
             if let Some(expected) = &function.params[parameter_index].ty {
+                let expected_type = self.annotation_type(expected);
                 self.assignable(
                     expected.clone(),
-                    actual_type.clone(),
+                    widened(
+                        &args[argument_index].value,
+                        actual_type.clone(),
+                        &expected_type,
+                    ),
                     args[argument_index].value.span(),
                     &format!(
                         "argument `{}` of `{method}()`",
@@ -5477,14 +6032,44 @@ impl<'a> Checker<'a> {
         step: Option<&Expr>,
     ) -> (Type, Option<Type>) {
         let uint = Type::concrete(VarType::UInt);
-        let mut start_type = self.expr(start);
-        let mut end_type = self.expr(end);
+        let bigint = Type::concrete(VarType::BigInt);
+        let start_literal = integer_literal_tree(start);
+        let end_literal = integer_literal_tree(end);
+        let (mut start_type, mut end_type) =
+            if start_literal == Some(true) || end_literal == Some(true) {
+                (
+                    self.range_operand_type(start, start_literal.is_some(), &bigint),
+                    self.range_operand_type(end, end_literal.is_some(), &bigint),
+                )
+            } else if start_literal.is_some() && end_literal.is_none() {
+                // Literal-only arithmetic has no flow facts to change while we
+                // check the other bound for context. Lowering still emits start first.
+                let diagnostics_start = self.diagnostics.len();
+                let end_type = self.expr(end);
+                let end_diagnostics = self.diagnostics.len() - diagnostics_start;
+                let start_type = self.range_operand_type(start, true, &end_type);
+                self.diagnostics[diagnostics_start..].rotate_left(end_diagnostics);
+                (start_type, end_type)
+            } else {
+                let start_type = self.expr(start);
+                let end_type = self.range_operand_type(end, end_literal.is_some(), &start_type);
+                (start_type, end_type)
+            };
 
-        if end_type == uint {
-            start_type = self.contextualized_literal_type(start, start_type, &uint);
+        if start_type.may_be_nil() {
+            start_type = self.require_value(start_type, start, "start a range at");
         }
-        if start_type == uint {
-            end_type = self.contextualized_literal_type(end, end_type, &uint);
+        if end_type.may_be_nil() {
+            end_type = self.require_value(end_type, end, "end a range at");
+        }
+
+        if start_type != bigint && end_type != bigint {
+            if end_type == uint {
+                start_type = self.contextualized_literal_type(start, start_type, &uint);
+            }
+            if start_type == uint {
+                end_type = self.contextualized_literal_type(end, end_type, &uint);
+            }
         }
 
         let range_type = match (&start_type, &end_type) {
@@ -5492,6 +6077,9 @@ impl<'a> Checker<'a> {
             | (Type::Primitive(VarType::UInt, false), Type::Primitive(VarType::UInt, false)) => {
                 start_type.clone()
             }
+            (Type::Primitive(VarType::BigInt, false), Type::Primitive(VarType::BigInt, false))
+            | (Type::Primitive(VarType::BigInt, false), Type::Dynamic)
+            | (Type::Dynamic, Type::Primitive(VarType::BigInt, false)) => bigint.clone(),
             (Type::Dynamic, _) | (_, Type::Dynamic) => Type::Dynamic,
             (Type::Poison, _) | (_, Type::Poison) => Type::Poison,
             (Type::Never, _) | (_, Type::Never) => Type::Never,
@@ -5500,7 +6088,7 @@ impl<'a> Checker<'a> {
                 self.error(
                     "E2002",
                     format!(
-                        "range bounds must both be `int` or both be `uint`, got {} and {}",
+                        "range bounds must have one integer type (`int`, `uint`, or `bigint`), got {} and {}",
                         start_type.display(),
                         end_type.display()
                     ),
@@ -5511,13 +6099,17 @@ impl<'a> Checker<'a> {
         };
 
         let step_type = step.map(|step| {
-            let mut actual = self.expr(step);
+            let mut actual =
+                self.range_operand_type(step, bigint_literal_expression(step), &range_type);
             if range_type == uint {
                 actual = self.contextualized_literal_type(step, actual, &uint);
             }
+            if actual.may_be_nil() {
+                actual = self.require_value(actual, step, "step a range by");
+            }
             if matches!(
                 range_type,
-                Type::Primitive(VarType::Int | VarType::UInt, false)
+                Type::Primitive(VarType::Int | VarType::UInt | VarType::BigInt, false)
             ) && actual != range_type
                 && !matches!(
                     actual,
@@ -5538,10 +6130,42 @@ impl<'a> Checker<'a> {
             actual
         });
 
+        if range_type == bigint {
+            self.bigint_range_expressions.extend(
+                [start, end]
+                    .into_iter()
+                    .chain(step)
+                    .map(crate::mutability::expr_id),
+            );
+        } else {
+            self.bigint_range_expressions.extend(
+                [(start, start_type), (end, end_type)]
+                    .into_iter()
+                    .filter(|(_, ty)| *ty == bigint)
+                    .map(|(bound, _)| crate::mutability::expr_id(bound)),
+            );
+        }
         (range_type, step_type)
     }
 
+    fn range_operand_type(&mut self, expr: &Expr, literal: bool, expected: &Type) -> Type {
+        if literal && *expected == Type::concrete(VarType::BigInt) {
+            self.contextualize_integer_literals(expr, expected);
+            c_record_kind(
+                &mut self.access_facts,
+                crate::mutability::expr_id(expr),
+                expected.clone(),
+            );
+            expected.clone()
+        } else {
+            self.expr(expr)
+        }
+    }
+
     fn contextualize_integer_literals(&mut self, expr: &Expr, expected: &Type) {
+        if let Type::Nullable(inner) = expected {
+            return self.contextualize_integer_literals(expr, inner);
+        }
         match (expected, expr.node()) {
             (Type::Primitive(VarType::UInt, _), Expr::Int(value)) if *value >= 0 => {
                 self.uint_literals.insert(crate::mutability::expr_id(expr));
@@ -5592,6 +6216,9 @@ impl<'a> Checker<'a> {
     }
 
     fn contextualized_literal_type(&mut self, expr: &Expr, actual: Type, expected: &Type) -> Type {
+        if let Type::Nullable(inner) = expected {
+            return self.contextualized_literal_type(expr, actual, inner);
+        }
         match (expected, expr.node(), actual) {
             (Type::Primitive(VarType::BigInt, _), expression, actual)
                 if bigint_literal_expression(expression)
@@ -5646,14 +6273,25 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn expr_with_expected_type(&mut self, expr: &Expr, expected: Option<&Type>) -> Type {
-        if let Some(expected) = expected {
-            self.contextualize_integer_literals(expr, expected);
-        }
-        self.expr(expr)
-    }
-
     fn expr_inner(&mut self, expr: &Expr) -> Type {
+        let id = crate::mutability::expr_id(expr);
+        let hint = self
+            .value_hint
+            .take_if(|(hinted, _)| *hinted == id)
+            .map(|(_, expected)| expected);
+        let used = !self.discarded.contains(&id);
+        // Record only a type of the literal's own shape: a skipped branch can
+        // carry a literal that its context would reject.
+        if let Some(expected) = hint.as_ref().map(Type::non_nil)
+            && match (expr.node(), &expected) {
+                (Expr::Array(_), Type::Array(_)) => true,
+                (Expr::Tuple(items), Type::Tuple(types)) => items.len() == types.len(),
+                _ => false,
+            }
+            && let Some(annotation) = self.type_annotation_for(&expected)
+        {
+            self.literal_types.insert(id, annotation);
+        }
         match expr.node() {
             Expr::BracketApply(_, _) => {
                 self.error(
@@ -5665,6 +6303,7 @@ impl<'a> Checker<'a> {
             }
             Expr::Apply(callee, arguments) => {
                 let callable = self.expr(callee);
+                let callable = self.require_value(callable, callee, "call");
                 let Type::Function(parameters, result) = callable else {
                     if callable != Type::Poison {
                         self.error(
@@ -5700,11 +6339,12 @@ impl<'a> Checker<'a> {
                         );
                         valid = false;
                     }
-                    let actual = self.expr(&argument.value);
+                    let actual =
+                        self.expr_with_expected_result(&argument.value, parameters.get(index));
                     if let Some(expected) = parameters.get(index)
                         && !type_compatible(expected, &actual)
                     {
-                        self.error(
+                        let mut diagnostic = Diagnostic::new(
                             "E2001",
                             format!(
                                 "argument {} expects {}, got {}",
@@ -5712,11 +6352,16 @@ impl<'a> Checker<'a> {
                                 expected.display(),
                                 actual.display()
                             ),
-                            argument.value.span(),
+                            argument.value.span().cloned(),
                         );
+                        if let Some(help) = nullable_type_mismatch_help(expected, &actual) {
+                            diagnostic = diagnostic.help(help);
+                        }
+                        self.diagnostics.push(diagnostic);
                         valid = false;
                     }
                 }
+                self.invalidate_call_flow_facts();
                 if valid { *result } else { Type::Poison }
             }
             Expr::Located(_, _) => unreachable!("node removes locations"),
@@ -5889,9 +6534,6 @@ impl<'a> Checker<'a> {
                         );
                         valid = false;
                     }
-                    if capture.mutable {
-                        self.reassigned_bindings.insert(binding.id);
-                    }
                     let ty = if capture.mutable {
                         binding.ty.clone()
                     } else {
@@ -5959,7 +6601,6 @@ impl<'a> Checker<'a> {
                         },
                         expr.span(),
                     );
-                    self.record_non_nil_parameter(parameter);
                 }
                 let saved_function = self.in_function;
                 let saved_async = self.in_async;
@@ -5971,8 +6612,13 @@ impl<'a> Checker<'a> {
                 self.in_function = true;
                 self.in_async = false;
                 self.normal_reachable = true;
-                let body_type = self.block(body);
+                let expected_body = Some(&declared_result).filter(|ty| contains_nullable(ty));
+                let body_type = self.block_expecting(body, expected_body);
                 if body_type != Type::Never {
+                    let body_type = match &body.tail {
+                        Some(tail) => widened(tail, body_type, &declared_result),
+                        None => body_type,
+                    };
                     valid &= self.assignable(
                         result_annotation.clone(),
                         body_type,
@@ -6001,8 +6647,13 @@ impl<'a> Checker<'a> {
                 let mut never = false;
                 let mut element: Option<Type> = None;
                 let mut inconsistent = false;
+                let expected_element = match hint.as_ref().map(Type::non_nil) {
+                    Some(Type::Array(element)) => Some(*element),
+                    _ => None,
+                };
+                let mut conflicting = false;
                 for item in items {
-                    let ty = self.expr(item);
+                    let ty = self.expr_with_expected_result(item, expected_element.as_ref());
                     never |= ty == Type::Never;
                     if ty != Type::Never && ty != Type::ErrorValue {
                         if let Some(previous) = &element
@@ -6012,8 +6663,18 @@ impl<'a> Checker<'a> {
                         {
                             inconsistent = true;
                         }
-                        element = Some(element.map_or(ty.clone(), |current| current.join(ty)));
+                        element = Some(match element.take() {
+                            None => ty,
+                            Some(current) => {
+                                let joined = self.join_values(current, ty, true);
+                                conflicting |= joined == Type::Poison;
+                                joined
+                            }
+                        });
                     }
+                }
+                if conflicting {
+                    return Type::Poison;
                 }
                 if inconsistent {
                     self.diagnostics.push(
@@ -6035,7 +6696,17 @@ impl<'a> Checker<'a> {
                 }
             }
             Expr::Tuple(items) => {
-                let types: Vec<_> = items.iter().map(|item| self.expr(item)).collect();
+                let expected_items = match hint.as_ref().map(Type::non_nil) {
+                    Some(Type::Tuple(expected)) if expected.len() == items.len() => expected,
+                    _ => Vec::new(),
+                };
+                let types: Vec<_> = items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| {
+                        self.expr_with_expected_result(item, expected_items.get(index))
+                    })
+                    .collect();
                 if types.contains(&Type::Never) {
                     Type::Never
                 } else {
@@ -6055,7 +6726,14 @@ impl<'a> Checker<'a> {
                 _ => Type::concrete(*target),
             },
             Expr::Unary(op, inner) => {
-                let ty = self.expr(inner);
+                let ty = if *op == UnOp::Not {
+                    let (ty, true_flow, false_flow) = self.branch(inner);
+                    self.branch_flows =
+                        Some((crate::mutability::expr_id(expr), false_flow, true_flow));
+                    ty
+                } else {
+                    self.expr(inner)
+                };
                 if *op == UnOp::Await {
                     if !self.in_async {
                         self.error(
@@ -6073,6 +6751,8 @@ impl<'a> Checker<'a> {
                         );
                         return Type::Poison;
                     }
+                    self.invalidate_call_flow_facts();
+                    let ty = self.require_value(ty, inner, "await");
                     return match ty {
                         Type::Task(result) => *result,
                         Type::Poison => Type::Poison,
@@ -6098,11 +6778,17 @@ impl<'a> Checker<'a> {
                     ) => ty.clone(),
                     (UnOp::Not, Type::Primitive(VarType::Bool, false)) => ty.clone(),
                     _ => {
-                        self.error(
+                        let mut diagnostic = Diagnostic::new(
                             "E2002",
                             format!("invalid operand {} for {op:?}", ty.display()),
-                            expr.span(),
+                            expr.span().cloned().or_else(|| self.location.clone()),
                         );
+                        if ty.may_be_nil() {
+                            diagnostic = diagnostic.help(
+                                "the operand may be `nil`; check it with `!= nil` or supply a fallback with `??`",
+                            );
+                        }
+                        self.diagnostics.push(diagnostic);
                         Type::Poison
                     }
                 }
@@ -6124,7 +6810,8 @@ impl<'a> Checker<'a> {
                 kind,
                 value,
                 fallback,
-            } => self.fallback(*kind, value, fallback, expr.span()),
+            } => self.fallback(*kind, value, fallback, expr.span(), hint.as_ref(), used),
+            Expr::Binary(op @ (BinOp::And | BinOp::Or), a, b) => self.logical(*op, a, b, expr),
             Expr::Binary(op, a, b) => {
                 let mut left = self.expr(a);
                 let mut right = self.expr(b);
@@ -6155,11 +6842,17 @@ impl<'a> Checker<'a> {
                 if matches!(op, BinOp::Eq | BinOp::NotEq) {
                     self.forget_equality_call(expr);
                     // Compile-time evaluation cannot call runtime trait methods.
+                    // A nil operand is compared without calling `equals`.
+                    let (left_value, right_value) = (left.non_nil(), right.non_nil());
                     if !self.in_comptime
-                        && matches!((&left, &right), (Type::Struct(..), Type::Struct(..)))
+                        && matches!(
+                            (&left_value, &right_value),
+                            (Type::Struct(..), Type::Struct(..))
+                        )
                     {
-                        return self.struct_equality(*op, (a, left), (b, right), expr);
+                        return self.struct_equality(*op, (a, left_value), (b, right_value), expr);
                     }
+                    self.nil_comparison(*op, a, b, expr);
                 }
                 self.binary_types(*op, left, right, expr.span(), Some((a, b)))
             }
@@ -6171,6 +6864,21 @@ impl<'a> Checker<'a> {
                 }
                 if receiver == Type::Never || index == Type::Never {
                     return Type::Never;
+                }
+                if receiver.may_be_nil() {
+                    let action = match (receiver.non_nil(), b.node()) {
+                        (Type::Struct(..) | Type::Record, Expr::Str(field)) => {
+                            format!("access field `{field}` of")
+                        }
+                        (Type::Struct(..) | Type::Tuple(_), Expr::Int(position)) => {
+                            format!("access position {position} of")
+                        }
+                        _ => "index".to_owned(),
+                    };
+                    return self.require_value(receiver, a, &action);
+                }
+                if self.require_value(index, b, "index with") == Type::Poison {
+                    return Type::Poison;
                 }
                 if let Type::Struct(id, struct_name, type_arguments) = &receiver {
                     let field_name = match b.node() {
@@ -6281,28 +6989,58 @@ impl<'a> Checker<'a> {
             } => self.associated_call(target, method, type_arguments, args, expr, None),
             Expr::MethodCall(receiver_expr, method, args) => {
                 let receiver = self.expr(receiver_expr);
+                let mut hints = vec![None; args.len()];
                 if let Some(function) = self
                     .extension_methods
                     .get(&(receiver.clone(), method.clone()))
                     .map(|extension| extension.function.clone())
                 {
-                    for (argument, parameter) in args.iter().zip(function.params.iter().skip(1)) {
+                    for ((argument, parameter), hint) in args
+                        .iter()
+                        .zip(function.params.iter().skip(1))
+                        .zip(&mut hints)
+                    {
                         if let Some(expected) = parameter.ty.as_ref() {
                             let expected_type = self.annotation_type(expected);
                             self.contextualize_integer_literals(argument, &expected_type);
+                            *hint = Some(expected_type).filter(contains_nullable);
                         }
                     }
+                } else if matches!(method.as_str(), "append" | "prepend")
+                    && let Type::Array(element) = receiver.non_nil()
+                    && contains_nullable(&element)
+                    && let Some(hint) = hints.first_mut()
+                {
+                    *hint = Some(*element);
                 }
+                // Error inspection accepts any value, so nil passes through.
+                let receiver = if receiver.may_be_nil()
+                    && !matches!(method.as_str(), "unwrap" | "expect" | "error_kind")
+                    && !self
+                        .extension_methods
+                        .contains_key(&(receiver.clone(), method.clone()))
+                {
+                    self.require_value(
+                        receiver,
+                        receiver_expr,
+                        &format!("call method `{method}()` on"),
+                    )
+                } else {
+                    receiver
+                };
                 let mut poisoned = receiver == Type::Poison;
                 let mut never = receiver == Type::Never;
                 let mut argument_types = Vec::with_capacity(args.len());
-                for arg in args {
-                    let ty = self.expr(arg);
+                for (arg, hint) in args.iter().zip(&hints) {
+                    let ty = self.expr_with_expected_result(arg, hint.as_ref());
                     poisoned |= ty == Type::Poison;
                     never |= ty == Type::Never;
                     argument_types.push(ty);
                 }
-                self.invalidate_mutable_flow_facts();
+                self.invalidate_call_flow_facts();
+                if receiver == Type::Poison {
+                    return Type::Poison;
+                }
                 let exact_method = self
                     .extension_methods
                     .get(&(receiver.clone(), method.clone()))
@@ -6417,9 +7155,10 @@ impl<'a> Checker<'a> {
                         .zip(function.params.iter().skip(1))
                     {
                         if let Some(expected) = &parameter.ty {
+                            let expected_type = self.annotation_type(expected);
                             self.assignable(
                                 expected.clone(),
-                                actual.clone(),
+                                widened(argument, actual.clone(), &expected_type),
                                 argument.span(),
                                 &format!("argument `{}` of `{method}()`", parameter.name),
                             );
@@ -6547,7 +7286,12 @@ impl<'a> Checker<'a> {
                     _ => Type::Dynamic,
                 }
             }
-            Expr::Block(block) | Expr::Capture(block) => self.block(block),
+            Expr::Block(block) | Expr::Capture(block) => {
+                if !used {
+                    self.discard_tail(block);
+                }
+                self.block_expecting(block, hint.as_ref())
+            }
             Expr::Match {
                 value,
                 arms,
@@ -6560,6 +7304,20 @@ impl<'a> Checker<'a> {
                 let base_flow = self.flow_facts.clone();
                 let mut unmatched_flow = Some(base_flow.clone());
                 let mut normal_exits = Vec::new();
+                // The scrutinee is evaluated once. A guard that can rebind it
+                // would separate the binding from the value being matched.
+                let stable_scrutinee = match value.node() {
+                    Expr::Ident(name) => {
+                        let mut writes = Writes::default();
+                        for guard in arms.iter().filter_map(|arm| arm.guard.as_ref()) {
+                            writes.expr(guard);
+                        }
+                        !writes.assigned.contains(name)
+                            && (arms.iter().all(|arm| arm.guard.is_none())
+                                || !self.writes.captured.contains(name))
+                    }
+                    _ => true,
+                };
                 for arm in arms {
                     let arm_flow = unmatched_flow.clone().unwrap_or_else(|| base_flow.clone());
                     self.flow_facts = arm_flow.clone();
@@ -6583,7 +7341,9 @@ impl<'a> Checker<'a> {
                             }) {
                                 self.refine_error_binding(value);
                             }
-                            if let Some(name) = &tested {
+                            if let Some(name) = &tested
+                                && stable_scrutinee
+                            {
                                 self.apply_type_pattern(value, name, true);
                             }
                             if let Some(name) = tested
@@ -6616,7 +7376,7 @@ impl<'a> Checker<'a> {
                                     self.apply_type_pattern(value, name, true);
                                 }
                                 if !error_pattern
-                                    && matches!(actual, Type::Enum(other, _) if other != id)
+                                    && matches!(actual.non_nil(), Type::Enum(other, _) if other != id)
                                 {
                                     self.error(
                                         "E2001",
@@ -6634,6 +7394,9 @@ impl<'a> Checker<'a> {
                                         ),
                                         expr.span(),
                                     );
+                                }
+                                if !error_pattern && stable_scrutinee {
+                                    self.narrow_non_nil(value);
                                 }
                                 if arm.guard.is_none() {
                                     covered.insert(resolved.unwrap());
@@ -6685,31 +7448,46 @@ impl<'a> Checker<'a> {
                             }
                         }
                     }
+                    let mut guard_rejected = None;
                     if let Some(guard) = &arm.guard {
-                        self.condition(guard);
+                        let (_, true_flow, false_flow) = self.condition(guard);
+                        self.flow_facts = true_flow;
+                        guard_rejected = Some(false_flow);
                     }
-                    let guard_flow = self.flow_facts.clone();
-                    let ty = self.block(&arm.body);
+                    if !used {
+                        self.discard_tail(&arm.body);
+                    }
+                    let ty = self.block_expecting(&arm.body, hint.as_ref());
                     if arm_reachable && ty != Type::Never {
                         normal_exits.push(self.flow_facts.clone());
                     }
-                    result = Some(result.map_or(ty.clone(), |current: Type| current.join(ty)));
+                    result = Some(match result.take() {
+                        None => ty,
+                        Some(current) => self.join_values(current, ty, used),
+                    });
                     self.scopes.pop();
                     self.scopes.pop();
                     self.normal_reachable = previous_reachability;
 
                     if !arm_reachable {
                         unmatched_flow = None;
-                    } else if arm.guard.is_some() {
-                        // A guard can fail even after the type test succeeds.
-                        unmatched_flow = Some(guard_flow);
+                    } else if let Some(rejected) = guard_rejected {
+                        // A later arm follows either a failed pattern or a
+                        // failed guard.
+                        unmatched_flow = Some(if matches!(arm.pattern, MatchPattern::Wildcard) {
+                            rejected
+                        } else {
+                            FlowFacts::join([arm_flow, rejected])
+                        });
                     } else {
                         match &arm.pattern {
                             MatchPattern::Wildcard => unmatched_flow = None,
                             MatchPattern::StringLiteral(_) | MatchPattern::CharacterLiteral(_) => {}
                             MatchPattern::Type(_) => {
                                 let mut next = arm_flow;
-                                if let Some(name) = tested_type.as_deref() {
+                                if let Some(name) = tested_type.as_deref()
+                                    && stable_scrutinee
+                                {
                                     self.flow_facts = next.clone();
                                     self.apply_type_pattern(value, name, false);
                                     next = self.flow_facts.clone();
@@ -6723,7 +7501,8 @@ impl<'a> Checker<'a> {
                     }
                 }
                 if *exhaustive && !wildcard && actual != Type::Poison {
-                    let enum_id = match actual {
+                    let scrutinee = actual.non_nil();
+                    let enum_id = match scrutinee {
                         Type::Enum(id, _) => Some(id),
                         Type::ErrorValue => self
                             .variants
@@ -6731,30 +7510,25 @@ impl<'a> Checker<'a> {
                             .map(|(id, _)| *id),
                         _ => None,
                     };
-                    let mut message = "non-exhaustive match: add missing variants or a `_` arm";
-                    let complete = match &actual {
-                        // A pattern of the scrutinee's own struct covers every
-                        // struct value; nil needs an arm unless it is ruled out.
-                        Type::Struct(_, name, _) if covered.contains(name) => {
-                            message = NILABLE_STRUCT_MATCH;
-                            covered.contains("nil")
-                                || match self.non_nil_proof(value) {
-                                    Some(Some(parameter)) => {
-                                        self.parameter_matches
-                                            .push((parameter, expr.span().cloned()));
-                                        true
-                                    }
-                                    proof => proof.is_some(),
-                                }
-                        }
+                    // A pattern of the scrutinee's own struct covers every
+                    // struct value.
+                    let values_covered = match &scrutinee {
+                        Type::Struct(_, name, _) => covered.contains(name),
                         _ => enum_id.is_some_and(|id| {
                             self.enum_variants[id]
                                 .iter()
                                 .all(|name| covered.contains(name))
                         }),
                     };
-                    if !complete {
-                        self.error("E2003", message, expr.span());
+                    let nil_covered = !actual.is_nullable() || covered.contains("nil");
+                    if !values_covered {
+                        self.error(
+                            "E2003",
+                            "non-exhaustive match: add missing variants or a `_` arm",
+                            expr.span(),
+                        );
+                    } else if !nil_covered {
+                        self.error("E2003", NILABLE_MATCH, expr.span());
                     } else {
                         unmatched_flow = None;
                     }
@@ -6781,23 +7555,38 @@ impl<'a> Checker<'a> {
                 body,
                 catch_name,
                 catch_block,
-            } => self.try_blocks(body, catch_name, catch_block),
+            } => {
+                if !used {
+                    self.discard_tail(body);
+                    self.discard_tail(catch_block);
+                }
+                self.try_blocks(body, catch_name, catch_block, hint.as_ref(), used)
+            }
             Expr::If {
                 cond,
                 then_branch,
                 else_branch,
             } => {
-                let condition = self.condition(cond);
+                let (condition, true_flow, false_flow) = self.condition(cond);
                 let reachable = self.normal_reachable;
                 let base_flow = self.flow_facts.clone();
                 let then_reachable = reachable && !matches!(cond.node(), Expr::Bool(false));
                 self.normal_reachable = then_reachable;
-                let a = self.expr(then_branch);
+                self.flow_facts = true_flow;
+                if !used {
+                    self.discard(then_branch);
+                    if let Some(else_branch) = else_branch {
+                        self.discard(else_branch);
+                    }
+                }
+                let a = self.expr_with_expected_result(then_branch, hint.as_ref());
                 let then_flow = self.flow_facts.clone();
-                self.flow_facts = base_flow.clone();
+                self.flow_facts = false_flow;
                 let else_reachable = reachable && !matches!(cond.node(), Expr::Bool(true));
                 self.normal_reachable = else_reachable;
-                let b = else_branch.as_ref().map_or(Type::Nil, |b| self.expr(b));
+                let b = else_branch.as_ref().map_or(Type::Nil, |branch| {
+                    self.expr_with_expected_result(branch, hint.as_ref())
+                });
                 let else_flow = self.flow_facts.clone();
                 self.normal_reachable = reachable;
                 let mut exits = Vec::new();
@@ -6818,7 +7607,7 @@ impl<'a> Checker<'a> {
                 {
                     Type::Never
                 } else {
-                    a.join(b)
+                    self.join_values(a, b, used)
                 }
             }
         }
@@ -6830,12 +7619,15 @@ impl<'a> Checker<'a> {
         value: &Expr,
         fallback: &Expr,
         span: Option<&SourceSpan>,
+        expected: Option<&Type>,
+        used: bool,
     ) -> Type {
         let lhs = self.expr(value);
         let alternative = match (kind, lhs.clone()) {
             (FallbackKind::Nil, Type::Nil) => Type::Never,
             (FallbackKind::Nil, Type::Primitive(VarType::Nil, _)) => Type::Never,
             (FallbackKind::Nil, Type::Primitive(t, _)) => Type::Primitive(t, false),
+            (FallbackKind::Nil, Type::Nullable(inner)) => *inner,
             (FallbackKind::Error, Type::ErrorValue) => Type::Never,
             _ => lhs.clone(),
         };
@@ -6860,15 +7652,21 @@ impl<'a> Checker<'a> {
             .fallback_possible
             .insert(crate::mutability::expr_id(fallback), can_fallback);
         // A skipped RHS is still checked for static violations.
-        let rhs = self.expr(fallback);
+        let skipped = self.flow_facts.clone();
+        let rhs = self.expr_with_expected_result(fallback, expected);
         self.normal_reachable = reachable;
+        if rhs == Type::Never {
+            self.flow_facts = skipped;
+        } else {
+            self.join_flow_exits([skipped, self.flow_facts.clone()]);
+        }
         if lhs == Type::Poison || rhs == Type::Poison {
             return Type::Poison;
         }
         if !can_fallback {
             return lhs;
         }
-        let result = alternative.clone().join(rhs.clone());
+        let result = self.join_values(alternative.clone(), rhs.clone(), used);
         if result == Type::Dynamic && alternative != Type::Dynamic && rhs != Type::Dynamic {
             self.error(
                 "E2001",
@@ -6887,7 +7685,12 @@ impl<'a> Checker<'a> {
 
     fn call(&mut self, name: &str, args: &[CallArgument], expr: &Expr) -> Type {
         let before = self.diagnostics.len();
-        let actual: Vec<_> = args.iter().map(|arg| self.expr(&arg.value)).collect();
+        let hints = self.argument_hints(name, args);
+        let actual: Vec<_> = args
+            .iter()
+            .zip(&hints)
+            .map(|(arg, hint)| self.expr_with_expected_result(&arg.value, hint.as_ref()))
+            .collect();
         let poisoned = actual.contains(&Type::Poison);
         let never = actual.contains(&Type::Never);
         let result = self.call_inner(name, args, actual, expr);
@@ -6900,6 +7703,50 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Report a builtin or native argument of the wrong type.
+    fn argument_mismatch(&mut self, name: &str, expected: &str, actual: &Type, value: &Expr) {
+        let mut diagnostic = Diagnostic::new(
+            "E2001",
+            format!(
+                "type mismatch: `{name}` expects {expected}, got {}",
+                actual.display()
+            ),
+            value.span().cloned().or_else(|| self.location.clone()),
+        );
+        if actual.may_be_nil() {
+            diagnostic = diagnostic.help(
+                "this value may be `nil`; check it with `!= nil` or supply a fallback with `??`",
+            );
+        }
+        self.diagnostics.push(diagnostic);
+    }
+
+    /// Nullable parameter types of a callee, which its arguments build.
+    /// Parameters that depend on a type parameter are inferred instead.
+    /// Diagnostics are left to the call check that follows.
+    fn argument_hints(&mut self, name: &str, args: &[CallArgument]) -> Vec<Option<Type>> {
+        let diagnostics = self.diagnostics.len();
+        let mut hints = vec![None; args.len()];
+        if let Some(resolved) = self.resolve(name, None)
+            && let Some(fields) = self
+                .functions
+                .get(&resolved)
+                .map(|function| function.params.as_slice())
+                .or_else(|| self.constructors.get(&resolved).map(|(_, fields)| *fields))
+                .or_else(|| self.variants.get(&resolved).map(|(_, fields)| *fields))
+        {
+            let bindings = crate::arguments::bind(name, fields, args);
+            for (hint, parameter) in hints.iter_mut().zip(bindings.by_argument) {
+                if let Some(ty) = parameter.and_then(|index| fields[index].ty.as_ref()) {
+                    *hint = Some(self.annotation_type(ty))
+                        .filter(|ty| contains_nullable(ty) && !contains_generic(ty));
+                }
+            }
+        }
+        self.diagnostics.truncate(diagnostics);
+        hints
+    }
+
     fn call_inner(
         &mut self,
         name: &str,
@@ -6907,10 +7754,9 @@ impl<'a> Checker<'a> {
         actual: Vec<Type>,
         expr: &Expr,
     ) -> Type {
-        // Without effect summaries, any call may mutate a captured local or a
-        // global. Drop refinements for mutable bindings before checking what
-        // follows the call; immutable scalar bindings keep their facts.
-        self.invalidate_mutable_flow_facts();
+        // Without effect summaries, any call may rebind a captured local or a
+        // global. Drop their refinements before checking what follows.
+        self.invalidate_call_flow_facts();
         let span = expr.span();
         let Some(resolved) = self.resolve(name, span) else {
             return Type::Poison;
@@ -7050,8 +7896,9 @@ impl<'a> Checker<'a> {
                             actual[i].clone(),
                             &expected_type,
                         );
+                        actual[i] = widened(&args[i].value, actual[i].clone(), &expected_type);
                         if actual[i] == Type::EmptyArray
-                            && let Type::Array(element) = self.annotation_type(&ty)
+                            && let Type::Array(element) = expected_type.non_nil()
                         {
                             self.refine_empty_array(&args[i].value, &element);
                         }
@@ -7096,6 +7943,13 @@ impl<'a> Checker<'a> {
             };
         }
         if let Some(builtin) = Builtin::from_name(&resolved) {
+            if matches!(builtin, Builtin::Len)
+                && let ([ty], [argument]) = (actual.as_slice(), args)
+                && self.require_value(ty.clone(), &argument.value, "take the length of")
+                    == Type::Poison
+            {
+                return Type::Poison;
+            }
             if matches!(builtin, Builtin::BuildInput) {
                 if !self.in_comptime {
                     self.error("E4002", format!("`{resolved}` requires a comptime-known path and is only available at comptime"), span);
@@ -7422,21 +8276,21 @@ impl<'a> Checker<'a> {
                     _ => continue,
                 };
                 if !valid {
-                    self.error(
-                        "E2001",
-                        format!(
-                            "type mismatch: `{name}` expects {expected}, got {}",
-                            actual.display()
-                        ),
-                        argument.value.span(),
-                    );
+                    self.argument_mismatch(name, expected, actual, &argument.value);
                 }
             }
             if let Builtin::Native(ref import) = builtin {
-                for ((parameter, actual), argument) in
-                    import.parameters().iter().zip(&actual).zip(args)
+                for (index, ((parameter, actual), argument)) in import
+                    .parameters()
+                    .iter()
+                    .zip(&actual)
+                    .zip(args)
+                    .enumerate()
                 {
                     let value = &argument.value;
+                    if native_rejects_nil(import.name(), index) {
+                        self.require_value(actual.clone(), value, &format!("call `{name}` with"));
+                    }
                     use crate::runtime::NativeType as N;
                     if *parameter == N::Number {
                         if !matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
@@ -7476,15 +8330,7 @@ impl<'a> Checker<'a> {
                     if !matches!(actual, Type::Dynamic | Type::Poison | Type::ErrorValue)
                         && !type_compatible(&expected, actual)
                     {
-                        self.error(
-                            "E2001",
-                            format!(
-                                "type mismatch: `{name}` expects {}, got {}",
-                                expected.display(),
-                                actual.display()
-                            ),
-                            value.span(),
-                        );
+                        self.argument_mismatch(name, &expected.display(), actual, value);
                     }
                 }
             }

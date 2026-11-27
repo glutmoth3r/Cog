@@ -16,6 +16,7 @@ ffi/gzip/                         optional async native gzip response compressor
 examples/tutorial_server/        Cog rewrite of the local tutorial server
 examples/tutorial_server/web/    browser page with Cog-only launch guidance
 examples/tutorial_server/cog.lock pinned local package graph
+examples/binary_assets/          binary responses, static assets, and raw request echo
 DESIGN_DNA.md                    design constraints
 AUDIT.md                         backend audit and remaining gaps
 IMPLEMENTATION_PLAN.md           completed scope and validation
@@ -27,9 +28,11 @@ Each connection carries one HTTP/1.1 request and one response, then closes.
 The parser accepts `Content-Length`, normalizes header names to lowercase,
 rejects duplicate headers and `Transfer-Encoding`, and enforces a 16 KiB header
 limit plus the caller's request-body limit. `Request` exposes case-insensitive
-headers, normalized media type, decoded query/form fields, and the standard JSON
-parse result. It does not implement TLS, chunked encoding, keep-alive, or binary
-request bodies.
+headers, normalized media type, decoded query/form fields, the raw `body_bytes`,
+and the standard JSON parse result. `body` remains the UTF-8 text view for
+existing callers; it is empty when the raw body is not valid UTF-8, and
+`body_text()` returns `nil` in that case. The parser does not implement TLS,
+chunked encoding, or keep-alive.
 
 ```cog
 const request = await http::read_request(socket, 96 * 1024)!!;
@@ -41,6 +44,9 @@ await http::write_response(socket, response)!!;
 `Request.query_param(name)` and `Request.form_param(name)` return the first
 matching `application/x-www-form-urlencoded` field, decoding `%HH` and `+`.
 `query_params` and `form_params` return all repeated values in wire order.
+The form helpers raise `Error::ParseFailure("http", "request body UTF-8")`
+when the raw body is not valid UTF-8. `request.json()` returns that same Error
+value for invalid UTF-8, and otherwise preserves the JSON parser's result.
 `request.is_json()` accepts `application/json` and `+json` media types;
 `is_form_urlencoded()` checks form content. `request.json()` returns the standard
 JSON parse result, so callers can handle malformed input explicitly.
@@ -123,9 +129,29 @@ route dispatch. The redirect helper only accepts 301, 302, 303, 307, and 308;
 `unauthorized_response(realm)` includes a Bearer challenge, and
 `not_acceptable_response(message)` pairs with Accept negotiation.
 
-`Request.body` is UTF-8 text; the request type does not expose an arbitrary
-binary body. Responses can be text or JSON; callers with a byte buffer can use
+`Request.body_bytes` preserves every request-body byte, including invalid UTF-8,
+and `content_length` continues to report its byte length. For text-oriented
+handlers, `Request.body` keeps the existing UTF-8 string API and `body_text()`
+provides an optional text view (`nil` for invalid UTF-8). `read_request` checks
+the declared `Content-Length` against its caller-supplied limit before reading
+the body. Responses can be text or JSON; callers with a byte buffer can use
 `http::write_bytes_response(socket, response, body)`.
+
+```cog
+use bytes;
+use http;
+use io;
+
+const request = await http::read_request(socket, 96 * 1024)!!;
+io::println(bytes::len(request.body_bytes)!!)!!;
+const response = http::binary_response(200, "application/octet-stream")!!;
+await http::write_bytes_response_for(socket, request, response,
+    request.body_bytes)!!;
+```
+
+The `examples/binary_assets` server also exposes `POST /echo`, which returns
+the request body byte-for-byte, and `POST /text`, which echoes valid UTF-8 while
+returning 415 for invalid text. Its request limit is 16 KiB.
 
 The optional [`ffi/gzip`](ffi/gzip/README.md) package uses Cog's C ABI v3 and a
 system zlib-compatible library to compress response bytes asynchronously. It is

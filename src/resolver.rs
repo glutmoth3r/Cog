@@ -7,10 +7,12 @@
 //! Bound declarations use unspellable internal names; source spans remain intact.
 use crate::ast::*;
 use crate::builtins::Builtin;
-use crate::diagnostic::{Diagnostic, SourceSpan};
+use crate::diagnostic::{Diagnostic, SourceFile, SourceSpan};
 use crate::frontend;
+use crate::hlparser::ParseOutput;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
+use std::rc::Rc;
 
 pub type ModuleKey = (usize, String);
 pub const CORE: usize = usize::MAX;
@@ -22,6 +24,12 @@ pub enum Source {
     Embedded(String, String),
     Empty,
 }
+
+pub(crate) struct EntryParse {
+    pub(crate) source: Rc<SourceFile>,
+    pub(crate) parsed: ParseOutput,
+}
+
 #[derive(Clone)]
 struct Symbol {
     bound: String,
@@ -50,6 +58,7 @@ pub struct Resolver {
     next_symbol: usize,
     poison: Vec<String>,
     entry: ModuleKey,
+    entry_parse: Option<EntryParse>,
     resolved_includes: BTreeSet<String>,
     references: BTreeMap<String, BTreeSet<String>>,
     current: Option<String>,
@@ -160,6 +169,7 @@ impl Resolver {
             next_symbol: 0,
             poison: Vec::new(),
             entry,
+            entry_parse: None,
             resolved_includes: BTreeSet::new(),
             references: BTreeMap::new(),
             current: None,
@@ -170,6 +180,11 @@ impl Resolver {
             loaded_source_bytes: 0,
             loaded_syntax_cost: 0,
         }
+    }
+
+    pub(crate) fn with_entry_parse(mut self, entry_parse: Option<EntryParse>) -> Self {
+        self.entry_parse = entry_parse;
+        self
     }
 
     /// Only the project loader may acknowledge entry-point inclusion declarations.
@@ -193,14 +208,23 @@ impl Resolver {
         name
     }
 
-    fn parse_source(&mut self, name: String, text: String) -> crate::hlparser::ParseOutput {
+    fn parse_source(
+        &mut self,
+        name: String,
+        text: String,
+        entry_parse: Option<EntryParse>,
+    ) -> ParseOutput {
         let remaining = (64 * 1024 * 1024usize).saturating_sub(self.loaded_source_bytes);
         if text.len() > remaining {
             self.error("compiler total source byte limit (64 MiB) exceeded", None);
             return frontend::parse(name, "");
         }
         self.loaded_source_bytes += text.len();
-        let mut parsed = frontend::parse(name, text);
+        // Resolution uses the latest file read or the exact snapshot hashed by the build.
+        let mut parsed = match entry_parse {
+            Some(entry) if entry.source.name == name && entry.source.text == text => entry.parsed,
+            _ => frontend::parse(name, text),
+        };
         match crate::ast_budget::program(&parsed.program).and_then(|cost| {
             self.loaded_syntax_cost
                 .checked_add(cost)
@@ -234,11 +258,16 @@ impl Resolver {
             .get_mut(key)
             .map(|source| std::mem::replace(source, Source::Empty))
             .unwrap_or(Source::Empty);
+        let entry_parse = if key == &self.entry {
+            self.entry_parse.take()
+        } else {
+            None
+        };
         let parsed = match source {
             Source::Empty => frontend::parse("<namespace>", ""),
-            Source::Embedded(name, text) => self.parse_source(name, text),
+            Source::Embedded(name, text) => self.parse_source(name, text, entry_parse),
             Source::Snapshot(path, bytes) => match String::from_utf8(bytes) {
-                Ok(text) => self.parse_source(path.display().to_string(), text),
+                Ok(text) => self.parse_source(path.display().to_string(), text, entry_parse),
                 Err(_) => {
                     self.error(
                         format!("source {} is not valid UTF-8", path.display()),
@@ -248,7 +277,7 @@ impl Resolver {
                 }
             },
             Source::File(path) => match crate::limits::read_source_text(&path) {
-                Ok(text) => self.parse_source(path.display().to_string(), text),
+                Ok(text) => self.parse_source(path.display().to_string(), text, entry_parse),
                 Err(e) => {
                     self.error(format!("cannot read {}: {e}", path.display()), None);
                     frontend::parse(path.display().to_string(), "")
@@ -1555,6 +1584,11 @@ impl Resolver {
                         value,
                         ty,
                     } => {
+                        if let Some(span) = value.span() {
+                            span.source
+                                .module_owner
+                                .get_or_init(|| owner_identity(&owner));
+                        }
                         if let Some(ty) = ty {
                             self.type_annotation(ty, &owner, &scopes);
                         }

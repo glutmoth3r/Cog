@@ -530,7 +530,7 @@ impl std::fmt::Display for CodegenError {
 }
 
 impl CodegenError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self::from_diagnostics(vec![crate::diagnostic::Diagnostic::new(
             "E3000", message, None,
         )])
@@ -803,7 +803,7 @@ fn runtime_type(annotation: &crate::ast::TypeAnnotation) -> Option<RuntimeType> 
             RuntimeType::Nominal("$core::Task".to_owned())
         }
         TypeKind::Applied { .. } | TypeKind::ResolvedApplied { .. } => {
-            RuntimeType::Nominal(annotation.canonical())
+            RuntimeType::Nominal(annotation.canonical_base())
         }
         TypeKind::TypeParameter(_) | TypeKind::SelfType => return None,
         TypeKind::Tuple(items) => {
@@ -827,6 +827,8 @@ struct Codegen<'a> {
     uint_literals: &'a std::collections::HashSet<usize>,
     uint_expressions: &'a std::collections::HashSet<usize>,
     bigint_literals: &'a std::collections::HashSet<usize>,
+    bigint_range_expressions: &'a std::collections::HashSet<usize>,
+    literal_types: &'a HashMap<usize, crate::ast::TypeAnnotation>,
     inline_functions: HashMap<String, InlineFunction<'a>>,
     inline_nodes_remaining: usize,
     trace_optimizer: bool,
@@ -861,18 +863,12 @@ pub fn compile(program: &Program) -> Result<CompiledProgram, CodegenError> {
     compile_with_modules(program, &HashMap::new())
 }
 
-pub(crate) fn compile_library(
+pub(crate) fn lower_with_names(
     program: &Program,
     names: &std::collections::BTreeMap<String, String>,
-) -> Result<CompiledProgram, CodegenError> {
-    compile_with_modules_and_names(program, &HashMap::new(), names, false)
-}
-
-pub(crate) fn compile_with_names(
-    program: &Program,
-    names: &std::collections::BTreeMap<String, String>,
-) -> Result<CompiledProgram, CodegenError> {
-    compile_with_modules_and_names(program, &HashMap::new(), names, true)
+    require_main: bool,
+) -> Result<Emitter, CodegenError> {
+    lower_with_modules_and_names(program, &HashMap::new(), names, require_main)
 }
 
 fn is_main_arguments_parameter(parameters: &[Param]) -> bool {
@@ -900,28 +896,22 @@ pub fn compile_with_modules(
     program: &Program,
     function_modules: &HashMap<String, String>,
 ) -> Result<CompiledProgram, CodegenError> {
-    compile_with_modules_and_entry(program, function_modules, true)
-}
-
-fn compile_with_modules_and_entry(
-    program: &Program,
-    function_modules: &HashMap<String, String>,
-    require_main: bool,
-) -> Result<CompiledProgram, CodegenError> {
-    compile_with_modules_and_names(
+    lower_with_modules_and_names(
         program,
         function_modules,
         &std::collections::BTreeMap::new(),
-        require_main,
-    )
+        true,
+    )?
+    .finish()
+    .map_err(CodegenError::new)
 }
 
-fn compile_with_modules_and_names(
+fn lower_with_modules_and_names(
     program: &Program,
     function_modules: &HashMap<String, String>,
     names: &std::collections::BTreeMap<String, String>,
     require_main: bool,
-) -> Result<CompiledProgram, CodegenError> {
+) -> Result<Emitter, CodegenError> {
     let expanded = if names.is_empty() {
         crate::generics::expand(program, function_modules)
     } else {
@@ -1126,6 +1116,8 @@ fn compile_with_modules_and_names(
         uint_literals: &checked.uint_literals,
         uint_expressions: &checked.uint_expressions,
         bigint_literals: &checked.bigint_literals,
+        bigint_range_expressions: &checked.bigint_range_expressions,
+        literal_types: &checked.literal_types,
         inline_functions,
         inline_nodes_remaining: MAX_INLINE_NODES_PER_FUNCTION,
         trace_optimizer: std::env::var_os("COG_OPT_TRACE").is_some(),
@@ -1237,7 +1229,7 @@ fn compile_with_modules_and_names(
         closure_index += 1;
     }
 
-    cg.out.finish().map_err(CodegenError::new)
+    Ok(cg.out)
 }
 
 impl<'a> Codegen<'a> {
@@ -1259,7 +1251,7 @@ impl<'a> Codegen<'a> {
         self.in_async = false;
         self.active_defers.clear();
 
-        // SAFETY: `compile_with_modules_and_names` drains the closure queue
+        // SAFETY: `lower_with_modules_and_names` drains the closure queue
         // synchronously before it drops the expanded program.
         let body = unsafe { closure.body.as_ref() };
 
@@ -1830,22 +1822,16 @@ impl<'a> Codegen<'a> {
                 let desc_label = self.fresh_label("for_desc");
                 let cmp_done_label = self.fresh_label("for_cmp_done");
                 scopes.push();
-                let start_zero = self.range_zero(start);
                 self.compile_expr(start, scopes)?;
-                self.out
-                    .extend([Instruction::Push(start_zero), Instruction::Sub]);
-                self.propagate_control_error(scopes)?;
-                let var_slot = scopes.define(var);
+                self.observe_range_value(start, scopes)?;
+                let var_slot = scopes.reserve_slot();
                 if scopes.cell_names.contains(var) {
                     self.out.emit(Instruction::MakeCell);
                     scopes.cell_slots.insert(var_slot);
                 }
                 self.out.emit(Instruction::Store(var_slot));
-                let end_zero = self.range_zero(end);
                 self.compile_expr(end, scopes)?;
-                self.out
-                    .extend([Instruction::Push(end_zero), Instruction::Sub]);
-                self.propagate_control_error(scopes)?;
+                self.observe_range_value(end, scopes)?;
                 let end_slot = scopes.next_slot;
                 scopes.next_slot += 1;
                 self.out.emit(Instruction::Store(end_slot));
@@ -1853,17 +1839,11 @@ impl<'a> Codegen<'a> {
                 // no `step` clause is present.
                 let step_slot = scopes.next_slot;
                 scopes.next_slot += 1;
-                let step_zero = step
-                    .as_ref()
-                    .map(|step| self.range_zero(step))
-                    .unwrap_or_else(|| self.range_zero(start));
                 match step {
                     Some(step_expr) => self.compile_expr(step_expr, scopes)?,
                     None => self.out.emit(Instruction::Push(self.range_one(start))),
                 }
-                self.out
-                    .extend([Instruction::Push(step_zero), Instruction::Sub]);
-                self.propagate_control_error(scopes)?;
+                self.observe_range_value(step.as_deref().unwrap_or(start), scopes)?;
                 self.out.emit(Instruction::Store(step_slot));
 
                 let valid_step = self.fresh_label("nonzero_step");
@@ -1885,6 +1865,7 @@ impl<'a> Codegen<'a> {
                 self.out.emit(Instruction::Pop);
                 self.out.bind(valid_step);
 
+                scopes.bind_slot(var, var_slot);
                 self.out.bind(cond_label);
                 // Direction is re-checked every iteration from step_slot
                 // rather than assumed once, so a step computed from a
@@ -2110,22 +2091,30 @@ impl<'a> Codegen<'a> {
         Ok(())
     }
 
-    fn range_zero(&self, expression: &Expr) -> Value {
-        if self
-            .uint_expressions
-            .contains(&crate::mutability::expr_id(expression))
-        {
-            Value::UInt(0)
+    fn observe_range_value(
+        &mut self,
+        expression: &Expr,
+        scopes: &mut Scopes,
+    ) -> Result<(), CodegenError> {
+        let id = crate::mutability::expr_id(expression);
+        let (identity, operation) = if self.bigint_range_expressions.contains(&id) {
+            // Multiplication by one checks the type and digit limit. Subtraction
+            // would also accept an int zero as its left operand for unary negation.
+            (Value::BigInt(1.into()), Instruction::Mul)
+        } else if self.uint_expressions.contains(&id) {
+            (Value::UInt(0), Instruction::Sub)
         } else {
-            Value::Int(0)
-        }
+            (Value::Int(0), Instruction::Sub)
+        };
+        self.out.extend([Instruction::Push(identity), operation]);
+        self.propagate_control_error(scopes)
     }
 
     fn range_one(&self, expression: &Expr) -> Value {
-        if self
-            .uint_expressions
-            .contains(&crate::mutability::expr_id(expression))
-        {
+        let id = crate::mutability::expr_id(expression);
+        if self.bigint_range_expressions.contains(&id) {
+            Value::BigInt(1.into())
+        } else if self.uint_expressions.contains(&id) {
             Value::UInt(1)
         } else {
             Value::Int(1)
@@ -2228,11 +2217,8 @@ impl<'a> Codegen<'a> {
                     step,
                 } => {
                     let var_slot = scopes.reserve_slot();
-                    let start_zero = self.range_zero(start);
                     self.compile_expr(start, scopes)?;
-                    self.out
-                        .extend([Instruction::Push(start_zero), Instruction::Sub]);
-                    self.propagate_control_error(scopes)?;
+                    self.observe_range_value(start, scopes)?;
                     if scopes.cell_names.contains(var) {
                         self.out.emit(Instruction::MakeCell);
                         scopes.cell_slots.insert(var_slot);
@@ -2240,25 +2226,16 @@ impl<'a> Codegen<'a> {
                     self.out.emit(Instruction::Store(var_slot));
 
                     let end_slot = scopes.reserve_slot();
-                    let end_zero = self.range_zero(end);
                     self.compile_expr(end, scopes)?;
-                    self.out
-                        .extend([Instruction::Push(end_zero), Instruction::Sub]);
-                    self.propagate_control_error(scopes)?;
+                    self.observe_range_value(end, scopes)?;
                     self.out.emit(Instruction::Store(end_slot));
 
                     let step_slot = scopes.reserve_slot();
-                    let step_zero = step
-                        .as_ref()
-                        .map(|step| self.range_zero(step))
-                        .unwrap_or_else(|| self.range_zero(start));
                     match step {
                         Some(step) => self.compile_expr(step, scopes)?,
                         None => self.out.emit(Instruction::Push(self.range_one(start))),
                     }
-                    self.out
-                        .extend([Instruction::Push(step_zero), Instruction::Sub]);
-                    self.propagate_control_error(scopes)?;
+                    self.observe_range_value(step.as_deref().unwrap_or(start), scopes)?;
                     self.out.emit(Instruction::Store(step_slot));
 
                     let valid_step = self.fresh_label("for_zip_nonzero_step");
@@ -3438,7 +3415,16 @@ impl<'a> Codegen<'a> {
             _ => {
                 self.compile_expr(expr, scopes)?;
                 if let Some(element_type) = runtime_array_element_type(expected) {
-                    self.out.emit(Instruction::ConstrainArrayType(element_type));
+                    if expected.nilable {
+                        let end = self.fresh_label("nullable_array");
+                        self.out
+                            .extend([Instruction::Dup, Instruction::IsType(ValueType::Nil)]);
+                        self.out.jump(Instruction::JumpIfTrue(0), end);
+                        self.out.emit(Instruction::ConstrainArrayType(element_type));
+                        self.out.bind(end);
+                    } else {
+                        self.out.emit(Instruction::ConstrainArrayType(element_type));
+                    }
                 }
                 Ok(())
             }
@@ -4056,6 +4042,14 @@ impl<'a> Codegen<'a> {
     }
 
     fn compile_expr_inner(&mut self, expr: &Expr, scopes: &mut Scopes) -> Result<(), CodegenError> {
+        // A literal inside a branch or argument takes the nullable element type
+        // that its context declares.
+        if matches!(expr.node(), Expr::Array(_) | Expr::Tuple(_))
+            && let Some(annotation) = self.literal_types.get(&crate::mutability::expr_id(expr))
+        {
+            let annotation = annotation.clone();
+            return self.compile_expr_typed_array(expr, &annotation, scopes);
+        }
         match expr.node() {
             Expr::BracketApply(_, _) => {
                 return Err(CodegenError::new("unresolved bracket expression"));

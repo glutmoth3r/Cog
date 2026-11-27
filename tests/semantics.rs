@@ -433,27 +433,11 @@ fn a_struct_pattern_alone_does_not_cover_possible_nil_or_other_types() {
             nilable,
         ),
         (
-            "fn find() -> Point? { nil } \
-             fn f() { const point: Point = find(); match point { Point => 1 }; }",
-            nilable,
-        ),
-        (
             "fn f(holder: Holder) { match holder.point { Point => 1 }; }",
             nilable,
         ),
         (
             "fn f() { const point: Point? = Point(x: 1); match point { Point => 1 }; }",
-            nilable,
-        ),
-        // A parameter that is written anywhere loses its call contract.
-        (
-            "fn find() -> Point? { nil } \
-             fn f(point: Point) { match point { Point => 1 }; point = find(); }",
-            nilable,
-        ),
-        (
-            "fn find() -> Point? { nil } \
-             fn f(point: Point) { point = find(); match point { Point => 1 }; }",
             nilable,
         ),
         (
@@ -509,21 +493,23 @@ fn user_clone_copies_recursive_optional_struct_fields() {
         struct Node { value: int, next: Node? }
         extend Node with Clone {
             fn clone(self) -> Node {
-                var next: Node? = nil;
-                when self.next is Node { next = self.next.clone(); }
-                Node(value: self.value, next: next)
+                const next = self.next;
+                Node(value: self.value, next: if next != nil { next.clone() })
             }
         }
+        fn link(node: Node) -> Node { node.next ?? Node(value: 0, next: nil) }
         fn main() {
             var head = Node(value: 1, next: Node(value: 2, next: Node(value: 3, next: nil)));
             const copy = head.clone();
             const generic = clone::value(head);
             head.value = 10;
-            var second = head.next;
+            var second = link(head);
             second.value = 20;
-            io::println($"{head.value} {head.next.value} {copy.value} {copy.next.value}");
-            io::println($"{copy.next.next.value} {generic.next.value}");
-            io::println(when copy.next.next.next is Node { "linked" } else { "end" });
+            const copied = link(copy);
+            const last = link(copied);
+            io::println($"{head.value} {link(head).value} {copy.value} {copied.value}");
+            io::println($"{last.value} {link(generic).value}");
+            io::println(when last.next is Node { "linked" } else { "end" });
         }
     "#),
         "10 20 1 2\n3 2\nend\n"
@@ -991,6 +977,63 @@ fn range_increment_overflow_is_catchable() {
         }
     "#),
         "once\nOverflow\n"
+    );
+}
+
+#[test]
+fn bigint_ranges_cross_fixed_width_limits_and_zip_with_collections() {
+    assert_eq!(
+        run(r#"
+        fn exact(value: bigint) -> bigint { value }
+        fn main() {
+            for value in 18446744073709551615..18446744073709551618 {
+                io::println(exact(value));
+            }
+            const start: bigint = -18446744073709551617;
+            for value in start..start - 6 step -2, label in ["first", "second"] {
+                io::println($"{label}: {value}");
+            }
+        }
+    "#),
+        "18446744073709551615\n18446744073709551616\n18446744073709551617\nfirst: -18446744073709551617\nsecond: -18446744073709551619\n"
+    );
+}
+
+#[test]
+fn bigint_ranges_check_dynamic_operands_and_propagate_errors() {
+    assert_eq!(
+        run(r#"
+        fn opaque(value) { value }
+        fn main() {
+            const end = 3 as bigint;
+            for value in opaque(1 as bigint)..end step opaque(1 as bigint) {
+                io::println(value);
+            }
+            try { for value in 0..end step 0 { io::println("wrong"); } }
+            catch(error) { io::println(error.error_kind()); }
+            try { for value in opaque(0)..end { io::println("wrong"); } }
+            catch(error) { io::println(error.error_kind()); }
+            try { for value in end..Error::Unordered() { io::println("wrong"); } }
+            catch(error) { io::println(error.error_kind()); }
+        }
+    "#),
+        "1\n2\nInvalidRangeStep\nTypeMismatch\nUnordered\n"
+    );
+}
+
+#[test]
+fn bigint_range_context_applies_before_checking_literal_arithmetic() {
+    assert_eq!(
+        run(r#"
+        fn main() {
+            const end = 18446744073709551617;
+            for value in 18446744073709551615 + (-1)..end
+                step 18446744073709551615 + (-9223372036854775808) + (-9223372036854775806) {
+                io::println(value);
+            }
+        }
+    "#),
+        "18446744073709551614\n18446744073709551615\n18446744073709551616\n"
     );
 }
 

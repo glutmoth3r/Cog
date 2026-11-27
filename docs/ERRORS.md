@@ -214,9 +214,8 @@ checked for semantic errors.
 
 For `T? ?? T`, the normal result is T. `T? ?! T` still permits nil. This changes
 the expression result, not the original binding's declared type. Control-flow
-checks can refine nullable values on paths that prove nil is absent; reassignment
-and calls that may mutate the binding invalidate those facts. General union
-inference remains pending.
+checks [narrow nullable bindings](LANGUAGE.md#narrowing) on paths that prove nil
+is absent. General union inference remains pending.
 
 ## Defer and cleanup failures
 

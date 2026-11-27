@@ -75,9 +75,10 @@ expressions. Non-literal `int` and `uint` values require an explicit cast.
   cannot convert to `uint`. `str::to_bigint` accepts signed decimal spelling;
   converting a BigInt to `int` or `uint` checks the destination range.
 - Ranges require bounds of one integer type. Nonnegative `int` literals can take
-  the type of a `uint` bound; `uint` ranges ascend and cannot use a negative step.
-  BigInt ranges are not implemented yet. Collection indexes and lengths remain
-  `int` in this first slice.
+  the type of a `uint` bound. A `bigint` bound gives integer-literal expressions
+  in the bounds or step `bigint` type, and dynamic operands in that range must
+  evaluate to `bigint`. BigInt ranges support negative steps; `uint` ranges
+  only ascend. Collection indexes and lengths remain `int`.
 
 ## Language and runtime integration
 
@@ -125,7 +126,8 @@ does not introduce arbitrary-precision allocation.
   tokens outside the `int` and `uint` ranges parse as `bigint`. `str::to_bigint`
   parses decimal integer spelling and propagates Overflow, ParseFailure, or the
   configured numeric digit limit. Compile-time scalar evaluation supports BigInt.
-  BigInt range iteration and native C ABI payloads are not implemented.
+  BigInt range iteration is supported in both single and parallel `for` clauses.
+  WASI and native C ABI v3 payloads do not support BigInt.
 
 ### `decimal`
 

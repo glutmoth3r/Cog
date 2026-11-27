@@ -27,7 +27,8 @@ fn when_without_else_keeps_the_unmatched_path_reachable_for_mutability() {
         extend Node {
             fn depth(self) -> int {
                 var below = 0;
-                when self.next is Node { below = self.next.depth(); }
+                const next = self.next;
+                when next is Node { below = next.depth(); }
                 below + 1
             }
         }

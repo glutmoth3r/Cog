@@ -374,7 +374,35 @@ impl Emitter {
         self.emit(Instruction::CallNative(index));
     }
 
-    pub fn finish(mut self) -> Result<CompiledProgram, String> {
+    pub fn finish(self) -> Result<CompiledProgram, String> {
+        let program = self.resolve()?;
+        let optimized = crate::optimizer::optimize(&program);
+        match crate::bytecode::validate(&optimized) {
+            Ok(()) => Ok(optimized),
+            Err(_) => {
+                // An optimizer invariant failure must preserve executable
+                // compiler output when the pre-optimization program is valid.
+                crate::bytecode::validate(&program)?;
+                Ok(program)
+            }
+        }
+    }
+
+    pub fn check(self) -> Result<(), String> {
+        if std::env::var_os("COG_OPT_TRACE").is_some() {
+            return self.finish().map(drop);
+        }
+        let program = self.resolve()?;
+        match crate::bytecode::validate(&program) {
+            Ok(()) => Ok(()),
+            // Optimization can shrink the program enough to satisfy validation limits.
+            Err(error) => {
+                crate::bytecode::validate(&crate::optimizer::optimize(&program)).map_err(|_| error)
+            }
+        }
+    }
+
+    fn resolve(mut self) -> Result<CompiledProgram, String> {
         if let Some(error) = self.error {
             return Err(error);
         }
@@ -413,24 +441,14 @@ impl Emitter {
         }
         let inline_frames =
             retain_referenced_inline_frames(&self.inline_frames, &mut self.source_map);
-        let program = CompiledProgram {
+        Ok(CompiledProgram {
             instructions: self.instructions,
             imports,
             functions: self.functions,
             callables: self.callables,
             source_map: self.source_map,
             inline_frames,
-        };
-        let optimized = crate::optimizer::optimize(&program);
-        match crate::bytecode::validate(&optimized) {
-            Ok(()) => Ok(optimized),
-            Err(_) => {
-                // An optimizer invariant failure must preserve executable
-                // compiler output when the pre-optimization program is valid.
-                crate::bytecode::validate(&program)?;
-                Ok(program)
-            }
-        }
+        })
     }
 }
 
@@ -602,5 +620,35 @@ fn float_text(n: f64) -> String {
         text
     } else {
         format!("{text}.0")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_accepts_bytecode_that_needs_optimization_to_fit_type_limits() {
+        fn emit() -> Emitter {
+            use crate::value::RuntimeType;
+
+            let oversized = (0..crate::value::MAX_RUNTIME_TYPE_DEPTH)
+                .fold(RuntimeType::Int, |ty, _| RuntimeType::Array(Box::new(ty)));
+            let mut out = Emitter::default();
+            let end = out.label();
+            out.emit(Instruction::Push(Value::Bool(false)));
+            out.jump(Instruction::JumpIfFalse(0), end);
+            out.extend([
+                Instruction::Push(Value::Nil),
+                Instruction::ConstrainArrayType(oversized),
+                Instruction::Pop,
+            ]);
+            out.bind(end);
+            out.emit(Instruction::Halt);
+            out
+        }
+
+        assert!(crate::bytecode::validate(&emit().resolve().unwrap()).is_err());
+        emit().check().unwrap();
     }
 }

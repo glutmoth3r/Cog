@@ -415,8 +415,14 @@ fn command(color: &mut Color) -> Result<(), String> {
             root.join("target").join(format!("{name}.wasm"))
         });
         let lock_update = prepared.as_ref().and_then(|p| p.lock_update.clone());
-        let (compiled, _, _, warnings) =
-            prepare(target, Mode::Check, &options, bytecode_input, prepared)?;
+        let (compiled, _, _, warnings) = prepare(
+            target,
+            Mode::Check,
+            &options,
+            bytecode_input,
+            prepared,
+            true,
+        )?;
         let compiled = compiled.ok_or("WASI builds require an application entry point")?;
         if !warnings.is_empty() {
             color.warning(&frontend::render(&warnings));
@@ -474,8 +480,14 @@ fn command(color: &mut Color) -> Result<(), String> {
                 warnings,
             )
         } else {
-            let (compiled, _, _, warnings) =
-                prepare(target, Mode::Check, &options, bytecode_input, prepared)?;
+            let (compiled, _, _, warnings) = prepare(
+                target,
+                Mode::Check,
+                &options,
+                bytecode_input,
+                prepared,
+                true,
+            )?;
             let compiled =
                 compiled.ok_or("AOT executable builds require an application entry point")?;
             (
@@ -497,17 +509,24 @@ fn command(color: &mut Color) -> Result<(), String> {
     if !options.plugins.is_empty() || package_has_plugins {
         return command_with_plugins(target, mode, options, color, prepared);
     }
-    let (compiled, reused, destination, warnings) =
-        prepare(target, mode, &options, bytecode_input, prepared).map_err(|error| {
-            let action = if bytecode_input {
-                "load"
-            } else if mode == Mode::Check {
-                "check"
-            } else {
-                "build"
-            };
-            cli_output::preparation_error(error, action, target, started.elapsed())
-        })?;
+    let (compiled, reused, destination, warnings) = prepare(
+        target,
+        mode,
+        &options,
+        bytecode_input,
+        prepared,
+        options.debug,
+    )
+    .map_err(|error| {
+        let action = if bytecode_input {
+            "load"
+        } else if mode == Mode::Check {
+            "check"
+        } else {
+            "build"
+        };
+        cli_output::preparation_error(error, action, target, started.elapsed())
+    })?;
     let elapsed = started.elapsed();
     if !warnings.is_empty() {
         color.warning(&frontend::render(&warnings));
@@ -649,6 +668,7 @@ fn prepare(
     options: &Options,
     bytecode_input: bool,
     prepared: Option<project::Prepared>,
+    retain_checked_bytecode: bool,
 ) -> Result<
     (
         Option<CompiledProgram>,
@@ -682,27 +702,23 @@ fn prepare(
         }
     });
     let (compiled, reused, warnings) = if let Some(prepared) = prepared {
-        if prepared.kind == config::PackageKind::Library {
-            if mode != Mode::Check {
-                return Err("library packages can be checked but not run or built yet".into());
+        let kind = prepared.kind;
+        if kind == config::PackageKind::Library && mode != Mode::Check {
+            return Err("library packages can be checked but not run or built yet".into());
+        }
+        if mode == Mode::Check {
+            let loaded = prepared.resolve();
+            if !retain_checked_bytecode || kind == config::PackageKind::Library {
+                (None, false, loaded.check(kind)?)
+            } else {
+                let (compiled, warnings) = project::compile_with_inputs_and_warnings(
+                    loaded.program,
+                    loaded.diagnostics,
+                    &loaded.names,
+                    &loaded.build_inputs,
+                )?;
+                (Some(compiled), false, warnings)
             }
-            let loaded = prepared.resolve();
-            let warnings = project::check_with_inputs_and_warnings(
-                loaded.program,
-                loaded.diagnostics,
-                &loaded.names,
-                &loaded.build_inputs,
-            )?;
-            (None, false, warnings)
-        } else if mode == Mode::Check {
-            let loaded = prepared.resolve();
-            let (compiled, warnings) = project::compile_with_inputs_and_warnings(
-                loaded.program,
-                loaded.diagnostics,
-                &loaded.names,
-                &loaded.build_inputs,
-            )?;
-            (Some(compiled), false, warnings)
         } else {
             let (built, warnings) = build::project_with_warnings(prepared, &destination)?;
             (Some(built.program), built.reused, warnings)

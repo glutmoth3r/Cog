@@ -2029,6 +2029,21 @@ fn comptime_03_struct_constructors_are_evaluated_and_materialized() {
 }
 
 #[test]
+fn comptime_reads_nested_struct_fields_and_preserves_error_values() {
+    output(
+        r#"
+        struct Counter { value: int }
+        struct Wrapper(Counter);
+        @comptime fn read(counter: Counter) -> int { counter.value ?! 7 }
+        @comptime const VALUE = Wrapper(Counter(11)).0.value;
+        @comptime const SAFE = read(Counter(1 / 0));
+        fn main() { io::println(VALUE); io::println(SAFE); }
+        "#,
+        "11\n7\n",
+    );
+}
+
+#[test]
 fn phase_03_comptime_error_can_be_recovered_before_the_mandatory_boundary() {
     output(
         r#"

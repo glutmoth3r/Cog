@@ -17,6 +17,10 @@ fn build_router() -> router::Router {
     var routes = router::Router::new();
     routes.get("/", "home");
     routes.get("/blob", "blob");
+    routes.post("/echo", "echo");
+    routes.post("/text", "text");
+    routes.post("/form", "form");
+    routes.post("/json", "json");
     routes.get_prefix("/assets/", "asset");
     routes
 }
@@ -43,6 +47,49 @@ fn build_router() -> router::Router {
                 http::binary_response(200, "application/octet-stream")!!,
             )!!;
             await http::write_bytes_response_for(socket, request, head, data)!!;
+        } else if matched.id == "echo" {
+            // Preserve arbitrary request bytes, including invalid UTF-8.
+            const head = security::apply_defaults(
+                http::binary_response(200, "application/octet-stream")!!,
+            )!!;
+            await http::write_bytes_response_for(
+                socket, request, head, request.body_bytes,
+            )!!;
+        } else if matched.id == "text" {
+            when request.body_text() is str {
+                await http::write_response_for(
+                    socket, request, http::text_response(200, request.body)!!,
+                )!!;
+            } else {
+                await http::write_response_for(
+                    socket, request, http::text_response(415, "Body is not UTF-8")!!,
+                )!!;
+            }
+        } else if matched.id == "form" {
+            var value = "";
+            var valid = true;
+            try { value = request.form_param("value") ?? ""; }
+            catch(error) { valid = false; }
+            if valid {
+                await http::write_response_for(
+                    socket, request, http::text_response(200, value)!!,
+                )!!;
+            } else {
+                await http::write_response_for(
+                    socket, request, http::bad_request_response("Invalid form body")!!,
+                )!!;
+            }
+        } else if matched.id == "json" {
+            const parsed = request.json();
+            when parsed is Error {
+                await http::write_response_for(
+                    socket, request, http::bad_request_response("Invalid JSON body")!!,
+                )!!;
+            } else {
+                await http::write_response_for(
+                    socket, request, http::text_response(200, "Valid JSON")!!,
+                )!!;
+            }
         } else if matched.id == "asset" {
             // "/assets/pyramid.wasm" is served from ./assets/pyramid.wasm.
             const raw = bytes::from_str(request.path)!!;

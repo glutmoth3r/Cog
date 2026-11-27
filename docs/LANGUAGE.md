@@ -179,7 +179,9 @@ fn main() {
 The current evaluator supports scalar literals, earlier `comptime` values,
 arithmetic, comparisons, boolean operators, unary operators, and string
 concatenation. It can also evaluate struct constructors, including nested
-constructors and field defaults. An `@comptime fn` can call other `@comptime fn`s and
+constructors and field defaults, and read named or positional struct fields
+such as `settings.limit` or `point.0`. Private fields are accessible only in
+their defining module. An `@comptime fn` can call other `@comptime fn`s and
 can use scalar or struct parameters, named/default arguments, local `const`/`var`
 bindings, `return`, and `if` blocks. Calls are evaluated before runtime lowering;
 their scalar or struct results are materialized for runtime use, and the function
@@ -244,9 +246,9 @@ from the runtime call. Compile-time value parameters and type parameters on
 
 Available annotations include `int`, `uint`, `bigint`, `float`, `bool`, `char`, `str`, singleton
 `nil`, the byte-buffer type `bytes`, user-defined struct/enum names, homogeneous dynamic
-arrays (`T[]`), fixed-shape tuples (`(T, U)`), and nullable forms such as `int?`. These types
-compose recursively, so `int[][]` is an array of arrays. Error is an orthogonal
-computational state, not an implicit member of the annotated normal type.
+arrays (`T[]`), fixed-shape tuples (`(T, U)`), and [nullable forms](#nullable-types) such as
+`int?` or `Node?`. These types compose recursively, so `int[][]` is an array of arrays. Error
+is an orthogonal computational state, not an implicit member of the annotated normal type.
 
 ```cog
 @!include("std")
@@ -279,12 +281,6 @@ takes precedence over the built-in type.
 Arrays keep byte buffers and resource handles apart at run time as the checker does: adding a
 buffer to an array of handles, or a handle to a `bytes[]` array, produces `TypeMismatch`.
 
-A non-nil initializer does not narrow declared `int?` to `int`. Control-flow
-checks can refine nullable values on paths that prove nil is absent, including a
-terminating nil arm and a positive type-pattern arm. Reassignment and calls that
-may mutate the binding invalidate those facts. Use an explicit cast or nil fallback
-when no proof is available. An annotation of `int` rejects normal nil.
-
 `as int`, `as uint`, `as bigint`, `as float`, `as bool`, `as char`, and `as str` request
 conversions. They do not require try/catch; failed conversion produces Error.
 Float-to-integer conversions truncate toward zero and check bounds; negative values
@@ -298,7 +294,9 @@ rather than rendering it. Characters compare by scalar value and do not support
 arithmetic.
 
 Local bindings infer available normal types. Unknown write constraints can leave a
-var dynamic; unannotated global var is currently dynamic. Crossing from a dynamic
+var dynamic. An unannotated global `var` is dynamic even when its initializer has a known
+type, so none of its uses are checked statically, including uses of a value that may be
+`nil`; annotate it to get those checks. Crossing from a dynamic
 value to an annotated type requires `as`. An unannotated parameter or result may be
 dynamic, but arrays carry their element-type invariant on the shared object itself.
 Known mismatches are rejected statically; mutations through dynamic code are checked
@@ -307,6 +305,96 @@ element type from an annotation or an unambiguous use. Inferred comptime type
 parameters on runtime functions and parameterized trait bounds are supported as
 described below. `Task[T]` is the async result-handle type. Callable types and an
 explicit `any` annotation are not implemented.
+
+## Nullable types
+
+`T?` admits `nil` in addition to the values of `T`. It applies to every type: primitives,
+structs, enums, arrays, tuples, records, `bytes`, tasks, function values, and generic
+parameters. `Node?[]` is an array of nullable elements and `Node[]?` is a nullable array.
+An annotation without `?` rejects `nil`.
+Parentheses around a single type only group it: `(fn() -> int)?` is a nullable function
+value, `fn() -> int?` a function with a nullable result, and `(fn() -> int)[]` an array of
+function values.
+
+A `T` value can be used where `T?` is expected; a `T?` value cannot be used where `T` is
+expected. Joining a value with `nil` produces `T?`, for example in
+`if found { node } else { nil }`, an `if` without `else`, a `match` or `when` that can fall
+through, or an array literal containing `nil`.
+
+Using a value that may be `nil` is a compile error: field and tuple access, method calls,
+indexing (both the indexed value and the index), calling a function value, iteration, range
+bounds and steps, `await`, `len`, arithmetic, conditions, passing it to a non-nullable
+parameter, field, or result, and passing it to a builtin or native parameter that requires a
+value, such as `str::to_int` or `hash::of`. `==`, `!=`, string interpolation, `??`, the Error
+inspection methods `unwrap`, `expect`, and `error_kind`, natives that render any value such
+as `str::to_str` and `json::stringify`, and `dynamic` destinations accept it. An `as`
+conversion stays checked at run time and produces Error when it cannot convert `nil`. Dynamic
+values keep their runtime checks.
+
+### Narrowing
+
+A check proves that a binding is not `nil` on the paths where the check holds:
+
+- `x == nil` and `x != nil` in `if` and `while` conditions and match guards, combined with
+  `&&`, `||`, and `!`;
+- an early exit such as `if x == nil { return; }`, `break`, `continue`, or `crash`;
+- `when x is T`, the `else` branch of `when x is nil`, and `match` arms that follow an
+  unguarded `nil` arm;
+- `x ?? fallback`, whose result is not `nil` unless the fallback is.
+
+```cog
+@!include("std")
+use io;
+
+struct Node { value: int, next: Node? }
+
+fn total(head: Node?) -> int {
+    var sum = 0;
+    var current: Node? = head;
+    while current != nil {
+        sum += current.value;
+        current = current.next;
+    }
+    sum
+}
+
+fn second(node: Node) -> int {
+    const next = node.next;
+    if next == nil { return 0; }
+    next.value
+}
+
+fn main() -> nil {
+    const list = Node(value: 1, next: Node(value: 2, next: nil));
+    io::println(total(list) + second(list))!!;
+}
+```
+
+Only bindings narrow: constants, parameters, and variables. Fields and elements can change
+through other references, so bind them to a `const` first. Code is checked in evaluation
+order: in `target[index] = value`, the target and index are checked and evaluated before the
+value, and a proof that the index expression ends does not apply to the value. A proof about a variable ends when
+it is assigned, including anywhere in a loop that is entered afterwards. A variable captured
+by a closure with `[var name]`, and a mutable global, lose their proofs at every call and
+`await`. A variable assigned in a `defer` block is never narrowed.
+
+A non-nil initializer or assignment does not narrow a declared `int?` to `int`. An
+unannotated local `var` takes the type of its initializer, so write
+`var current: Node? = head;` when `nil` is assigned later. An unannotated global `var` is
+dynamic: write `var cached: Node? = find();` to have its uses checked.
+
+Array element types and generic type arguments are exact, including the nullability inside
+function types: `int[]` is not `int?[]`, `Box[int]` is not `Box[int?]`, and
+`Box[fn() -> Node]` is not `Box[fn() -> Node?]`. Branches of `if`, `match`, `try`, `??`, and
+array literals therefore cannot join `Node[]` with `Node?[]` into a used value; the compiler
+does not widen an array that may be shared.
+
+A literal takes the declared element type in a binding initializer, argument, constructor
+field or field default, or function result, also through blocks, `if`, `match`, `try`, and
+`??` branches in those positions, so `const values: int?[] = [1, 2];` and
+`const picked: int?[] = if found { [1] } else { [] };` are valid. Assigning such a literal to
+an existing variable is not yet supported. A generic constructor selects a nullable instance
+from the declared destination or parameter, as in `const box: Box[int?] = Box(value: 1);`.
 
 ## Functions, arguments, and results
 
@@ -500,8 +588,10 @@ fn main() -> nil {
 `if` takes a boolean condition and supports `else`/`else if`. A value-producing
 conditional uses block tails; known normal branch types must be compatible.
 `while` loops while its condition is true. `for name in start..end [step value]`
-uses an exclusive end bound with `int` or `uint` bounds; the default step matches
-the bound type, and zero step produces Error. Unsigned ranges ascend.
+uses an exclusive end bound. The bounds and step use the same integer type
+(`int`, `uint`, or `bigint`). The default step is one of that type, zero step
+produces `Error::InvalidRangeStep`, and negative steps descend. Unsigned ranges
+only ascend. A `bigint` bound gives integer literals in the range `bigint` type.
 Comma-separated `for` clauses iterate in parallel and stop when the first source
 is exhausted. For each clause, Cog evaluates its source and initializes its
 iterator before moving to the next clause; a custom `into_iter()` call is part of
@@ -562,30 +652,20 @@ Enums and structs have nominal identities, including package/module identity.
 tuple and empty structs; nil, Error, anonymous records, enum variants, and other
 structs with the same fields do not match.
 
-An unguarded struct arm makes a `match` exhaustive only when the scrutinee's static type is
-that struct and nil is covered: either by an unguarded `nil` arm, as required for `Person?`,
-or because the scrutinee cannot be nil. Struct types do not yet record nullability, so the
-checker accepts only these proofs without a `nil` arm:
-
-- a constructor call, or a call to a named non-generic function whose result is annotated
-  with a non-nil type;
-- a parameter annotated with a non-nil type that is never assigned or captured mutably;
-- an unannotated or non-nil `const` initialized from one of the above (a `const` copy of a
-  parameter does not count).
-
-Any other scrutinee, such as a field, an element, a `var`, or a method result, needs a `nil`
-or `_` arm. A dynamic scrutinee, or one of another type, still needs `_`. As with exhaustive
-enum matches, an Error scrutinee matches no struct arm and the `match` yields nil; add an
-`Error` or `_` arm to handle it. Generic struct templates such as `Box` cannot be tested
-because a pattern cannot name type arguments. Struct patterns with field bindings
-are not supported.
+An unguarded struct arm makes a `match` exhaustive when the scrutinee's static type is that
+struct. A nullable scrutinee such as `Person?` also needs an unguarded `nil` arm or `_`, and
+the same applies to a nullable enum. A dynamic scrutinee, or one of another type, still needs
+`_`. As with exhaustive enum matches, an Error scrutinee matches no struct arm and the `match`
+yields nil; add an `Error` or `_` arm to handle it. Generic struct templates such as `Box`
+cannot be tested because a pattern cannot name type arguments. Struct patterns with field
+bindings are not supported.
 
 `is` is only the separator inside `when`; `if x is int` and `const b = x is int`
 are errors. Patterns inspect values without casting or narrowing declared nullable
-types. Explicit Error patterns inspect errors before a surrounding catch.
+types, although a successful test [narrows](#narrowing) a binding. Explicit Error patterns
+inspect errors before a surrounding catch.
 
-A struct type test guards access to an optional struct field. For example, a
-`Clone` implementation can copy a recursive field:
+A `Clone` implementation can copy a recursive field by binding it to a constant:
 
 ```cog
 @!include("std")
@@ -596,15 +676,15 @@ struct Node { value: int, next: Node? }
 
 extend Node with Clone {
     fn clone(self) -> Node {
-        var next: Node? = nil;
-        when self.next is Node { next = self.next.clone(); }
-        Node(value: self.value, next: next)
+        const next = self.next;
+        Node(value: self.value, next: if next != nil { next.clone() })
     }
 }
 
 fn main() -> nil {
     const copy = Node(value: 1, next: Node(value: 2, next: nil)).clone();
-    io::println(copy.next.value)!!;
+    const second = copy.next;
+    if second != nil { io::println(second.value)!!; }
 }
 ```
 
