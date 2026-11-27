@@ -1,4 +1,7 @@
 //! Embedded standard-library sources consumed by the common module resolver.
+/// Embedded modules that only other embedded modules can import.
+pub(crate) const INTERNAL: &[&str] = &["byte_match"];
+
 pub(crate) const SOURCES: &[(&str, &str)] = &[
     ("array", include_str!("../core/array.cog")),
     ("array_storage", include_str!("../core/array_storage.cog")),

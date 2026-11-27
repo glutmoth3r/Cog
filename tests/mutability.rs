@@ -1421,3 +1421,19 @@ fn pending_clone_results_add_no_noise_to_a_failing_round() {
         assert!(!error.contains("E1003"), "{error}");
     }
 }
+
+#[test]
+fn conditional_binding_diagnostics_name_only_source_bindings() {
+    for body in [
+        "struct S { x: int } fn main() { if const v = S(x: 1) { v.x = 2; } }",
+        "const A: int[][] = [[1]]; fn main() { if const v = A { if const q = v[0] { q.append(1); } } }",
+    ] {
+        let error = project::compile_source("mutability.cog", &source(body)).unwrap_err();
+        assert!(
+            error.contains("cannot mutate through const/read-only access from"),
+            "{error}"
+        );
+        assert!(error.contains("`v`"), "{error}");
+        assert!(!error.contains('$'), "{error}");
+    }
+}

@@ -11,8 +11,13 @@ node --disable-warning=ExperimentalWarning examples/wasm/run.mjs target/scalar.w
 
 The host needs a WASI Preview 1 runtime. The example runner uses Node 24 or
 later. The guest receives arguments after its executable name, including Unicode
-text. An integer `main` result supplies its low eight bits as the process status;
-other normal results use status 0. It exits with status 1 when an Error reaches
+text. The result of a `main` declared `-> int` supplies its low eight bits as the
+process status; every other `main` uses status 0. The command passes that value,
+from 0 to 255, to the Preview 1 `proc_exit` call. Hosts differ in what they
+accept: the example Node runner reports the whole range, while hosts such as
+Wasmtime accept only statuses below 126 and report a trap or host error for
+larger ones. Use 0 to 125 for a status that is portable across VM, native, and
+WASI runs. The command exits with status 1 when an Error reaches
 the entry point, and reports
 its kind and bytecode origin on stderr. A source coordinate appears when the
 bytecode contains one. Optimizer inlining can remove logical frames. WASI reports

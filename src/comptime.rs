@@ -3598,10 +3598,13 @@ fn eval_binary(
     if let ComptimeValue::Error(error) = right {
         return Ok(ComptimeValue::Error(error));
     }
-    if matches!(op, BinOp::Eq | BinOp::NotEq)
-        && !matches!(left, Nil)
-        && !matches!(right, Nil)
-        && [&left, &right].iter().any(|value| {
+    if matches!(op, BinOp::Eq | BinOp::NotEq) && !matches!(left, Nil) && !matches!(right, Nil) {
+        // Struct equality is the type's `Eq` implementation, which is runtime
+        // code. Comparing the fields here could silently disagree with it.
+        if contains_struct(&left) || contains_struct(&right) {
+            return Err("struct comparison is not supported at comptime: `==` and `!=` use the type's `Eq` implementation, which runs only at runtime".into());
+        }
+        if [&left, &right].iter().any(|value| {
             matches!(
                 value,
                 ComptimeValue::Sequence { .. }
@@ -3610,9 +3613,9 @@ fn eval_binary(
                         ..
                     }
             )
-        })
-    {
-        return Err("array, tuple, and enum equality is not supported at comptime".into());
+        }) {
+            return Err("array, tuple, and enum equality is not supported at comptime".into());
+        }
     }
     match (op, left, right) {
         (BinOp::Add, Int(a), Int(b)) => checked_int(a.checked_add(b)),
@@ -3958,6 +3961,26 @@ fn matches_pattern(pattern: &MatchPattern, value: &ComptimeValue) -> bool {
                     && matches!(value, ComptimeValue::Error(error) if name.rsplit("::").next() == Some(error.kind()))
         }
     }
+}
+
+/// Whether a value is a struct or holds one in an array, tuple or enum payload.
+fn contains_struct(value: &ComptimeValue) -> bool {
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            ComptimeValue::Sequence { items, .. } => pending.extend(items),
+            ComptimeValue::Nominal {
+                enum_name: Some(_),
+                fields,
+                ..
+            } => pending.extend(fields.iter().map(|(_, value)| value)),
+            ComptimeValue::Nominal {
+                enum_name: None, ..
+            } => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn equal(left: &ComptimeValue, right: &ComptimeValue) -> bool {

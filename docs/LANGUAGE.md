@@ -186,6 +186,12 @@ enforce the defining module's private fields. An `@comptime fn` can call other
 `@comptime fn`s and use aggregate parameters and results, named/default arguments,
 local `const`/`var` bindings, `return`, and `if` blocks.
 
+`==` and `!=` are not supported on structs at compile time, including structs
+inside arrays, tuples, or enum payloads: struct equality is the type's
+`eq::Eq` implementation, which runs only at runtime. Such a comparison is a
+compile error. Comparing with `nil` and comparing individual scalar fields
+remain available.
+
 ```cog
 enum Mode { Fast, Limit(n: int) }
 @comptime const PRIMES: int[] = [2, 3, 5, 7];
@@ -365,7 +371,8 @@ A check proves that a binding is not `nil` on the paths where the check holds:
 `crash(value)` is also an expression with no normal result, so
 `node.next ?? crash("missing next node")` asserts a non-`nil` fallback.
 The fallback is evaluated only when the left operand is `nil`; `crash` is fatal
-and is not a recoverable Error.
+and is not a recoverable Error. A parenthesized `crash(...)` can also end a
+block as its tail, as in `fn main() -> int { crash("unreachable") }`.
 
 `if const next = node.next { ... } else { ... }` evaluates the value once and
 binds its non-`nil` result as `next` inside the first branch. The binding is
@@ -1109,12 +1116,15 @@ form, `run` supplies command-line arguments after `--`, excluding the executable
 name. No other `main` parameter signature is supported. `--restricted` denies
 access to `process::args()` and therefore to this argument list.
 `--restricted` also applies fixed runtime limits; see [runtime](RUNTIME.md).
-When `main` returns an `int`, its low eight bits become the process exit status
-(`-1` becomes 255, and 256 becomes 0). This also applies to `@async main` after
-its tasks and cleanup complete. A non-integer result exits with status 0; an
-unhandled runtime failure exits with status 1. VM, JIT, native executables and
-WASI commands use the same rule. Embedding APIs return normally and expose the
-status through `RunContext::exit_code()`.
+When `main` declares the result type `int`, as in `fn main() -> int`, the low
+eight bits of its result become the process exit status (`-1` becomes 255, and
+256 becomes 0). This also applies to `@async fn main() -> int` after its tasks
+and cleanup complete. Every other `main` exits with status 0 after a successful
+run, including one without a declared result type whose tail is an integer and
+one declared as `uint` or `int?`. An unhandled runtime failure exits with status
+1. VM, JIT, native executables and WASI commands compute the status the same way;
+some WASI hosts accept only a smaller [status range](WEBASSEMBLY.md). Embedding
+APIs return normally and expose the status through `RunContext::exit_code()`.
 `use math::{PI, max as larger};` and `use math::*;` are supported. Only `len` and
 `exclusive` are in the ordinary prelude. Imports can also be block-local.
 

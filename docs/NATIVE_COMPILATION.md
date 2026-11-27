@@ -22,9 +22,10 @@ must point to an existing archive.
 
 ## Compilation and execution
 
-An integer result from synchronous or asynchronous `main` becomes the process
-exit status after cleanup, using its low eight bits. Other normal results use
-status 0, and unhandled runtime failures use status 1.
+The result of a synchronous or asynchronous `main` declared `-> int` becomes the
+process exit status after cleanup, using its low eight bits. Every other `main`
+uses status 0 after a successful run, and unhandled runtime failures use status
+1.
 
 Native builds use standard project discovery, lock resolution, build inputs,
 the frontend, optimizer, and bytecode verifier. For a project with multiple

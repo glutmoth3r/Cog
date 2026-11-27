@@ -137,9 +137,17 @@ remain immutable, so changed contents require a new package version.
 The command installs one repository; it does not fetch transitive Git
 dependencies. Dependencies must already resolve through local paths or
 installed packages supported by `dependencies.kdl`. The checkout
-is temporary and is removed after installation. Authentication uses the local
-Git configuration and available credentials, with interactive terminal prompts
-disabled. Installing packages can include native plugins; trust the source
+is temporary. It is created in a new directory under `$COG_HOME/tmp/` (by default
+`~/.cog/tmp/`), private to the current user on Unix, and is removed after
+installation succeeds or fails. Interrupting the command can leave that
+directory behind; it is safe to delete when no installation is running.
+Authentication uses the local Git configuration and available credentials, with
+interactive terminal prompts disabled. Git subprocesses do not inherit
+variables that select a repository, such as `GIT_DIR`, `GIT_WORK_TREE`, or
+`GIT_INDEX_FILE`, so running the command from a Git hook or alias cannot modify
+the calling repository. Configuration and transport variables, such as
+`GIT_CONFIG_GLOBAL`, `GIT_CONFIG_COUNT`, and `GIT_SSH_COMMAND`, remain in
+effect. Installing packages can include native plugins; trust the source
 before using them.
 
 For GitHub installs, local path dependencies must resolve inside the checkout,

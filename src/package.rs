@@ -1191,6 +1191,31 @@ fn user_store_root() -> Result<PathBuf, String> {
     Ok(root)
 }
 
+/// Create `tmp` inside the Cog home for disposable CLI work, private to the
+/// current user on Unix when newly created. An interrupted command can leave
+/// entries there.
+#[doc(hidden)]
+pub fn user_temporary_root() -> Result<PathBuf, String> {
+    let root = user_store_root()?;
+    ensure_store_directory(&root)?;
+    let temporary = root.join("tmp");
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    match builder.create(&temporary) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot create temporary directory {}: {error}",
+                temporary.display()
+            ));
+        }
+    }
+    ensure_store_directory(&temporary)?;
+    Ok(temporary)
+}
+
 fn store_component(value: &str) -> String {
     let display = safe_file_component(value);
     let digest = blake3::hash(value.as_bytes()).to_hex().to_string();

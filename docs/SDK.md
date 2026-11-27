@@ -47,8 +47,8 @@ indices). This identifies a contract; it provides no publisher authentication.
 Locally built unsigned artifacts remain supported.
 
 Running a program never exits the embedding process. After a successful run,
-`RunContext::exit_code()` reports the low eight bits of an integer `main` result
-(or 0 for a non-integer result). A failed run returns its usual SDK error and
+`RunContext::exit_code()` reports the low eight bits of the result of a `main`
+declared `-> int` (or 0 for any other `main`). A failed run returns its usual SDK error and
 resets this metadata to 0. The CLI and executable launchers use the status only
 after cleanup succeeds.
 

@@ -142,8 +142,7 @@ fn github_install_uses_revision_and_existing_local_store_without_network() {
         "second",
     ]);
 
-    let temp = dir.0.join("temporary");
-    std::fs::create_dir_all(&temp).unwrap();
+    let temp = dir.0.join("home/tmp");
     let config = dir.0.join("empty-gitconfig");
     std::fs::write(&config, "").unwrap();
     let prefix = format!("file://{}/", dir.0.join("remotes").display());
@@ -151,7 +150,6 @@ fn github_install_uses_revision_and_existing_local_store_without_network() {
         Command::new(env!("CARGO_BIN_EXE_cog"))
             .args(args)
             .env("COG_HOME", dir.0.join("home"))
-            .env("TMPDIR", &temp)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", &config)
             .env("GIT_CONFIG_COUNT", "1")
@@ -327,4 +325,155 @@ fn github_install_uses_revision_and_existing_local_store_without_network() {
         String::from_utf8_lossy(&safe.stderr)
     );
     assert_eq!(std::fs::read_dir(&temp).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn github_install_ignores_repository_environment_and_checks_out_inside_cog_home() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = Directory::new();
+    let git = |repository: &std::path::Path, args: &[&str]| {
+        let output = Command::new("git")
+            .current_dir(repository)
+            .args([
+                "-c",
+                "user.name=Cog Test",
+                "-c",
+                "user.email=cog@example.invalid",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let source = dir.0.join("remotes/example/math.git");
+    dir.write(
+        "remotes/example/math.git/package.kdl",
+        "package \"integer-math\" version=\"0.1.0\" kind=\"library\"\n",
+    );
+    dir.write("remotes/example/math.git/src/lib.cog", "");
+    let victim = dir.0.join("victim");
+    dir.write("victim/precious.txt", "unchanged\n");
+    for repository in [&source, &victim] {
+        git(repository, &["init", "--quiet", "--initial-branch=main"]);
+        git(repository, &["add", "."]);
+        git(repository, &["commit", "--quiet", "-m", "first"]);
+    }
+    let victim_state = || {
+        (
+            git(&victim, &["symbolic-ref", "HEAD"]),
+            git(&victim, &["rev-parse", "HEAD"]),
+            git(&victim, &["status", "--porcelain"]),
+            std::fs::read(victim.join(".git/index")).unwrap(),
+        )
+    };
+    let before = victim_state();
+
+    // Observe what every Git subprocess receives through a wrapper on PATH.
+    let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("git"))
+        .find(|path| path.is_file())
+        .unwrap();
+    let log = dir.0.join("git.log");
+    let wrapper = dir.0.join("bin/git");
+    dir.write(
+        "git-wrapper",
+        &format!(
+            "#!/bin/sh\n\
+             env | grep '^GIT_' >> '{log}'\n\
+             for last; do :; done\n\
+             if [ \"$2\" = --quiet ] && [ \"$1\" = clone ]; then\n\
+             echo \"checkout=$last\" >> '{log}'\n\
+             ls -ld \"$(dirname \"$last\")\" >> '{log}'\n\
+             fi\n\
+             exec '{git}' \"$@\"\n",
+            log = log.display(),
+            git = real_git.display(),
+        ),
+    );
+    std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+    // A child process writes the executable, so no concurrently forked test can
+    // inherit a writable handle to it.
+    let copied = Command::new("sh")
+        .args(["-c", "cp \"$0\" \"$1\" && chmod 755 \"$1\""])
+        .arg(dir.0.join("git-wrapper"))
+        .arg(&wrapper)
+        .status()
+        .unwrap();
+    assert!(copied.success());
+    let path = std::env::join_paths(
+        std::iter::once(wrapper.parent().unwrap().to_path_buf())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+
+    let config = dir.0.join("empty-gitconfig");
+    std::fs::write(&config, "").unwrap();
+    let prefix = format!("file://{}/", dir.0.join("remotes").display());
+    let home = dir.0.join("home");
+    let victim_git = victim.join(".git");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_cog"))
+            .args(args)
+            .env("PATH", &path)
+            .env("COG_HOME", &home)
+            .env("GIT_DIR", &victim_git)
+            .env("GIT_WORK_TREE", &victim)
+            .env("GIT_INDEX_FILE", victim_git.join("index"))
+            .env("GIT_COMMON_DIR", &victim_git)
+            .env("GIT_OBJECT_DIRECTORY", victim_git.join("objects"))
+            .env("GIT_NAMESPACE", "elsewhere")
+            // User transport and configuration settings stay in effect.
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", &config)
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", format!("url.{prefix}.insteadOf"))
+            .env("GIT_CONFIG_VALUE_0", "https://github.com/")
+            .output()
+            .unwrap()
+    };
+
+    let installed = run(&["install", "--git", "example/math"]);
+    assert_eq!(victim_state(), before);
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let seen = std::fs::read_to_string(&log).unwrap();
+    for removed in [
+        "GIT_DIR=",
+        "GIT_WORK_TREE=",
+        "GIT_INDEX_FILE=",
+        "GIT_COMMON_DIR=",
+        "GIT_OBJECT_DIRECTORY=",
+        "GIT_NAMESPACE=",
+    ] {
+        assert!(!seen.contains(removed), "{removed}: {seen}");
+    }
+    assert!(seen.contains("GIT_CONFIG_GLOBAL="), "{seen}");
+    let temporary = home.join("tmp");
+    assert!(
+        seen.contains(&format!("checkout={}/", temporary.display())),
+        "{seen}"
+    );
+    assert!(seen.contains("\ndrwx------"), "{seen}");
+    assert_eq!(
+        std::fs::metadata(&temporary).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(std::fs::read_dir(&temporary).unwrap().count(), 0);
+
+    assert_failure(
+        &run(&["install", "--git", "example/math", "--rev", "missing"]),
+        "git failed",
+    );
+    assert_eq!(victim_state(), before);
+    assert_eq!(std::fs::read_dir(&temporary).unwrap().count(), 0);
 }

@@ -378,3 +378,46 @@ fn discarded_body_tails_preserve_statement_condition_error_behavior() {
         );
     }
 }
+
+fn crashes(body: &str, expected_output: &str, expected: &str) {
+    let compiled = project::compile_source("tails.cog", &source(body))
+        .unwrap_or_else(|error| panic!("{body}: {error}"));
+    let decoded = bytecode::decode(&bytecode::encode(&compiled).unwrap()).unwrap();
+    let mut output = Vec::new();
+    let error = interpreter::run_with(&decoded, &mut output).unwrap_err();
+    assert_eq!(
+        String::from_utf8(output).unwrap(),
+        expected_output,
+        "{body}"
+    );
+    assert!(error.to_string().contains(expected), "{body}: {error}");
+}
+
+#[test]
+fn crash_is_a_never_typed_block_tail() {
+    for body in [
+        "fn main() -> int { crash(\"boom\") }",
+        "fn value() -> int { crash(\"boom\") } fn main() { io::println(value()); }",
+        "fn value(c: bool) -> int { if c { 1 } else { crash(\"boom\") } } fn main() { io::println(value(false)); }",
+        "fn value(c: bool) -> int { if c { 1 } else { crash(\"boom\"); } } fn main() { io::println(value(false)); }",
+        "fn value(c: bool) -> int { const x: int = if c { crash(\"boom\") } else { 1 }; x } fn main() { io::println(value(true)); }",
+        "fn value(c: int) -> int { match c { _ => { crash(\"boom\") } } } fn main() { io::println(value(0)); }",
+        "fn value(x: int?) -> int { if x == nil { crash(\"boom\") } x + 1 } fn main() { io::println(value(nil)); }",
+        "fn main() { if true { crash(\"boom\") } }",
+    ] {
+        crashes(body, "", "boom");
+    }
+    crashes(
+        "fn reason() -> str { io::println(\"evaluated\"); \"boom\" } fn main() -> int { io::println(\"first\"); crash(reason(), \"context\") }",
+        "first\nevaluated\n",
+        "context",
+    );
+    output(
+        "fn value(c: bool) -> int { if c { 1 } else { crash(\"boom\") } } fn main() { io::println(value(true)); }",
+        "1\n",
+    );
+    output(
+        "fn value(x: int?) -> int { if x == nil { crash(\"boom\") } x + 1 } fn main() { io::println(value(1)); }",
+        "2\n",
+    );
+}

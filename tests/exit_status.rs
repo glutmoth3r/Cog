@@ -119,6 +119,133 @@ fn archived_application_uses_status_and_non_integer_main_defaults_to_zero() {
     );
 }
 
+/// `main` sources whose result must not select the exit status.
+const UNDECLARED_STATUS: &[&str] = &[
+    "fn main() { 7 }",
+    "fn main() { return 7; }",
+    "@async fn main() { (await yield_now())!!; 7 }",
+    "fn main(args: str[]) { 7 }",
+    "fn main() -> uint { 18446744073709551615 }",
+    "@async fn main() -> uint { 18446744073709551615 }",
+    "fn main() -> int? { 7 }",
+    "fn main() -> str { \"normal\" }",
+];
+
+/// `main` sources that declare `int`, with their expected status.
+const DECLARED_STATUS: &[&str] = &[
+    "fn main() -> int { 7 }",
+    "fn main() -> int { return 7; }",
+    "@async fn main() -> int { (await yield_now())!!; 7 }",
+    "fn main(args: str[]) -> int { 7 }",
+    "@comptime const Status: type = int; fn main() -> Status { 7 }",
+];
+
+/// `main` sources that end with an unhandled failure.
+const FAILING_MAIN: &[&str] = &[
+    "fn main() { (1 / 0)!!; }",
+    "fn main() { 1 / 0 }",
+    "@async fn main() { (await yield_now())!!; 1 / 0 }",
+    "@async fn main() { (await yield_now())!!; (1 / 0)!!; }",
+];
+
+fn status_source(body: &str) -> String {
+    format!("@!include(\"std\") {body}")
+}
+
+#[test]
+fn only_a_declared_int_main_selects_the_status() {
+    let engine = sdk::Engine::new();
+    let run_main = |body: &str| {
+        let artifact = project::compile_source("status.cog", &status_source(body))
+            .unwrap_or_else(|error| panic!("{body}: {error}"));
+        let program = engine
+            .decode(&bytecode::encode(&artifact).unwrap())
+            .unwrap();
+        let mut output = Vec::new();
+        let mut context = sdk::RunContext::new(&mut output);
+        let result = program.run_in(&mut context);
+        (result.is_ok(), context.exit_code())
+    };
+    for body in UNDECLARED_STATUS {
+        assert_eq!(run_main(body), (true, 0), "{body}");
+    }
+    for body in DECLARED_STATUS {
+        assert_eq!(run_main(body), (true, 7), "{body}");
+    }
+    for body in FAILING_MAIN {
+        assert_eq!(run_main(body), (false, 0), "{body}");
+    }
+    let directory = Directory::new();
+    let file = directory.0.join("status.cog");
+    for (bodies, expected) in [
+        (UNDECLARED_STATUS, 0),
+        (DECLARED_STATUS, 7),
+        (FAILING_MAIN, 1),
+    ] {
+        for body in bodies {
+            std::fs::write(&file, status_source(body)).unwrap();
+            for jit in [false, true] {
+                let mut options = vec!["run".as_ref(), file.as_os_str()];
+                if jit {
+                    options.push("--jit".as_ref());
+                }
+                let output = run(&options);
+                assert_eq!(
+                    output.status.code(),
+                    Some(expected),
+                    "{body}, jit={jit}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires rustc's wasm32-wasip1 target and Node with WASI Preview 1"]
+fn wasi_ignores_results_of_undeclared_main() {
+    let directory = Directory::new();
+    for (body, expected) in [
+        ("fn main() { 7 }", 0),
+        ("fn main() -> uint { 18446744073709551615 }", 0),
+        ("fn main() -> int { 7 }", 7),
+        ("fn main() { 1 / 0 }", 1),
+    ] {
+        let artifact = project::compile_source("status.cog", &status_source(body)).unwrap();
+        let wasm = directory.0.join("status.wasm");
+        cog::wasm::build_executable(&artifact, &wasm).unwrap();
+        let output = Command::new("node")
+            .arg("--disable-warning=ExperimentalWarning")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/examples/wasm/run.mjs"
+            ))
+            .arg(&wasm)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(expected), "{body}");
+    }
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+#[ignore = "requires a C compiler and the Cog AOT runtime archive"]
+fn aot_ignores_results_of_undeclared_main() {
+    let directory = Directory::new();
+    for (body, expected) in [
+        ("fn main() { 7 }", 0),
+        ("@async fn main() { (await yield_now())!!; 7 }", 0),
+        ("fn main() -> int { 7 }", 7),
+        ("fn main() { 1 / 0 }", 1),
+    ] {
+        let artifact = project::compile_source("status.cog", &status_source(body)).unwrap();
+        let executable = directory.0.join("status");
+        cog::native::build_executable(&artifact, &executable).unwrap();
+        let output = Command::new(&executable).output().unwrap();
+        assert_eq!(output.status.code(), Some(expected), "{body}");
+    }
+}
+
 #[test]
 fn embedding_reports_status_without_exiting_and_resets_it_between_runs() {
     let engine = sdk::Engine::new();

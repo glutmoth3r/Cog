@@ -135,6 +135,35 @@ fn a_third_module_cannot_implement_a_trait() {
 }
 
 #[test]
+fn a_shared_trait_and_type_module_is_suggested_once() {
+    let project = Directory::new(&[
+        (
+            "geo.cog",
+            "public trait Show { fn show(self) -> str; } public struct Square {}",
+        ),
+        (
+            "glue.cog",
+            r#"
+            use geo::Show;
+            use geo::Square;
+            extend Square with Show { fn show(self) -> str { "square" } }
+            "#,
+        ),
+        (
+            "main.cog",
+            "use glue; use geo::Square; fn main() { Square().show(); }",
+        ),
+    ]);
+    let error = project.rejects();
+    assert!(error.contains(MISPLACED), "{error}");
+    assert!(
+        error.contains("move the implementation to module `geo`, or wrap"),
+        "{error}"
+    );
+    assert!(!error.contains("or module `geo`"), "{error}");
+}
+
+#[test]
 fn built_in_targets_belong_only_to_the_trait_module() {
     for target in ["int", "int[]", "(int, str)", "int?"] {
         let source = format!(

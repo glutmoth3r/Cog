@@ -249,6 +249,7 @@ impl Resolver {
         }
         if let Some((module, _)) = type_owner
             && module.0 != CORE
+            && module != trait_owner
         {
             homes.push(self.describe_module(module));
         }

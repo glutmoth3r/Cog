@@ -75,25 +75,8 @@ impl Fixture {
 
 fn with_explicit_std_package(source: &str) -> String {
     const STANDARD_MODULES: &[&str] = &[
-        "array",
-        "ascii",
-        "base64",
-        "byte_match",
-        "bytes",
-        "clone",
-        "entropy",
-        "eq",
-        "err",
-        "fmt",
-        "hex",
-        "io",
-        "math",
-        "ord",
-        "process",
-        "random",
-        "sort",
-        "str",
-        "time",
+        "array", "ascii", "base64", "bytes", "clone", "entropy", "eq", "err", "fmt", "hex", "io",
+        "math", "ord", "process", "random", "sort", "str", "time",
     ];
 
     let has_std_include = source.contains("@!include(\"std\")");
@@ -2182,7 +2165,6 @@ fn core_implementation_helpers_are_private_for_all_import_forms() {
         ("hex", "digit", "digit(10, false)"),
         ("hex", "nibble", "nibble(65)"),
         ("str", "skip_scalars", "skip_scalars(nil, 0, 0)"),
-        ("byte_match", "scan", "scan(nil, nil, 0, 0)"),
         ("random", "state", "state"),
         ("random", "initialized", "initialized"),
         ("random", "MODULUS", "MODULUS"),
@@ -2217,6 +2199,35 @@ fn core_implementation_helpers_are_private_for_all_import_forms() {
             );
         }
     }
+}
+
+#[test]
+fn internal_core_modules_cannot_be_imported_by_user_code() {
+    let f = Fixture::new();
+    f.write("package.kdl", "package \"app\" version=\"0.1.0\"\n");
+    for import in [
+        "use byte_match;",
+        "use byte_match::first;",
+        "use byte_match::*;",
+        "use byte_match from std;",
+        "use std::byte_match;",
+        "use std::byte_match::first;",
+    ] {
+        f.write(
+            "src/main.cog",
+            &format!("@!include(\"std\") {import} fn main() {{}}"),
+        );
+        let error = f.compile().unwrap_err();
+        assert!(error.contains("unknown"), "{import}: {error}");
+    }
+    // The name is free for a project module, while core modules keep using
+    // the internal helper.
+    f.write("src/byte_match.cog", "public fn answer() -> int { 42 }");
+    f.write(
+        "src/main.cog",
+        "@!include(\"std\") use io; use str; use byte_match; fn main() { io::println(byte_match::answer()); io::println(str::contains(\"abc\", \"b\")); }",
+    );
+    assert_eq!(f.run(), "42\ntrue\n");
 }
 
 #[test]

@@ -1656,7 +1656,25 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_crash(&mut self) -> Result<Stmt, HlParseError> {
+        let start = self.pos;
+        let parenthesized = self.peek_at(1) == Some(&Token::LParen);
         let statement = self.parse_crash_inner()?;
+        if parenthesized && self.peek() == Some(&Token::RBrace) {
+            // A block tail is the `crash(...)` expression.
+            let span = self.location(start);
+            let statement = match span.clone() {
+                Some(span) => Stmt::Located(span, Box::new(statement)),
+                None => statement,
+            };
+            let expression = Expr::Block(Block {
+                stmts: vec![statement],
+                tail: None,
+            });
+            return Ok(Stmt::Expr(match span {
+                Some(span) => Expr::Located(span, Box::new(expression)),
+                None => expression,
+            }));
+        }
         self.expect(&Token::Semi)?;
         Ok(statement)
     }

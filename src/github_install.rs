@@ -27,9 +27,35 @@ fn github_url(input: &str) -> Result<String, String> {
     Ok(format!("https://github.com/{owner}/{repository}.git"))
 }
 
+/// Inherited variables that select a repository, its storage or its refs. Git
+/// sets them for hooks and aliases, where they would redirect these commands
+/// onto the caller's repository. Configuration, credential and transport
+/// variables stay in effect, including command-scope `GIT_CONFIG_COUNT` and
+/// `GIT_CONFIG_PARAMETERS`.
+const REPOSITORY_ENVIRONMENT: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG",
+    "GIT_DIR",
+    "GIT_GRAFT_FILE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_PREFIX",
+    "GIT_QUARANTINE_PATH",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_SHALLOW_FILE",
+    "GIT_WORK_TREE",
+];
+
 fn git(args: &[&std::ffi::OsStr], directory: Option<&Path>) -> Result<String, String> {
     let mut command = Command::new("git");
     command.args(args).env("GIT_TERMINAL_PROMPT", "0");
+    for name in REPOSITORY_ENVIRONMENT {
+        command.env_remove(name);
+    }
     if let Some(directory) = directory {
         command.current_dir(directory);
     }
@@ -44,13 +70,16 @@ fn git(args: &[&std::ffi::OsStr], directory: Option<&Path>) -> Result<String, St
 }
 
 fn temporary_directory() -> Result<PathBuf, String> {
+    let root = cog::package::user_temporary_root()?;
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     for _ in 0..16 {
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce)
             .map_err(|error| format!("cannot create temporary checkout: {error}"))?;
-        let path =
-            std::env::temp_dir().join(format!("cog-git-{:032x}", u128::from_ne_bytes(nonce)));
-        match std::fs::create_dir(&path) {
+        let path = root.join(format!("git-{:032x}", u128::from_ne_bytes(nonce)));
+        match builder.create(&path) {
             Ok(()) => return Ok(path),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(format!("cannot create temporary checkout: {error}")),

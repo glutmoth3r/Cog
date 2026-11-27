@@ -1237,6 +1237,25 @@ fn lower_with_modules_and_names(
             cg.out.emit(Instruction::Halt);
             cg.out.bind(returned_normally);
         }
+        // The final value selects the process status only when `main` declares
+        // `int`. Otherwise discard it, keeping an Error so that it still fails.
+        let declares_status = program.items.iter().any(|item| {
+            matches!(item, Item::Function(function)
+            if function.name == "main"
+                && function.result_type.as_ref().is_some_and(|result| {
+                    !result.nilable
+                        && matches!(result.kind, TypeKind::Primitive(VarType::Int))
+                }))
+        });
+        if !declares_status {
+            let halt = cg.fresh_label("main_failed");
+            cg.out.emit(Instruction::Dup);
+            cg.out.emit(Instruction::IsType(ValueType::Error));
+            cg.out.jump(Instruction::JumpIfTrue(0), halt);
+            cg.out.emit(Instruction::Pop);
+            cg.out.emit(Instruction::Push(Value::Nil));
+            cg.out.bind(halt);
+        }
     }
     cg.out.emit(Instruction::Halt);
     for item in &program.items {

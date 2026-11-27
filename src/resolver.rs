@@ -394,6 +394,11 @@ impl Resolver {
         }
     }
 
+    /// Internal embedded modules do not exist for user code.
+    fn visible(key: &ModuleKey, owner: &ModuleKey) -> bool {
+        key.0 != CORE || owner.0 == CORE || !crate::core_modules::INTERNAL.contains(&key.1.as_str())
+    }
+
     fn has_std(&self, owner: &ModuleKey) -> bool {
         owner.0 == CORE
             || self
@@ -432,8 +437,10 @@ impl Resolver {
                                 || crate::builtins::native_module(&native_path))
                         {
                             Some(Binding::Native(native_path))
-                        } else {
+                        } else if Self::visible(&child, owner) {
                             self.module(child)
+                        } else {
+                            None
                         }
                     };
                 match (found, rest.is_empty()) {
@@ -513,7 +520,9 @@ impl Resolver {
         }
         if self.has_std(owner) {
             let key = (CORE, name.to_owned());
-            if self.sources.contains_key(&key) || crate::builtins::native_module(name) {
+            if Self::visible(&key, owner)
+                && (self.sources.contains_key(&key) || crate::builtins::native_module(name))
+            {
                 candidates.insert(key);
             }
         }
@@ -566,6 +575,7 @@ impl Resolver {
             .copied()
             .or_else(|| (package == "std" && self.has_std(owner)).then_some(CORE));
         target
+            .filter(|id| Self::visible(&(*id, path.to_owned()), owner))
             .and_then(|id| {
                 self.module((id, path.to_owned())).or_else(|| {
                     (id == CORE && crate::builtins::native_module(path))

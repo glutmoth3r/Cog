@@ -102,7 +102,8 @@ remaining release acceptance gates, and the next language goals. See the [langua
     scalar and immutable aggregate evaluation, array indexing and length, tuple
     and field reads, enum matching, comptime functions, limited type-valued
     bindings, and documented phase/Error behavior. `@comptime var`, reassignment,
-    loops, and native calls remain outside it. WASI materialization covers supported
+    loops, native calls, and struct `==`/`!=` (a compile error, because `eq::Eq`
+    runs only at runtime) remain outside it. WASI materialization covers supported
     arrays. Tuples and enums require the VM, JIT, or native backend.
   - Beta excludes composing user-defined `Clone` implementations through arrays
     and tuples. Structural cloning remains available for supported primitive leaves

@@ -415,14 +415,12 @@ fn comptime_aggregates_keep_types_through_reads_and_materialization() {
         @comptime const BOX = Box(pack());
         @comptime const PAIR = BOX.value;
         @comptime const FROM_PAIR = PAIR.1;
-        @comptime const STRUCT_EQUAL = Box(1) == Box(1);
         @comptime const SAFE = VALUES[20] ?! 0;
         @comptime const COORDS: (int, int) = (1, 2);
         @comptime const OPTIONAL_COORDS: (int?, int) = COORDS;
         fn main() {
             @comptime const LOCAL = (EMPTY_BOX.value, FROM_PAIR);
             io::println(FIRST);
-            io::println(STRUCT_EQUAL);
             io::println(SAFE);
             var coords = OPTIONAL_COORDS.clone();
             coords.0 = nil;
@@ -435,7 +433,46 @@ fn comptime_aggregates_keep_types_through_reads_and_materialization() {
             io::println(match DEFAULT { Mode::Limit(values, n) => values[n], _ => nil });
         }
         "#),
-        "5\nfalse\n0\nnil\n[9]:[2, 3, 5, 7, nil]:[2, 3, 5, 7]:5:5\n3\n"
+        "5\n0\nnil\n[9]:[2, 3, 5, 7, nil]:[2, 3, 5, 7]:5:5\n3\n"
+    );
+}
+
+#[test]
+fn comptime_struct_comparison_is_a_diagnostic() {
+    let prelude = "use eq::Eq;
+        struct P { x: int }
+        extend P with Eq[P] { fn eq(self, other: P) -> bool { true } }
+        struct Plain { x: int }
+        struct Box[T: type] { value: T }
+        enum E { Data(p: P), Empty }";
+    for declaration in [
+        "@comptime const X = P(1) == P(2);",
+        "@comptime const X = P(1) != P(2);",
+        "@comptime const X = Plain(1) == Plain(1);",
+        "@comptime const X = Box(1) == Box(1);",
+        "@comptime const X = [P(1)] == [P(1)];",
+        "@comptime const X = (1, Plain(1)) != (1, Plain(1));",
+        "@comptime const X = E::Data(P(1)) == E::Empty();",
+        "@comptime const X = [[(0, E::Data(P(1)))]] == [];",
+        "@comptime fn same(a: P, b: P) -> bool { a == b } @comptime const X = same(P(1), P(1));",
+    ] {
+        let source = format!("@!include(\"std\") {prelude} {declaration} fn main() {{}}");
+        let error = project::compile_source("comptime_eq.cog", &source).unwrap_err();
+        assert!(
+            error.contains("error[E4001]")
+                && error.contains("struct comparison is not supported at comptime"),
+            "{declaration}: {error}"
+        );
+    }
+    assert_eq!(
+        run(r#"
+        struct P { x: int }
+        @comptime const ABSENT = P(1) == nil;
+        @comptime const PRESENT = nil != P(1);
+        @comptime const FIELDS = P(1).x == P(1).x;
+        fn main() { io::println((ABSENT, PRESENT, FIELDS)); }
+        "#),
+        "[false, true, true]\n"
     );
 }
 

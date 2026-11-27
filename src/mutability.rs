@@ -883,7 +883,13 @@ impl<'a> Pass<'a> {
                 "E1003",
                 format!(
                     "cannot mutate through const/read-only access from `{}`",
-                    readonly.into_iter().collect::<Vec<_>>().join("`, `")
+                    // `$` names are desugaring temporaries, such as the value
+                    // of `if const`; the source binding is listed beside them.
+                    readonly
+                        .into_iter()
+                        .filter(|name| !name.starts_with('$'))
+                        .collect::<Vec<_>>()
+                        .join("`, `")
                 ),
                 expr.span().cloned().or_else(|| self.location.clone()),
             ));

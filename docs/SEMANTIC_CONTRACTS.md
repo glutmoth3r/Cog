@@ -165,7 +165,11 @@ Contracts clone_01..02 are active regressions.
 Global and local `@comptime const name[: T] = expression;` bindings are evaluated after
 name resolution and before runtime lowering. Scalar literals, earlier comptime
 bindings, arithmetic, comparisons, boolean operators, unary operators, and string
-concatenation are supported. Aggregate expressions include array and tuple
+concatenation are supported. `==` and `!=` on a struct, or on any array, tuple,
+or enum value holding one, are compile errors: struct equality is the type's
+`eq::Eq` implementation, which runs only at runtime, so the evaluator never
+substitutes a field comparison. Comparison with `nil` remains available.
+Aggregate expressions include array and tuple
 literals, struct and enum constructors, array indices, literal tuple positions,
 field reads, built-in array and string `len`, and enum matches. Constructors can
 be nested, use named arguments, and use struct field defaults. Struct field reads
