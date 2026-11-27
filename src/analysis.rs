@@ -5289,6 +5289,7 @@ impl<'a> Checker<'a> {
                     .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
                     .unwrap_or(text.len());
                 let (path, rest) = text.split_at(end);
+                let rest = rest.trim_start();
                 (!path.is_empty() && (rest.is_empty() || rest.starts_with(['.', '['])))
                     .then(|| path.to_owned())
             })

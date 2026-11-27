@@ -1,5 +1,4 @@
 //! Small, conservative source warnings that never affect compilation success.
-use crate::analysis::writes::Writes;
 use crate::ast::{
     BinOp, Block, Expr, FallbackKind, ForClause, FunctionDecl, Item, MatchPattern, Program, Stmt,
     StringPart, TypeAnnotation, TypeKind, UnOp, VarType,
@@ -12,8 +11,11 @@ struct Local {
     read: bool,
     report_unused: bool,
     boolean: bool,
-    /// The value this binding holds here is certainly an Error.
+    /// The value this binding holds here is certainly an Error, unless it or
+    /// the binding it was copied from is rebound.
     error: bool,
+    /// Index into `Linter::bindings`.
+    id: usize,
     task_group: Option<usize>,
     span: Option<SourceSpan>,
 }
@@ -26,6 +28,16 @@ struct TaskGroup {
     report: bool,
 }
 
+/// Facts about one binding that are only complete after its whole item.
+#[derive(Default)]
+struct Binding {
+    /// Assigned or mutably captured somewhere. Nothing is certain about its
+    /// value without control-flow analysis.
+    rebound: bool,
+    /// The binding whose Error this one was initialized from.
+    source: Option<usize>,
+}
+
 #[derive(Default)]
 struct Linter {
     scopes: Vec<HashMap<String, Local>>,
@@ -35,9 +47,9 @@ struct Linter {
     task_groups: Vec<TaskGroup>,
     /// An enclosing string expression visibly handles or propagates Error.
     error_handled: bool,
-    /// Names assigned or mutably captured in the item being checked. Nothing
-    /// is certain about their values without control-flow analysis.
-    rebound: Writes,
+    bindings: Vec<Binding>,
+    /// Error interpolations, reported unless the named binding proves rebound.
+    error_holes: Vec<(usize, Diagnostic)>,
 }
 
 pub(crate) fn check_with_names(
@@ -130,14 +142,11 @@ fn diagnostic_position(diagnostic: &Diagnostic) -> (String, usize) {
 
 impl Linter {
     fn initializer(&mut self, value: &Expr) {
-        self.rebound = Writes::default();
-        self.rebound.expr(value);
         self.expr(value, true);
+        self.report_error_holes();
     }
 
     fn function(&mut self, function: &FunctionDecl) {
-        self.rebound = Writes::default();
-        self.rebound.block(&function.body);
         self.scopes.push(HashMap::new());
         for parameter in &function.params {
             let boolean = parameter
@@ -146,11 +155,25 @@ impl Linter {
                 .is_some_and(|ty| matches!(ty.kind, TypeKind::Primitive(VarType::Bool)));
             self.define_with_type(&parameter.name, false, None, boolean, None);
             if parameter.ty.as_ref().is_some_and(is_error_annotation) {
-                self.mark_error(&parameter.name);
+                self.mark_error(&parameter.name, None);
             }
         }
         self.block(&function.body, true);
         self.pop_scope();
+        self.report_error_holes();
+    }
+
+    fn report_error_holes(&mut self) {
+        for (binding, warning) in std::mem::take(&mut self.error_holes) {
+            let mut chain = std::iter::successors(Some(binding), |&id| self.bindings[id].source);
+            let repeated = self
+                .warnings
+                .iter()
+                .any(|other| other.code == warning.code && other.span == warning.span);
+            if !repeated && !chain.any(|id| self.bindings[id].rebound) {
+                self.warnings.push(warning);
+            }
+        }
     }
 
     fn block(&mut self, block: &Block, report: bool) {
@@ -200,7 +223,7 @@ impl Linter {
                     .as_ref()
                     .is_some_and(|ty| matches!(ty.kind, TypeKind::Primitive(VarType::Bool)))
                     || self.expr_is_boolean(value);
-                let error = self.known_error(value).is_some();
+                let source = self.error_source(value);
                 match pattern {
                     crate::ast::BindingPattern::Name(name) => {
                         let task_group = if cold_task_call {
@@ -209,8 +232,8 @@ impl Linter {
                             task_alias
                         };
                         self.define_with_type(name, report, statement.span(), boolean, task_group);
-                        if error {
-                            self.mark_error(name);
+                        if source.is_some() {
+                            self.mark_error(name, source);
                         }
                     }
                     crate::ast::BindingPattern::Tuple(_) => {
@@ -229,10 +252,12 @@ impl Linter {
                 self.define_with_type(name, report, statement.span(), boolean, None);
             }
             Stmt::Assign { target, value } => {
+                self.mark_rebound(target);
                 self.lvalue(target, report);
                 self.expr(value, report);
             }
             Stmt::CompoundAssign { target, value, .. } => {
+                self.mark_rebound(target);
                 self.expr(target, report);
                 self.expr(value, report);
             }
@@ -250,7 +275,7 @@ impl Linter {
                 self.block(body, report);
                 self.scopes.push(HashMap::new());
                 self.define(catch_name, report, statement.span());
-                self.mark_error(catch_name);
+                self.mark_error(catch_name, None);
                 self.block(catch_block, report);
                 self.pop_scope();
             }
@@ -452,10 +477,13 @@ impl Linter {
                 }
             }
             Expr::Call(name, args) => {
+                // Like `.error_kind()`, these receive the Error themselves.
+                let inspects = matches!(name.as_str(), "err::kind" | "err::message");
                 for argument in args {
                     if name == "spawn" && argument.name.is_none() {
                         self.mark_task_started(&argument.value, report);
                     } else {
+                        self.error_handled = inspects;
                         self.expr(&argument.value, report);
                     }
                 }
@@ -528,20 +556,23 @@ impl Linter {
                 let mut errors = Vec::new();
                 for capture in captures {
                     let name = Expr::Ident(capture.name.clone());
-                    errors.push(self.known_error(&name).is_some());
+                    if capture.mutable {
+                        self.mark_rebound(&name);
+                    }
+                    errors.push(self.error_source(&name));
                     self.expr(&name, report);
                 }
                 self.scopes.push(HashMap::new());
                 for (capture, error) in captures.iter().zip(errors) {
                     self.define(&capture.name, report, expression.span());
-                    if error {
-                        self.mark_error(&capture.name);
+                    if error.is_some() {
+                        self.mark_error(&capture.name, error);
                     }
                 }
                 for parameter in params {
                     self.define(&parameter.name, report, expression.span());
                     if parameter.ty.as_ref().is_some_and(is_error_annotation) {
-                        self.mark_error(&parameter.name);
+                        self.mark_error(&parameter.name, None);
                     }
                 }
                 self.block(body, report);
@@ -562,7 +593,7 @@ impl Linter {
                                     !is_error_pattern(&other.pattern) && other.body == arm.body
                                 }) =>
                         {
-                            self.mark_error(name);
+                            self.mark_error(name, None);
                             Some(name)
                         }
                         _ => None,
@@ -595,7 +626,7 @@ impl Linter {
                 self.block(body, report);
                 self.scopes.push(HashMap::new());
                 self.define(catch_name, report, expression.span());
-                self.mark_error(catch_name);
+                self.mark_error(catch_name, None);
                 self.block(catch_block, report);
                 self.pop_scope();
             }
@@ -654,21 +685,41 @@ impl Linter {
         match expression.node() {
             Expr::Cast(value, _) => self.known_error(value),
             Expr::Ident(name) => self
-                .scopes
-                .iter()
-                .rev()
-                .find_map(|scope| scope.get(name))
+                .lookup(name)
                 .is_some_and(|local| local.error)
                 .then_some(name.as_str()),
             _ => None,
         }
     }
 
-    /// Records that a binding certainly holds an Error for its whole scope.
-    fn mark_error(&mut self, name: &str) {
-        if !self.rebound.assigned.contains(name) && !self.rebound.captured.contains(name) {
-            self.set_error(name, true);
+    fn lookup(&self, name: &str) -> Option<&Local> {
+        self.scopes.iter().rev().find_map(|scope| scope.get(name))
+    }
+
+    /// The binding a certainly-Error expression reads.
+    fn error_source(&self, expression: &Expr) -> Option<usize> {
+        let name = self.known_error(expression)?;
+        self.lookup(name).map(|local| local.id)
+    }
+
+    /// Records an assignment to, or a mutable capture of, a whole binding.
+    fn mark_rebound(&mut self, target: &Expr) {
+        if let Expr::Ident(name) = target.node()
+            && let Some(id) = self.lookup(name).map(|local| local.id)
+        {
+            self.bindings[id].rebound = true;
         }
+    }
+
+    /// Records that a binding holds an Error for its whole scope, provided that
+    /// neither it nor `source` is rebound.
+    fn mark_error(&mut self, name: &str, source: Option<usize>) {
+        if source.is_some()
+            && let Some(id) = self.lookup(name).map(|local| local.id)
+        {
+            self.bindings[id].source = source;
+        }
+        self.set_error(name, true);
     }
 
     fn set_error(&mut self, name: &str, error: bool) {
@@ -689,9 +740,9 @@ impl Linter {
         let span = hole.span().or(string);
         // A `when` with alternative patterns repeats its body in every arm.
         if self
-            .warnings
+            .error_holes
             .iter()
-            .any(|warning| warning.code == "W0008" && warning.span.as_ref() == span)
+            .any(|(_, warning)| warning.span.as_ref() == span)
         {
             return;
         }
@@ -710,7 +761,9 @@ impl Linter {
             "for the message as str, interpolate `{{err::message({name})}}` after `use err;`"
         ))
         .help("if the Error should propagate, make that visible with `!!`");
-        self.warnings.push(warning);
+        if let Some(binding) = self.error_source(hole) {
+            self.error_holes.push((binding, warning));
+        }
     }
 
     fn is_cold_task_call(&self, expression: &Expr) -> bool {
@@ -818,6 +871,8 @@ impl Linter {
     ) {
         // An underscore name is tracked only for what its value is known to be.
         let ignored = name.starts_with('_');
+        let id = self.bindings.len();
+        self.bindings.push(Binding::default());
         self.scopes
             .last_mut()
             .expect("a function or block scope is active")
@@ -828,6 +883,7 @@ impl Linter {
                     report_unused: report_unused && !ignored,
                     boolean: boolean && !ignored,
                     error: false,
+                    id,
                     task_group: task_group.filter(|_| !ignored),
                     span: span.cloned(),
                 },

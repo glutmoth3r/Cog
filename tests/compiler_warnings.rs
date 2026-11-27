@@ -93,6 +93,12 @@ fn warns_when_a_catch_binding_is_interpolated_into_a_string() {
         "const result = risky();\n when result is Error::DivisionByZero | Error::Overflow { log($\"{result}\"); }",
         "const show = fn[](failure: Error) -> str { $\"{failure}\" };",
         "try { risky()!!; } catch(error) { const show = fn[error]() -> nil { log($\"{error}\"); }; (show)(); }",
+        // Writes to a shadowing binding do not rebind the outer one.
+        "try { risky()!!; } catch(e) { const _s = $\"failed: {e}\"; if true { var e = 0; e += 1; } }",
+        "try { risky()!!; } catch(e) { if true { var e = 0; e = 1; log($\"{e}\"); } log($\"failed: {e}\"); }",
+        "try { risky()!!; } catch(e) { var n = 0; const bump = fn[var n]() -> nil { n += 1; }; (bump)(); if true { var e = 0; const set = fn[var e]() -> nil { e = 1; }; (set)(); } log($\"{e}\"); }",
+        "try { risky()!!; } catch(error) { const copy = error; log($\"{copy}\"); } var copy = 0; copy = 1; log($\"{copy}\");",
+        "var e = 0; e = 1; try { risky()!!; } catch(e) { log($\"{e}\"); } log($\"{e}\");",
     ] {
         assert_eq!(error_interpolations(body).len(), 1, "{body}");
     }
@@ -137,6 +143,11 @@ fn does_not_warn_when_error_handling_in_an_interpolation_is_visible() {
         "try { risky()!!; } catch(error) { log($\"failed: {error}\".error_kind()); }",
         "try { risky()!!; } catch(error) { log($\"failed: {error.error_kind()}\"); }",
         "try { risky()!!; } catch(error) { log($\"failed: {err::kind(error)}\"); }",
+        "try { risky()!!; } catch(error) { log(err::kind($\"failed: {error}\")); }",
+        "try { risky()!!; } catch(error) { log(err::message($\"failed: {error}\")); }",
+        "try { risky()!!; } catch(error) { log(err::kind((\"a\" + $\"failed: {error}\") as str)); }",
+        "try { risky()!!; } catch(error) { var copy = error; const second = copy; copy = \"text\"; log($\"{second}\"); }",
+        "try { risky()!!; } catch(error) { var copy = error; const show = fn[copy]() -> nil { log($\"{copy}\"); }; copy = \"text\"; (show)(); }",
         "try { risky()!!; } catch(error) { io::println(error)!!; }",
         "const result = risky();\n log($\"value: {result}\");",
         "const result = risky();\n when result is Error {} else { log($\"value: {result}\"); }",
@@ -154,6 +165,22 @@ fn does_not_warn_when_error_handling_in_an_interpolation_is_visible() {
     ] {
         assert!(error_interpolations(body).is_empty(), "{body}");
     }
+}
+
+#[test]
+fn an_error_string_passed_to_an_inspection_function_is_inspected() {
+    let source = "@!include(\"std\")\nuse io;\nuse err::kind as describe;\nuse err::message;\nfn main() {\n    try { io::println(1 / 0); } catch(failure) {\n        io::println(describe($\"failed: {failure}\"))!!;\n        io::println(message($\"failed: {failure}\"))!!;\n    }\n}\n";
+    let (program, warnings) =
+        project::compile_source_with_warnings("warnings.cog", source).unwrap();
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let decoded = cog::bytecode::decode(&cog::bytecode::encode(&program).unwrap()).unwrap();
+    let mut output = Vec::new();
+    cog::interpreter::run_with(&decoded, &mut output).unwrap();
+    assert_eq!(
+        String::from_utf8(output).unwrap(),
+        "DivisionByZero\ndivision by zero\n"
+    );
 }
 
 #[test]

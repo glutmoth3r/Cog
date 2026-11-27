@@ -81,6 +81,9 @@ the VM's semantics, including Error kinds and payload fields:
   character. Converting between `int` and `uint` reports `Overflow` when the
   value does not fit.
 - `err::message`, with the VM's text.
+- `str::to_str`, which interpolating a single value such as `$"{count}"`,
+  `.to_str()`, and `as str` use. An Error or str passes through unchanged; other
+  supported values become the VM's text.
 - `str::builder`, `str::build`, and `fmt::write`. Only the first `{}` in a
   template is replaced. `str::build` returns a snapshot.
 
@@ -105,7 +108,7 @@ types that mention `float` or `bigint`), BigInt, tuples (including tuple pattern
 array templates from the assembler, `collections::Map` and `Set` operations (they
 need native hashing), `.clone()` on arrays, function values and closures, async,
 crash, filesystem access, user native imports, and other host operations such as
-`str::to_str`, `bytes::copy`, `bytes::slice`, and `bytes::concat`; any other
+`bytes::copy`, `bytes::slice`, and `bytes::concat`; any other
 reachable host operation fails the build. The guest has no VM resource limits:
 allocation failure for `bytes::new` reports `ResourceLimit`, but string and
 builder sizes are bounded only by Wasm memory. This guest reports a source origin

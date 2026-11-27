@@ -519,6 +519,7 @@ impl LowerFunction<'_, '_> {
                     "str::to_char" => "to_char",
                     "str::builder" => "str_builder",
                     "str::build" => "str_build",
+                    "str::to_str" => "to_str",
                     "fmt::write" => "fmt_write",
                     "$vm::iterator_new" => "iterator_new",
                     "$vm::iterator_next" => "iterator_next",

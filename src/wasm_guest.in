@@ -724,6 +724,18 @@ fn fmt_write(arguments: [V; 3], pc: usize) -> V {
     V::StrBuf(buffer)
 }
 
+/// An Error or str passes through; any other value becomes its rendered text.
+fn to_str([value]: [V; 1], pc: usize) -> V {
+    if matches!(value, V::Error(_) | V::Str(_)) {
+        return value;
+    }
+    let mut text = String::new();
+    match render_value(&mut text, &value, 0, "str") {
+        Ok(()) => V::Str(text.into()),
+        Err(resource) => resource_limit(pc, resource),
+    }
+}
+
 /// Build a struct or a core Error from `MakeRecord` entries. The compiler
 /// verified statically that the record is one of the two.
 fn make_record(entries: Vec<(V, V)>, pc: usize) -> V {

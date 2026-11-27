@@ -613,10 +613,13 @@ fn nil_help_spells_globals_as_the_source_references_them() {
              fn main() {{ {body} }}"
         )
     };
-    for spelled in ["local", "config::cached", "shared"] {
+    for (spelled, gap) in ["local", "config::cached", "shared"]
+        .into_iter()
+        .flat_map(|spelled| ["", " ", "\n    "].map(|gap| (spelled, gap)))
+    {
         f.write(
             "main.cog",
-            &program(&format!("const x: int = {spelled}.value;")),
+            &program(&format!("const x: int = {spelled}{gap}.value;")),
         );
         let error = f.compile().unwrap_err();
         let help = format!(

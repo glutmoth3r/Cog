@@ -294,7 +294,9 @@ buffer or rendering depth limit produces a `ResourceLimit` Error instead.
 Compiler warning `W0008` reports an interpolation hole that is certainly an Error:
 a `catch` binding, a parameter declared as `err::Error`, a binding inside an Error
 pattern arm, or a local initialized from one of these, optionally converted with
-`as`. Bindings that are reassigned or mutably captured are not tracked, and neither
-are dynamic values, fields, elements, or call results. No warning is reported when
-the string is the operand of `!!`, `?!`, `.error_kind()`, `.unwrap()`, or
-`.expect()`, including through `+`. The warning does not change runtime behavior.
+`as`. Bindings that are reassigned or mutably captured are not tracked, nor are
+locals initialized from them; a shadowing binding of the same name is tracked
+separately. Dynamic values, fields, elements, and call results are not tracked.
+No warning is reported when the string is the operand of `!!`, `?!`,
+`.error_kind()`, `.unwrap()`, `.expect()`, `err::kind`, or `err::message`,
+including through `+`. The warning does not change runtime behavior.

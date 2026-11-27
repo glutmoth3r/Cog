@@ -395,6 +395,71 @@ fn wasi_error_messages_match_the_vm() {
     );
 }
 
+const TO_STR_PROGRAM: &str = r#"@!include("std")
+use io;
+use str;
+use fmt;
+use bytes;
+use err::Error;
+struct Pair { second: str, first: int }
+struct Node { next: Node? }
+fn risky() -> int { 1 / 0 }
+fn identity(value) { value }
+fn show(value) -> nil {
+    const text = str::to_str(value);
+    when text is Error { io::println("error " + text.error_kind())!!; }
+    else { io::println(text)!!; }
+}
+fn main(args: str[]) -> nil {
+    const number = str::to_int(args[0])!!;
+    io::println($"{number}")!!;
+    io::println($"{str::to_uint(args[0])!!}")!!;
+    io::println($"{number > 0}")!!;
+    io::println($"{args[1]}")!!;
+    io::println($"{nil}")!!;
+    io::println($"{args}")!!;
+    show(-number);
+    show(str::to_uint("18446744073709551615")!!);
+    show(false);
+    show('é');
+    show("plain");
+    show(identity(nil));
+    show([[1, 2], []]);
+    show([nil]);
+    show(Pair("two", 1));
+    show([Pair("a", 2)]);
+    show(bytes::new(3));
+    var builder = str::builder()!!;
+    fmt::write(builder, "{}", "built")!!;
+    show(builder);
+    show(identity(1 / 0));
+    show(Error::InvalidArgument("next"));
+    show([identity(1 / 0)]);
+    try { risky(); }
+    catch(cause) { show(Error::InvalidArgument(cause)); }
+    io::println(number.to_str())!!;
+    io::println(number as str)!!;
+    var node = Node(nil);
+    node.next = node;
+    show(node);
+    const failed = $"{risky()}";
+    io::println(failed.error_kind())!!;
+    io::println($"{risky()}")!!;
+}
+"#;
+
+#[test]
+#[ignore = "requires rustc's wasm32-wasip1 target and Node with WASI Preview 1"]
+fn wasi_converts_values_to_text_like_the_vm() {
+    let output = assert_vm_parity("to_str", TO_STR_PROGRAM, &["5", "text"]);
+    assert!(
+        output.starts_with("5\n5\ntrue\ntext\nnil\n[5, text]\n-5\n"),
+        "{output}"
+    );
+    assert!(output.contains("error ResourceLimit\n"), "{output}");
+    assert!(output.contains("[Error: division by zero]\n"), "{output}");
+}
+
 const SHIFT_PROGRAM: &str = r#"@!include("std")
 use io;
 use str;
