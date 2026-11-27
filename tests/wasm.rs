@@ -341,6 +341,32 @@ fn wasi_string_builders_append_and_snapshot_like_the_vm() {
     assert_eq!(lines[3], "true");
 }
 
+const ERROR_FIELD_PROGRAM: &str = r#"@!include("std")
+use io;
+use err::Error;
+struct Node { value: int }
+fn bad() -> Node { Error::InvalidArgument("next") }
+fn read() -> int { const broken = bad(); broken.value }
+fn main(args: str[]) -> nil {
+    when read() is Error::InvalidArgument(op) { io::println(op)!!; }
+    try { const number = args[0] as int; }
+    catch(error) {
+        io::println(error.from)!!;
+        when error.absent is Error::ParseFailure(from, to) { io::println(to)!!; }
+    }
+    read()!!;
+}
+"#;
+
+#[test]
+#[ignore = "requires rustc's wasm32-wasip1 target and Node with WASI Preview 1"]
+fn wasi_field_reads_of_an_error_keep_the_cause_like_the_vm() {
+    assert_eq!(
+        assert_vm_parity("error_field", ERROR_FIELD_PROGRAM, &["invalid"]),
+        "next\nstr\nint\n"
+    );
+}
+
 const SHIFT_PROGRAM: &str = r#"@!include("std")
 use io;
 use str;

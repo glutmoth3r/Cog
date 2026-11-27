@@ -320,9 +320,11 @@ fn index(value: V, key: V, pc: usize) -> V {
     match (value, key) {
         (V::Error(error), V::Tag(_)) => V::Tag(error.tag().into()),
         (_, V::Tag(_)) => V::Nil,
-        (V::Error(error), V::Str(field)) => error
-            .field(&field)
-            .unwrap_or_else(|| missing_field(field, pc)),
+        // Only the Error's own payload can be read; see the VM's `index_value`.
+        (V::Error(error), V::Str(field)) => match error.field(&field) {
+            Some(value) => value,
+            None => V::Error(error),
+        },
         (error @ V::Error(_), _) | (_, error @ V::Error(_)) => error,
         (V::Array(array), V::Int(index)) => {
             let Ok(items) = array.items.try_borrow() else {

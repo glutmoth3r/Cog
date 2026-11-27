@@ -564,3 +564,41 @@ fn array_contracts_keep_byte_buffers_and_handles_distinct() {
         "TypeMismatch\nTypeMismatch\n2\nTypeMismatch\nTypeMismatch\n2\n"
     );
 }
+
+#[test]
+fn builtin_length_operations_name_the_bytes_api() {
+    for body in [
+        r#"fn main() { const data = bytes::from_str("ab"); io::println(data.len())!!; }"#,
+        r#"fn main() { const data = bytes::from_str("ab"); io::println(len(data))!!; }"#,
+        "fn size(data: bytes) -> int { data.len() }
+         fn main() {}",
+        "fn size(data: bytes?) -> int { if data != nil { return data.len(); } 0 }
+         fn main() {}",
+        "struct Buffer { data: bytes }
+         fn size(buffer: Buffer) -> int { len(buffer.data) }
+         fn main() {}",
+        "fn size(value) -> int { when value is bytes { return value.len(); } 0 }
+         fn main() {}",
+    ] {
+        rejects(body, "does not accept `bytes`");
+        rejects(body, "bytes::len(buffer)");
+    }
+}
+
+#[test]
+fn the_suggested_bytes_length_and_user_length_methods_still_work() {
+    assert_eq!(
+        run(r#"
+        struct Buffer { data: bytes }
+        extend Buffer { fn len(self) -> int { bytes::len(self.data)!! } }
+        fn main() {
+            const data = bytes::from_str("ab");
+            io::println(bytes::len(data)!!)!!;
+            io::println(Buffer(data).len())!!;
+            io::println("ab".len())!!;
+            io::println(len([1, 2, 3]))!!;
+        }
+        "#),
+        "2\n2\n2\n3\n"
+    );
+}

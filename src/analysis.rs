@@ -5246,12 +5246,18 @@ impl<'a> Checker<'a> {
             format!("cannot {action} a value of type `{name}` that may be `nil`")
         };
         let help = match operand.node() {
-            Expr::Ident(binding) if self.writes.deferred.contains(binding) => format!(
-                "`{binding}` is assigned in a `defer` block and cannot be narrowed; copy it to a `const` and check that"
-            ),
-            Expr::Ident(binding) => format!(
-                "check `{binding} != nil` first, or supply a fallback with `{binding} ?? value`"
-            ),
+            Expr::Ident(binding) => {
+                let spelled = self.source_binding_name(binding, operand);
+                if self.writes.deferred.contains(binding) {
+                    format!(
+                        "`{spelled}` is assigned in a `defer` block and cannot be narrowed; copy it to a `const` and check that"
+                    )
+                } else {
+                    format!(
+                        "check `{spelled} != nil` first, or supply a fallback with `{spelled} ?? value`"
+                    )
+                }
+            }
             _ => "bind it to a `const` and check that with `!= nil`, or supply a fallback with `??`; fields and elements are not narrowed".to_owned(),
         };
         self.diagnostics.push(
@@ -5263,6 +5269,44 @@ impl<'a> Checker<'a> {
             .help(help),
         );
         Type::Poison
+    }
+
+    /// Spells a referenced binding as the source does. Globals carry linked
+    /// symbols, and a help message has to quote text that is valid in place:
+    /// the short name, a module path, or an import alias.
+    fn source_binding_name(&self, binding: &str, reference: &Expr) -> String {
+        if !self.access_facts.symbol_names.contains_key(binding) {
+            return binding.to_owned();
+        }
+        // The receiver of a member access has no span of its own; the
+        // enclosing postfix expression starts with it.
+        reference
+            .span()
+            .or(self.location.as_ref())
+            .and_then(|span| span.source.text.get(span.range.clone()))
+            .and_then(|text| {
+                let end = text
+                    .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
+                    .unwrap_or(text.len());
+                let (path, rest) = text.split_at(end);
+                (!path.is_empty() && (rest.is_empty() || rest.starts_with(['.', '['])))
+                    .then(|| path.to_owned())
+            })
+            // The linked symbol is displayed with its module path.
+            .unwrap_or_else(|| binding.to_owned())
+    }
+
+    /// The built-in length operations count array elements and string scalars.
+    /// A byte buffer's length is a `bytes` module operation.
+    fn reject_bytes_length(&mut self, operation: &str, span: Option<&SourceSpan>) {
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E2001",
+                format!("`{operation}` does not accept `bytes`"),
+                span.cloned().or_else(|| self.location.clone()),
+            )
+            .help("import `bytes` and call `bytes::len(buffer)` for the byte length"),
+        );
     }
 
     fn binary_types(
@@ -7231,6 +7275,10 @@ impl<'a> Checker<'a> {
                 if never {
                     return Type::Never;
                 }
+                if method == "len" && receiver == Type::Bytes {
+                    self.reject_bytes_length("len()", expr.span());
+                    return Type::Poison;
+                }
                 match method.as_str() {
                     "empty_like" => match receiver {
                         Type::Array(_) | Type::Dynamic | Type::ErrorValue => receiver,
@@ -7948,6 +7996,10 @@ impl<'a> Checker<'a> {
                 && self.require_value(ty.clone(), &argument.value, "take the length of")
                     == Type::Poison
             {
+                return Type::Poison;
+            }
+            if matches!(builtin, Builtin::Len) && actual.as_slice() == [Type::Bytes] {
+                self.reject_bytes_length("len", span);
                 return Type::Poison;
             }
             if matches!(builtin, Builtin::BuildInput) {

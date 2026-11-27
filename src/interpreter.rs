@@ -4954,9 +4954,12 @@ fn index_value(object: Value, key: Value) -> Value {
         (Value::Variant(tag, _), Value::TypeTag(_)) => Ok(Value::TypeTag(tag.clone())),
         (Value::Error(err), Value::TypeTag(_)) => Ok(Value::TypeTag(err.tag())),
         (_, Value::TypeTag(_)) => Ok(Value::Nil),
-        (Value::Error(err), Value::Str(name)) => {
-            err.field(name).map_or_else(|| missing_field(name), Ok)
-        }
+        // Only the Error's own payload can be read. Any other field belongs to
+        // the value the Error stands in for, so the first cause is kept.
+        (Value::Error(err), Value::Str(name)) => match err.field(name) {
+            Some(value) => Ok(value),
+            None => Ok(object),
+        },
         (Value::Error(_), _) => Ok(object),
         (_, Value::Error(_)) => Ok(key),
         (Value::Array(arr), Value::Int(i)) => array_index(arr, *i),

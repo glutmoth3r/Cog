@@ -608,6 +608,8 @@ Copy, slice, and concat allocate independent storage and obey the runtime buffer
 limit; concat accepts aliases, including the same buffer for both arguments.
 Invalid byte values, negative/out-of-bounds ranges, and invalid UTF-8 produce Error.
 `len(str)` counts Unicode scalars; use `bytes::len(bytes::from_str(text))` for bytes.
+The built-in `len(value)` and `value.len()` do not accept a `bytes` buffer; a
+statically known buffer is a compile error, so call `bytes::len(buffer)`.
 
 ```cog
 @!include("std")

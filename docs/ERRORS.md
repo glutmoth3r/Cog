@@ -76,6 +76,11 @@ Function-call arguments are observed in written order, so an Error argument stop
 later argument evaluation. Boolean short-circuiting and fallback operators retain
 their own lazy rules.
 
+Reading a field of an Error keeps the first cause: when a value that should be a
+struct or record holds an Error, `value.field` evaluates to that same Error, not
+to a `MissingField` Error. The exception is a name that is part of the Error's own
+payload, such as `op` or `message`, which reads the payload.
+
 An `if` or `while` condition observes Error as it evaluates: neither branch/body
 runs, later condition work after the Error is skipped, and a surrounding lexical
 handler receives it. Earlier side effects remain. An Error used as an array index

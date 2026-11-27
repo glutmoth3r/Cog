@@ -597,6 +597,45 @@ fn type_diagnostics_name_structs_and_enums_and_qualify_only_duplicates() {
 }
 
 #[test]
+fn nil_help_spells_globals_as_the_source_references_them() {
+    let f = Fixture::new();
+    f.write(
+        "config.cog",
+        "public struct Entry { value: int }
+         fn find() -> Entry? { Entry(1) }
+         public const cached = find();",
+    );
+    let program = |body: &str| {
+        format!(
+            "use io; use config; use config::{{cached as shared}};
+             fn find() -> config::Entry? {{ config::Entry(2) }}
+             const local = find();
+             fn main() {{ {body} }}"
+        )
+    };
+    for spelled in ["local", "config::cached", "shared"] {
+        f.write(
+            "main.cog",
+            &program(&format!("const x: int = {spelled}.value;")),
+        );
+        let error = f.compile().unwrap_err();
+        let help = format!(
+            "check `{spelled} != nil` first, or supply a fallback with `{spelled} ?? value`"
+        );
+        assert!(error.contains(&help), "{help}: {error}");
+        assert!(!error.contains("$symbol"), "{error}");
+        // The suggested check is valid source and narrows the global.
+        f.write(
+            "main.cog",
+            &program(&format!(
+                "if {spelled} != nil {{ io::println({spelled}.value)!!; }}"
+            )),
+        );
+        f.compile().unwrap();
+    }
+}
+
+#[test]
 fn selective_core_constant_alias_works_in_interpolation() {
     let f = Fixture::new();
     f.write("package.kdl", "package \"app\" version=\"1\"\n");
