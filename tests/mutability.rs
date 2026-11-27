@@ -271,6 +271,76 @@ fn chained_helpers_over_map_records_keep_effects_and_check_quickly() {
     );
 }
 
+/// A `main` in which rows keep flowing between `size` locals, so every row can
+/// have reached any local through any subset of the others.
+fn row_ring(size: usize, setup: &str, end: &str) -> String {
+    let mut body = format!("fn main() {{ {setup} var seed = [[0]]; seed.append([1]);");
+    for i in 0..size {
+        body.push_str(&format!(
+            "var a{i}: int[][] = []; a{i}.append(seed[0]!!)!!;"
+        ));
+    }
+    body.push_str("for _round in 0..3 {");
+    for i in 0..size {
+        for step in [1, 3] {
+            let target = (i + step) % size;
+            body.push_str(&format!("a{target}.append(a{i}[0]!!)!!;"));
+        }
+    }
+    body.push_str(&format!("}} {end} }}"));
+    body
+}
+
+#[test]
+fn recombined_alias_origins_check_quickly_and_keep_capabilities() {
+    // Keeping each combination of origins apart took minutes at this size.
+    let (done, finished) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        assert_eq!(
+            run(&row_ring(
+                16,
+                "",
+                "a7[0]!!.append(9)!!; io::println(seed[0]!!);"
+            )),
+            "[0, 9]\n"
+        );
+        rejects(
+            &row_ring(
+                16,
+                "const frozen = [7];",
+                "a0.append(frozen)!!; a1.append(a0[1]!!)!!; a1[0]!!.append(9)!!; a1[7]!!.append(9)!!;",
+            ),
+            "cannot mutate through const/read-only access from `frozen`",
+        );
+        done.send(()).unwrap();
+    });
+    if finished.recv_timeout(std::time::Duration::from_secs(60))
+        == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    {
+        panic!("mutability analysis exceeded its time ceiling");
+    }
+    worker.join().unwrap();
+}
+
+#[test]
+fn merged_alias_origins_still_justify_vars_and_block_strong_updates() {
+    // `p` stands for one array reached through either `x` or `y`.
+    assert_eq!(
+        run(
+            "fn f(flag: bool) { var inner = [[1]]; var x = inner; var y = inner; \
+             var p = if flag { x } else { y }; p[0] = [2]; p[0]!!.append(3)!!; \
+             io::println(inner); } fn main() { f(true); }"
+        ),
+        "[[2, 3]]\n"
+    );
+    // An element overwritten through two origins keeps its older capability.
+    rejects(
+        "fn f(flag: bool) { const frozen = [1]; var inner = [frozen]; var x = inner; var y = inner; \
+         var p = if flag { x } else { y }; p[0] = [2]; p[0]!!.append(3)!!; } fn main() { f(true); }",
+        "cannot mutate through const/read-only access from `frozen`",
+    );
+}
+
 #[test]
 fn local_constants_and_default_arguments_are_checked_in_declaration_context() {
     rejects(

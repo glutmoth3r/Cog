@@ -83,26 +83,53 @@ impl Path {
         path
     }
 }
-#[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+/// The references a value may stand for, sorted, with at most one entry for each
+/// path in each of the writable and read-only classes. Calls and control flow
+/// combine origins differently at nearly every step, so keeping each combination
+/// apart grows exponentially. Checks only need the union of origins per class.
+#[derive(Clone, Default, PartialEq, Eq)]
 struct Access {
-    refs: BTreeSet<Reference>,
+    refs: Vec<Reference>,
 }
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq)]
 struct Reference {
     path: Path,
     readonly: BTreeSet<String>,
     // Provenance also counts mutable uses through aliases of a local var.
     locals: BTreeSet<usize>,
+    // Distinct origins share this entry, which therefore rules out a strong
+    // update even when it is the only entry.
+    merged: bool,
+}
+impl Reference {
+    fn class(&self) -> (&Path, bool) {
+        (&self.path, !self.readonly.is_empty())
+    }
+    fn merge(&mut self, other: &Self) {
+        self.merged |= other.merged;
+        if self.readonly != other.readonly || self.locals != other.locals {
+            self.merged = true;
+            for name in &other.readonly {
+                if !self.readonly.contains(name) {
+                    self.readonly.insert(name.clone());
+                }
+            }
+            self.locals.extend(&other.locals);
+        }
+    }
 }
 impl Access {
     fn root(root: Root) -> Self {
-        Self {
-            refs: [Reference {
-                path: Path { root, keys: vec![] },
-                readonly: BTreeSet::new(),
-                locals: BTreeSet::new(),
-            }]
-            .into(),
+        symbolic(Path { root, keys: vec![] })
+    }
+    fn slot(&self, reference: &Reference) -> Result<usize, usize> {
+        self.refs
+            .binary_search_by(|entry| entry.class().cmp(&reference.class()))
+    }
+    fn insert(&mut self, reference: Reference) {
+        match self.slot(&reference) {
+            Ok(index) => self.refs[index].merge(&reference),
+            Err(index) => self.refs.insert(index, reference),
         }
     }
     fn union(&mut self, other: &Self) {
@@ -111,8 +138,9 @@ impl Access {
             return;
         }
         for reference in &other.refs {
-            if !self.refs.contains(reference) {
-                self.refs.insert(reference.clone());
+            match self.slot(reference) {
+                Ok(index) => self.refs[index].merge(reference),
+                Err(index) => self.refs.insert(index, reference.clone()),
             }
         }
     }
@@ -127,21 +155,18 @@ impl Access {
             let mut reference = reference.clone();
             reference.readonly.extend(through.readonly.iter().cloned());
             reference.locals.extend(&through.locals);
-            self.refs.insert(reference);
+            reference.merged |= through.merged;
+            self.insert(reference);
         }
     }
     fn map(&self, mut f: impl FnMut(&mut Reference)) -> Self {
-        Self {
-            refs: self
-                .refs
-                .iter()
-                .cloned()
-                .map(|mut r| {
-                    f(&mut r);
-                    r
-                })
-                .collect(),
+        let mut result = Self::default();
+        for reference in &self.refs {
+            let mut reference = reference.clone();
+            f(&mut reference);
+            result.insert(reference);
         }
+        result
     }
     fn readonly(&self, name: &str) -> Self {
         self.map(|r| {
@@ -227,12 +252,12 @@ impl State<'_> {
 }
 fn symbolic(path: Path) -> Access {
     Access {
-        refs: [Reference {
+        refs: vec![Reference {
             path,
             readonly: BTreeSet::new(),
             locals: BTreeSet::new(),
-        }]
-        .into(),
+            merged: false,
+        }],
     }
 }
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -746,7 +771,7 @@ impl<'a> Pass<'a> {
     fn project(&self, access: &Access, key: &Key) -> Access {
         if key == &Key::Descendant {
             let mut result = access.clone();
-            let mut pending: Vec<_> = access.refs.iter().cloned().collect();
+            let mut pending = access.refs.clone();
             let mut visited = BTreeSet::new();
             while let Some(reference) = pending.pop() {
                 if !visited.insert(reference.path.clone()) {
@@ -822,8 +847,9 @@ impl<'a> Pass<'a> {
     }
     fn store(&mut self, access: &Access, key: Key, value: Access, strong: bool) {
         self.retain_deferred_store(access, &value);
-        let strong =
-            strong && access.refs.len() == 1 && !matches!(key, Key::AnyIndex | Key::Descendant);
+        let strong = strong
+            && matches!(access.refs.as_slice(), [reference] if !reference.merged)
+            && !matches!(key, Key::AnyIndex | Key::Descendant);
         for reference in &access.refs {
             let path = reference.path.child(key.clone());
             if strong && !self.state.many.contains(&reference.path.root) {
