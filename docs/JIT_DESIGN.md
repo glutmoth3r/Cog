@@ -42,6 +42,15 @@ JIT V1 is successful when it can safely select work that is likely to repay comp
   then reproduces errors and traces itself. Eligibility does not imply native
   coverage: an unlowered instruction, such as aggregate construction, ends
   the compiled attempt in the same way.
+- An OSR loop backs off from a compiled callee that keeps ending this way,
+  because each attempt repeats work the VM then redoes. The first 128
+  consecutive failures cost nothing extra, which also lets calls missed inside
+  the callee become hot enough to compile. Later failures send 2, 4, and up to
+  4096 calls straight to the VM before the next native attempt. A success or any
+  newly compiled function resets the count, so a callee is never disabled for
+  good. A function the VM entered, or a program whose bridge declines calls,
+  needs no separate rule: a failure leaves the function, which has its own
+  cooldown.
 - `CallValue` targets that are closures or bound function values owned by
   the running program use the same adapter when their body is compiled and
   side-effect free; captures are passed through the child frame. Other

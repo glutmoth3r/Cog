@@ -23,6 +23,7 @@ use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
 use num_traits::{ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -44,6 +45,11 @@ const MAX_JIT_CALL_ARGS: usize = 16;
 /// Compiled callees nest on the native stack. Deeper chains unwind to the
 /// outermost compiled call, which the VM then executes.
 const MAX_JIT_CALL_DEPTH: usize = 32;
+/// Consecutive failed attempts before a compiled callee is backed off. They
+/// give calls it misses enough heat to be compiled.
+const CALLEE_FAILURE_TOLERANCE: u32 = HOT_CALL_THRESHOLD as u32;
+/// Longest run of bridged calls between native retries of a failing callee.
+const MAX_CALLEE_BACKOFF_CALLS: u32 = 4096;
 const MAX_JIT_MEMOIZED_CALLABLES: usize = 64;
 const MAX_BOOTSTRAP_PROBES: usize = 3;
 const WINDOW_BACKEDGES: u64 = 256;
@@ -131,6 +137,7 @@ struct JitCallable<'a> {
     plan: &'a FunctionPlan,
     signature: &'a CallableSignature,
     int_slot_arguments: Option<bool>,
+    backoff: &'a Cell<CalleeBackoff>,
 }
 
 /// Read-only view of the JIT state used to resolve compiled callees lazily
@@ -180,6 +187,7 @@ impl<'a> JitCallableSource<'a> {
             plan: plan.as_ref(),
             signature,
             int_slot_arguments,
+            backoff: &candidate.callee_backoff,
         })
     }
 }
@@ -283,6 +291,9 @@ struct JitExecutionContext<'a, 'bridge> {
     /// Number of compiled callees currently active on the native stack.
     call_depth: usize,
     bridge: Option<&'a mut RuntimeBridge<'bridge>>,
+    /// The bridge refuses Cog calls for this program, so a failed compiled
+    /// call leaves the function instead of being repeated.
+    bridge_declines_calls: bool,
     arguments: Vec<Value>,
     committed: bool,
     bridge_active: bool,
@@ -307,6 +318,7 @@ impl<'a> JitExecutionContext<'a, '_> {
             call_frames: Vec::new(),
             call_depth: 0,
             bridge: None,
+            bridge_declines_calls: false,
             arguments: Vec::new(),
             committed: false,
             bridge_active: false,
@@ -569,6 +581,50 @@ struct ProfileFile {
     functions: BTreeMap<usize, FunctionProfile>,
 }
 
+/// Backoff for a callee of a function the VM entered with a bridge. A compiled
+/// callee that cannot finish natively is repeated by the VM in full, so one
+/// that keeps failing is bridged without a native attempt for a doubling number
+/// of calls. Occasional failures skip nothing, and a success or a newly
+/// compiled function resets the state, so a callee is never disabled for good.
+#[derive(Debug, Clone, Copy, Default)]
+struct CalleeBackoff {
+    consecutive_failures: u32,
+    calls_to_skip: u32,
+    #[cfg(test)]
+    native_attempts: u64,
+}
+
+impl CalleeBackoff {
+    /// Consumes one call of the current wait, if any.
+    fn skip_call(&mut self) -> bool {
+        let skip = self.calls_to_skip != 0;
+        self.calls_to_skip = self.calls_to_skip.saturating_sub(1);
+        skip
+    }
+
+    fn record(&mut self, completed: bool) {
+        self.consecutive_failures = if completed {
+            0
+        } else {
+            self.consecutive_failures.saturating_add(1)
+        };
+        self.calls_to_skip = match self
+            .consecutive_failures
+            .saturating_sub(CALLEE_FAILURE_TOLERANCE)
+        {
+            0 => 0,
+            excess => 1 << excess.min(MAX_CALLEE_BACKOFF_CALLS.ilog2()),
+        };
+    }
+
+    fn update<T>(cell: &Cell<Self>, change: impl FnOnce(&mut Self) -> T) -> T {
+        let mut state = cell.get();
+        let result = change(&mut state);
+        cell.set(state);
+        result
+    }
+}
+
 struct Candidate {
     profile: FunctionProfile,
     window_edges: u64,
@@ -581,6 +637,8 @@ struct Candidate {
     last_selection_call: u64,
     compiled: Option<CompiledFunction>,
     disabled: bool,
+    /// Updated while native code holds the candidates immutably.
+    callee_backoff: Cell<CalleeBackoff>,
 }
 
 impl Candidate {
@@ -597,6 +655,7 @@ impl Candidate {
             last_selection_call: 0,
             compiled: None,
             disabled: false,
+            callee_backoff: Cell::default(),
         }
     }
 }
@@ -676,6 +735,8 @@ pub(crate) struct JitState {
     bootstrap_probes: usize,
     compile_tokens_ns: i64,
     token_refill_at: Instant,
+    /// Learned from the first declined operation; the reasons are program-wide.
+    bridge_declines_calls: bool,
 }
 
 impl JitState {
@@ -725,6 +786,7 @@ impl JitState {
             bootstrap_probes: 0,
             compile_tokens_ns: TOKEN_CAPACITY_NS as i64,
             token_refill_at: Instant::now(),
+            bridge_declines_calls: false,
         })
     }
 
@@ -773,7 +835,15 @@ impl JitState {
                 0
             },
             token_refill_at: Instant::now(),
+            bridge_declines_calls: false,
         })
+    }
+
+    /// A new compiled function may be what a failing callee was missing.
+    fn retry_failing_callees(&mut self) {
+        for candidate in self.candidates.values() {
+            CalleeBackoff::update(&candidate.callee_backoff, |backoff| backoff.record(true));
+        }
     }
 
     pub(crate) fn contains(&self, entry: usize, target: usize) -> bool {
@@ -855,6 +925,7 @@ impl JitState {
         // OSR entry can use the callee once it has been compiled.
         runtime.profile_fallback_calls = self.compiler.is_some();
         runtime.bridge = Some(bridge);
+        runtime.bridge_declines_calls = self.bridge_declines_calls;
         runtime.stats = debug.then(BridgeStats::default);
         let runtime_context = (&mut runtime as *mut JitExecutionContext<'_, '_>).cast();
         let mut roots = Vec::new();
@@ -936,8 +1007,10 @@ impl JitState {
             return Some(JitExit::InvalidCommittedFrame);
         }
         let committed = runtime.committed;
+        let bridge_declines_calls = runtime.bridge_declines_calls;
         let deferred_calls = std::mem::take(&mut runtime.deferred_calls);
         drop(runtime);
+        self.bridge_declines_calls = bridge_declines_calls;
         let exit = match decode_exit(&plan, artifact, &frame, status) {
             Ok(exit) => exit,
             Err(()) => {
@@ -1337,6 +1410,7 @@ impl JitState {
                             }
                         );
                     }
+                    self.retry_failing_callees();
                     self.persist();
                 }
                 Err(error) => {
@@ -1509,6 +1583,7 @@ impl JitState {
                             candidate.profile.total_calls
                         );
                     }
+                    self.retry_failing_callees();
                     self.persist();
                 }
                 Err(error) => {
@@ -2906,6 +2981,7 @@ unsafe fn jit_runtime_bridge_inner(
         }
         BridgeOutcome::Unsupported(reason) => {
             context.fallback = Some(reason);
+            context.bridge_declines_calls = true;
             context.bridge_active = false;
             false
         }
@@ -3314,7 +3390,8 @@ unsafe fn jit_compiled_value_call(
 /// result is rooted again, so repeated calls do not accumulate temporaries.
 /// Any exit other than a normal completion with a non-Error value of the
 /// declared result type returns `None`. The callee committed nothing, so the
-/// caller can let the VM execute the whole call instead.
+/// caller can let the VM execute the whole call instead. Calls that the bridge
+/// would repeat are subject to the callee's `CalleeBackoff`.
 ///
 /// SAFETY: `frame` is the live caller frame and `context_ptr` its active
 /// execution context. `base..base + arity` lies within the caller's verified
@@ -3332,6 +3409,17 @@ unsafe fn invoke_compiled_callee(
     // the whole invocation and each access is a short borrow that ends before
     // the native callee runs or after it returned.
     if arity > MAX_JIT_CALL_ARGS || unsafe { (*context_ptr).call_depth } >= MAX_JIT_CALL_DEPTH {
+        return None;
+    }
+    // Nested failures unwind to the call made by the VM-entered function, so
+    // only that call is repeated. When the bridge cannot repeat it, the failure
+    // leaves that function instead, which has its own cooldown.
+    let bridged = unsafe {
+        (*context_ptr).call_depth == 0
+            && (*context_ptr).bridge.is_some()
+            && !(*context_ptr).bridge_declines_calls
+    };
+    if bridged && CalleeBackoff::update(callable.backoff, CalleeBackoff::skip_call) {
         return None;
     }
     let variant_tags = unsafe { (*context_ptr).variant_tags };
@@ -3409,6 +3497,8 @@ unsafe fn invoke_compiled_callee(
         // SAFETY: `callable.entry` belongs to the same live JITModule as the
         // caller, and `child.prepare` built its frame for that function. The
         // child buffers, shared roots, and execution context outlive the call.
+        #[cfg(test)]
+        CalleeBackoff::update(callable.backoff, |backoff| backoff.native_attempts += 1);
         let status = unsafe { (callable.entry)(&mut child.frame) };
         unsafe { (*context_ptr).call_depth -= 1 };
         let artifact = unsafe { (*context_ptr).artifact };
@@ -3442,10 +3532,14 @@ unsafe fn invoke_compiled_callee(
         (*frame.roots).truncate(root_len);
         (*context_ptr).call_frames.push(child);
     }
-    match result? {
+    let result = result.and_then(|result| match result {
         Ok(slot) => Some(slot),
         Err(value) => append_owned_value(value, unsafe { &mut *frame.roots }, variant_tags),
+    });
+    if bridged {
+        CalleeBackoff::update(callable.backoff, |backoff| backoff.record(result.is_some()));
     }
+    result
 }
 
 fn decode_exit(
@@ -7418,6 +7512,7 @@ fn main() -> nil {}
             last_selection_call: 0,
             compiled: None,
             disabled: false,
+            callee_backoff: Cell::default(),
         }
     }
 
@@ -7510,6 +7605,7 @@ fn main() -> nil {}
             bootstrap_probes: MAX_BOOTSTRAP_PROBES,
             compile_tokens_ns: TOKEN_CAPACITY_NS as i64,
             token_refill_at: Instant::now(),
+            bridge_declines_calls: false,
         };
 
         let decision = state.candidate_decision(entry);
@@ -7586,6 +7682,7 @@ fn main() -> nil {}
             bootstrap_probes: MAX_BOOTSTRAP_PROBES,
             compile_tokens_ns: TOKEN_CAPACITY_NS as i64,
             token_refill_at: Instant::now(),
+            bridge_declines_calls: false,
         };
 
         assert!(matches!(
@@ -8284,5 +8381,214 @@ ret
             );
             assert!(jit.candidates[&leaf].compiled.is_some());
         }
+    }
+
+    /// `leaf(index, from, period)` runs a scalar prefix and then constructs an
+    /// array, which is unsupported natively, when `index < from` or `index` is
+    /// a multiple of `period`. `middle` only forwards to `leaf`.
+    const LATE_EXIT_CALLS: &str = "call main 0
+pop
+halt
+.function work 3 0
+work:
+store 2
+store 1
+store 0
+push 0
+store 3
+push 0
+store 4
+loop:
+load 3
+load 0
+lt
+jz done
+load 4
+load 3
+load 1
+load 2
+call middle 3
+add
+store 4
+load 3
+push 1
+add
+store 3
+jmp loop
+done:
+load 4
+ret
+.function middle 3 0
+middle:
+store 2
+store 1
+store 0
+load 0
+load 1
+load 2
+call leaf 3
+ret
+.function leaf 3 0
+leaf:
+store 2
+store 1
+store 0
+load 0
+load 1
+lt
+jnz unsupported
+load 0
+load 2
+mod
+push 0
+eq
+jz fine
+unsupported:
+push 0
+array 1
+pop
+fine:
+load 0
+ret
+.function main 0 0
+main:
+push 0
+ret
+";
+
+    /// Runs the `work` loop over `calls` iterations with `compiled` callees and
+    /// returns the native attempts of the callee `work` calls and the bridged
+    /// calls.
+    fn run_late_exit_loop(calls: i64, from: i64, period: i64, nested: bool) -> (u64, i64) {
+        let mut artifact = crate::parser::assemble(LATE_EXIT_CALLS).unwrap();
+        let entries = callable_entries(&artifact);
+        let [work, middle, leaf, _main] = entries[..] else {
+            panic!("fixture declares four functions");
+        };
+        // `work` calls `middle`; the direct case redirects it to `leaf`.
+        let callee = if nested { middle } else { leaf };
+        let call = (work..middle)
+            .find(|pc| matches!(artifact.instructions[*pc], Instruction::Call(..)))
+            .unwrap();
+        artifact.instructions[call] = Instruction::Call(callee, 3);
+        let mut jit = JitState::new(&artifact, None).unwrap();
+        for entry in [work, middle, leaf] {
+            force_call_compiled(&mut jit, &artifact, entry);
+        }
+        let target = jit.plans[&work].osr_entries[0];
+        let mut pc = target;
+        let mut locals = [calls, from, period, 0, 0]
+            .map(|value| Some(Value::Int(value)))
+            .to_vec();
+        let mut stack = Vec::new();
+        let mut bridge_calls = 0;
+        let exit = jit.try_osr(
+            &artifact,
+            work,
+            target,
+            &mut pc,
+            &mut locals,
+            0,
+            &mut stack,
+            0,
+            &crate::interpreter::CaptureValues::default(),
+            &mut false,
+            false,
+            &Rc::new(()),
+            &mut |_, operands, _| {
+                bridge_calls += 1;
+                BridgeOutcome::Returned {
+                    value: operands[0].clone(),
+                    propagation_pending: false,
+                }
+            },
+        );
+        assert_eq!(exit, Some(JitExit::Completed));
+        let expected = calls * (calls - 1) / 2;
+        assert!(
+            matches!(stack[..], [Value::Int(sum)] if sum == expected),
+            "{stack:?}"
+        );
+        (
+            jit.candidates[&callee].callee_backoff.get().native_attempts,
+            bridge_calls,
+        )
+    }
+
+    #[test]
+    fn callees_that_always_exit_late_back_off_to_the_vm_bridge() {
+        for nested in [false, true] {
+            let (attempts, bridge_calls) = run_late_exit_loop(20_000, 0, 1, nested);
+            assert_eq!(bridge_calls, 20_000, "nested={nested}");
+            // The tolerance, the doubling waits, then one probe per cap.
+            assert!(attempts <= 150, "nested={nested} attempts={attempts}");
+        }
+    }
+
+    #[test]
+    fn occasionally_failing_callees_keep_running_natively() {
+        for nested in [false, true] {
+            let (attempts, bridge_calls) = run_late_exit_loop(2_000, 0, 10, nested);
+            assert_eq!(attempts, 2_000, "nested={nested}");
+            assert_eq!(bridge_calls, 200, "nested={nested}");
+        }
+    }
+
+    #[test]
+    fn declined_bridges_do_not_back_off_callees() {
+        let artifact = crate::parser::assemble(LATE_EXIT_CALLS).unwrap();
+        let mut jit = JitState::new(&artifact, None).unwrap();
+        let entries = callable_entries(&artifact);
+        let [work, middle, leaf, _main] = entries[..] else {
+            panic!("fixture declares four functions");
+        };
+        for entry in [work, middle, leaf] {
+            force_call_compiled(&mut jit, &artifact, entry);
+        }
+        let target = jit.plans[&work].osr_entries[0];
+        let rounds = 2 * u64::from(CALLEE_FAILURE_TOLERANCE);
+        for _ in 0..rounds {
+            jit.candidates.get_mut(&work).unwrap().retry_after_backedges = 0;
+            let mut pc = target;
+            // Every call is unsupported: `index` stays below `from`.
+            let mut locals = [1, 1, 1, 0, 0]
+                .map(|value| Some(Value::Int(value)))
+                .to_vec();
+            let exit = jit.try_osr(
+                &artifact,
+                work,
+                target,
+                &mut pc,
+                &mut locals,
+                0,
+                &mut Vec::new(),
+                0,
+                &crate::interpreter::CaptureValues::default(),
+                &mut false,
+                false,
+                &Rc::new(()),
+                &mut |_, _, _| BridgeOutcome::Unsupported("test bridge"),
+            );
+            assert!(matches!(exit, Some(JitExit::ResumeAt { .. })), "{exit:?}");
+        }
+        assert_eq!(
+            jit.candidates[&middle].callee_backoff.get().native_attempts,
+            rounds
+        );
+    }
+
+    #[test]
+    fn backed_off_callees_return_to_native_code_once_they_succeed() {
+        let (attempts, bridge_calls) = run_late_exit_loop(20_000, 1_000, i64::MAX, false);
+        // `index == 0` is also a multiple of the period and below `from`.
+        let longest_wait = i64::from(MAX_CALLEE_BACKOFF_CALLS);
+        assert!(
+            (1_000..=1_000 + longest_wait).contains(&bridge_calls),
+            "bridge_calls={bridge_calls}"
+        );
+        assert!(
+            attempts >= (20_000 - 1_000 - longest_wait) as u64,
+            "attempts={attempts}"
+        );
     }
 }
