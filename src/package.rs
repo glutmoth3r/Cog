@@ -2014,11 +2014,15 @@ fn protect_archive_output(
     plan: &ArchivePlan,
     output: &Path,
 ) -> Result<(), String> {
+    // The archive holds one target's plugin libraries; the output must not
+    // replace the libraries declared for other targets either.
     for input in plan
         .source_paths()
         .chain(prepared.archive_inputs.iter().map(PathBuf::as_path))
+        .map(Path::to_path_buf)
+        .chain(crate::build::plugin_libraries(prepared))
     {
-        let input = crate::build::resolve_build_path(input)?;
+        let input = crate::build::resolve_build_path(&input)?;
         if crate::build::same_build_path(&input, output) {
             return Err(format!(
                 "package output would overwrite a project input: {}",

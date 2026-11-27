@@ -34,8 +34,12 @@ static void *worker(void *pointer) {
     if (atomic_load_explicit(&operation->cancelled, memory_order_acquire)) return NULL;
     atomic_store_explicit(&operation->result, operation->delay_ms * 2, memory_order_release);
     atomic_store_explicit(&operation->done, 1, memory_order_release);
-    /* Async worker threads may only call this thread-safe wake function. */
-    (void)host->wake(wake_context);
+    /* Async worker threads may only call this thread-safe wake function. A
+     * full wake queue must be retried, but cancellation still stops promptly. */
+    while (host->wake(wake_context) == COG_LIMIT) {
+        if (atomic_load_explicit(&operation->cancelled, memory_order_acquire)) break;
+        nanosleep(&pause, NULL);
+    }
     return NULL;
 }
 

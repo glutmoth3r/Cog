@@ -41,6 +41,8 @@ use std::time::Instant;
 
 const MAX_ASYNC_TASKS: usize = 1_000_000;
 const MAX_STACK_EFFECT_CACHE_INSTRUCTIONS: usize = 4096;
+/// Queued plugin wake notifications; each task holds at most one at a time.
+const PLUGIN_WAKE_CAPACITY: usize = 4096;
 
 #[derive(Clone, Default)]
 pub(crate) struct CaptureValues(Option<HeapRef<ClosureCaptures>>);
@@ -1012,7 +1014,7 @@ impl AsyncScheduler {
         let handle = TaskHandle::new(id, abandoned_sender, abandoned_pending);
         let plugin_wake = if matches!(&target, AsyncTaskTarget::Native { .. }) {
             if self.plugin_wake_sender.is_none() {
-                let (sender, receiver) = mpsc::sync_channel(4096);
+                let (sender, receiver) = mpsc::sync_channel(PLUGIN_WAKE_CAPACITY);
                 self.plugin_wake_sender = Some(sender);
                 self.plugin_wake_receiver = Some(receiver);
             }
@@ -3515,7 +3517,9 @@ impl AsyncScheduler {
     }
 
     fn wake_plugin_tasks(&mut self) -> Result<(), RuntimeError> {
-        loop {
+        // Consuming a notification lets its worker queue another one. One pass
+        // takes at most a full queue; later passes pick up the remainder.
+        for _ in 0..PLUGIN_WAKE_CAPACITY {
             let received = match self.plugin_wake_receiver.as_ref() {
                 Some(receiver) => receiver.try_recv(),
                 None => return Ok(()),
@@ -3530,6 +3534,7 @@ impl AsyncScheduler {
                 }
             }
         }
+        Ok(())
     }
 
     fn wake_plugin_task(&mut self, id: usize) -> Result<(), RuntimeError> {
@@ -6959,6 +6964,50 @@ fn execute_vm(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plugin worker can wake again as soon as its notification is consumed.
+    /// One drain must still end so that timers and ready tasks make progress.
+    #[test]
+    fn plugin_wake_drain_ends_while_workers_keep_waking() {
+        let mut scheduler = AsyncScheduler::new(None, None, None);
+        let (sender, receiver) = mpsc::sync_channel(PLUGIN_WAKE_CAPACITY);
+        scheduler.plugin_wake_receiver = Some(receiver);
+        let mut leases = Vec::new();
+        let mut wakes = Vec::new();
+        for _ in 0..16 {
+            let lease = scheduler
+                .create_target(AsyncTaskTarget::Sleep(Value::Float(0.0)))
+                .unwrap();
+            let wake = AsyncWakeHandle::new(lease.id(), sender.clone());
+            scheduler.tasks.get_mut(&lease.id()).unwrap().plugin_wake = Some(wake.clone());
+            leases.push(lease);
+            wakes.push(wake);
+        }
+        let drained = AtomicBool::new(false);
+        let timed_out = AtomicBool::new(false);
+        let running = std::sync::atomic::AtomicUsize::new(0);
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        std::thread::scope(|scope| {
+            for wake in &wakes {
+                scope.spawn(|| {
+                    running.fetch_add(1, Ordering::AcqRel);
+                    while !drained.load(Ordering::Acquire) {
+                        if Instant::now() >= deadline {
+                            timed_out.store(true, Ordering::Release);
+                            return;
+                        }
+                        let _ = wake.wake();
+                    }
+                });
+            }
+            while running.load(Ordering::Acquire) < wakes.len() {
+                std::thread::yield_now();
+            }
+            scheduler.wake_plugin_tasks().unwrap();
+            drained.store(true, Ordering::Release);
+        });
+        assert!(!timed_out.load(Ordering::Acquire));
+    }
 
     #[test]
     fn cleanup_root_reservation_preserves_values_on_size_or_allocation_failure() {

@@ -141,32 +141,27 @@ impl AsyncWakeHandle {
     }
 
     pub(crate) fn wake(&self) -> Result<(), RuntimeError> {
-        if self
-            .signalled
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        // `wake` and `reset` both use read-modify-write operations. A coalesced
+        // wake is therefore ordered before the reset it merges into, and the
+        // following poll observes everything the worker published before it.
+        if self.signalled.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        match self.sender.try_send(self.task) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => {
-                self.signalled.store(false, Ordering::Release);
-                Err(RuntimeError::ResourceLimit {
+        self.sender.try_send(self.task).map_err(|error| {
+            self.reset();
+            match error {
+                TrySendError::Full(_) => RuntimeError::ResourceLimit {
                     resource: "async plugin wake queue",
-                })
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                self.signalled.store(false, Ordering::Release);
-                Err(RuntimeError::InvalidArgument {
+                },
+                TrySendError::Disconnected(_) => RuntimeError::InvalidArgument {
                     op: "async plugin wakeup",
-                })
+                },
             }
-        }
+        })
     }
 
     pub(crate) fn reset(&self) {
-        self.signalled.store(false, Ordering::Release);
+        self.signalled.swap(false, Ordering::AcqRel);
     }
 }
 
@@ -2448,6 +2443,65 @@ mod limits_tests {
             writable: true,
             dirty: false,
         }
+    }
+
+    /// A wake that is coalesced into a notification the scheduler is consuming
+    /// must still publish the worker's progress to the following poll.
+    #[test]
+    fn coalesced_async_wakes_never_hide_worker_progress() {
+        use std::sync::atomic::AtomicUsize;
+        const ROUNDS: usize = 200_000;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+        let wake = AsyncWakeHandle::new(0, sender);
+        let started = AtomicUsize::new(0);
+        let finished = AtomicUsize::new(0);
+        let progress = AtomicUsize::new(0);
+        // Spin for a tight interleaving, but only when both threads can run.
+        let spin_limit = match std::thread::available_parallelism() {
+            Ok(threads) if threads.get() > 1 => 1_000,
+            _ => 0,
+        };
+        let reach = |counter: &AtomicUsize, round: usize| {
+            let mut spins = 0;
+            while counter.load(Ordering::Acquire) < round {
+                if spins < spin_limit {
+                    spins += 1;
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+        };
+        let lost = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for round in 1..=ROUNDS {
+                    reach(&started, round);
+                    progress.store(round, Ordering::Release);
+                    wake.wake().unwrap();
+                    finished.store(round, Ordering::Release);
+                }
+            });
+            let mut lost = 0;
+            for round in 1..=ROUNDS {
+                // Leave one notification outstanding, then consume it while
+                // the worker publishes progress and wakes again.
+                wake.wake().unwrap();
+                receiver.try_recv().unwrap();
+                started.store(round, Ordering::Release);
+                for _ in 0..round % 64 {
+                    std::hint::spin_loop();
+                }
+                wake.reset();
+                let seen = progress.load(Ordering::Acquire);
+                reach(&finished, round);
+                let renotified = receiver.try_recv().is_ok();
+                lost += usize::from(seen != round && !renotified);
+                wake.reset();
+                while receiver.try_recv().is_ok() {}
+            }
+            lost
+        });
+        assert_eq!(lost, 0);
     }
 
     #[test]

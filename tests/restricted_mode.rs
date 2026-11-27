@@ -274,6 +274,50 @@ fn restricted_eval_denies_filesystem_process_and_time_access() {
 }
 
 #[test]
+fn restricted_mode_applies_to_application_archives() {
+    let scratch = Scratch::new();
+    std::fs::write(
+        scratch.root.join("package.kdl"),
+        "package \"restricted-archive\" version=\"1\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        scratch.root.join("src/main.cog"),
+        sync_program("use fs;", "fs::create_dir(\"made\")"),
+    )
+    .unwrap();
+    let archive = scratch.root.join("application.cogpkg");
+    let build = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .args(["package", "build"])
+        .arg(&scratch.root)
+        .arg("-o")
+        .arg(&archive)
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "{}", report(&build));
+    let run = |arguments: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_cog"))
+            .arg("run")
+            .args(arguments)
+            .arg(&archive)
+            .current_dir(scratch.work())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+
+    let output = run(&["--restricted"]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert_eq!(output.stdout, b"denied\n", "{}", report(&output));
+    assert!(scratch.entries().is_empty(), "{:?}", scratch.entries());
+
+    let output = run(&[]);
+    assert!(output.status.success(), "{}", report(&output));
+    assert_eq!(output.stdout, b"allowed\n", "{}", report(&output));
+    assert_eq!(scratch.entries(), ["made"]);
+}
+
+#[test]
 fn restricted_mode_is_rejected_together_with_native_plugins() {
     let scratch = Scratch::new();
     let output = scratch.run(

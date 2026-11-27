@@ -16,6 +16,8 @@ extern "C" {
 /* Trusted, version 3 ABI. Host value views are borrowed and callbacks run
  * on the VM thread. Async plugins may wake from worker threads, but may not
  * call any other host function from those threads. All views are borrowed.
+ * The host table passed to an async start stays valid until that operation's
+ * cancel or destroy_operation returns; wake_context has the same lifetime.
  * No exception/panic may cross C. See docs/SDK.md for the complete contract. */
 /* Host-issued, invocation-scoped opaque token. The current host stores a
  * 52-bit generation in bits 63..12 and a zero-based 12-bit slot in bits 11..0.

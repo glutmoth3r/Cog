@@ -708,3 +708,41 @@ fn run_context_applies_optional_buffer_limits() {
     assert!(error.message().contains("runtime resource limit: bytes"));
     assert!(output.is_empty(), "the failing allocation precedes output");
 }
+
+#[test]
+fn callback_panic_payloads_with_panicking_destructors_stay_contained() {
+    struct Bomb;
+    impl Drop for Bomb {
+        fn drop(&mut self) {
+            panic!("payload destructor");
+        }
+    }
+
+    let mut engine = Engine::new();
+    engine
+        .register(
+            "host::explode",
+            Signature::new(vec![], Type::Nil),
+            |_, _| std::panic::panic_any(Bomb),
+        )
+        .unwrap();
+    let program = engine
+        .compile(
+            "explode.cog",
+            r#"
+            @!include("std") use host; use io; use err::Error;
+            fn main() {
+                when host::explode() is Error::NativeFailure { io::println("contained"); }
+                when host::explode() is Error::NativeFailure { io::println("again"); }
+            }
+        "#,
+        )
+        .unwrap();
+    let mut output = Vec::new();
+    engine
+        .decode(&program.encode().unwrap())
+        .unwrap()
+        .run(&mut output)
+        .unwrap();
+    assert_eq!(output, b"contained\nagain\n");
+}

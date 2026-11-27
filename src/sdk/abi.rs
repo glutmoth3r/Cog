@@ -15,6 +15,8 @@ pub const PENDING: Status = 6;
 pub const VERSION: u32 = 3;
 pub const ERROR_VALUE: u32 = 12;
 pub const OPAQUE_VALUE: u32 = 255;
+/// Longest error text the host accepts from `set_error`.
+pub(super) const MAX_ERROR_BYTES: usize = 64 * 1024;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -409,7 +411,8 @@ impl PluginCall<'_> {
 }
 
 /// Invoke a safe Rust plugin callback and catch unwinding panics before the C
-/// boundary. The host's normal panic hook may still run.
+/// boundary. The host's normal panic hook may still run. Error text beyond the
+/// host's 64 KiB limit is truncated at a character boundary.
 ///
 /// # Safety
 /// The host table, context, argument array and output pointer must obey ABI v3
@@ -465,14 +468,17 @@ pub unsafe fn dispatch(
             OK
         }
         Ok(Err(error)) => {
+            let message = error.message();
+            let message = &message[..message.floor_char_boundary(MAX_ERROR_BYTES)];
             // SAFETY: the validated live host table provides a call-scoped
             // `set_error`; the borrowed message lives through the synchronous call.
             unsafe {
-                (host.set_error)(context, Bytes::new(error.message().as_bytes()));
+                (host.set_error)(context, Bytes::new(message.as_bytes()));
             }
             FAILURE
         }
-        Err(_) => {
+        Err(payload) => {
+            super::discard_panic(payload);
             // SAFETY: same validated host/context contract as the error path.
             unsafe {
                 (host.set_error)(context, Bytes::new(b"Rust plugin callback panicked"));
@@ -505,7 +511,10 @@ pub unsafe fn create_state<T: Default>(output: *mut *mut c_void) -> Status {
             }
             OK
         }
-        Err(_) => PANIC,
+        Err(payload) => {
+            super::discard_panic(payload);
+            PANIC
+        }
     }
 }
 
@@ -518,9 +527,12 @@ pub unsafe fn destroy_state<T>(state: *mut c_void) {
     if !state.is_null() {
         // SAFETY: the caller guarantees this is the live pointer returned by
         // `create_state::<T>` and that it is destroyed exactly once after use.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             drop(Box::from_raw(state.cast::<T>()));
         }));
+        if let Err(payload) = result {
+            super::discard_panic(payload);
+        }
     }
 }
 
@@ -593,6 +605,113 @@ mod tests {
         assert_eq!(text.bytes().unwrap(), "Cog λ".as_bytes());
         assert_eq!(text.string().unwrap(), "Cog λ");
         assert_eq!(call.string(1).unwrap(), "Cog λ");
+    }
+
+    /// A host table that only records the error text a plugin reports, using
+    /// the same 64 KiB bound as the real host.
+    fn dispatch_with_recording_host(
+        callback: impl FnOnce(&PluginCall<'_>) -> Result<Handle, Error>,
+    ) -> (Status, Option<String>) {
+        unsafe extern "C" fn inspect(_: *mut c_void, _: Handle, _: *mut ValueView) -> Status {
+            INVALID
+        }
+        unsafe extern "C" fn make(_: *mut c_void, _: *const ValueView, _: *mut Handle) -> Status {
+            INVALID
+        }
+        unsafe extern "C" fn get(_: *mut c_void, _: Handle, _: usize, _: *mut Handle) -> Status {
+            INVALID
+        }
+        unsafe extern "C" fn set(_: *mut c_void, _: Handle, _: usize, _: Handle) -> Status {
+            INVALID
+        }
+        unsafe extern "C" fn output(_: *mut c_void, _: Bytes) -> Status {
+            INVALID
+        }
+        unsafe extern "C" fn set_error(context: *mut c_void, bytes: Bytes) -> Status {
+            if bytes.len > 64 * 1024 {
+                return LIMIT;
+            }
+            // SAFETY: `dispatch` passes a live message and the test's own slot.
+            let bytes = unsafe { std::slice::from_raw_parts(bytes.data, bytes.len) };
+            let message = std::str::from_utf8(bytes).unwrap().to_owned();
+            unsafe { *context.cast::<Option<String>>() = Some(message) };
+            OK
+        }
+        unsafe extern "C" fn wake(_: *mut c_void) -> Status {
+            INVALID
+        }
+        let host = HostV3 {
+            size: size_of::<HostV3>() as u32,
+            version: VERSION,
+            inspect,
+            make,
+            array_get: get,
+            array_set: set,
+            write_output: output,
+            set_error,
+            wake,
+        };
+        let mut message = None::<String>;
+        let mut result = 0;
+        // SAFETY: the table, context and output slot outlive this call.
+        let status = unsafe {
+            dispatch(
+                &host,
+                (&mut message as *mut Option<String>).cast(),
+                std::ptr::null(),
+                0,
+                &mut result,
+                callback,
+            )
+        };
+        (status, message)
+    }
+
+    struct PanickingPayload;
+    impl Drop for PanickingPayload {
+        fn drop(&mut self) {
+            panic!("payload destructor");
+        }
+    }
+
+    #[test]
+    fn dispatch_contains_panic_payloads_with_panicking_destructors() {
+        let (status, message) =
+            dispatch_with_recording_host(|_| std::panic::panic_any(PanickingPayload));
+        assert_eq!(status, PANIC);
+        assert_eq!(message.as_deref(), Some("Rust plugin callback panicked"));
+    }
+
+    #[test]
+    fn dispatch_truncates_oversized_error_text_on_a_character_boundary() {
+        // One ASCII byte shifts every two-byte character across the bound.
+        let text = format!("x{}", "\u{3bb}".repeat(64 * 1024));
+        let (status, message) = dispatch_with_recording_host(|_| Err(Error::new(text.clone())));
+        assert_eq!(status, FAILURE);
+        let message = message.expect("a truncated message reaches the host");
+        assert_eq!(message.len(), 64 * 1024 - 1);
+        assert!(text.starts_with(&message));
+    }
+
+    #[test]
+    fn rust_state_wrappers_contain_panic_payload_destructors() {
+        struct InitBomb;
+        impl Default for InitBomb {
+            fn default() -> Self {
+                std::panic::panic_any(PanickingPayload)
+            }
+        }
+        #[derive(Default)]
+        struct DropBomb;
+        impl Drop for DropBomb {
+            fn drop(&mut self) {
+                std::panic::panic_any(PanickingPayload)
+            }
+        }
+        let mut state = std::ptr::null_mut();
+        assert_eq!(unsafe { create_state::<InitBomb>(&mut state) }, PANIC);
+        assert_eq!(unsafe { create_state::<DropBomb>(&mut state) }, OK);
+        unsafe { destroy_state::<DropBomb>(state) };
     }
 
     #[test]

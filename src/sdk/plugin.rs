@@ -435,6 +435,8 @@ struct LibraryState {
 
 struct PluginAsyncFactory {
     state: Rc<LibraryState>,
+    name: Rc<str>,
+    result: Type,
     start: abi::AsyncStartV3,
     poll: abi::AsyncPollV3,
     cancel: abi::AsyncCancelV3,
@@ -449,12 +451,17 @@ struct WakeRegistration {
 
 struct PluginAsyncOperation {
     state: Rc<LibraryState>,
+    name: Rc<str>,
+    result: Type,
     operation: *mut c_void,
     poll: abi::AsyncPollV3,
     cancel: abi::AsyncCancelV3,
     destroy: abi::AsyncDestroyV3,
     wake: Box<WakeRegistration>,
     cancelled: bool,
+    /// Set once `poll` returns a status other than PENDING. Releasing any
+    /// other operation cancels it before destruction.
+    completed: bool,
 }
 
 fn runtime_plugin_failure(error: Error) -> RuntimeError {
@@ -519,20 +526,31 @@ impl NativeAsyncFactory for PluginAsyncFactory {
                 &mut operation,
             )
         };
-        if status != abi::OK || frame.error.is_some() {
-            return Err(runtime_plugin_failure(failure(frame.error.unwrap_or_else(
+        let reported = frame.error.take();
+        // A nonzero status leaves cleanup to the plugin.
+        if status != abi::OK {
+            return Err(runtime_plugin_failure(failure(reported.unwrap_or_else(
                 || format!("async plugin start failed ({status})"),
             ))));
         }
-        Ok(Box::new(PluginAsyncOperation {
+        let operation = Box::new(PluginAsyncOperation {
             state: self.state.clone(),
+            name: self.name.clone(),
+            result: self.result,
             operation,
             poll: self.poll,
             cancel: self.cancel,
             destroy: self.destroy,
             wake,
             cancelled: false,
-        }))
+            completed: false,
+        });
+        // An OK status transfers the operation to the host even when the
+        // plugin also reported an error; dropping it cancels and destroys it.
+        if let Some(message) = reported {
+            return Err(runtime_plugin_failure(failure(message)));
+        }
+        Ok(operation)
     }
 }
 
@@ -564,6 +582,7 @@ impl NativeAsyncOperation for PluginAsyncOperation {
                 &mut result,
             )
         };
+        self.completed = status != abi::PENDING;
         if status == abi::PENDING && frame.error.is_none() {
             return Ok(None);
         }
@@ -572,15 +591,18 @@ impl NativeAsyncOperation for PluginAsyncOperation {
                 || format!("async plugin poll failed ({status})"),
             ))));
         }
-        frame
-            .get(result)
-            .cloned()
-            .map(|value| Some(value.0))
-            .map_err(|_| {
-                runtime_plugin_failure(failure(
-                    "async plugin returned an invalid or expired value handle",
-                ))
-            })
+        let value = frame.get(result).map_err(|_| {
+            runtime_plugin_failure(failure(
+                "async plugin returned an invalid or expired value handle",
+            ))
+        })?;
+        if !matches!(value.0, VmValue::Error(_)) && !self.result.runtime().accepts(&value.0) {
+            return Err(runtime_plugin_failure(failure(format!(
+                "native function `{}` returned a value outside its contract",
+                self.name
+            ))));
+        }
+        Ok(Some(value.0.clone()))
     }
 
     fn cancel(&mut self) {
@@ -599,6 +621,10 @@ impl NativeAsyncOperation for PluginAsyncOperation {
 
 impl Drop for PluginAsyncOperation {
     fn drop(&mut self) {
+        // Run teardown and failed starts or polls abandon incomplete work.
+        if !self.completed {
+            self.cancel();
+        }
         self.wake
             .active
             .store(false, std::sync::atomic::Ordering::Release);
@@ -650,7 +676,8 @@ enum PluginCallbacks {
 // length is bounded here, but raw pointer validity can only come from the ABI
 // contract and the unsafe trust boundary in `load`.
 unsafe fn view<'a>(bytes: Bytes, limit: usize) -> Result<&'a [u8], Error> {
-    if bytes.len > limit || (bytes.len != 0 && bytes.data.is_null()) {
+    // No slice may exceed `isize::MAX`, whatever the configured limit allows.
+    if bytes.len > limit.min(isize::MAX as usize) || (bytes.len != 0 && bytes.data.is_null()) {
         return Err(failure("invalid plugin byte view"));
     }
     if bytes.len == 0 {
@@ -825,6 +852,8 @@ unsafe fn load(
             } => {
                 let factory = Rc::new(PluginAsyncFactory {
                     state: state.clone(),
+                    name: name.as_str().into(),
+                    result: signature.result,
                     start,
                     poll,
                     cancel,
@@ -939,7 +968,10 @@ fn guarded(action: impl FnOnce() -> Result<(), Status>) -> Status {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)) {
         Ok(Ok(())) => abi::OK,
         Ok(Err(status)) => status,
-        Err(_) => abi::PANIC,
+        Err(payload) => {
+            super::discard_panic(payload);
+            abi::PANIC
+        }
     }
 }
 // SAFETY: `context` is the active `Frame` pointer passed by the host to this
@@ -1145,7 +1177,7 @@ unsafe extern "C" fn set_error(context: *mut c_void, bytes: Bytes) -> Status {
         let frame = unsafe { frame(context) };
         // SAFETY: the plugin supplies readable error bytes for this callback;
         // `view` bounds the length before constructing the slice.
-        let bytes = unsafe { view(bytes, 64 * 1024) }.map_err(|_| abi::LIMIT)?;
+        let bytes = unsafe { view(bytes, abi::MAX_ERROR_BYTES) }.map_err(|_| abi::LIMIT)?;
         frame.error = Some(
             std::str::from_utf8(bytes)
                 .map_err(|_| abi::INVALID)?

@@ -545,35 +545,13 @@ fn command(color: &mut Color) -> Result<(), String> {
             if !bytecode_input && !reused {
                 color.status("built", &destination, elapsed);
             }
-            let capabilities = if options.restricted {
-                VmCapabilities {
-                    allow_print: true,
-                    allow_read: true,
-                    ..VmCapabilities::restricted()
-                }
-            } else {
-                VmCapabilities::default()
-            };
-            let mut stdout = OutputCap::new(std::io::stdout(), options.restricted);
-            let mut context = RuntimeContext::new(&mut stdout, capabilities);
-            if options.restricted {
-                context.limits = cog::runtime::RuntimeLimits::restricted_defaults();
-            }
-            context.configure_jit(options.jit, Some(&jit_profile_path(target)), options.debug);
-            context.set_process_arguments(options.program_args);
-            interpreter::run_with_context(
+            execute_bytecode(
                 compiled
                     .as_ref()
                     .ok_or("internal error: run has no compiled program")?,
-                &mut context,
+                target,
+                options,
             )
-            .map_err(|error| {
-                format_runtime_error(
-                    &error,
-                    context.last_source_location(),
-                    context.last_runtime_diagnostic(),
-                )
-            })
         }
         Mode::Build => {
             color.status(
@@ -584,6 +562,37 @@ fn command(color: &mut Color) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+/// Run a program without native plugins under the requested CLI policy.
+fn execute_bytecode(
+    compiled: &CompiledProgram,
+    target: &Path,
+    options: Options,
+) -> Result<(), String> {
+    let capabilities = if options.restricted {
+        VmCapabilities {
+            allow_print: true,
+            allow_read: true,
+            ..VmCapabilities::restricted()
+        }
+    } else {
+        VmCapabilities::default()
+    };
+    let mut stdout = OutputCap::new(std::io::stdout(), options.restricted);
+    let mut context = RuntimeContext::new(&mut stdout, capabilities);
+    if options.restricted {
+        context.limits = cog::runtime::RuntimeLimits::restricted_defaults();
+    }
+    context.configure_jit(options.jit, Some(&jit_profile_path(target)), options.debug);
+    context.set_process_arguments(options.program_args);
+    interpreter::run_with_context(compiled, &mut context).map_err(|error| {
+        format_runtime_error(
+            &error,
+            context.last_source_location(),
+            context.last_runtime_diagnostic(),
+        )
+    })
 }
 
 fn eval_expression(expression: &str, options: &Options, color: &Color) -> Result<(), String> {
@@ -811,14 +820,17 @@ fn command_with_plugins(
             }
         }
     }
+    let mut plugin_files = Vec::new();
     for path in &options.plugins {
         let manifest = PluginManifest::read(path).map_err(|error| error.to_string())?;
+        let directory = path.parent().unwrap_or(Path::new("."));
+        plugin_files.push(path.clone());
+        plugin_files.push(directory.join(&manifest.library));
         if mode == Mode::Run {
             // SAFETY: `--plugin` is explicit authorization to execute this trusted
             // native library with process authority. Check/build never load it;
             // descriptor validation cannot make an untrusted library safe.
-            unsafe { manifest.load(&mut engine, path.parent().unwrap_or(Path::new("."))) }
-                .map_err(|error| error.to_string())?;
+            unsafe { manifest.load(&mut engine, directory) }.map_err(|error| error.to_string())?;
         } else {
             manifest
                 .register_metadata(&mut engine)
@@ -834,6 +846,7 @@ fn command_with_plugins(
             .clone()
             .unwrap_or_else(|| target.to_path_buf());
         if mode == Mode::Build {
+            protect_plugin_files(&destination, &plugin_files)?;
             program
                 .write(&destination)
                 .map_err(|error| error.to_string())?;
@@ -851,6 +864,9 @@ fn command_with_plugins(
                 target.with_extension("cogb")
             }
         });
+        if mode != Mode::Check {
+            protect_plugin_files(&destination, &plugin_files)?;
+        }
         if prepared.kind == config::PackageKind::Library {
             let warnings = engine
                 .check_library_prepared(prepared)
@@ -920,6 +936,51 @@ fn command_with_plugins(
     }
 }
 
+/// A build output must not replace a `--plugin` manifest or its library.
+fn protect_plugin_files(destination: &Path, plugin_files: &[PathBuf]) -> Result<(), String> {
+    let output = replaced_path(destination)?;
+    for input in plugin_files {
+        let input = replaced_path(input)?;
+        #[cfg(unix)]
+        let linked = {
+            use std::os::unix::fs::MetadataExt;
+            matches!(
+                (input.metadata(), output.metadata()),
+                (Ok(input), Ok(output))
+                    if input.dev() == output.dev() && input.ino() == output.ino()
+            )
+        };
+        #[cfg(not(unix))]
+        let linked = false;
+        if input == output || linked {
+            return Err(format!(
+                "output would overwrite a plugin file: {}",
+                destination.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The file that writing `path` would replace. Symbolic links resolve before a
+/// following `..`, including paths through directories the writer would create.
+fn replaced_path(path: &Path) -> Result<PathBuf, String> {
+    let absolute = std::path::absolute(path)
+        .map_err(|error| format!("cannot resolve path {}: {error}", path.display()))?;
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        if component == std::path::Component::ParentDir {
+            resolved.pop();
+        } else {
+            resolved.push(component);
+            if let Ok(real) = resolved.canonicalize() {
+                resolved = real;
+            }
+        }
+    }
+    Ok(resolved)
+}
+
 fn command_with_application(target: &Path, options: Options, color: &Color) -> Result<(), String> {
     use cog::sdk::{Engine, PluginManifest, RunContext};
 
@@ -975,6 +1036,15 @@ fn command_with_application(target: &Path, options: Options, color: &Color) -> R
         // SAFETY: this manifest was explicitly supplied for the requested run;
         // its library must obey the trusted C ABI v3 contract.
         unsafe { manifest.load(&mut engine, &root) }.map_err(|error| error.to_string())?;
+    }
+    if options.restricted {
+        // No plugins are present, so the CLI's restricted VM policy applies.
+        let compiled = bytecode::decode(&application.bytecode)?;
+        if options.debug {
+            println!("bytecode\n{}", compiled.disassemble());
+        }
+        color.status("loaded", target, started.elapsed());
+        return execute_bytecode(&compiled, target, options);
     }
     let program = engine
         .decode(&application.bytecode)

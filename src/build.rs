@@ -250,6 +250,15 @@ pub(crate) fn protect_build_inputs(
     Ok(())
 }
 
+/// Every native library declared by the package graph, for all targets.
+pub(crate) fn plugin_libraries(prepared: &Prepared) -> impl Iterator<Item = PathBuf> {
+    prepared.plugins.iter().flat_map(|(root, plugin)| {
+        plugin
+            .library_paths()
+            .map(move |library| root.join(library))
+    })
+}
+
 fn protect_project_inputs(prepared: &Prepared, artifact: &Path) -> Result<(), String> {
     let output = resolve_build_path(artifact)?;
     let sources = prepared
@@ -260,12 +269,7 @@ fn protect_project_inputs(prepared: &Prepared, artifact: &Path) -> Result<(), St
             _ => None,
         })
         .chain(prepared.assets.iter().map(|(root, path)| root.join(path)))
-        .chain(
-            prepared
-                .plugins
-                .iter()
-                .map(|(root, plugin)| root.join(&plugin.library)),
-        );
+        .chain(plugin_libraries(prepared));
     let lock = prepared.root.join("cog.lock");
     for input in sources {
         let input = resolve_build_path(&input)?;

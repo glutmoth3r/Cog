@@ -338,6 +338,11 @@ fn package_plugin_loader_rejects_mutated_paths_outside_the_package_root() {
 
 #[cfg(any(unix, windows))]
 fn c_plugin(directory: &Directory, flags: &[&str]) -> PathBuf {
+    c_fixture(directory, "native_plugin", flags)
+}
+
+#[cfg(any(unix, windows))]
+fn c_fixture(directory: &Directory, source: &str, flags: &[&str]) -> PathBuf {
     let output = directory.library("c_plugin");
     let mut compiler = Command::new(if cfg!(windows) { "cl.exe" } else { "cc" });
     compiler.current_dir(&directory.0);
@@ -379,7 +384,11 @@ fn c_plugin(directory: &Directory, flags: &[&str]) -> PathBuf {
             .arg("-o")
             .arg(&output);
     }
-    compiler.arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native_plugin.c"));
+    compiler.arg(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(format!("{source}.c")),
+    );
     check(&mut compiler);
     output
 }
@@ -921,4 +930,210 @@ fn library_package_native_metadata_checks_without_main_or_loading_library() {
             .arg(&directory.0),
     );
     assert!(!directory.0.join("target/native-library.cogb").exists());
+}
+
+#[cfg(any(unix, windows))]
+fn run_source(engine: &Engine, source: &str) -> String {
+    let program = engine.compile("lifecycle.cog", source).unwrap();
+    let program = engine.decode(&program.encode().unwrap()).unwrap();
+    let mut output = Vec::new();
+    program.run(&mut output).unwrap();
+    String::from_utf8(output).unwrap()
+}
+
+/// Await one operation of the lifecycle fixture and return the operation
+/// callbacks that the host invoked for it, including those at run teardown.
+#[cfg(any(unix, windows))]
+fn lifecycle(operation: &str, pattern: &str) -> String {
+    let directory = Directory::new();
+    let library = c_fixture(&directory, "native_lifecycle_plugin", &[]);
+    let mut engine = Engine::new();
+    unsafe { engine.load_plugin(&library) }.unwrap();
+    let output = run_source(
+        &engine,
+        &format!(
+            "@!include(\"std\") use probe; use io; use err::Error; use async::time; @async fn main() -> nil {{ when await {operation} is {pattern} {{ io::println(\"matched\"); }} else {{ io::println(\"unexpected\"); }} }}"
+        ),
+    );
+    assert_eq!(output, "matched\n", "{operation}");
+    run_source(
+        &engine,
+        "@!include(\"std\") use probe; use io; fn main() { io::println(probe::events()); }",
+    )
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn completed_async_plugin_operations_are_destroyed_without_cancellation() {
+    assert_eq!(lifecycle("probe::ready()", "int"), "start;destroy;\n");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn async_plugin_operations_abandoned_at_run_end_are_cancelled_before_destruction() {
+    assert_eq!(
+        lifecycle("time::timeout(probe::forever(), 0.01)", "Error::Timeout"),
+        "start;cancel;destroy;\n"
+    );
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn successful_async_start_that_reports_an_error_releases_the_operation() {
+    assert_eq!(
+        lifecycle("probe::start_error()", "Error::NativeFailure"),
+        "start;cancel;destroy;\n"
+    );
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn pending_async_poll_that_reports_an_error_cancels_the_operation() {
+    assert_eq!(
+        lifecycle("probe::pending_error()", "Error::NativeFailure"),
+        "start;cancel;destroy;\n"
+    );
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn async_plugin_results_are_checked_against_the_declared_type() {
+    assert_eq!(
+        lifecycle("probe::bad_result()", "Error::NativeFailure"),
+        "start;destroy;\n"
+    );
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn oversized_plugin_output_views_are_rejected_without_default_limits() {
+    let directory = Directory::new();
+    let library = c_fixture(&directory, "native_lifecycle_plugin", &[]);
+    let mut engine = Engine::new();
+    unsafe { engine.load_plugin(&library) }.unwrap();
+    assert_eq!(
+        run_source(
+            &engine,
+            "@!include(\"std\") use probe; use io; fn main() { io::println(probe::oversized_output()); }",
+        ),
+        "4\n"
+    );
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn build_outputs_cannot_replace_declared_or_explicit_plugin_files() {
+    let directory = Directory::new();
+    let package = directory.0.join("package");
+    std::fs::create_dir_all(package.join("src")).unwrap();
+    std::fs::create_dir_all(package.join("native")).unwrap();
+    std::fs::write(
+        package.join("package.kdl"),
+        r#"package "guarded-plugins" version="1" {
+    plugin version=1 {
+        library target="x86_64-unknown-linux-gnu" path="native/linux.so"
+        library target="x86_64-pc-windows-msvc" path="native/windows.dll"
+        library target="aarch64-apple-darwin" path="native/macos.dylib"
+        function "host::probe" result="int"
+    }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("src/main.cog"),
+        "@!include(\"std\") use host; fn main() { host::probe(); }",
+    )
+    .unwrap();
+    let libraries = [
+        "native/linux.so",
+        "native/windows.dll",
+        "native/macos.dylib",
+    ];
+    for library in libraries {
+        std::fs::write(package.join(library), b"library bytes").unwrap();
+    }
+    let rejected = |command: &mut Command, input: &Path| {
+        let before = std::fs::read(input).unwrap();
+        let result = command.output().unwrap();
+        assert!(!result.status.success(), "{command:?}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("would overwrite"),
+            "{command:?}\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(std::fs::read(input).unwrap(), before, "{command:?}");
+    };
+    for library in libraries {
+        let input = package.join(library);
+        rejected(
+            Command::new(env!("CARGO_BIN_EXE_cog"))
+                .arg("build")
+                .arg(&package)
+                .arg("-o")
+                .arg(&input),
+            &input,
+        );
+        rejected(
+            Command::new(env!("CARGO_BIN_EXE_cog"))
+                .args(["package", "build"])
+                .arg(&package)
+                .args(["--target", "x86_64-unknown-linux-gnu", "-o"])
+                .arg(&input),
+            &input,
+        );
+    }
+
+    let manifest = directory.0.join("plugin.kdl");
+    let library = directory.0.join("external.so");
+    let source = directory.0.join("main.cog");
+    std::fs::write(
+        &manifest,
+        "plugin version=1 library=\"external.so\"\nfunction \"host::probe\" result=\"int\"",
+    )
+    .unwrap();
+    std::fs::write(&library, b"library bytes").unwrap();
+    std::fs::write(
+        &source,
+        "@!include(\"std\") use host; fn main() { host::probe(); }",
+    )
+    .unwrap();
+    let artifact = directory.0.join("program.cogb");
+    check(
+        Command::new(env!("CARGO_BIN_EXE_cog"))
+            .arg("build")
+            .arg(&source)
+            .arg("--plugin")
+            .arg(&manifest)
+            .arg("-o")
+            .arg(&artifact),
+    );
+    // The same file through a hard link, or through a directory that writing
+    // the output would create, is also protected.
+    let linked = directory.0.join("linked.so");
+    std::fs::hard_link(&library, &linked).unwrap();
+    let indirect = directory.0.join("missing/../external.so");
+    // Each requested output paired with the file that must stay unchanged.
+    let mut outputs = vec![
+        (&manifest, &manifest),
+        (&library, &library),
+        (&indirect, &library),
+    ];
+    if cfg!(unix) {
+        outputs.push((&linked, &linked));
+    }
+    for input in [&source, &artifact] {
+        for (output, protected) in outputs.iter().copied() {
+            rejected(
+                Command::new(env!("CARGO_BIN_EXE_cog"))
+                    .arg("build")
+                    .arg(input)
+                    .arg("--plugin")
+                    .arg(&manifest)
+                    .arg("-o")
+                    .arg(output),
+                protected,
+            );
+        }
+    }
 }

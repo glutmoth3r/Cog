@@ -505,6 +505,17 @@ impl NativeContext<'_, '_> {
     }
 }
 
+/// Release a caught panic payload without letting its destructor unwind. Hosts
+/// and plugins call this where a second unwind would cross a C boundary or reach
+/// the VM. A payload raised by that destructor is leaked.
+fn discard_panic(payload: Box<dyn std::any::Any + Send>) {
+    if let Err(nested) =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(payload)))
+    {
+        std::mem::forget(nested);
+    }
+}
+
 thread_local! { static IN_CALLBACK: Cell<bool> = const { Cell::new(false) }; }
 fn entry_allowed() -> Result<(), Error> {
     if IN_CALLBACK.with(Cell::get) {
@@ -576,9 +587,12 @@ impl Engine {
                 Ok(Err(error)) => Err(RuntimeError::NativeFailure {
                     message: format!("{label}: {error}"),
                 }),
-                Err(_) => Err(RuntimeError::NativeFailure {
-                    message: format!("{label}: callback panicked"),
-                }),
+                Err(payload) => {
+                    discard_panic(payload);
+                    Err(RuntimeError::NativeFailure {
+                        message: format!("{label}: callback panicked"),
+                    })
+                }
             }
         });
         self.insert(name, signature, Some(invoke))
