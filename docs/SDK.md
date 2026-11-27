@@ -154,6 +154,12 @@ from compiled code uses the usual linked dispatch, including permission
 checks, native Errors, and callback-scoped handles. Programs retain their
 linked native library for the lifetime of the import.
 
+`run_in` executes, and JIT-compiles, on the calling thread. Give a thread that
+enables the JIT at least 1 MiB of stack; the 2 MiB default of Rust spawned
+threads satisfies this. Stack exhaustion terminates the process. See
+[thread stack requirements](JIT_DESIGN.md#thread-stack-requirements) for the
+measurements and their limits.
+
 ## Independently built CLI plugins
 
 For source projects, package-declared plugins are discovered from the root and

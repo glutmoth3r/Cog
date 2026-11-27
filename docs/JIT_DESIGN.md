@@ -125,6 +125,41 @@ Normal dynamic fallback and runtime faults are not compiler failures. They may t
 - Keep helper callbacks synchronous and bounded by their frame contracts. BigInt results share the JIT root arena, capped at 65,536 values; a full arena falls back before the current operation. The compiled-callee adapter is limited to compatible side-effect-free bodies. The synchronous VM bridge handles other eligible calls.
 - Expose decision reasons in debug output: warming, bootstrap probe, adaptive compile, budget defer, full cache, unsupported candidate, fallback cooldown, compile failure, and invalid native frame.
 
+## Thread stack requirements
+
+Compiled code runs on the calling thread, and the runtime JIT compiles on that
+thread too. Each nested compiled call uses native stack, up to the limit of 32
+described above. Running out of stack terminates the process; it is not a Cog
+Error.
+
+**Recommendation:** give a thread that enables the JIT at least 1 MiB of stack,
+for debug and release builds. The 2 MiB default of Rust spawned threads
+satisfies this. This is a margin over the measurements below, not a guaranteed
+bound.
+
+Smallest passing sizes were measured on x86_64 Linux (GNU) with Rust 1.99.1,
+without debug information, by bisecting in 4 KiB steps. The programs are small
+integer recursions: one stays within 32 compiled frames; the other also exceeds
+the limit and ends in division-by-zero Errors.
+
+| Execution on a thread of the given size | Debug | Release |
+| --- | --- | --- |
+| VM: SDK decode and run | 120-124 KiB | at most 16 KiB (smallest tried) |
+| JIT: SDK decode and run, including compilation | 360 KiB | 108 KiB |
+| AOT: C thread, shared library open and calls | 252-256 KiB | 72 KiB |
+| JIT unit tests for nested and recursive calls | 240-248 KiB | 96 KiB |
+| SDK source compilation of the same programs | 268 KiB | 48 KiB |
+
+The SDK and C thread sizes are those requested from the thread API. Unit test
+sizes are `RUST_MIN_STACK` values. `COG_AOT_JIT=1` did not change the AOT
+result. AOT executables of these programs, which run on the main thread,
+needed a stack resource limit of 260 KiB (debug) and 76 KiB (release).
+
+The numbers do not cover host frames already on the stack, native callbacks,
+other or larger programs, deeply nested source, other platforms, or other
+toolchain and optimization settings. Measure the intended host before using a
+smaller stack.
+
 ## Completed V1 implementation slices
 
 ### 1. Native exit validation and fallback lifecycle — implemented
